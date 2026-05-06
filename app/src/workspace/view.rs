@@ -11009,6 +11009,10 @@ impl Workspace {
         }
 
         let history_model = BlocklistAIHistoryModel::handle(ctx);
+        let is_local_conversation = history_model
+            .as_ref(ctx)
+            .get_conversation_metadata(&conversation_id)
+            .is_some_and(|m| m.is_restorable_locally);
         let future = history_model
             .as_ref(ctx)
             .load_conversation_data(conversation_id);
@@ -11043,6 +11047,7 @@ impl Workspace {
                 terminal_view.restore_conversation_and_directory_context(
                     conversation,
                     FeatureFlag::AgentView.is_enabled(),
+                    is_local_conversation,
                     |terminal_view, ctx| {
                         terminal_view.redetermine_global_focus(ctx);
                     },

@@ -146,9 +146,14 @@ impl TerminalView {
                 } else {
                     Box::new(|_, _| {})
                 };
+                let is_local = BlocklistAIHistoryModel::handle(ctx)
+                    .as_ref(ctx)
+                    .get_conversation_metadata(&conversation_id)
+                    .is_some_and(|m| m.is_restorable_locally);
                 me.restore_conversation_and_directory_context(
                     conversation,
                     false,
+                    is_local,
                     on_restored,
                     ctx,
                 );

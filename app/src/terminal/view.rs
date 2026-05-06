@@ -11978,8 +11978,9 @@ impl TerminalView {
 
     /// Opens a folder that the user may or may not have opened in the past
     pub fn open_repo_folder(&mut self, path: String, ctx: &mut ViewContext<Self>) {
+        let escaped = self.shell_family(ctx).shell_escape(&path);
         self.input.update(ctx, |input, ctx| {
-            input.try_execute_command(format!("cd \"{path}\"").as_str(), ctx);
+            input.try_execute_command(&format!("cd {escaped}"), ctx);
         });
 
         self.toggle_left_panel_file_tree(true, ctx);

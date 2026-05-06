@@ -3203,6 +3203,7 @@ impl PaneGroup {
                     view.restore_conversation_and_directory_context(
                         LoadedConversationData::CLIAgent(cli_conversation),
                         true,
+                        false,
                         |_, _| {},
                         ctx,
                     );
@@ -4299,6 +4300,7 @@ impl PaneGroup {
 
         success
     }
+
 
     /// Clear all panes that were hidden due to being closed (for undo functionality)
     /// This is typically called when starting pane rearrangement operations
