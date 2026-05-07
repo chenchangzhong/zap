@@ -218,6 +218,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
         $bootstrappedMsg = @{
             hook = 'Bootstrapped'
             value = @{
+                session_id = $global:_warpSessionId
                 histfile = $(Get-PSReadLineOption).HistorySavePath
                 shell = 'pwsh'
                 home_dir = "$HOME"
@@ -248,6 +249,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
         $preexecMsg = @{
             hook = 'Preexec'
             value = @{
+                session_id = $global:_warpSessionId
                 command = $command
             }
         }
@@ -272,6 +274,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
         $updateMsg = @{
             hook = 'FinishUpdate'
             value = @{
+                session_id = $global:_warpSessionId
                 update_id = $updateId
             }
         }
@@ -362,6 +365,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
             $inputBufferMsg = @{
                 hook = 'InputBuffer'
                 value = @{
+                    session_id = $global:_warpSessionId
                     buffer = $inputBuffer
                 }
             }
@@ -455,6 +459,7 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
         $commandFinishedMsg = @{
             hook = 'CommandFinished'
             value = @{
+                session_id = $global:_warpSessionId
                 exit_code = $exitCode
                 next_block_id = "precmd-${global:_warpSessionId}-$blockId"
             }
@@ -914,7 +919,9 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
     function Clear-Host() {
         $inputBufferMsg = @{
             hook = 'Clear'
-            value = @{}
+            value = @{
+                session_id = $global:_warpSessionId
+            }
         }
         Warp-Send-JsonMessage $inputBufferMsg
     }
@@ -922,7 +929,9 @@ $null = New-Module -Name Warp-Module -ScriptBlock {
     function clear() {
         $inputBufferMsg = @{
             hook = 'Clear'
-            value = @{}
+            value = @{
+                session_id = $global:_warpSessionId
+            }
         }
         Warp-Send-JsonMessage $inputBufferMsg
     }
