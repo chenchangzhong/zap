@@ -1470,7 +1470,7 @@ fn test_server_token_compatibility_ignores_unknown_token() {
 
 #[test]
 // This tests the end-to-end behavior to correctly switch focus among panels.
-// (The only panels that can be focused currently are WD, workspace, & AI assistant.)
+// (The only panels that can be focused currently are WD, workspace, & the agent panel.)
 fn test_switch_focus_panels() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1521,7 +1521,7 @@ fn test_switch_focus_panels() {
             );
         });
 
-        // Shift focus from workspace to right panel when AI assistant is open
+        // Shift focus from workspace to right panel when the agent panel is open
         workspace.update(&mut app, |view, ctx| {
             view.current_workspace_state.is_ai_assistant_panel_open = true;
             view.focus_right_panel(ctx);
