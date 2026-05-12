@@ -8,6 +8,7 @@ use crate::ai::agent::ImageContext;
 use crate::ai::blocklist::agent_view::agent_input_footer::{
     AgentInputFooter, AgentInputFooterEvent,
 };
+use crate::terminal::cli_agent_sessions::listener::agent_supports_rich_status;
 use crate::terminal::cli_agent_sessions::{
     event::{CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventType},
     CLIAgentInputEntrypoint, CLIAgentSessionsModel,
@@ -600,14 +601,16 @@ impl TerminalView {
     }
 
     /// Conditionally closes CLI agent rich input after a prompt submission.
-    /// When auto-toggle is active with a plugin listener, rich input stays
-    /// open (status-change events manage visibility instead).
-    /// Otherwise, respects the auto-dismiss-after-submit setting.
+    /// When auto-toggle is active with a plugin listener that emits rich
+    /// status, rich input stays open (status-change events manage visibility
+    /// instead). Otherwise, respects the auto-dismiss-after-submit setting.
     fn maybe_close_rich_input_after_submit(&mut self, ctx: &mut ViewContext<Self>) {
         let session = CLIAgentSessionsModel::as_ref(ctx).session(self.view_id);
-        let has_plugin = session
-            .as_ref()
-            .is_some_and(|s| s.listener.is_some() && s.should_auto_toggle_input);
+        let has_plugin = session.as_ref().is_some_and(|s| {
+            s.listener.is_some()
+                && s.should_auto_toggle_input
+                && agent_supports_rich_status(&s.agent)
+        });
         let ai_settings = AISettings::as_ref(ctx);
 
         let should_close = if has_plugin && *ai_settings.auto_toggle_rich_input {
