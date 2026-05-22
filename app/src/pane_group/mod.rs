@@ -39,7 +39,9 @@ use crate::terminal::cli_agent_sessions::plugin_manager::PluginModalKind;
 use crate::terminal::view::inline_banner::{
     ZeroStatePromptSuggestionTriggeredFrom, ZeroStatePromptSuggestionType,
 };
-use crate::terminal::view::load_ai_conversation::RestoredAIConversation;
+use crate::terminal::view::load_ai_conversation::{
+    RestoreConversationEntryBehavior, RestoredAIConversation,
+};
 use crate::undo_close::UndoCloseStack;
 use crate::undo_close::UndoCloseStackEvent;
 #[cfg(target_family = "wasm")]
@@ -2602,6 +2604,7 @@ impl PaneGroup {
                 terminal_view.restore_conversation_after_view_creation(
                     RestoredAIConversation::new(child_conversation),
                     true,
+                    RestoreConversationEntryBehavior::PreserveAgentViewState,
                     ctx,
                 );
                 terminal_view.enter_agent_view(
@@ -2618,6 +2621,7 @@ impl PaneGroup {
             self.discard_pane(new_pane_id.into(), ctx);
         }
     }
+
 
     /// Helper that creates the initial [`PaneData`] and [`InitialFocus`] given a terminal view.
     /// This is a common case in creating a new pane group with a single terminal session.
@@ -3192,6 +3196,7 @@ impl PaneGroup {
                     view.restore_conversation_after_view_creation(
                         RestoredAIConversation::new(*conversation),
                         true,
+                        RestoreConversationEntryBehavior::EnterRestoredConversation,
                         ctx,
                     );
                 });
@@ -3207,6 +3212,7 @@ impl PaneGroup {
                     view.restore_conversation_and_directory_context(
                         LoadedConversationData::CLIAgent(cli_conversation),
                         true,
+                        RestoreConversationEntryBehavior::PreserveAgentViewState,
                         false,
                         |_, _| {},
                         ctx,
@@ -4304,6 +4310,7 @@ impl PaneGroup {
 
         success
     }
+
 
 
     /// Clear all panes that were hidden due to being closed (for undo functionality)

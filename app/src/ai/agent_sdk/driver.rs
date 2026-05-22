@@ -1196,7 +1196,8 @@ impl AgentDriver {
                 | BlocklistAIHistoryEvent::UpdatedConversationMetadata { .. }
                 | BlocklistAIHistoryEvent::ClearedActiveConversation { .. }
                 | BlocklistAIHistoryEvent::UpdatedConversationArtifacts { .. }
-                | BlocklistAIHistoryEvent::ConversationAgentIdAssigned { .. } => (),
+                | BlocklistAIHistoryEvent::ConversationAgentIdAssigned { .. }
+                | BlocklistAIHistoryEvent::ConversationOwnershipTransferred { .. } => (),
             }
         });
 

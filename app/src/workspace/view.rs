@@ -75,7 +75,9 @@ use crate::settings_view::mcp_servers_page::MCPServersSettingsPage;
 use crate::terminal::model::terminal_model::ConversationTranscriptViewerStatus;
 use crate::terminal::session_settings::SessionSettings;
 use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionType;
-use crate::terminal::view::load_ai_conversation::{RestorationDirState, RestoredAIConversation};
+use crate::terminal::view::load_ai_conversation::{
+    RestorationDirState, RestoreConversationEntryBehavior, RestoredAIConversation,
+};
 use crate::terminal::view::{ConversationRestorationInNewPaneType, OnboardingIntention};
 use crate::ui_components::red_notification_dot::RedNotificationDot;
 #[cfg(feature = "local_fs")]
@@ -427,6 +429,7 @@ use crate::tab::{
     tab_position_id, uses_vertical_tabs, NewSessionMenuItem, PaneNameMenuTarget, SelectedTabColor,
     TabBarState, TabComponent, TabData, TabTelemetryAction, TAB_BAR_BORDER_HEIGHT,
 };
+
 use crate::terminal::view::ssh_file_upload::FileUploadId;
 use crate::ui_components::icons;
 use crate::TelemetryEvent;
@@ -10961,6 +10964,26 @@ impl Workspace {
             self.restore_conversation_in_new_tab(conversation_id, ctx);
             return;
         };
+
+        let already_exists_in_active_pane = {
+            let terminal_view_id = terminal_view.as_ref(ctx).view_id();
+            let history_model = BlocklistAIHistoryModel::as_ref(ctx);
+            history_model.conversation(&conversation_id).is_some()
+                && history_model
+                    .all_live_conversations_for_terminal_view(terminal_view_id)
+                    .any(|conversation| conversation.id() == conversation_id)
+        };
+        if already_exists_in_active_pane {
+            terminal_view.update(ctx, |terminal_view, ctx| {
+                terminal_view.enter_agent_view_for_conversation(
+                    None,
+                    AgentViewEntryOrigin::RestoreExistingConversation,
+                    conversation_id,
+                    ctx,
+                );
+            });
+            return;
+        }
         // Check if there's an active long-running command in the active terminal.
         // If not, set the active terminal view to loading since we're going to restore in the active pane.
         // We do these operations together to hold the model lock across them.
@@ -11027,8 +11050,15 @@ impl Workspace {
                 terminal_view.restore_conversation_and_directory_context(
                     conversation,
                     FeatureFlag::AgentView.is_enabled(),
+                    RestoreConversationEntryBehavior::PreserveAgentViewState,
                     is_local_conversation,
-                    |terminal_view, ctx| {
+                    move |terminal_view, ctx| {
+                        terminal_view.enter_agent_view_for_conversation(
+                            None,
+                            AgentViewEntryOrigin::RestoreExistingConversation,
+                            conversation_id,
+                            ctx,
+                        );
                         terminal_view.redetermine_global_focus(ctx);
                     },
                     ctx,
@@ -11286,6 +11316,7 @@ impl Workspace {
                         terminal_view.restore_conversation_after_view_creation(
                             RestoredAIConversation::new(forked_conversation.clone()),
                             true,
+                            RestoreConversationEntryBehavior::EnterRestoredConversation,
                             ctx,
                         );
                         terminal_view
@@ -12348,6 +12379,7 @@ impl Workspace {
             );
         });
     }
+
 
     pub(crate) fn handle_file_tree_event(
         &mut self,

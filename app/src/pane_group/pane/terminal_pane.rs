@@ -1094,6 +1094,7 @@ fn handle_ai_history_event(
         | BlocklistAIHistoryEvent::UpgradedTask { .. }
         | BlocklistAIHistoryEvent::UpdatedConversationMetadata { .. }
         | BlocklistAIHistoryEvent::UpdatedConversationArtifacts { .. }
-        | BlocklistAIHistoryEvent::ConversationAgentIdAssigned { .. } => (),
+        | BlocklistAIHistoryEvent::ConversationAgentIdAssigned { .. }
+        | BlocklistAIHistoryEvent::ConversationOwnershipTransferred { .. } => (),
     }
 }
