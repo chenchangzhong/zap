@@ -1,38 +1,28 @@
 use settings::Setting as _;
-use warpui::{
-    fonts::FamilyId, AddSingletonModel, AppContext, AssetProvider, Entity, ModelContext,
-    SingletonEntity, WindowId,
-};
+use warpui::fonts::FamilyId;
+use warpui::{AddSingletonModel, AppContext, AssetProvider, Entity, ModelContext, SingletonEntity};
 
 #[cfg(target_os = "macos")]
 mod macos_app_icon {
-    #[allow(deprecated)]
-    pub use cocoa::{
-        appkit::NSApp,
-        base::{id, nil},
-    };
-    pub use objc::{class, msg_send, sel, sel_impl};
+    pub use objc2::rc::autoreleasepool;
+    pub use objc2::{AnyThread, MainThreadMarker};
+    pub use objc2_app_kit::{NSApplication, NSImage, NSWorkspace, NSWorkspaceIconCreationOptions};
+    pub use objc2_foundation::{ns_string, NSBundle, NSString};
     pub use warp_core::channel::{Channel, ChannelState};
-    pub use warpui::platform::mac::{make_nsstring, AutoreleasePoolGuard};
 
     pub use crate::settings::app_icon::{AppIcon, AppIconSettings, AppIconSettingsChangedEvent};
 }
+use anyhow::anyhow;
 #[cfg(target_os = "macos")]
 use macos_app_icon::*;
-
-use crate::{
-    settings::{
-        active_theme_kind, font::heading_font_size_multipliers_from_settings, FontSettings,
-        FontSettingsChangedEvent, MonospaceFontSize, Settings, ThemeSettings, UI_FONT_SIZE_MIN,
-        UI_FONT_SIZE_MAX,
-    },
-    themes::theme::{ThemeKind, WarpTheme},
-    ASSETS,
-};
-
-use anyhow::anyhow;
-
 pub use warp_core::ui::appearance::{Appearance, AppearanceEvent};
+
+use crate::settings::{
+    active_theme_kind, FontSettings, FontSettingsChangedEvent, MonospaceFontSize, Settings,
+    ThemeSettings,
+};
+use crate::themes::theme::{ThemeKind, WarpTheme};
+use crate::ASSETS;
 
 /// Manages the state of the app-wide Appearance settings, it is responsible
 /// for 1) listening to settings changes and update the underlying Appearance
@@ -85,16 +75,6 @@ impl AppearanceManager {
                         });
                     }
                 }
-                FontSettingsChangedEvent::MonospaceFallbackFontName { .. } => {
-                    let font_name = FontSettings::as_ref(ctx)
-                        .monospace_fallback_font_name
-                        .value()
-                        .clone();
-                    let new_family = get_or_load_optional_font_family(&font_name, ctx);
-                    Appearance::handle(ctx).update(ctx, |appearance, ctx| {
-                        appearance.set_terminal_fallback_font_family(new_family, ctx);
-                    });
-                }
                 FontSettingsChangedEvent::MonospaceFontSize { .. } => {
                     let new_font_size = *FontSettings::as_ref(ctx).monospace_font_size.value();
                     Appearance::handle(ctx).update(ctx, |appearance, ctx| {
@@ -138,38 +118,6 @@ impl AppearanceManager {
                         }
                     }
                 }
-                FontSettingsChangedEvent::UiFontName { .. } => {
-                    let font_name = FontSettings::as_ref(ctx).ui_font_name.value().clone();
-                    let new_family = if font_name.is_empty() {
-                        load_default_ui_font_family(ctx).ok()
-                    } else {
-                        get_or_load_font_family(&font_name, ctx)
-                    };
-                    if let Some(new_family) = new_family {
-                        Appearance::handle(ctx).update(ctx, |appearance, ctx| {
-                            appearance.set_ui_font_family(new_family, ctx);
-                        });
-                    }
-                }
-                FontSettingsChangedEvent::UiFontSize { .. } => {
-                    let new_font_size = *FontSettings::as_ref(ctx).ui_font_size.value();
-                    let clamped = new_font_size.clamp(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX);
-                    Appearance::handle(ctx).update(ctx, |appearance, ctx| {
-                        appearance.set_ui_font_size(clamped, ctx);
-                    });
-                }
-                FontSettingsChangedEvent::MarkdownHeadingH1Scale { .. }
-                | FontSettingsChangedEvent::MarkdownHeadingH2Scale { .. }
-                | FontSettingsChangedEvent::MarkdownHeadingH3Scale { .. }
-                | FontSettingsChangedEvent::MarkdownHeadingH4Scale { .. }
-                | FontSettingsChangedEvent::MarkdownHeadingH5Scale { .. }
-                | FontSettingsChangedEvent::MarkdownHeadingH6Scale { .. } => {
-                    let new_multipliers =
-                        heading_font_size_multipliers_from_settings(FontSettings::as_ref(ctx));
-                    Appearance::handle(ctx).update(ctx, |appearance, ctx| {
-                        appearance.set_heading_font_size_multipliers(new_multipliers, ctx);
-                    });
-                }
                 _ => {}
             },
         );
@@ -202,29 +150,6 @@ impl AppearanceManager {
         self.refresh_theme_state(ctx);
     }
 
-    /// Applies a per-window theme override, affecting only `window_id`. Windows
-    /// without an override continue to follow the global theme (including
-    /// system-theme follow via `refresh_theme_state`).
-    pub fn set_window_theme(
-        &mut self,
-        window_id: WindowId,
-        theme_kind: ThemeKind,
-        ctx: &mut ModelContext<Self>,
-    ) {
-        let theme = Settings::theme_for_theme_kind(&theme_kind, ctx);
-        Appearance::handle(ctx).update(ctx, |appearance, ctx| {
-            appearance.set_window_theme(window_id, theme, ctx);
-        });
-    }
-
-    /// Clears a per-window theme override, returning `window_id` to the global
-    /// theme. No-op if the window has no override.
-    pub fn clear_window_theme(&mut self, window_id: WindowId, ctx: &mut ModelContext<Self>) {
-        Appearance::handle(ctx).update(ctx, |appearance, ctx| {
-            appearance.clear_window_theme(window_id, ctx);
-        });
-    }
-
     #[cfg(target_os = "macos")]
     pub fn app_icon_at_startup(&self) -> AppIcon {
         self.app_icon_at_startup
@@ -244,7 +169,6 @@ impl AppearanceManager {
     /// Also see the README.md file in app/DockTilePlugin for more information on how best to test
     /// changes to the dock tile plugin.
     #[cfg(target_os = "macos")]
-    #[allow(deprecated)]
     pub fn set_app_icon(&self, app: &AppContext) {
         let icon = *AppIconSettings::as_ref(app).app_icon.value();
 
@@ -253,14 +177,16 @@ impl AppearanceManager {
         // settings/autoupdate callbacks whose thread of origin varies. Wrap
         // the body in a local pool so the autoreleased NSStrings (and any
         // other temporaries Cocoa hands back) are released when this returns.
-        // `AutoreleasePoolGuard` drains on `Drop`, covering every exit path.
-        unsafe {
-            let _pool = AutoreleasePoolGuard::new();
-
-            let app: id = NSApp();
-            let bundle: id = msg_send![class!(NSBundle), mainBundle];
-            let bundle_path: id = msg_send![bundle, bundlePath];
-            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        // `autoreleasepool` drains when the closure returns, covering every
+        // exit path (including early returns and panics).
+        autoreleasepool(|_| {
+            // SAFETY: `set_app_icon` only runs on the main thread, since it
+            // requires a `&AppContext`, which is only accessible there.
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let ns_app = NSApplication::sharedApplication(mtm);
+            let bundle = NSBundle::mainBundle();
+            let bundle_path = bundle.bundlePath();
+            let workspace = NSWorkspace::sharedWorkspace();
 
             // If the user has selected the default icon, reset to the icon that is statically
             // bundled in the app bundle. The bundled icon gets automatically "filtered" according
@@ -279,10 +205,15 @@ impl AppearanceManager {
                 && self.app_icon_at_startup == AppIcon::Default
             {
                 log::debug!("User has default icon selected, resetting to bundle default");
-                // Reset to nil to use the bundle's default icon
-                let _: () = msg_send![app, setApplicationIconImage:nil];
-                let _: () = msg_send![workspace, setIcon:nil forFile:bundle_path options:0];
-                let _: () = msg_send![workspace, noteFileSystemChanged:bundle_path];
+                // Reset to nil to use the bundle's default icon.
+                // SAFETY: `setApplicationIconImage:` accepts `nil` to restore the bundled icon.
+                unsafe { ns_app.setApplicationIconImage(None) };
+                workspace.setIcon_forFile_options(
+                    None,
+                    &bundle_path,
+                    NSWorkspaceIconCreationOptions::empty(),
+                );
+                workspace.noteFileSystemChanged_(&bundle_path);
                 return;
             }
 
@@ -290,47 +221,48 @@ impl AppearanceManager {
 
             log::debug!("Setting app icon in memory to: {icon_name}");
             // Locate the plugin bundle.
-            let plugins_path: id = msg_send![bundle, builtInPlugInsPath];
-            let plugin_name = make_nsstring("ZapDockTilePlugin.docktileplugin");
-            let plugin_path: id =
-                msg_send![plugins_path, stringByAppendingPathComponent: plugin_name];
-            let plugin_bundle: id = msg_send![class!(NSBundle), bundleWithPath: plugin_path];
-
-            if plugin_bundle == nil {
+            let Some(plugins_path) = bundle.builtInPlugInsPath() else {
                 log::warn!("Failed to get dock tile plugin bundle");
                 return;
-            }
+            };
+            let plugin_name = ns_string!("WarpDockTilePlugin.docktileplugin");
+            let plugin_path = plugins_path.stringByAppendingPathComponent(plugin_name);
+            let Some(plugin_bundle) = NSBundle::bundleWithPath(&plugin_path) else {
+                log::warn!("Failed to get dock tile plugin bundle");
+                return;
+            };
 
             // Read the images from the plugin bundle.
-            let image_name = make_nsstring(icon_name);
-            let extension = make_nsstring("png");
-            let image_path: id =
-                msg_send![plugin_bundle, pathForResource:image_name ofType:extension];
-
-            if image_path == nil {
+            let image_name = NSString::from_str(icon_name);
+            let extension = ns_string!("png");
+            let Some(image_path) =
+                plugin_bundle.pathForResource_ofType(Some(&image_name), Some(extension))
+            else {
                 log::warn!("Failed to get image path for icon: {icon_name}");
                 return;
-            }
+            };
 
             // Create the image from the file.
-            let image: id = msg_send![class!(NSImage), alloc];
-            let image: id = msg_send![image, initWithContentsOfFile:image_path];
-
-            if image == nil {
+            let Some(image) = NSImage::initWithContentsOfFile(NSImage::alloc(), &image_path) else {
                 log::warn!("Failed to create image for icon: {icon_name}");
                 return;
-            }
+            };
 
             // Override the bundled icon with this new image.
-            let _: () = msg_send![app, setApplicationIconImage:image];
-            let _: () = msg_send![workspace, setIcon:image forFile:bundle_path options:0];
-            let _: () = msg_send![workspace, noteFileSystemChanged:bundle_path];
+            // SAFETY: `setApplicationIconImage:` accepts a non-nil image.
+            unsafe { ns_app.setApplicationIconImage(Some(&image)) };
+            workspace.setIcon_forFile_options(
+                Some(&image),
+                &bundle_path,
+                NSWorkspaceIconCreationOptions::empty(),
+            );
+            workspace.noteFileSystemChanged_(&bundle_path);
 
-            // Balance the +1 retain from `[NSImage alloc]`. `setApplicationIconImage:` and
-            // `setIcon:forFile:options:` both retain the image, so it remains alive as the
-            // active app/dock icon after we release our own reference.
-            let _: () = msg_send![image, release];
-        }
+            // `image` is a `Retained<NSImage>` that releases the `+1` retain from
+            // `[NSImage alloc]` when it drops at the end of this scope.
+            // `setApplicationIconImage:` and `setIcon:forFile:options:` both retain the
+            // image, so it remains alive as the active app/dock icon.
+        });
     }
 }
 
@@ -454,14 +386,6 @@ fn get_or_load_font_family(font_name: &str, ctx: &mut AppContext) -> Option<Fami
     })
 }
 
-fn get_or_load_optional_font_family(font_name: &str, ctx: &mut AppContext) -> Option<FamilyId> {
-    if font_name.is_empty() {
-        None
-    } else {
-        get_or_load_font_family(font_name, ctx)
-    }
-}
-
 fn build_appearance(ctx: &mut AppContext) -> Appearance {
     let default_monospace_font_family = load_default_monospace_font_family(ctx)
         .expect("unable to load default monospace font family");
@@ -470,24 +394,11 @@ fn build_appearance(ctx: &mut AppContext) -> Appearance {
         .value()
         .clone();
     let am_font_name = FontSettings::as_ref(ctx).ai_font_name.value().clone();
-    let monospace_fallback_font_name = FontSettings::as_ref(ctx)
-        .monospace_fallback_font_name
-        .value()
-        .clone();
 
     let monospace_font_family_from_settings = get_or_load_font_family(&monospace_font_name, ctx);
-    let monospace_fallback_font_family_from_settings =
-        get_or_load_optional_font_family(&monospace_fallback_font_name, ctx);
 
-    let ui_font_name = FontSettings::as_ref(ctx).ui_font_name.value().clone();
-    let ui_font_size = *FontSettings::as_ref(ctx).ui_font_size.value();
-
-    let ui_font_family = if ui_font_name.is_empty() {
-        load_default_ui_font_family(ctx).expect("unable to load default ui font family")
-    } else {
-        get_or_load_font_family(&ui_font_name, ctx)
-            .unwrap_or_else(|| load_default_ui_font_family(ctx).expect("unable to load default ui font family"))
-    };
+    let ui_font_family =
+        load_default_ui_font_family(ctx).expect("unable to load default ui font family");
 
     let am_font_family_from_settings = get_or_load_font_family(&am_font_name, ctx);
 
@@ -499,9 +410,6 @@ fn build_appearance(ctx: &mut AppContext) -> Appearance {
     let monospace_font_weight = *FontSettings::as_ref(ctx).monospace_font_weight.value();
 
     let line_height_ratio = *FontSettings::as_ref(ctx).line_height_ratio.value();
-
-    let heading_multipliers =
-        heading_font_size_multipliers_from_settings(FontSettings::as_ref(ctx));
 
     let theme_kind = active_theme_kind(ThemeSettings::as_ref(ctx), ctx);
     let theme = Settings::theme_for_theme_kind(&theme_kind, ctx);
@@ -516,10 +424,7 @@ fn build_appearance(ctx: &mut AppContext) -> Appearance {
         ui_font_family,
         line_height_ratio,
         am_font_family_from_settings.unwrap_or(default_monospace_font_family),
-        monospace_fallback_font_family_from_settings,
         password_font_family,
-        ui_font_size.clamp(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX),
-        heading_multipliers,
     )
 }
 

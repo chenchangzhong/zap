@@ -36,13 +36,10 @@ fn main() -> Result<()> {
         println!("cargo:rustc-link-lib=framework=MetalKit");
         println!("cargo:rustc-link-lib=framework=UserNotifications");
 
-        println!("cargo:rerun-if-changed=src/platform/mac/objc/app_bundle.h");
-        println!("cargo:rerun-if-changed=src/platform/mac/objc/app_bundle.m");
         println!("cargo:rerun-if-changed=src/platform/mac/objc/services.h");
         println!("cargo:rerun-if-changed=src/platform/mac/objc/services.m");
 
         cc::Build::new()
-            .file("src/platform/mac/objc/app_bundle.m")
             .file("src/platform/mac/objc/services.m")
             .compile("warp_objc");
 
