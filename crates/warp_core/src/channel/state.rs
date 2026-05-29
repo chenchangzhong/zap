@@ -1,17 +1,16 @@
+use std::borrow::Cow;
+use std::collections::HashSet;
+
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
-use std::{borrow::Cow, collections::HashSet};
-use url::{Origin, Url};
-
-#[cfg(not(feature = "test-util"))]
-use crate::channel::config::DISABLED_HTTP_SENTINEL;
-use crate::AppId;
-use crate::{
-    channel::config::{ChannelConfig, McpOAuthProviderConfig},
-    features::FeatureFlag,
-};
+use url::{Origin, ParseError, Url};
 
 use super::Channel;
+use crate::channel::config::{
+    ChannelConfig, McpOAuthProviderConfig, OzConfig, RudderStackDestination, WarpServerConfig,
+};
+use crate::features::FeatureFlag;
+use crate::AppId;
 
 lazy_static! {
     static ref CHANNEL_STATE: Mutex<ChannelState> = Mutex::new(ChannelState::init());
@@ -37,14 +36,18 @@ pub struct ChannelState {
 impl ChannelState {
     pub fn init() -> Self {
         let channel = Channel::Oss;
-        let app_id = AppId::new("dev", "zap", "Zap");
+        let app_id = AppId::new("dev", "warp", "WarpOss");
         Self {
             channel,
             additional_features: Default::default(),
             config: ChannelConfig {
                 app_id,
                 logfile_name: "".into(),
+                server_config: WarpServerConfig::production(),
+                oz_config: OzConfig::production(),
+                telemetry_config: None,
                 autoupdate_config: None,
+                crash_reporting_config: None,
                 mcp_static_config: None,
             },
         }
@@ -78,6 +81,40 @@ impl ChannelState {
         cfg!(debug_assertions) || matches!(Self::channel(), Channel::Local | Channel::Dev)
     }
 
+    pub fn override_server_root_url(url: impl Into<Cow<'static, str>>) -> Result<(), ParseError> {
+        let url = url.into();
+        Url::parse(&url)?;
+        CHANNEL_STATE.lock().config.server_config.server_root_url = url;
+        Ok(())
+    }
+
+    pub fn override_ws_server_url(url: impl Into<Cow<'static, str>>) -> Result<(), ParseError> {
+        let url = url.into();
+        Url::parse(&url)?;
+        CHANNEL_STATE.lock().config.server_config.rtc_server_url = url;
+        Ok(())
+    }
+
+    pub fn override_session_sharing_server_url(
+        url: impl Into<Cow<'static, str>>,
+    ) -> Result<(), ParseError> {
+        let url = url.into();
+        Url::parse(&url)?;
+        CHANNEL_STATE
+            .lock()
+            .config
+            .server_config
+            .session_sharing_server_url = Some(url);
+        Ok(())
+    }
+
+    pub fn uses_staging_server() -> bool {
+        let Ok(url) = Url::parse(Self::server_root_url().as_ref()) else {
+            return false;
+        };
+        url.host_str() == Some("staging.warp.dev")
+    }
+
     /// Returns the canonical identifier for the application.
     ///
     /// This should not be used for namespacing persisted data - such use cases
@@ -89,7 +126,7 @@ impl ChannelState {
     /// Returns a profile name for isolating user data. This should be used to
     /// sandbox how user data is stored.
     ///
-    /// This is a debugging tool for isolating development instances of Zap, and is not
+    /// This is a debugging tool for isolating development instances of Warp, and is not
     /// supported in release builds.
     pub fn data_profile() -> Option<String> {
         if cfg!(debug_assertions) {
@@ -126,15 +163,7 @@ impl ChannelState {
     }
 
     pub fn debug_str() -> String {
-        let state = CHANNEL_STATE.lock();
-        format!(
-            "ChannelState {{ channel: {:?}, additional_features: {:?}, app_id: {:?}, autoupdate_configured: {}, mcp_static_configured: {} }}",
-            state.channel,
-            state.additional_features,
-            state.config.app_id,
-            state.config.autoupdate_config.is_some(),
-            state.config.mcp_static_config.is_some()
-        )
+        format!("{:?}", *CHANNEL_STATE.lock())
     }
 
     pub fn logfile_name() -> Cow<'static, str> {
@@ -142,15 +171,29 @@ impl ChannelState {
     }
 
     pub fn telemetry_file_name() -> Cow<'static, str> {
-        Cow::default()
+        CHANNEL_STATE
+            .lock()
+            .config
+            .telemetry_config
+            .as_ref()
+            .map(|tc| tc.telemetry_file_name.clone())
+            .unwrap_or_default()
     }
 
+    /// Returns whether this build has a telemetry config and can therefore ship
+    /// telemetry events. Builds like OpenWarp intentionally ship with
+    /// `telemetry_config: None`, in which case UI that controls telemetry
+    /// should be hidden since the toggle has no effect.
     pub fn is_telemetry_available() -> bool {
-        false
+        CHANNEL_STATE.lock().config.telemetry_config.is_some()
     }
 
+    /// Returns whether this build has a crash reporting config and can therefore
+    /// ship crash reports. Builds like OpenWarp intentionally ship with
+    /// `crash_reporting_config: None`, in which case UI that controls crash
+    /// reporting should be hidden since the toggle has no effect.
     pub fn is_crash_reporting_available() -> bool {
-        false
+        CHANNEL_STATE.lock().config.crash_reporting_config.is_some()
     }
 
     pub fn releases_base_url() -> Cow<'static, str> {
@@ -163,12 +206,76 @@ impl ChannelState {
             .unwrap_or_default()
     }
 
+    pub fn firebase_api_key() -> Cow<'static, str> {
+        CHANNEL_STATE
+            .lock()
+            .config
+            .server_config
+            .firebase_auth_api_key
+            .clone()
+    }
+
+    pub fn ws_server_url() -> Cow<'static, str> {
+        CHANNEL_STATE
+            .lock()
+            .config
+            .server_config
+            .rtc_server_url
+            .clone()
+    }
+
+    /// Returns the HTTP(S) root URL for the RTC server. Used for HTTP endpoints
+    /// served by warp-server-rtc (e.g. the agent event SSE stream).
+    ///
+    /// Derived from [`ws_server_url`] by rewriting the scheme (`wss`→`https`,
+    /// `ws`→`http`) and stripping the path. Falls back to [`server_root_url`]
+    /// when the WS URL cannot be parsed or uses an unexpected scheme — this
+    /// keeps override paths (e.g. `WARP_WS_SERVER_URL=...`) working without a
+    /// separate override for the HTTP variant.
+    pub fn rtc_http_url() -> Cow<'static, str> {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "test-util")] {
+                Cow::Owned(MOCK_SERVER_URL.clone())
+            } else {
+                match derive_http_origin_from_ws_url(&Self::ws_server_url()) {
+                    Some(origin) => Cow::Owned(origin),
+                    None => Self::server_root_url(),
+                }
+            }
+        }
+    }
+
+    pub fn session_sharing_server_url() -> Option<Cow<'static, str>> {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "test-util")] {
+                Some(Cow::Borrowed("fake_session_sharing_url"))
+            } else {
+                CHANNEL_STATE.lock().config.server_config.session_sharing_server_url.clone()
+            }
+        }
+    }
+
+    pub fn oz_root_url() -> Cow<'static, str> {
+        CHANNEL_STATE.lock().config.oz_config.oz_root_url.clone()
+    }
+
     pub fn server_root_url() -> Cow<'static, str> {
         cfg_if::cfg_if! {
             if #[cfg(feature = "test-util")] {
                 Cow::Owned(MOCK_SERVER_URL.clone())
             } else {
-                Cow::Borrowed(DISABLED_HTTP_SENTINEL)
+                CHANNEL_STATE.lock().config.server_config.server_root_url.clone()
+            }
+        }
+    }
+
+    pub fn workload_audience_url() -> Cow<'static, str> {
+        let state = CHANNEL_STATE.lock();
+        match &state.config.oz_config.workload_audience_url {
+            Some(url) => url.clone(),
+            None => {
+                drop(state);
+                Self::server_root_url()
             }
         }
     }
@@ -180,12 +287,34 @@ impl ChannelState {
             .origin()
     }
 
-    pub fn channel() -> Channel {
-        CHANNEL_STATE.lock().channel
+    /// Returns the rudderstack destination for all events that don't contain user-generated content.
+    pub fn rudderstack_non_ugc_destination() -> RudderStackDestination {
+        let state = CHANNEL_STATE.lock();
+
+        state
+            .config
+            .telemetry_config
+            .as_ref()
+            .and_then(|tc| tc.rudderstack_config.as_ref())
+            .map(|rs| rs.non_ugc_destination())
+            .unwrap_or_default()
     }
 
-    pub fn is_cloud_disabled() -> bool {
-        true
+    /// Returns the rudderstack destination for all events that contain user-generated content.
+    pub fn rudderstack_ugc_destination() -> RudderStackDestination {
+        let state = CHANNEL_STATE.lock();
+
+        state
+            .config
+            .telemetry_config
+            .as_ref()
+            .and_then(|tc| tc.rudderstack_config.as_ref())
+            .map(|rs| rs.ugc_destination())
+            .unwrap_or_default()
+    }
+
+    pub fn channel() -> Channel {
+        CHANNEL_STATE.lock().channel
     }
 
     #[cfg(feature = "test-util")]
@@ -203,6 +332,16 @@ impl ChannelState {
     #[cfg(not(feature = "test-util"))]
     pub fn app_version() -> Option<&'static str> {
         option_env!("GIT_RELEASE_TAG")
+    }
+
+    pub fn sentry_url() -> Cow<'static, str> {
+        CHANNEL_STATE
+            .lock()
+            .config
+            .crash_reporting_config
+            .as_ref()
+            .map(|crc| crc.sentry_url.clone())
+            .unwrap_or_default()
     }
 
     pub fn show_autoupdate_menu_items() -> bool {
@@ -245,12 +384,30 @@ impl ChannelState {
             // Dummy value--integration tests shouldn't support URL schemes.
             Channel::Integration => "warpintegration",
             Channel::Local => "warplocal",
-            Channel::Oss => "zap",
+            Channel::Oss => "warposs",
         }
     }
 }
 
-/// Zap Wave 5-5：`derive_http_origin_from_ws_url` 随 `rtc_http_url()` 一同物理删。
+/// Derives an HTTP(S) origin URL from a WebSocket URL by rewriting the scheme
+/// (`wss`→`https`, `ws`→`http`) and stripping the path, query, and fragment.
+/// Returns [`None`] when the input cannot be parsed as a URL or uses a scheme
+/// other than `ws` or `wss`.
+#[cfg(not(feature = "test-util"))]
+fn derive_http_origin_from_ws_url(ws_url: &str) -> Option<String> {
+    let url = Url::parse(ws_url).ok()?;
+    let http_scheme = match url.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        _ => return None,
+    };
+    let host = url.host_str()?;
+    let mut origin = format!("{http_scheme}://{host}");
+    if let Some(port) = url.port() {
+        origin.push_str(&format!(":{port}"));
+    }
+    Some(origin)
+}
 
 #[cfg(all(test, not(feature = "test-util")))]
 #[path = "state_tests.rs"]
@@ -264,28 +421,17 @@ fn app_id_from_bundle() -> Option<AppId> {
     // We skip this for tests, as the call to `mainBundle` can take 30+ms,
     // which is a significant portion of the total test runtime.
     #[cfg(all(target_os = "macos", not(feature = "test-util")))]
-    #[allow(deprecated)]
-    unsafe {
-        use cocoa::{
-            base::{id, nil},
-            foundation::NSBundle,
-        };
-        use objc::{msg_send, sel, sel_impl};
-        use warpui::platform::mac::utils::nsstring_as_str;
+    {
+        use objc2_foundation::NSBundle;
 
-        let bundle = id::mainBundle();
-        if bundle != nil {
-            let nsstring: id = msg_send![bundle, bundleIdentifier];
-            if nsstring != nil {
-                let app_id = nsstring_as_str(nsstring)
-                    .expect("bundle IDs should always be valid UTF-8 strings");
-
-                if !app_id.is_empty() {
-                    return Some(
-                        AppId::parse(app_id)
-                            .expect("macOS bundle identifier has an unexpected format"),
-                    );
-                }
+        let bundle = NSBundle::mainBundle();
+        if let Some(bundle_identifier) = bundle.bundleIdentifier() {
+            let app_id = bundle_identifier.to_string();
+            if !app_id.is_empty() {
+                return Some(
+                    AppId::parse(&app_id)
+                        .expect("macOS bundle identifier has an unexpected format"),
+                );
             }
         }
     }
