@@ -421,14 +421,8 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
     for (NSUInteger i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
         NSButton *button = [self standardWindowButton:buttons[i]];
         if (button && !button.hidden) {
-            // macOS 27: convertPoint:fromView:nil returns wrong coords for titlebar buttons.
-            // button.frame is in titlebar view coords; manually convert to window coords.
-            CGFloat windowHeight = self.frame.size.height;
-            NSView *titlebarView = [button superview];
-            CGFloat titlebarHeight = titlebarView ? titlebarView.frame.size.height : 28.0;
-            NSRect frameInWindow = button.frame;
-            frameInWindow.origin.y = windowHeight - titlebarHeight + button.frame.origin.y;
-            if (NSPointInRect(event.locationInWindow, frameInWindow)) {
+            NSPoint point = [button convertPoint:event.locationInWindow fromView:nil];
+            if (NSPointInRect(point, button.bounds)) {
                 return button;
             }
         }
@@ -452,14 +446,9 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
         case NSEventTypeLeftMouseDown: {
             NSButton *windowButton = [self standardWindowButtonAtEvent:event];
             if (windowButton) {
-                _leftMouseDownStartedInNativeWindowChrome = YES;
-                if (windowButton == [self standardWindowButton:NSWindowCloseButton]) {
-                    [self performClose:nil];
-                } else if (windowButton == [self standardWindowButton:NSWindowMiniaturizeButton]) {
-                    [self miniaturize:nil];
-                } else if (windowButton == [self standardWindowButton:NSWindowZoomButton]) {
-                    [self performZoom:nil];
-                }
+                _leftMouseDownStartedInNativeWindowChrome = NO;
+                [windowButton mouseDown:event];
+                break;
             }
             _leftMouseDownStartedInNativeWindowChrome = [self eventIsOverResizeEdge:event];
             [super sendEvent:event];
@@ -475,24 +464,16 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
         // This breaks drag-and-drop for panes and tabs (see CLD-2581), so we work around it with
         // custom dispatching.
         case NSEventTypeLeftMouseUp:
-            if (@available(macOS 27, *)) {
-                if (_leftMouseDownStartedInNativeWindowChrome) {
-                    [super sendEvent:event];
-                } else {
-                    [self.contentView mouseUp:event];
-                }
+            if (_leftMouseDownStartedInNativeWindowChrome && @available(macOS 27, *)) {
+                [super sendEvent:event];
             } else {
                 [self.contentView mouseUp:event];
             }
             _leftMouseDownStartedInNativeWindowChrome = NO;
             break;
         case NSEventTypeLeftMouseDragged:
-            if (@available(macOS 27, *)) {
-                if (_leftMouseDownStartedInNativeWindowChrome) {
-                    [super sendEvent:event];
-                } else {
-                    [self.contentView mouseDragged:event];
-                }
+            if (_leftMouseDownStartedInNativeWindowChrome && @available(macOS 27, *)) {
+                [super sendEvent:event];
             } else {
                 [self.contentView mouseDragged:event];
             }
