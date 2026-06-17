@@ -1,14 +1,15 @@
 // We can use `std::process:Command` here because this is invoked within a build script,
-// _not_ within the Zap binary (where it could cause a terminal to temporarily flash on
+// _not_ within the Warp binary (where it could cause a terminal to temporarily flash on
 // Windows).
 #![allow(clippy::disallowed_types)]
 
-use cfg_aliases::cfg_aliases;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::{env, fs};
 
 use anyhow::Result;
+use cfg_aliases::cfg_aliases;
 use sha2::Digest;
-use std::path::Path;
-use std::{env, fs, process::Command};
 use walkdir::WalkDir;
 use warp_util::assets::{
     ASSETS_DIR, ASYNC_ASSETS_DIR, CONPTY_DLL_FILE, DXCOMPILER_DLL_FILE, DXIL_DLL_FILE,
@@ -28,13 +29,13 @@ fn main() -> Result<()> {
 
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
     let target_family = env::var("CARGO_CFG_TARGET_FAMILY")?;
-    let target_env = env::var("CARGO_CFG_TARGET_ENV")?;
 
     add_features(&target_family, &target_os);
 
     if target_os == "macos" && target_family != "wasm" {
         println!("cargo:rustc-link-lib=framework=MetalKit");
         println!("cargo:rustc-link-lib=framework=UserNotifications");
+        build_and_link_sentry();
 
         println!("cargo:rerun-if-changed=src/platform/mac/objc/services.h");
         println!("cargo:rerun-if-changed=src/platform/mac/objc/services.m");
@@ -44,8 +45,8 @@ fn main() -> Result<()> {
             .compile("warp_objc");
 
         // Build the dock tile plugin
-        println!("cargo:rerun-if-changed=DockTilePlugin/ZapDockTilePlugin.m");
-        println!("cargo:rerun-if-changed=DockTilePlugin/ZapDockTilePlugin.h");
+        println!("cargo:rerun-if-changed=DockTilePlugin/WarpDockTilePlugin.m");
+        println!("cargo:rerun-if-changed=DockTilePlugin/WarpDockTilePlugin.h");
         println!("cargo:rerun-if-changed=DockTilePlugin/Info.plist");
         println!("cargo:rerun-if-changed=DockTilePlugin/Makefile");
 
@@ -63,8 +64,8 @@ fn main() -> Result<()> {
         // Copy the dock tile plugin to the output directory
         let profile = get_build_profile_name();
         let target_dir = app_target_dir(&profile).expect("Failed to get app target directory");
-        let plugin_src = Path::new("DockTilePlugin/ZapDockTilePlugin.docktileplugin");
-        let plugin_dst = target_dir.join("ZapDockTilePlugin.docktileplugin");
+        let plugin_src = Path::new("DockTilePlugin/WarpDockTilePlugin.docktileplugin");
+        let plugin_dst = target_dir.join("WarpDockTilePlugin.docktileplugin");
 
         if !status.success() {
             fs::remove_dir_all(plugin_src).expect("Failed to clean up plugin directory");
@@ -113,15 +114,6 @@ fn main() -> Result<()> {
     }
 
     if target_os == "windows" {
-        if target_env == "msvc"
-            && env::var("CARGO_FEATURE_WINDOWS_HIGH_PERFORMANCE_GPU_DEFAULT").is_ok()
-        {
-            println!("cargo:rustc-link-arg-bin=zap-oss=/EXPORT:NvOptimusEnablement,DATA");
-            println!(
-                "cargo:rustc-link-arg-bin=zap-oss=/EXPORT:AmdPowerXpressRequestHighPerformance,DATA"
-            );
-        }
-
         // Retrieve the Cargo profile name so that we can put a copy of ConPTY in
         // the correct target subdirectory.
         //
@@ -165,7 +157,7 @@ fn generate_channel_config_if_needed(target_family: &str, target_os: &str) {
     let config_bin = "warp-channel-config";
 
     // Check if the config binary is available on PATH. If not, we can't generate embedded
-    // configs. This is expected for external contributors building Zap OSS.
+    // configs. This is expected for external contributors building Warp OSS.
     if Command::new(config_bin)
         .arg("--help")
         .stdout(std::process::Stdio::null())
@@ -245,6 +237,138 @@ fn add_features(target_family: &str, target_os: &str) {
     }
 }
 
+fn build_and_link_sentry() {
+    // Ensure we re-run the build script if the target framework directory changes.
+    println!("cargo:rerun-if-env-changed=FRAMEWORK_OVERRIDE");
+
+    // If the cocoa_sentry feature is not enabled, there's nothing more to do here.
+    if env::var("CARGO_FEATURE_COCOA_SENTRY").is_err() {
+        return;
+    }
+
+    // Download/update the Sentry framework.
+    let dir_name = env::var("FRAMEWORK_OVERRIDE").unwrap_or_else(|_| "default".to_string());
+    let frameworks_dir = format!("frameworks/{dir_name}");
+    let standalone = env::var("CARGO_FEATURE_STANDALONE").is_ok();
+    download_sentry_framework(&frameworks_dir, &dir_name, standalone);
+
+    let sentry_dir = if standalone {
+        "Sentry.xcframework"
+    } else {
+        "Sentry-Dynamic-WithARM64e.xcframework"
+    };
+    let sentry_framework_path = format!("{frameworks_dir}/{sentry_dir}/macos-arm64_arm64e_x86_64");
+
+    // Make sure we re-run the build script if the framework directory changes (e.g.: it gets
+    // deleted).
+    println!("cargo:rerun-if-changed={sentry_framework_path}");
+
+    // Link the Sentry framework, and compile our objc logic that interfaces with it.
+    println!("cargo:rustc-link-search=framework=app/{sentry_framework_path}");
+    println!("cargo:rustc-link-lib=framework=Sentry");
+
+    // If building standalone, we need to copy some flags from the Sentry build that the static library requires.
+    if standalone {
+        println!("cargo:rustc-link-lib=c++");
+        let swift_library_path = get_xcode_toolchain().join("usr/lib/swift/macosx");
+        println!(
+            "cargo:rustc-link-search=all={}",
+            swift_library_path.display()
+        );
+        // Embed /usr/lib/swift as LC_RPATH so the deployed standalone CLI binary can
+        // find Swift runtime dylibs on the remote host. On macOS 12.3+, Apple ships
+        // the Swift runtime as an OS-level framework at /usr/lib/swift. Without this,
+        // remote macOS hosts fail with:
+        //   dyld: Library not loaded: @rpath/libswiftCore.dylib
+        //   Reason: no LC_RPATH's found
+        // See: https://github.com/warpdotdev/warp/issues/12631
+        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+    }
+
+    compile_sentry_objc_lib(&sentry_framework_path);
+}
+
+fn download_sentry_framework(frameworks_dir: &str, dir_name: &str, standalone: bool) {
+    // Build absolute path to the script from workspace root.
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let workspace_root = manifest_dir.parent().unwrap();
+    let script_path = workspace_root.join("script/macos/update_sentry_cocoa");
+
+    let cocoa_sentry_version = match dir_name {
+        "default" | "dev" => "9.4.1",
+        name => panic!("Invalid framework override: {name}"),
+    };
+
+    let mut cmd = Command::new(&script_path);
+    cmd.current_dir(workspace_root)
+        .arg("--dir")
+        .arg(format!("app/{frameworks_dir}"))
+        .arg("--version")
+        .arg(cocoa_sentry_version);
+
+    if standalone {
+        cmd.arg("--static");
+    }
+
+    let output = cmd
+        .output()
+        .expect("Failed to run update_sentry_cocoa script");
+    if !output.status.success() {
+        panic!(
+            "Failed to download/update Sentry frameworks:\n--- stdout\n{}\n--- stderr\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn compile_sentry_objc_lib(sentry_framework_path: &str) {
+    println!("cargo:rerun-if-changed=src/platform/mac/objc/crash_reporting.h");
+    println!("cargo:rerun-if-changed=src/platform/mac/objc/crash_reporting.m");
+
+    // We need to tell `Clang` to build with a specific framework path. This is represented within
+    // Clang by the `-F` flag, which is not supported directly in the `cc::Build` API, so we
+    // directly pass the flag and its value instead.
+    cc::Build::new()
+        .file("src/platform/mac/objc/crash_reporting.m")
+        .flag(format!("-F{sentry_framework_path}").as_str())
+        .compile("warp_sentry_objc");
+}
+
+#[cfg(unix)]
+fn get_xcode_toolchain() -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut output = Command::new("xcode-select")
+        .arg("-p")
+        .output()
+        .expect("Could not run xcode-select");
+    if !output.status.success() {
+        panic!(
+            "`xcode-select -p` failed:\n\n--- stdout\n{}\n\n--- stderr\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Trim trailing whitespace.
+    while output
+        .stdout
+        .last()
+        .is_some_and(|b| b.is_ascii_whitespace())
+    {
+        output.stdout.pop();
+    }
+
+    PathBuf::from(OsString::from_vec(output.stdout)).join("Toolchains/XcodeDefault.xctoolchain")
+}
+
+#[cfg(not(unix))]
+fn get_xcode_toolchain() -> PathBuf {
+    panic!("get_xcode_toolchain is only supported on macOS")
+}
+
 fn copy_async_assets() {
     println!("cargo:rerun-if-changed=assets/async");
     println!("cargo:rerun-if-env-changed=ASSET_TARGET_DIR");
@@ -283,7 +407,7 @@ fn copy_async_assets() {
     }
 }
 
-/// Copies the DLLs needed to run Zap on Windows.
+/// Copies the DLLs needed to run Warp on Windows.
 ///
 /// They are organized as follows:
 /// - `conpty.dll`
@@ -338,63 +462,21 @@ fn copy_windows_assets(target_dir: &Path) {
         .expect("Could not copy platform OpenConsole.exe");
 }
 
-/// 把 `GIT_RELEASE_TAG`(如 `v2026.05.10.preview` 或 `v0`)解析成
-/// Windows VERSIONINFO 需要的 4 段 16-bit 数字。不识别的段(如
-/// "preview")跳过,不足 4 段补 0。
-///
-/// 为什么要认真填不是都填 1.0.0.0:Windows Shell / Defender / SmartScreen
-/// 会拿这个数值 FILEVERSION 与 installer `MyAppVersion`(字符串形式的同一
-/// `GIT_RELEASE_TAG`)做一致性校验,不一致会被走额外 reputation/cache miss 路径。
-#[cfg(windows)]
-fn parse_file_version_quad(tag: &str) -> (u16, u16, u16, u16) {
-    let stripped = tag.strip_prefix('v').unwrap_or(tag);
-    let mut parts = stripped
-        .split('.')
-        .filter_map(|s| s.parse::<u32>().ok())
-        .map(|n| n.min(u16::MAX as u32) as u16);
-    let a = parts.next().unwrap_or(0);
-    let b = parts.next().unwrap_or(0);
-    let c = parts.next().unwrap_or(0);
-    let d = parts.next().unwrap_or(0);
-    (a, b, c, d)
-}
-
 #[cfg(windows)]
 fn embed_resource_file(target_dir: &Path) {
     use std::io::Write;
 
     let version = env::var("GIT_RELEASE_TAG").unwrap_or("v0".to_owned());
-    // 默认值与 publisher 一致定为「Zap」,与 `script/windows/bundle.ps1` OSS 分支
-    // (`$APP_NAME = 'Zap'`) + AUMID `dev.zap.Zap` + Cargo bundle
-    // metadata 全局对齐。Windows 任务管理器的进程分组名实际取自 PE 资源中的
-    // `FileDescription` / `ProductName`(不是窗口标题),所以这里若回退默认 "Zap",
-    // 直接 `cargo build` 出来的 dev 二进制在任务管理器里会显示成 `Zap(N)`。
-    // 上游官方流水线在调用前会显式 `export WARP_APP_NAME=...` 覆盖,不受影响。
-    let app_name = env::var("WARP_APP_NAME").unwrap_or_else(|_| "Zap".to_owned());
-    let bin_name = env::var("CARGO_BIN_NAME").unwrap_or("oss".to_owned());
-    // 以 `WARP_APP_PUBLISHER` 覆盖;默认与 installer / AUMID 一致为「Zap」。
-    // 保持 installer `MyAppPublisher`、Cargo bundle metadata `copyright`、
-    // 进程 AUMID `dev.zap.Zap` 三处全局对齐，避免 Windows Shell
-    // 因 publisher / product name fingerprint 不一致而 miss 掉 icon cache。
-    let publisher = env::var("WARP_APP_PUBLISHER").unwrap_or_else(|_| "Zap".to_owned());
-    let (ver_major, ver_minor, ver_patch, ver_build) = parse_file_version_quad(&version);
+    let app_name = env::var("WARP_APP_NAME").unwrap_or("Warp".to_owned());
+    let bin_name = env::var("CARGO_BIN_NAME").unwrap_or("local".to_owned());
 
     let icon_path = Path::new("channels")
-        .join(&bin_name)
+        .join(bin_name)
         .join("icon")
-        .join("padded")
+        .join("no-padding")
         .join("icon.ico");
 
-    if !icon_path.exists() {
-        println!(
-            "cargo:warning=Icon not found at {} (CARGO_BIN_NAME={bin_name}): \
-             skipping Windows resource embed. \
-             Set CARGO_BIN_NAME or add channels/{bin_name}/icon/padded/icon.ico",
-            icon_path.display()
-        );
-        return;
-    }
-    fs::copy(&icon_path, target_dir.join("icon.ico"))
+    fs::copy(icon_path, target_dir.join("icon.ico"))
         .unwrap_or_else(|err| panic!("Could not copy icon: {err:#}"));
 
     let resource_file_path = target_dir.join("resource.rc");
@@ -408,8 +490,8 @@ fn embed_resource_file(target_dir: &Path) {
 
 IDI_ICON ICON "icon.ico"
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     {ver_major},{ver_minor},{ver_patch},{ver_build}
-PRODUCTVERSION  {ver_major},{ver_minor},{ver_patch},{ver_build}
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS__WINDOWS32
@@ -420,13 +502,13 @@ BEGIN
     BEGIN
         BLOCK "040904E4"
         BEGIN
-            VALUE "CompanyName",      "{publisher}\0"
+            VALUE "CompanyName",      "Denver Technologies, Inc\0"
             VALUE "FileDescription",  "{app_name}\0"
             VALUE "FileVersion",      "{version}\0"
-            VALUE "LegalCopyright",   "© 2025-2026, {publisher}\0"
-            VALUE "InternalName",     "{bin_name}\0"
-            VALUE "OriginalFilename", "{bin_name}.exe\0"
-            VALUE "ProductName",      "{app_name}\0"
+            VALUE "LegalCopyright",   "© 2025, Denver Technologies, Inc\0"
+            VALUE "InternalName",     "\0"
+            VALUE "OriginalFilename", "\0"
+            VALUE "ProductName",      "Warp\0"
             VALUE "ProductVersion",   "{version}\0"
         END
     END
