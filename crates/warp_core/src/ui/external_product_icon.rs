@@ -11,6 +11,7 @@ pub enum ExternalProductIcon {
     Composio,
     Resend,
     Sentry,
+    YouDotCom,
 }
 
 impl ExternalProductIcon {
@@ -26,6 +27,7 @@ impl ExternalProductIcon {
             "composio" => Some(ExternalProductIcon::Composio),
             "resend" => Some(ExternalProductIcon::Resend),
             "sentry" => Some(ExternalProductIcon::Sentry),
+            "you.com" => Some(ExternalProductIcon::YouDotCom),
             _other => None,
         }
     }
@@ -41,6 +43,7 @@ impl ExternalProductIcon {
             ExternalProductIcon::Composio => "bundled/svg/composio.svg",
             ExternalProductIcon::Resend => "bundled/svg/resend.svg",
             ExternalProductIcon::Sentry => "bundled/svg/sentry.svg",
+            ExternalProductIcon::YouDotCom => "bundled/svg/you-com.svg",
         }
     }
 
