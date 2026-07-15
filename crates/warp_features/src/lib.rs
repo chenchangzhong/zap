@@ -686,6 +686,81 @@ pub enum FeatureFlag {
     /// 关闭时,UI 入口隐藏,`Client::new()` 退回 reqwest 默认(读环境变量)。
     /// 见 Issue #72。
     HttpProxySettings,
+    /// Enables continuing cloud mode conversations in the cloud after an execution ends.
+    HandoffCloudCloud,
+
+    /// Enables the local-to-cloud Oz handoff entry points (footer chip and
+    /// `/move-to-cloud` slash command) that fork the active local Oz
+    /// conversation into a fresh cloud agent run with the current workspace
+    /// snapshot attached. Requires `OzHandoff` to also be enabled.
+    HandoffLocalCloud,
+
+    /// Enables creating API keys scoped to named agents in the API key
+    /// management UI. When enabled the "Team" option in the key-type
+    /// selector is replaced with "Agent" and users can pick which agent
+    /// identity the key authenticates as.
+    NamedAgents,
+    /// Gates the driver behavior that writes GitHub credentials to disk
+    /// (`~/.git-credentials`, `~/.config/gh/hosts.yaml`) and runs the
+    /// background refresh loop that keeps them fresh during a task run.
+    GitCredentialRefresh,
+
+    /// Gates the v2 billing and usage page redesign.
+    BillingAndUsagePageV2,
+    /// Enables configurable expanded context windows for eligible GPT models.
+    GPTConfigurableContextWindow,
+
+    /// Replaces the raw harness CLI command with a styled header showing CLI name + status icon.
+    HarnessSessionHeader,
+
+    /// Enables the code review view for remote sessions.
+    RemoteCodeReview,
+
+    /// Gates the Grouped Tabs feature.
+    GroupedTabs,
+
+    /// Gates the Pinned Tabs feature, which lets users pin individual tabs
+    /// and whole tab groups so they stay at the front of the tab list and
+    /// are protected from reordering.
+    PinnedTabs,
+
+    /// Gates the SuperGrok feature, which lets users
+    /// connect a Grok subscription instead of pasting an API key.
+    SuperGrok,
+
+    /// Gates Gemini Enterprise (GEAP) BYOLLM, which lets users
+    /// route eliglible models to GEAP instead of Warp-managed inference.
+    GeminiEnterprise,
+
+    /// Gates NLD input classification matching the buffer against agent
+    /// prompt history (in addition to shell command history). Still in
+    /// development, so enabled only for dev/dogfood builds.
+    NldPromptHistoryMatch,
+
+    /// Gates the custom model router feature, which allows users to define
+    /// their own model routers.
+    CustomModelRouters,
+
+    /// Enables state-mutating recovery for abnormal terminal lifecycle sequences.
+    TerminalLifecycleRecovery,
+
+    /// Shows a warning in the agent view when the active conversation's
+    /// provider-side prompt cache has expired.
+    PromptCacheExpiryWarning,
+
+    /// Enables the `--runner` flag on `run-cloud`, which overrides an agent's
+    /// compute (docker image, instance shape, setup commands) by runner ID.
+    CloudRunners,
+
+    /// Renders MCP tool-call request and response JSON as an interactive
+    /// collapsible tree with typed colors and per-row Copy JSON, instead of
+    /// a flat pretty-printed blob.
+    McpJsonTreeView,
+
+    /// Renders supported solid box-drawing characters (`U+2500..=U+257F`)
+    /// procedurally as cell-filling rectangles instead of from the font,
+    /// eliminating seams between adjacent box-drawing cells in the terminal.
+    BoxDrawingGlyphs,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
@@ -748,6 +823,22 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::ConfigurableContextWindow,
     FeatureFlag::DragTabsToWindows,
     FeatureFlag::ServerFileBrowser,
+    #[cfg(not(windows))]
+    FeatureFlag::SshRemoteServer,
+    FeatureFlag::RemoteCodebaseIndexing,
+    FeatureFlag::GPTConfigurableContextWindow,
+    FeatureFlag::RestorePromptOnInlineModelSelectorSearch,
+    FeatureFlag::WarpControlCli,
+    FeatureFlag::NldPromptHistoryMatch,
+    FeatureFlag::TerminalLifecycleRecovery,
+    FeatureFlag::PromptCacheExpiryWarning,
+    FeatureFlag::BackgroundComputerUse,
+    FeatureFlag::ContextWindowUsageBreakdown,
+    FeatureFlag::JupyterNotebookRendering,
+    FeatureFlag::CloudRunners,
+    FeatureFlag::WaitForEventsParentRegistration,
+    FeatureFlag::McpJsonTreeView,
+    FeatureFlag::BoxDrawingGlyphs,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Zap).
