@@ -142,19 +142,10 @@ impl TaskStore {
     }
 
     pub fn exchange_by_id(&self, exchange_id: AIAgentExchangeId) -> Option<&AIAgentExchange> {
-        if let Some(exchange) = self
-            .exchanges
-            .get(&exchange_id)
-            .and_then(|exchange_ref| self.lookup_exchange(exchange_ref))
-        {
-            return Some(exchange);
-        }
         self.tasks
             .values()
             .find_map(|task| task.exchange(exchange_id))
     }
-    pub fn first_exchange(&self) -> Option<&AIAgentExchange> {
-        self.linearized_refs
             .first()
             .and_then(|r| self.lookup_exchange(r))
     }
