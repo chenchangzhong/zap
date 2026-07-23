@@ -1989,5 +1989,5 @@ fn parse_block_leading_spaces<'a, E: ContextError<&'a str> + ParseError<&'a str>
 }
 
 #[cfg(test)]
-#[path = "markdown_parser_tests.rs"]
+#[path = "markdown_parser_test.rs"]
 mod tests;
