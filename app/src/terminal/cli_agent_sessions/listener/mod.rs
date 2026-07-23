@@ -79,7 +79,8 @@ fn create_handler(agent: &CLIAgent) -> Option<Box<dyn CLIAgentSessionHandler>> {
         // https://github.com/badlogic/pi-mono), which emit the same
         // structured OSC 777 events as the first-party Claude/OpenCode/Gemini
         // plugins. We don't ship install flows for them — we just listen.
-        CLIAgent::Claude
+        CLIAgent::OhMyPi
+        | CLIAgent::Claude
         | CLIAgent::OpenCode
         | CLIAgent::Gemini
         | CLIAgent::Auggie
@@ -92,7 +93,6 @@ fn create_handler(agent: &CLIAgent) -> Option<Box<dyn CLIAgentSessionHandler>> {
         | CLIAgent::Copilot
         | CLIAgent::CursorCli
         | CLIAgent::Goose
-        | CLIAgent::Omp
         | CLIAgent::Unknown => None,
     }
 }
