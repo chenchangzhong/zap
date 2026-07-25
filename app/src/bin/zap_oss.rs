@@ -34,6 +34,7 @@ fn main() -> Result<()> {
     );
     if cfg!(debug_assertions) {
         state = state.with_additional_features(DEBUG_FLAGS);
+        state = state.with_additional_features(&[warp_core::features::FeatureFlag::OmpModelSelector]);
     }
     // 始终启用 IME marked-text 渲染:winit 的 IME 路径在 macOS / Windows 都支持,
     // 但若不在此处显式开启,Zap 会把 preedit / 输入合成更新整体丢弃,只剩 OS 的候选窗

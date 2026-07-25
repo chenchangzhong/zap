@@ -84,6 +84,8 @@ mod writeable_pty;
 pub mod wsl;
 
 pub mod cli_agent;
+pub mod omp_models;
+pub mod omp_model_selector;
 pub use cli_agent::CLIAgent;
 pub(crate) mod cli_agent_sessions;
 

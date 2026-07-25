@@ -184,6 +184,7 @@ pub struct AgentInputFooter {
     nld_button: ViewHandle<ActionButton>,
     file_button: ViewHandle<ActionButton>,
     context_window_button: ViewHandle<ActionButton>,
+    omp_model_selector: Option<ViewHandle<crate::terminal::omp_model_selector::OmpModelSelector>>,
     model_selector: ViewHandle<ProfileModelSelector>,
     ftu_callout_close_button: ViewHandle<ActionButton>,
     // Zap Wave 7-3:`environment_selector` field was removed with the hosted-mode footer.
@@ -556,6 +557,24 @@ impl AgentInputFooter {
                 .with_tooltip_alignment(TooltipAlignment::Left)
         });
 
+
+        let omp_model_selector = if FeatureFlag::OmpModelSelector.is_enabled() {
+            let view = ctx.add_typed_action_view(|ctx| {
+                crate::terminal::omp_model_selector::OmpModelSelector::new(
+                    "omp".to_string(),
+                    terminal_view_id,
+                    ctx,
+                )
+            });
+            ctx.subscribe_to_view(&view, |_me, _, _event, _ctx| {
+                // Model switching is handled by socket → extension's
+                // pi.runtime.sendUserMessage("/model <selector>").
+            });
+            Some(view)
+        } else {
+            None
+        };
+
         let profile_model_selector_full = ctx.add_typed_action_view(|ctx| {
             let mut selector = ProfileModelSelector::new(
                 menu_positioning_provider.clone(),
@@ -693,6 +712,7 @@ impl AgentInputFooter {
             plugin_operation_in_progress: false,
             plugin_chip_ready: false,
             context_window_button,
+            omp_model_selector,
             model_selector: profile_model_selector_full,
             // Zap Wave 7-3:`environment_selector` field init was removed with hosted-mode UI.
             // 子系统物理删。
@@ -1314,6 +1334,9 @@ impl AgentInputFooter {
             if let Some(element) = self.render_cli_toolbar_item(item, &shared_status, app) {
                 right_buttons.add_child(element);
             }
+        }
+        if let Some(ref selector) = self.omp_model_selector {
+            right_buttons.add_child(ChildView::new(selector).finish());
         }
 
         let content = Wrap::row()

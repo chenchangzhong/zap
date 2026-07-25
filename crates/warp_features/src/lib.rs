@@ -761,6 +761,9 @@ pub enum FeatureFlag {
     /// procedurally as cell-filling rectangles instead of from the font,
     /// eliminating seams between adjacent box-drawing cells in the terminal.
     BoxDrawingGlyphs,
+    /// Shows an omp model selector dropdown in the CLI agent toolbar
+    /// when an OhMyPi agent session is active.
+    OmpModelSelector,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
@@ -829,6 +832,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::NldPromptHistoryMatch,
     FeatureFlag::TerminalLifecycleRecovery,
     FeatureFlag::PromptCacheExpiryWarning,
+    FeatureFlag::OmpModelSelector,
     FeatureFlag::CloudRunners,
     FeatureFlag::McpJsonTreeView,
     FeatureFlag::BoxDrawingGlyphs,
