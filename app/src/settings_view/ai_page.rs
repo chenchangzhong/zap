@@ -3507,9 +3507,18 @@ impl TypedActionView for AISettingsPageView {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     let mut providers = settings.agent_providers.value().clone();
                     if let Some(p) = providers.iter_mut().find(|p| p.id == *provider_id) {
+                        // Helper: find a catalog model matching a possibly-stripped local ID.
+                        let find_cat_model = |local_id: &str| -> Option<&crate::ai::agent_providers::models_dev::Model> {
+                            cat_models.get(local_id)
+                                .or_else(|| {
+                                    cat_models.values().find(|m| {
+                                        m.id.ends_with(&format!("/{local_id}"))
+                                    })
+                                })
+                        };
                         // 既有 id 用 catalog 元数据覆盖;catalog 多出的追加;本地多出的(用户自定义)保留。
                         for local_model in p.models.iter_mut() {
-                            if let Some(cat_m) = cat_models.get(&local_model.id) {
+                            if let Some(cat_m) = find_cat_model(&local_model.id) {
                                 let merged = models_dev::into_agent_provider_model(cat_m);
                                 local_model.context_window = merged.context_window;
                                 local_model.max_output_tokens = merged.max_output_tokens;
@@ -3537,7 +3546,8 @@ impl TypedActionView for AISettingsPageView {
                         let existing: std::collections::HashSet<String> =
                             p.models.iter().map(|m| m.id.clone()).collect();
                         for cat_m in cat_models.values() {
-                            if !existing.contains(&cat_m.id) {
+                            let clean_id = crate::ai::agent_providers::models_dev::strip_uuid_prefix(&cat_m.id);
+                            if !existing.contains(clean_id) {
                                 p.models.push(models_dev::into_agent_provider_model(cat_m));
                             }
                         }

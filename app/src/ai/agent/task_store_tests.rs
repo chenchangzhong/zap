@@ -892,4 +892,3 @@ fn test_exchange_by_id_resolves_unlinked_subtask_exchange() {
         assert_eq!(store.exchange_by_id(*id).map(|e| e.id), Some(*id));
     }
 }
->>>>>>> 07956a677 (Fix crash resolving exchanges in not-yet-linked subtasks (TaskStore::exchange_by_id) (#13789))

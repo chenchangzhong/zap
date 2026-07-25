@@ -165,14 +165,29 @@ impl ModelCaps {
 pub fn lookup_caps(provider_id: &str, model_id: &str) -> Option<ModelCaps> {
     let s = state().read().ok()?;
     let catalog = s.catalog.as_ref()?;
-    if let Some(p) = catalog.get(provider_id) {
-        if let Some(m) = p.models.get(model_id) {
+
+    // Try exact match first (catalog keys may have UUID prefix, model may not).
+    let find_model = |models: &BTreeMap<String, Model>| -> Option<ModelCaps> {
+        if let Some(m) = models.get(model_id) {
             return Some(ModelCaps::from_model(m));
+        }
+        // models.dev keys may be `"uuid/model-name"` while `model_id` is `"model-name"`.
+        for (key, m) in models {
+            if key.ends_with(&format!("/{model_id}")) || *key == *model_id {
+                return Some(ModelCaps::from_model(m));
+            }
+        }
+        None
+    };
+
+    if let Some(p) = catalog.get(provider_id) {
+        if let Some(caps) = find_model(&p.models) {
+            return Some(caps);
         }
     }
     for p in catalog.values() {
-        if let Some(m) = p.models.get(model_id) {
-            return Some(ModelCaps::from_model(m));
+        if let Some(caps) = find_model(&p.models) {
+            return Some(caps);
         }
     }
     None
@@ -326,15 +341,24 @@ pub fn filter_catalog(catalog: &Catalog, query: &str) -> Vec<(String, Provider)>
 /// 默认把 catalog 推断的 image/pdf/audio 写进字段(用户首次 sync / quick-add 时
 /// 直接看到模型能力被同步进 toml,不需要展开 detail 才看到)。
 /// 后续 sync 时调用方只往 None 槽位填新值,Some(_) 视为用户显式覆盖跳过。
+///
+/// models.dev 的模型 ID 可能带 UUID 前缀(如 `"uuid/deepseek-v4-flash"`),
+/// 剥离前缀后只保留实际模型名(`"deepseek-v4-flash"`)作为本地 `id`。
+pub fn strip_uuid_prefix(id: &str) -> &str {
+    id.rsplit_once('/').map(|(_, name)| name).unwrap_or(id)
+}
+
 pub fn into_agent_provider_model(model: &Model) -> crate::settings::AgentProviderModel {
     let caps = ModelCaps::from_model(model);
+    let raw_id = model.id.clone();
+    let clean_id = strip_uuid_prefix(&raw_id).to_string();
     crate::settings::AgentProviderModel {
         name: if model.name.is_empty() {
-            model.id.clone()
+            clean_id.clone()
         } else {
             model.name.clone()
         },
-        id: model.id.clone(),
+        id: clean_id,
         context_window: model.limit.context,
         max_output_tokens: model.limit.output,
         reasoning: model.reasoning,
