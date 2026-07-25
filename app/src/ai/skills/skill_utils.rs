@@ -28,7 +28,7 @@ use crate::warp_managed_paths_watcher::warp_managed_skill_dirs;
 /// 2. **同 rank 时 reference 路径短者胜**:取为稳定 tiebreak。
 ///
 /// 该实现覆盖了三种场景:
-/// - `npx skills` 软链同名 skill 到 `~/.agents/skills/` / `~/.warp/skills/` / `~/.claude/skills/`
+/// - `npx skills` 软链同名 skill 到 `~/.agents/skills/` / `~/.zap/skills/` / `~/.claude/skills/`
 ///   (同名不同 provider) → 保留高优先级 provider。
 /// - 同名 skill 同时存在于多个目录(例如 repo root + subdir) → 各自保留,让调用方按路径上下文处理。
 /// - 同名不同内容 (不同 provider) → 保留高优先级 provider。

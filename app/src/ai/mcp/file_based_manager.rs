@@ -256,9 +256,8 @@ impl FileBasedMCPManager {
                 })
             })
     }
-
     /// Returns `true` if the server identified by `hash` is referenced from the global
-    /// Zap config (`~/.warp/.mcp.json`). Global Zap servers always auto-spawn.
+    /// Zap config (`~/.zap/.mcp.json`). Global Zap servers always auto-spawn.
     fn is_global_warp_server(&self, hash: u64) -> bool {
         self.file_based_servers_by_root
             .iter()
@@ -386,11 +385,10 @@ impl FileBasedMCPManager {
     /// when its config does not specify `working_directory`.
     ///
     /// The spawn root is the directory the config was discovered in, with one
-    /// exception: global Zap installs are discovered in `~/.warp*/`, which
+    /// exception: global Zap installs are discovered in `~/.zap*/`, which
     /// isn't a useful cwd for spawned processes, so they are remapped to the
-    /// home directory instead.
     /// - Project-scoped installations: the repo root.
-    /// - Global installations (`~/.warp/.mcp.json`, `~/.claude.json`, etc.): the
+    /// - Global installations (`~/.zap/.mcp.json`, `~/.claude.json`, etc.): the
     ///   home directory.
     ///
     /// If the installation is referenced from multiple roots, the lexicographically
