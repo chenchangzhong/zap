@@ -7263,7 +7263,7 @@ impl TerminalView {
     /// Receiving the warpui::Event::KeyDown event from a child element.
     /// Generally, this should be control characters rather than printable characters.
     fn keydown_on_terminal(&mut self, characters: &str, ctx: &mut ViewContext<Self>) {
-        if self.is_long_running() {
+        if self.is_long_running() || self.model.lock().is_alt_screen_active() {
             self.on_ssh_warpification_key_event(Some(SshKeyEvent::from_chars(characters)), ctx);
             self.highlighted_link.invalidate();
             self.report_possible_typeahead(characters);
@@ -7311,6 +7311,10 @@ impl TerminalView {
         self.on_ssh_warpification_key_event(Some(SshKeyEvent::from_chars(characters)), ctx);
 
         if self.should_write_typed_chars_to_pty(ctx) {
+            self.highlighted_link.invalidate();
+            self.report_possible_typeahead(characters);
+            self.write_user_bytes_to_pty(characters.as_bytes().to_vec(), ctx);
+        } else if self.model.lock().is_alt_screen_active() {
             self.highlighted_link.invalidate();
             self.report_possible_typeahead(characters);
             self.write_user_bytes_to_pty(characters.as_bytes().to_vec(), ctx);
@@ -18700,17 +18704,10 @@ impl TerminalView {
         let should_focus_terminal = {
             let semantic_selection = SemanticSelection::as_ref(ctx);
             let model = self.model.lock();
-            let block_list = model.block_list();
-
-            let has_bootstrapped = model.block_list().is_bootstrapping_precmd_done();
-
-            let has_active_user_terminal_command = block_list.active_block().is_active_and_long_running()
-                && !block_list.active_block().is_agent_in_control()
-                // The only case where terminal can take focus _while_ input is visible is
-                // pre-bootstrap, for example when oh-my-zsh prompts you to update -- at this point
-                // the input is visible but you should still be able to click into the block for the
-                // oh-my-zsh prompt and send input directly to the pty.
-                && (!is_input_visible || !has_bootstrapped);
+            let has_active_user_terminal_command =
+                (model.block_list().active_block().is_active_and_long_running()
+                    && !model.block_list().active_block().is_agent_in_control())
+                || model.is_alt_screen_active();
 
             let is_shell_mode = !self.ai_input_model.as_ref(ctx).is_ai_input_enabled();
             let are_blocks_selected = !self.selected_blocks.is_empty();

@@ -1575,10 +1575,22 @@ impl BlockListElement {
             // If the block list is receiving the first mouse click on activation, we should
             // not handle the event directly (typically by selecting a block). Instead,
             // let a view higher up the view tree decide how to handle it.
+            //
+            // When alt screen is active (e.g. fzf/htop/ranger), dispatch focus so the TUI
+            // receives keyboard input, while still letting the view hierarchy handle activation.
+            if self.model.lock().is_alt_screen_active() {
+                ctx.dispatch_typed_action(TerminalAction::Focus);
+            }
             return false;
         }
 
         if !self.pane_state.is_focused() {
+            // When alt screen is active (e.g. fzf/htop/ranger), clicking the grid should
+            // focus the terminal so keyboard events reach the TUI.
+            if self.model.lock().is_alt_screen_active() {
+                ctx.dispatch_typed_action(TerminalAction::Focus);
+                return true;
+            }
             return false;
         }
 
