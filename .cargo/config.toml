@@ -9,7 +9,8 @@
 MACOSX_DEPLOYMENT_TARGET = "10.14"
 
 [build]
-rustflags = ["-C", "symbol-mangling-version=v0", "-C", "link-args=-Wl,-headerpad_max_install_names"]
+rustc-wrapper = "sccache"
+rustflags = ["-C", "symbol-mangling-version=v0", "-C", "link-args=-Wl,-headerpad_max_install_names", "-C", "link-args=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
 
 [net]
 git-fetch-with-cli = true
