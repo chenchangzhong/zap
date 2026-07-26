@@ -37,14 +37,14 @@ impl SyncDataSource for ZeroStateDataSource {
             return Ok(vec![]);
         }
 
-        // This is kind of a convoluted way to explicitly order these commands after all others.
-        //
-        // DataSource implementations must return highest priority items last (results sorted in
-        // ascending order of priority).
-        //
-        // The results construction below basically orders all active commands, sorted
-        // alphabetically, except for the commands in this vec, which are explicitly appended
-        // to all the other alphabetically sorted commands, in this order.
+        // When OMP is active, ZeroState returns nothing — SlashCommandDataSource handles it.
+        let is_omp = self.slash_command_data_source
+            .as_ref(app)
+            .is_omp_cli_agent(app);
+        if is_omp {
+            return Ok(vec![]);
+        }
+
         let prioritized_commands = vec![
             &*commands::EDIT,
             &*commands::CONVERSATIONS,

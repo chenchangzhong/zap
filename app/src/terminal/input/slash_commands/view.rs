@@ -62,6 +62,11 @@ pub enum SlashCommandsEvent {
         reference: SkillReference,
         name: String,
     },
+    /// An OMP command was selected from the menu.
+    /// Inserts the command text into the input buffer.
+    SelectedOmpCommand {
+        text: String,
+    },
 }
 
 /// Wrapper around `InlineMenuView` specialized for slash commands.
@@ -219,7 +224,6 @@ impl InlineSlashCommandView {
             mixer.run_query(slash_command_query(&filter), ctx);
         });
     }
-
     fn handle_selection(
         &mut self,
         item: &AcceptSlashCommandOrSavedPrompt,
@@ -242,15 +246,12 @@ impl InlineSlashCommandView {
                     name: name.clone(),
                 });
             }
+            AcceptSlashCommandOrSavedPrompt::OmpCommand { text } => {
+                ctx.emit(SlashCommandsEvent::SelectedOmpCommand {
+                    text: text.clone(),
+                });
+            }
         }
-    }
-
-    pub fn select_up(&self, ctx: &mut ViewContext<Self>) {
-        self.menu_view.update(ctx, |v, ctx| v.select_up(ctx));
-    }
-
-    pub fn select_down(&self, ctx: &mut ViewContext<Self>) {
-        self.menu_view.update(ctx, |v, ctx| v.select_down(ctx));
     }
 
     pub fn accept_selected_item(&self, cmd_or_ctrl_enter: bool, ctx: &mut ViewContext<Self>) {
@@ -261,6 +262,15 @@ impl InlineSlashCommandView {
     pub fn result_count(&self, app: &AppContext) -> usize {
         self.mixer.as_ref(app).results().len()
     }
+
+    pub fn select_up(&self, ctx: &mut ViewContext<Self>) {
+        self.menu_view.update(ctx, |v, ctx| v.select_up(ctx));
+    }
+
+    pub fn select_down(&self, ctx: &mut ViewContext<Self>) {
+        self.menu_view.update(ctx, |v, ctx| v.select_down(ctx));
+    }
+
 }
 
 impl View for InlineSlashCommandView {

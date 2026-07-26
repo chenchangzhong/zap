@@ -265,7 +265,7 @@ impl CLIAgent {
             CLIAgent::Goose => &[SkillProvider::Agents],
             CLIAgent::DeepSeek => &[SkillProvider::Agents],
             CLIAgent::Antigravity => &[SkillProvider::Agents],
-            CLIAgent::OhMyPi => &[SkillProvider::Agents],
+            CLIAgent::OhMyPi => &[SkillProvider::OhMyPi, SkillProvider::Agents],
             CLIAgent::Unknown => &[],
         }
     }

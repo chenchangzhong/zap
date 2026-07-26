@@ -42,6 +42,8 @@ use crate::{
     settings::{AISettings, AISettingsChangedEvent, InputSettings, InputSettingsChangedEvent},
     terminal::model::session::active_session::{ActiveSession, ActiveSessionEvent},
 };
+use crate::search::slash_command_menu::omp_commands::{OmpCommandItem, OmpCommandSource};
+use crate::terminal::CLIAgent;
 
 pub struct DataSourceArgs {
     pub active_session: ModelHandle<ActiveSession>,
@@ -245,7 +247,50 @@ impl SlashCommandDataSource {
             .filter(|s| matches!(s.input_state, CLIAgentInputState::Open { .. }))
             .map(|s| s.agent.supported_skill_providers())
     }
+
+    /// Returns the active CLI agent if CLI agent input is open for this terminal.
+    fn active_cli_agent(&self, ctx: &AppContext) -> Option<CLIAgent> {
+        CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.terminal_view_id)
+            .filter(|s| matches!(s.input_state, CLIAgentInputState::Open { .. }))
+            .map(|s| s.agent)
+    }
+
+    /// Returns `true` if the active CLI agent is OhMyPi.
+    pub(super) fn is_omp_cli_agent(&self, ctx: &AppContext) -> bool {
+        self.active_cli_agent(ctx) == Some(CLIAgent::OhMyPi)
+    }
+
+    /// Load OMP commands (builtin + custom) for display in the slash menu.
+    fn omp_commands(&self, app: &AppContext) -> Vec<OmpCommandItem> {
+        // Load OMP skills through skill manager, filtered to OhMyPi provider.
+        let skill_items = if FeatureFlag::ListSkills.is_enabled()
+            && AISettings::as_ref(app).is_any_ai_enabled(app)
+        {
+            let cwd = self.active_session.as_ref(app).current_working_directory();
+            let cwd_path = cwd.as_ref().map(std::path::Path::new);
+            let skills = SkillManager::handle(app)
+                .as_ref(app)
+                .get_skills_for_working_directory(cwd_path, app);
+            let skill_manager = SkillManager::as_ref(app);
+            let omp_providers = &[SkillProvider::OhMyPi, SkillProvider::Agents];
+            skills
+                .into_iter()
+                .filter(|s| skill_manager.skill_exists_for_any_provider(s, omp_providers))
+                .map(|s| OmpCommandItem {
+                    text: format!("/skill:{}", s.name),
+                    description: s.description,
+                    source: OmpCommandSource::Skill,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+
+        crate::search::slash_command_menu::omp_commands::all_omp_commands(skill_items)
+    }
 }
+
 
 impl SyncDataSource for SlashCommandDataSource {
     type Action = AcceptSlashCommandOrSavedPrompt;
@@ -255,34 +300,72 @@ impl SyncDataSource for SlashCommandDataSource {
         query: &Query,
         app: &warpui::AppContext,
     ) -> Result<Vec<QueryResult<Self::Action>>, DataSourceRunErrorWrapper> {
+        // ── OMP mode: show OMP commands + OMP skills ──
+        if self.is_omp_cli_agent(app) {
+            let omp_items = self.omp_commands(app);
+            if query.text.is_empty() {
+                return Ok(omp_items.iter().rev().map(|item| {
+                    let a = Appearance::as_ref(app);
+                    QueryResult::from(InlineItem {
+                        action: AcceptSlashCommandOrSavedPrompt::OmpCommand { text: item.text.clone() },
+                        icon_path: "bundled/svg/zap.svg",
+                        name: item.text.clone(),
+                        description: Some(item.description.clone()),
+                        font_family: a.monospace_font_family(),
+                        name_match_result: None,
+                        description_match_result: None,
+                        score: OrderedFloat(f64::MIN),
+                    })
+                }).collect());
+            }
+            let query_text = query.text.trim().to_lowercase();
+            let mut results = Vec::new();
+            for item in &omp_items {
+                let name = &item.text;
+                let desc = &item.description;
+                if let Some(fr) = SlashCommandFuzzyMatchResult::try_match(&query_text, name, Some(desc)) {
+                    let score = fr.score();
+                    if query_text.len() > 1 && score <= 25.0 { continue; }
+                    let prefix_boost = prefix_match_bonus(&query_text, name);
+                    let source_bonus = match item.source {
+                        OmpCommandSource::Skill => OrderedFloat(1000.0),
+                        _ => OrderedFloat(2000.0),
+                    };
+                    let a = Appearance::as_ref(app);
+                    results.push(QueryResult::from(
+                        InlineItem {
+                            action: AcceptSlashCommandOrSavedPrompt::OmpCommand { text: item.text.clone() },
+                            icon_path: "bundled/svg/zap.svg",
+                            name: item.text.clone(),
+                            description: Some(item.description.clone()),
+                            font_family: a.monospace_font_family(),
+                            name_match_result: fr.name_match_result,
+                            description_match_result: fr.description_match_result,
+                            score: source_bonus * OrderedFloat(score) + OrderedFloat(prefix_boost) * source_bonus
+                                + OrderedFloat(1.0 / name.len() as f64),
+                        }
+                    ));
+                }
+            }
+            return Ok(results);
+        }
+
+        // ── Normal mode: Zap static commands + skills ──
         if query.text.is_empty() {
             return Ok(vec![]);
         }
-
         let query_text = query.text.trim().to_lowercase();
-
         let mut results = Vec::new();
 
-        /// Multiplier to ensure static commands always appear at the top of the match results.
         const SCORE_MULTIPLIER: OrderedFloat<f64> = OrderedFloat(1000.0);
 
         for (id, command) in self.active_commands_by_id.iter() {
             if let Some(fuzzy_result) = SlashCommandFuzzyMatchResult::try_match(
-                &query_text,
-                command.name,
-                None, // Don't match on description for slash commands.
+                &query_text, command.name, None,
             ) {
                 let score = fuzzy_result.score();
-
-                // Only include results with score > 25 once the user has started typing a query and is past the first character
-                if query_text.len() > 1 && score <= 25.0 {
-                    continue;
-                }
-
-                // Boost prefix matches so that closer matches (e.g. "new" → "/new")
-                // rank above longer fuzzy matches (e.g. "new" → "/create-new-project").
+                if query_text.len() > 1 && score <= 25.0 { continue; }
                 let prefix_boost = prefix_match_bonus(&query_text, command.name);
-
                 results.push(QueryResult::from(
                     InlineItem::from_slash_command(id, command, app)
                         .with_name_match_result(fuzzy_result.name_match_result)
@@ -290,16 +373,12 @@ impl SyncDataSource for SlashCommandDataSource {
                         .with_score(
                             OrderedFloat(score) * SCORE_MULTIPLIER
                                 + OrderedFloat(prefix_boost) * SCORE_MULTIPLIER
-                                // Boost commands with shorter names, if match result is otherwise
-                                // equal.
                                 + OrderedFloat(1. / command.name.len() as f64),
                         ),
                 ));
             }
         }
 
-        // Also search skills — when CLI agent input is open, filter to natively supported providers.
-        // Skills are invoked by the agent, so they're hidden entirely when AI is globally off.
         if FeatureFlag::ListSkills.is_enabled() && AISettings::as_ref(app).is_any_ai_enabled(app) {
             let cli_agent_providers = self.active_cli_agent_providers(app);
             let cwd = self.active_session.as_ref(app).current_working_directory();
@@ -307,35 +386,20 @@ impl SyncDataSource for SlashCommandDataSource {
             let skills = SkillManager::handle(app)
                 .as_ref(app)
                 .get_skills_for_working_directory(cwd_path, app);
-
             let skill_manager = SkillManager::as_ref(app);
             for mut skill in skills {
-                // In CLI agent input mode, only show skills that exist in a supported
-                // provider folder. We check all paths (not just the deduplicated
-                // provider) because deduplication may have picked a higher-priority
-                // provider even when the skill also exists in the CLI agent's folder.
                 if let Some(providers) = &cli_agent_providers {
                     if !skill_manager.skill_exists_for_any_provider(&skill, providers) {
                         continue;
                     }
-                    // Re-map the provider to the best supported one so the icon
-                    // reflects the active CLI agent's native provider.
                     skill.provider = skill_manager.best_supported_provider(&skill, providers);
                 }
                 if let Some(fuzzy_result) = SlashCommandFuzzyMatchResult::try_match(
-                    &query_text,
-                    &skill.name,
-                    Some(&skill.description),
+                    &query_text, &skill.name, Some(&skill.description),
                 ) {
                     let score = fuzzy_result.score();
-
-                    // Only include results with score > 25 once the user has started typing a query
-                    if query_text.len() > 1 && score <= 25.0 {
-                        continue;
-                    }
-
+                    if query_text.len() > 1 && score <= 25.0 { continue; }
                     let prefix_boost = prefix_match_bonus(&query_text, &skill.name);
-
                     results.push(QueryResult::from(
                         InlineItem::from_skill(&skill, app)
                             .with_name_match_result(fuzzy_result.name_match_result)
@@ -354,31 +418,12 @@ impl SyncDataSource for SlashCommandDataSource {
     }
 }
 
-/// Computes a bonus score for slash command matches where the query is a prefix
-/// of the command name. This ensures closer matches (e.g., "new" → "/new") rank
-/// above longer fuzzy matches (e.g., "new" → "/figma-create-new-file").
-///
-/// Returns a value in `[0.0, 100.0]` based on the query's coverage of the name.
-/// An exact match yields the maximum bonus of 100; partial prefix matches yield
-/// a proportionally smaller bonus.
-fn prefix_match_bonus(query: &str, name: &str) -> f64 {
-    let name_lower = name.to_lowercase();
-    let name_stripped = name_lower.strip_prefix('/').unwrap_or(&name_lower);
-    if name_stripped.starts_with(query) {
-        // coverage = 1.0 for exact match, smaller for partial prefix match.
-        let coverage = query.len() as f64 / name_stripped.len() as f64;
-        coverage * 100.0
-    } else {
-        0.0
-    }
+impl Entity for SlashCommandDataSource {
+    type Event = UpdatedActiveCommands;
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct UpdatedActiveCommands;
-
-impl Entity for SlashCommandDataSource {
-    type Event = UpdatedActiveCommands;
-}
 
 #[derive(Debug, Clone)]
 pub struct InlineItem {
@@ -413,7 +458,6 @@ impl InlineItem {
 
     pub(super) fn from_skill(skill: &SkillDescriptor, app: &AppContext) -> Self {
         let appearance = Appearance::handle(app).as_ref(app);
-        // Use icon_override if set (e.g. Figma skills), otherwise derive from provider.
         let icon = if let Some(override_icon) = skill.icon_override {
             override_icon
         } else {
@@ -457,6 +501,17 @@ impl InlineItem {
         self.score = score;
         self
     }
+}
+fn prefix_match_bonus(query: &str, name: &str) -> f64 {
+    let name = name.strip_prefix('/').unwrap_or(name);
+    let query = query.strip_prefix('/').unwrap_or(query);
+    if query.eq_ignore_ascii_case(name) {
+        return 100.0;
+    }
+    if name.to_lowercase().starts_with(&query.to_lowercase()) {
+        return 50.0 * (query.len() as f64 / name.len() as f64);
+    }
+    0.0
 }
 
 #[cfg(test)]

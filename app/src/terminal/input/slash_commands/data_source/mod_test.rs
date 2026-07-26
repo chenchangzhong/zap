@@ -11,9 +11,9 @@ fn exact_match_returns_full_bonus() {
 
 #[test]
 fn partial_prefix_returns_proportional_bonus() {
-    // "for" is a prefix of "fork" → coverage 3/4 = 75.
+    // "for" is a prefix of "fork" → 50 * (3/4) = 37.5
     let bonus = prefix_match_bonus("for", "/fork");
-    assert!((bonus - 75.0).abs() < f64::EPSILON);
+    assert!((bonus - 37.5).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -29,11 +29,10 @@ fn case_insensitive() {
     assert!((bonus - 100.0).abs() < f64::EPSILON);
 }
 
-#[test]
 fn name_without_slash_prefix() {
     // Skills don't have the '/' prefix in their name.
     let bonus = prefix_match_bonus("figma", "figma-create-new-file");
-    let coverage = 5.0 / 21.0 * 100.0;
+    let coverage = 50.0 * (5.0 / 21.0);
     assert!((bonus - coverage).abs() < f64::EPSILON);
 }
 

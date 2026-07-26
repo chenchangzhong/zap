@@ -46,6 +46,7 @@ use crate::view_components::DismissibleToast;
 use crate::workspace::{ForkedConversationDestination, ToastStack, WorkspaceAction};
 use crate::TelemetryEvent;
 
+/// A slash command or saved prompt selected from the slash commands menu.
 #[derive(Debug, Clone)]
 pub enum AcceptSlashCommandOrSavedPrompt {
     SlashCommand {
@@ -54,10 +55,15 @@ pub enum AcceptSlashCommandOrSavedPrompt {
     SavedPrompt {
         id: SyncId,
     },
-    /// A skill selected from browse or search. Contains name (for display/insertion) and path/bundled_skill_id (for execution).
+    /// A skill selected from browse or search.
     Skill {
         reference: SkillReference,
         name: String,
+    },
+    /// An OMP command (builtin, custom, or skill) selected from the slash menu.
+    /// Selected from the menu → inserts command text into buffer.
+    OmpCommand {
+        text: String,
     },
 }
 impl InlineMenuAction for AcceptSlashCommandOrSavedPrompt {
@@ -330,6 +336,10 @@ impl Input {
                     editor.set_buffer_text(format!("/{name} ").as_str(), ctx);
                 });
                 self.close_slash_commands_menu(ctx);
+            }
+            SlashCommandsEvent::SelectedOmpCommand { text } => {
+                self.close_slash_commands_menu(ctx);
+                ctx.emit(Event::SubmitCLIAgentInput { text: format!("{text} ") });
             }
         }
     }

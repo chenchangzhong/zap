@@ -76,6 +76,9 @@ impl From<SkillProvider> for api::skill_descriptor::Provider {
             SkillProvider::Droid => api::skill_descriptor::provider::Type::Droid(()),
             SkillProvider::Github => api::skill_descriptor::provider::Type::Github(()),
             SkillProvider::OpenCode => api::skill_descriptor::provider::Type::OpenCode(()),
+            // OhMyPi maps to Zap/Warp in the proto — they share the same
+            // Zap ecosystem for skill serialization.
+            SkillProvider::OhMyPi => api::skill_descriptor::provider::Type::Warp(()),
         };
 
         api::skill_descriptor::Provider {

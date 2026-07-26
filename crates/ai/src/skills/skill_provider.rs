@@ -39,6 +39,7 @@ pub enum SkillProvider {
     Droid,
     Github,
     OpenCode,
+    OhMyPi,
 }
 
 /// Represents the scope of a skill.
@@ -70,7 +71,6 @@ pub struct SkillProviderDefinition {
     /// Relative path from root (repo or home), constructed with platform-aware joining.
     pub skills_path: PathBuf,
 }
-
 impl SkillProvider {
     /// Returns the default icon for this provider.
     pub fn icon(&self) -> Icon {
@@ -80,6 +80,7 @@ impl SkillProvider {
             SkillProvider::Gemini => Icon::GeminiLogo,
             SkillProvider::Droid => Icon::DroidLogo,
             SkillProvider::OpenCode => Icon::OpenCodeLogo,
+            SkillProvider::OhMyPi => Icon::Zap,
             SkillProvider::Zap
             | SkillProvider::Agents
             | SkillProvider::Cursor
@@ -113,6 +114,10 @@ pub static SKILL_PROVIDER_DEFINITIONS: LazyLock<Vec<SkillProviderDefinition>> =
             SkillProviderDefinition {
                 provider: SkillProvider::Claude,
                 skills_path: PathBuf::from(".claude").join("skills"),
+            },
+            SkillProviderDefinition {
+                provider: SkillProvider::OhMyPi,
+                skills_path: PathBuf::from(".omp").join("agent").join("skills"),
             },
             SkillProviderDefinition {
                 provider: SkillProvider::Codex,
