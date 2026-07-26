@@ -115,6 +115,8 @@ impl OmpModelSelector {
                     if let Some(idx) = selected { menu.set_selected_by_index(idx, ctx); }
                     ctx.notify();
                 });
+            } else if let Err(e) = r {
+                log::warn!("OmpModelSelector: refresh failed: {e}");
             }
             ctx.notify();
         });

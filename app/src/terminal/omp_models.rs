@@ -72,7 +72,8 @@ impl OmpModelRegistry {
     /// On any failure (binary not found, non-zero exit, malformed JSON, empty list)
     /// the existing model list is preserved and `Err` is returned.
     pub async fn refresh(&mut self) -> Result<(), String> {
-        let mut cmd = command::r#async::Command::new(&self.omp_binary);
+        let binary = self.resolve_binary().await?;
+        let mut cmd = command::r#async::Command::new(&binary);
         cmd.args(["models", "--json"]);
 
         let output = run_with_timeout(&mut cmd, 10).await?;
@@ -88,7 +89,41 @@ impl OmpModelRegistry {
 
         self.models = models;
         self.last_refresh = Some(Instant::now());
+        self.omp_binary = binary;
         Ok(())
+    }
+
+    /// Resolve the `omp` binary path.
+    /// When launched as a GUI app (e.g. from Finder), PATH may not include
+    /// Homebrew paths like `/opt/homebrew/bin`. This method tries the binary
+    /// name directly first, then falls back to common installation paths.
+    async fn resolve_binary(&self) -> Result<String, String> {
+        let candidates = if self.omp_binary.contains('/') {
+            vec![self.omp_binary.clone()]
+        } else {
+            let mut c = vec![self.omp_binary.clone()];
+            c.push("/opt/homebrew/bin/omp".into());
+            c.push("/usr/local/bin/omp".into());
+            c.push("/home/linuxbrew/.linuxbrew/bin/omp".into());
+            c
+        };
+        for path in &candidates {
+            if command::r#async::Command::new(path)
+                .arg("--version")
+                .stdout(command::Stdio::null())
+                .stderr(command::Stdio::null())
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                return Ok(path.clone());
+            }
+        }
+        Err(format!(
+            "omp binary not found (tried: {})",
+            candidates.join(", ")
+        ))
     }
 
     /// Returns the cached model slice.
