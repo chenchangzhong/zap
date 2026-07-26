@@ -7615,22 +7615,19 @@ impl Input {
             && has_attached_context
         {
             self.clear_attached_context(ctx);
-        } else {
-            if FeatureFlag::AgentView.is_enabled()
-                && !self.agent_view_controller.as_ref(ctx).is_fullscreen()
-            {
-                if self.ai_input_model.as_ref(ctx).is_ai_input_enabled() {
-                    // This implies the contents of the terminal input are autodetected as an agent
-                    // prompt; overrides the autodetection by explicitly setting input mode back to
-                    // terminal.
-                    self.set_input_mode_terminal(false, ctx);
-                }
-            } else {
-                self.set_input_mode_natural_language_detection(ctx);
+        } else if FeatureFlag::AgentView.is_enabled()
+            && !self.agent_view_controller.as_ref(ctx).is_fullscreen()
+        {
+            if self.ai_input_model.as_ref(ctx).is_ai_input_enabled() {
+                self.set_input_mode_terminal(false, ctx);
             }
+        } else if FeatureFlag::AgentView.is_enabled()
+            && self.agent_view_controller.as_ref(ctx).is_fullscreen()
+        {
             ctx.emit(Event::Escape);
         }
     }
+
 
     /// Emits an `AgentModeAutodetectionFalsePositive` telemetry event if the current input text has
     /// been autodetected as AI input and the user manually toggled to shell.

@@ -566,15 +566,21 @@ impl AgentInputFooter {
                     ctx,
                 )
             });
-            ctx.subscribe_to_view(&view, |_me, _, _event, _ctx| {
-                // Model switching is handled by socket → extension's
-                // pi.runtime.sendUserMessage("/model <selector>").
+            ctx.subscribe_to_view(&view, |_me, _, event, ctx| {
+                match event {
+                    crate::terminal::omp_model_selector::OmpModelSelectorEvent::ModelSelected { .. }
+                    | crate::terminal::omp_model_selector::OmpModelSelectorEvent::MenuClosed => {
+                        ctx.emit(AgentInputFooterEvent::ModelSelectorClosed);
+                    }
+                    crate::terminal::omp_model_selector::OmpModelSelectorEvent::MenuOpened => {
+                        ctx.emit(AgentInputFooterEvent::ModelSelectorOpened);
+                    }
+                }
             });
             Some(view)
         } else {
             None
         };
-
         let profile_model_selector_full = ctx.add_typed_action_view(|ctx| {
             let mut selector = ProfileModelSelector::new(
                 menu_positioning_provider.clone(),
