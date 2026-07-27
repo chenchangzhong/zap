@@ -66,7 +66,7 @@ ls -l target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app/Contents/Resour
 
 OMP 模型列表（`omp models --json`）只显示有 API key 的 provider。
 Release 构建从 Finder 启动时没有终端的环境变量，
-`OmpModelRegistry` 会在后台通过 `$SHELL -l -c printenv` 获取用户环境。
+`OmpModelRegistry` 会在后台通过 `$SHELL -l -i -c printenv` 获取用户环境。
 
 常见 API Key（如 `DEEPSEEK_API_KEY`、`ANTHROPIC_API_KEY`）会自动传入 `omp` 子进程，
 无需额外配置。

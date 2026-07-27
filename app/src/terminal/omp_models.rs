@@ -173,11 +173,12 @@ impl OmpModelRegistry {
 /// Get environment variables from the user's login shell.
 /// GUI apps on macOS don't inherit the user's shell environment
 /// (e.g. API keys like DEEPSEEK_API_KEY). This function runs
-/// `$SHELL -l -c printenv` to capture those variables.
+/// `$SHELL -l -i -c printenv` to capture those variables.
 pub fn get_user_env() -> Vec<(String, String)> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let output = std::process::Command::new(&shell)
         .arg("-l")
+        .arg("-i")
         .arg("-c")
         .arg("printenv")
         .output()

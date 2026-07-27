@@ -102,6 +102,7 @@ impl OmpModelSelector {
         }, |me, (r, model, registry), ctx| {
             me.registry = registry; me.loading = false;
             if let Ok(()) = r {
+                log::info!("OmpModelSelector: refresh success, {} models loaded", me.registry.models().len());
                 if me.selected_model.is_none() { me.selected_model = model; }
                 let items: Vec<MenuItem<OmpModelSelectorAction>> = me.registry.models().iter()
                     .map(|m| MenuItem::Item(MenuItemFields::new(format!("{} ({})", m.name, m.provider))
