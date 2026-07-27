@@ -9,7 +9,7 @@
 ## 快速构建（debug 运行）
 
 ```bash
-cargo run -p warp
+cargo run --bin zap-oss
 ```
 
 ## 发布版打包
@@ -19,11 +19,14 @@ cargo run -p warp
 ```bash
 cargo clean
 ```
-清理约 21.6GB 编译缓存。构建时长约 6–8 分钟。
+
+清理约 21.6GB 编译缓存，构建时长约 6–8 分钟。
 
 ### 2. 构建 DockTilePlugin
 
-DockTilePlugin 须在打 .app bundle 前编译到 `target/` 下。
+bundle 脚本会尝试嵌入 DockTilePlugin，若不存在则跳过（不影响 .app 运行）。
+
+如需构建：
 
 ```bash
 make -C app/DockTilePlugin clean
@@ -31,99 +34,125 @@ make -C app/DockTilePlugin
 cp -R app/DockTilePlugin/ZapDockTilePlugin.docktileplugin target/release-lto/
 ```
 
-注意：构建前确保 `target/release-lto/ZapDockTilePlugin.docktileplugin` 不存在，否则 bundle 脚本会报错退出。
-
-### 3. 构建 .app bundle
+### 3. 构建 .app bundle（一键完成）
 
 ```bash
 ./script/macos/bundle --channel oss --selfsign --nouniversal --arch aarch64
 ```
 
-参数说明：
-- `--channel oss` — 开源版渠道
-- `--selfsign` — 使用本地 Apple Development 证书签名
-- `--nouniversal --arch aarch64` — 仅编译 ARM64（Apple Silicon），不编译 x86_64
+`--selfsign` 自动搜索本地 Apple Development 证书签名，
+同时自动编译自适应图标。**一步完成构建、签名、图标编译**，无需额外操作。
 
-产出的 `.app` 路径：
+如需兼容 Intel Mac，去掉 `--nouniversal`。
+
+产出的 .app 和 .dmg：
+
 ```
 target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app
+target/aarch64-apple-darwin/release-lto/bundle/dmg/Zap.dmg
 ```
 
-### 4. 编译自适应图标
+### 4. 验证
 
-macOS Sequoia 支持根据系统主题（浅色/深色）自动切换图标。需要用 `actool` 编译 `.icon` bundle：
+```bash
+# 检查签名（正常应输出 Signature size=xxxx，不是 adhoc）
+codesign -dv target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app
+
+# 检查自适应图标
+ls -l target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app/Contents/Resources/Assets.car
+```
+
+## 环境变量说明
+
+OMP 模型列表（`omp models --json`）只显示有 API key 的 provider。
+Release 构建从 Finder 启动时没有终端的环境变量，
+`OmpModelRegistry` 会在后台通过 `$SHELL -l -c printenv` 获取用户环境。
+
+常见 API Key（如 `DEEPSEEK_API_KEY`、`ANTHROPIC_API_KEY`）会自动传入 `omp` 子进程，
+无需额外配置。
+
+预览可用模型：
+
+```bash
+omp models --json | python3 -m json.tool
+```
+
+## 常见问题
+
+### 签名回退到 ad-hoc
+
+`--selfsign` 依赖 `security find-identity | grep "Apple Development"` 查找证书。
+若没找到或选错，会回退到 ad-hoc 签名。
+
+手动用证书哈希签名：
+
+```bash
+# 先用 security find-identity 找到证书哈希
+security find-identity -p codesigning -v
+
+# 然后手动签名
+codesign --force --deep --options runtime \
+  --sign "证书哈希" \
+  --entitlements script/Debug-Entitlements.plist \
+  target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app
+```
+
+### DockTilePlugin 找不到
+
+`cp: target/release-lto/ZapDockTilePlugin.docktileplugin: No such file or directory`
+
+不影响 app 运行，只是 Dock 上的进度条等插件功能不可用。
+执行 `cargo clean` 后需重新构建（见步骤 2）。
+
+### 图标不跟随系统主题切换
+
+检查 `Contents/Resources/Assets.car` 是否存在。若缺失，运行：
 
 ```bash
 script/compile_icon oss target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app
 ```
 
-该步骤产生：
-- `AppIcon.icns` — 后备图标
-- `Assets.car` — 自适应图标资源（系统主题切换用）
+图标源文件位于 `app/channels/oss/icon/AppIcon.icon/`，若该目录不存在 `compile_icon` 会静默跳过。
 
-`.icon` bundle 源文件位置：
+### OMP 模型列表为空
+
+可能原因：
+
+1. **OMP 二进制没找到** — 从 Finder 启动时 PATH 不含 `/opt/homebrew/bin`。
+   代码已内置 `resolve_binary()` 自动搜索常见 Homebrew 路径。
+
+2. **API Key 环境变量缺失** — GUI app 不继承 shell 的 `DEEPSEEK_API_KEY` 等。
+   代码已内置 `get_user_env()` 从 login shell 获取环境变量。
+
+3. **debug 构建功能正常但 release 没有** — 检查 feature flag 是否被 `cfg!(debug_assertions)` 误包裹。
+   OmpModelSelector 此前就是这个原因。
+
+### 第三方许可证生成失败
+
+```text
+error: no such command: `about`
 ```
-app/channels/oss/icon/AppIcon.icon/
-```
 
-若该目录不存在，`compile_icon` 会静默跳过（仅 OSS 渠道），导致 `Assets.car` 缺失。
-
-### 5. 重新签名
-
-编译图标后 bundle 内容发生了变化，**必须重新签名**，否则 macOS 会拒绝运行或丢失权限。
+需安装 `cargo-about`，否则 bundle 脚本会继续但跳过许可证生成：
 
 ```bash
-codesign --force --deep --options runtime \
-  --sign "CF74906DE6F1B22ACEE43D6BD020A6589F6FC161" \
-  --entitlements script/Debug-Entitlements.plist \
-  target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app
+cargo install cargo-about
 ```
 
-验证签名：
-```bash
-codesign -dv target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app
-```
+不影响 app 构建，仅 `THIRD_PARTY_LICENSES.txt` 缺失。
+### `--skip-build` 的问题
 
-正常输出应包含 `Signature size=xxxx`（不是 `adhoc`）。
+`--skip-build` 会导致 bundle 脚本跳过 `compile_icon`，产出的 .app 没有自适应图标。
+还会导致路径错位（.app 跑到 `dmg/Zap.app` 而非 `osx/Zap.app`）。
+除非调试打包流程，否则不要使用。
 
-### 6. 打包 DMG
+### 手动补图标后 DMG 需要重建
+
+如果手动运行 `compile_icon` 和 `codesign` 补图标，DMG 是在脚本中早先生成的，
+内容仍是旧版 .app。需要重新打包：
 
 ```bash
 BUNDLE=target/aarch64-apple-darwin/release-lto/bundle
 rm -f "$BUNDLE/dmg/Zap.dmg"
-hdiutil create -volname "Zap" \
-  -srcfolder "$BUNDLE/osx/Zap.app" \
-  -ov -format UDZO \
-  "$BUNDLE/dmg/Zap.dmg"
+hdiutil create -volname "Zap" -srcfolder "$BUNDLE/osx/Zap.app" -ov -format UDZO "$BUNDLE/dmg/Zap.dmg"
 ```
-
-## 常见问题
-
-### `--skip-build` 的问题
-
-`--skip-build` 会导致：
-- 跳过 `compile_icon`，产出的 .app 没有自适应图标
-- 路径错位，.app 会跑到 `dmg/Zap.app` 而非 `osx/Zap.app`
-- 只使用 `--skip-build` 然后手动补 `compile_icon`，仍需重新签名和重建 DMG
-
-**建议**：除非调试打包流程，否则不要使用 `--skip-build`。
-
-### `--selfsign` 签名不生效
-
-`--selfsign` 有时会回退到 ad-hoc 签名而非开发证书。表现：`codesign -dv` 输出 `Signature=adhoc`。
-
-**原因**：bundle 脚本的签名逻辑依赖 `security find-identity | grep "Apple Development"`，可能找不到或选错证书。
-
-**解决**：`--selfsign` 完后手动用证书哈希签名（见第 5 步）。
-
-### `ZapDockTilePlugin.docktileplugin 找不到`
-
-bundle 脚本期望 `target/release-lto/ZapDockTilePlugin.docktileplugin` 已存在。如果执行过 `cargo clean`，这个产物会被清除，需要重新构建（见第 2 步）。
-
-### `DockTilePlugin` 的 .gitignore
-
-`app/DockTilePlugin/ZapDockTilePlugin.docktileplugin/` 是编译产物，需加入 `.gitignore`，避免误提交。
-
-### 图标目录不存在
-
-`app/channels/oss/icon/AppIcon.icon/` 必须存在，否则 `compile_icon` 静默跳过，不生成 `Assets.car`。
