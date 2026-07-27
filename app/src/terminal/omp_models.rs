@@ -75,7 +75,12 @@ impl OmpModelRegistry {
         let binary = self.resolve_binary().await?;
         let mut cmd = command::r#async::Command::new(&binary);
         cmd.args(["models", "--json"]);
-
+        // Forward the user's shell environment (API keys etc.) that GUI apps
+        // don't inherit from launchd.
+        let user_env = get_user_env();
+        if !user_env.is_empty() {
+            cmd.envs(user_env);
+        }
         let output = run_with_timeout(&mut cmd, 10).await?;
 
         let response: ModelsResponse = serde_json::from_slice(&output.stdout)
@@ -163,4 +168,36 @@ impl OmpModelRegistry {
         Ok(default)
     }
 
+}
+
+/// Get environment variables from the user's login shell.
+/// GUI apps on macOS don't inherit the user's shell environment
+/// (e.g. API keys like DEEPSEEK_API_KEY). This function runs
+/// `$SHELL -l -c printenv` to capture those variables.
+pub fn get_user_env() -> Vec<(String, String)> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let output = std::process::Command::new(&shell)
+        .arg("-l")
+        .arg("-c")
+        .arg("printenv")
+        .output()
+        .ok();
+    let Some(output) = output else { return Vec::new(); };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '=');
+            let key = parts.next()?;
+            let val = parts.next().unwrap_or("");
+            // Skip shell-internal vars that could cause issues
+            if key.is_empty() || key.starts_with("BASH_") || key.starts_with("ZSH_") {
+                return None;
+            }
+            Some((key.to_owned(), val.to_owned()))
+        })
+        .collect()
 }
