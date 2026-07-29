@@ -366,18 +366,16 @@ fn cli_agent_footer_renders_for_viewer_of_shared_ambient_agent_session() {
             CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
                 sessions.set_session(
                     view_id,
-                    CLIAgentSession {
-                        agent: CLIAgent::Claude,
-                        status: CLIAgentSessionStatus::InProgress,
-                        session_context: CLIAgentSessionContext::default(),
-                        input_state: CLIAgentInputState::Closed,
-                        listener: None,
-                        plugin_version: None,
-                        remote_host: None,
-                        draft_text: None,
-                        custom_command_prefix: None,
-                        should_auto_toggle_input: false,
-                    },
+                    CLIAgentSession { agent: CLIAgent::Claude,
+                    status: CLIAgentSessionStatus::InProgress,
+                    session_context: CLIAgentSessionContext::default(),
+                    input_state: CLIAgentInputState::Closed,
+                    listener: None,
+                    plugin_version: None,
+                    remote_host: None,
+                    draft_text: None,
+                    custom_command_prefix: None,
+                    should_auto_toggle_input: false, current_model: None },
                     ctx,
                 );
             });

@@ -23,6 +23,7 @@ pub(super) fn parse(body: &str) -> Option<CLIAgentEvent> {
         "permission_replied" => CLIAgentEventType::PermissionReplied,
         "question_asked" => CLIAgentEventType::QuestionAsked,
         "idle_prompt" => CLIAgentEventType::IdlePrompt,
+        "model_change" => CLIAgentEventType::ModelChange,
         other => CLIAgentEventType::Unknown(other.to_string()),
     };
 
@@ -54,6 +55,7 @@ pub(super) fn parse(body: &str) -> Option<CLIAgentEvent> {
             tool_name: raw.tool_name,
             tool_input_preview,
             plugin_version: raw.plugin_version,
+            model: raw.model,
         },
     })
 }
@@ -73,4 +75,5 @@ struct RawEvent {
     tool_name: Option<String>,
     tool_input: Option<serde_json::Value>,
     plugin_version: Option<String>,
+    model: Option<String>,
 }

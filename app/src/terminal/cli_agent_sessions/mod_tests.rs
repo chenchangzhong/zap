@@ -246,18 +246,16 @@ fn apply_event_preserves_input_session() {
         },
         previous_was_lock_set_with_empty_buffer: true,
     };
-    let mut session = CLIAgentSession {
-        agent: CLIAgent::Claude,
-        status: CLIAgentSessionStatus::InProgress,
-        session_context: CLIAgentSessionContext::default(),
-        input_state,
-        should_auto_toggle_input: false,
-        listener: None,
-        remote_host: None,
-        plugin_version: None,
-        draft_text: None,
-        custom_command_prefix: None,
-    };
+    let mut session = CLIAgentSession { agent: CLIAgent::Claude,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext::default(),
+    input_state,
+    should_auto_toggle_input: false,
+    listener: None,
+    remote_host: None,
+    plugin_version: None,
+    draft_text: None,
+    custom_command_prefix: None, current_model: None };
 
     let event = CLIAgentEvent {
         v: 1,
@@ -279,21 +277,19 @@ fn apply_event_preserves_input_session() {
 
 #[test]
 fn stop_without_query_preserves_previous_prompt() {
-    let mut session = CLIAgentSession {
-        agent: CLIAgent::DeepSeek,
-        status: CLIAgentSessionStatus::InProgress,
-        session_context: CLIAgentSessionContext {
-            query: Some("explain the diff".to_owned()),
-            ..Default::default()
-        },
-        input_state: CLIAgentInputState::Closed,
-        should_auto_toggle_input: false,
-        listener: None,
-        remote_host: None,
-        plugin_version: None,
-        draft_text: None,
-        custom_command_prefix: None,
-    };
+    let mut session = CLIAgentSession { agent: CLIAgent::DeepSeek,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext {
+        query: Some("explain the diff".to_owned()),
+        ..Default::default()
+    },
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    remote_host: None,
+    plugin_version: None,
+    draft_text: None,
+    custom_command_prefix: None, current_model: None };
 
     let event = CLIAgentEvent {
         v: 1,
@@ -322,35 +318,31 @@ fn stop_without_query_preserves_previous_prompt() {
 
 #[test]
 fn is_remote_returns_true_when_remote_host_is_set() {
-    let session = CLIAgentSession {
-        agent: CLIAgent::Claude,
-        status: CLIAgentSessionStatus::InProgress,
-        session_context: CLIAgentSessionContext::default(),
-        input_state: CLIAgentInputState::Closed,
-        should_auto_toggle_input: false,
-        listener: None,
-        plugin_version: None,
-        draft_text: None,
-        remote_host: Some("user@devbox".to_owned()),
-        custom_command_prefix: None,
-    };
+    let session = CLIAgentSession { agent: CLIAgent::Claude,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext::default(),
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    plugin_version: None,
+    draft_text: None,
+    remote_host: Some("user@devbox".to_owned()),
+    custom_command_prefix: None, current_model: None };
     assert!(session.is_remote());
 }
 
 #[test]
 fn is_remote_returns_false_when_remote_host_is_none() {
-    let session = CLIAgentSession {
-        agent: CLIAgent::Claude,
-        status: CLIAgentSessionStatus::InProgress,
-        session_context: CLIAgentSessionContext::default(),
-        input_state: CLIAgentInputState::Closed,
-        should_auto_toggle_input: false,
-        listener: None,
-        remote_host: None,
-        plugin_version: None,
-        draft_text: None,
-        custom_command_prefix: None,
-    };
+    let session = CLIAgentSession { agent: CLIAgent::Claude,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext::default(),
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    remote_host: None,
+    plugin_version: None,
+    draft_text: None,
+    custom_command_prefix: None, current_model: None };
     assert!(!session.is_remote());
 }
 
@@ -407,18 +399,16 @@ fn failure_tracking_is_independent_per_agent() {
 
 #[test]
 fn session_start_sets_plugin_version() {
-    let mut session = CLIAgentSession {
-        agent: CLIAgent::Claude,
-        status: CLIAgentSessionStatus::InProgress,
-        session_context: CLIAgentSessionContext::default(),
-        input_state: CLIAgentInputState::Closed,
-        should_auto_toggle_input: false,
-        listener: None,
-        plugin_version: None,
-        draft_text: None,
-        remote_host: None,
-        custom_command_prefix: None,
-    };
+    let mut session = CLIAgentSession { agent: CLIAgent::Claude,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext::default(),
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    plugin_version: None,
+    draft_text: None,
+    remote_host: None,
+    custom_command_prefix: None, current_model: None };
 
     let event = CLIAgentEvent {
         v: 1,
@@ -439,18 +429,16 @@ fn session_start_sets_plugin_version() {
 
 #[test]
 fn session_start_without_plugin_version_leaves_none() {
-    let mut session = CLIAgentSession {
-        agent: CLIAgent::Claude,
-        status: CLIAgentSessionStatus::InProgress,
-        session_context: CLIAgentSessionContext::default(),
-        input_state: CLIAgentInputState::Closed,
-        should_auto_toggle_input: false,
-        listener: None,
-        plugin_version: None,
-        draft_text: None,
-        remote_host: None,
-        custom_command_prefix: None,
-    };
+    let mut session = CLIAgentSession { agent: CLIAgent::Claude,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext::default(),
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    plugin_version: None,
+    draft_text: None,
+    remote_host: None,
+    custom_command_prefix: None, current_model: None };
 
     let event = CLIAgentEvent {
         v: 1,

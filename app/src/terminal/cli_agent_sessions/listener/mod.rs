@@ -60,7 +60,8 @@ pub fn session_supports_rich_status(session: &CLIAgentSession) -> bool {
 pub fn is_agent_supported(agent: &CLIAgent) -> bool {
     matches!(
         agent,
-        CLIAgent::Claude
+        CLIAgent::OhMyPi
+            | CLIAgent::Claude
             | CLIAgent::OpenCode
             | CLIAgent::Codex
             | CLIAgent::Gemini
@@ -512,39 +513,35 @@ mod tests {
 
     #[test]
     fn deepseek_legacy_osc9_session_is_not_rich_status() {
-        let session = CLIAgentSession {
-            agent: CLIAgent::DeepSeek,
-            status: super::super::CLIAgentSessionStatus::InProgress,
-            session_context: super::super::CLIAgentSessionContext::default(),
-            input_state: super::super::CLIAgentInputState::Closed,
-            should_auto_toggle_input: false,
-            listener: None,
-            remote_host: None,
-            plugin_version: None,
-            draft_text: None,
-            custom_command_prefix: None,
-        };
+        let session = CLIAgentSession { agent: CLIAgent::DeepSeek,
+        status: super::super::CLIAgentSessionStatus::InProgress,
+        session_context: super::super::CLIAgentSessionContext::default(),
+        input_state: super::super::CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None, current_model: None };
 
         assert!(!session_supports_rich_status(&session));
     }
 
     #[test]
     fn deepseek_structured_session_is_rich_status() {
-        let session = CLIAgentSession {
-            agent: CLIAgent::DeepSeek,
-            status: super::super::CLIAgentSessionStatus::InProgress,
-            session_context: super::super::CLIAgentSessionContext {
-                session_id: Some("sess_1234".to_owned()),
-                ..Default::default()
-            },
-            input_state: super::super::CLIAgentInputState::Closed,
-            should_auto_toggle_input: false,
-            listener: None,
-            remote_host: None,
-            plugin_version: None,
-            draft_text: None,
-            custom_command_prefix: None,
-        };
+        let session = CLIAgentSession { agent: CLIAgent::DeepSeek,
+        status: super::super::CLIAgentSessionStatus::InProgress,
+        session_context: super::super::CLIAgentSessionContext {
+            session_id: Some("sess_1234".to_owned()),
+            ..Default::default()
+        },
+        input_state: super::super::CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None, current_model: None };
 
         assert!(session_supports_rich_status(&session));
     }

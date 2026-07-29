@@ -1,4 +1,5 @@
 use std::process::Output;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 /// Represents a model available through the `omp` binary.
@@ -20,7 +21,7 @@ struct ModelsResponse {
 
 /// Cached registry of omp models, backed by the `omp` CLI binary.
 ///
-/// All subprocess calls use a 10-second timeout.
+/// All subprocess calls use a 30-second timeout.
 pub struct OmpModelRegistry {
     models: Vec<OmpModel>,
     last_refresh: Option<Instant>,
@@ -81,7 +82,7 @@ impl OmpModelRegistry {
         if !user_env.is_empty() {
             cmd.envs(user_env);
         }
-        let output = run_with_timeout(&mut cmd, 10).await?;
+        let output = run_with_timeout(&mut cmd, 30).await?;
 
         let response: ModelsResponse = serde_json::from_slice(&output.stdout)
             .map_err(|e| format!("failed to parse models --json: {e}"))?;
@@ -137,26 +138,12 @@ impl OmpModelRegistry {
         &self.models
     }
 
-    /// Runs `<omp_binary> config set modelRoles '{"default":"<selector>"}'`.
-    pub async fn set_model(&self, selector: &str) -> Result<(), String> {
-        use serde_json::json;
-        let records = json!({"default": selector});
-        let record_str = serde_json::to_string(&records)
-            .map_err(|e| format!("serialize error: {e}"))?;
-
-        let mut cmd = command::r#async::Command::new(&self.omp_binary);
-        cmd.args(["config", "set", "modelRoles", &record_str]);
-
-        run_with_timeout(&mut cmd, 10).await?;
-        Ok(())
-    }
-
     /// Runs `<omp_binary> config get modelRoles` and extracts the `default` field.
     pub async fn read_current_model(&self) -> Result<String, String> {
         let mut cmd = command::r#async::Command::new(&self.omp_binary);
         cmd.args(["config", "get", "modelRoles"]);
 
-        let output = run_with_timeout(&mut cmd, 10).await?;
+        let output = run_with_timeout(&mut cmd, 30).await?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Parse the JSON record and extract the "default" field.
         let records: serde_json::Value = serde_json::from_str(&stdout)
@@ -175,6 +162,12 @@ impl OmpModelRegistry {
 /// (e.g. API keys like DEEPSEEK_API_KEY). This function runs
 /// `$SHELL -l -i -c printenv` to capture those variables.
 pub fn get_user_env() -> Vec<(String, String)> {
+    static CACHE: LazyLock<Vec<(String, String)>> = LazyLock::new(compute_user_env);
+    CACHE.clone()
+}
+
+/// 实际执行慢速登录 shell 抓取环境变量。仅在进程内首次调用时运行一次。
+fn compute_user_env() -> Vec<(String, String)> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let output = std::process::Command::new(&shell)
         .arg("-l")

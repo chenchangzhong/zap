@@ -22,6 +22,7 @@ pub enum CLIAgentEventType {
     PermissionReplied,
     QuestionAsked,
     IdlePrompt,
+    ModelChange,
     Unknown(String),
 }
 
@@ -36,6 +37,7 @@ pub struct CLIAgentEventPayload {
     pub tool_name: Option<String>,
     pub tool_input_preview: Option<String>,
     pub plugin_version: Option<String>,
+    pub model: Option<String>,
 }
 
 /// A parsed event from a CLI agent plugin.

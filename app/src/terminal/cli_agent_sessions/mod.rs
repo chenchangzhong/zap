@@ -141,6 +141,8 @@ pub struct CLIAgentSession {
     /// the first word of the command (the binary/alias the user typed).
     /// Used to customize plugin instructions and force manual install mode.
     pub custom_command_prefix: Option<String>,
+    /// The current model reported by the CLI agent plugin via `model_change` events.
+    pub current_model: Option<String>,
 }
 
 impl CLIAgentSession {
@@ -206,6 +208,10 @@ impl CLIAgentSession {
             // IdlePrompt means the agent is sitting at its prompt waiting for input.
             // This should not affect status — otherwise it would override Success after a Stop event.
             CLIAgentEventType::IdlePrompt => return None,
+            CLIAgentEventType::ModelChange => {
+                self.current_model = event.payload.model.clone();
+                return None;
+            }
             CLIAgentEventType::SessionStart => {
                 self.plugin_version = event.payload.plugin_version.clone();
                 return None;
@@ -251,6 +257,12 @@ pub enum CLIAgentSessionsModelEvent {
         terminal_view_id: EntityId,
         agent: CLIAgent,
     },
+    /// The CLI agent reported a model change via a `model_change` event.
+    ModelChanged {
+        terminal_view_id: EntityId,
+        agent: CLIAgent,
+        model: String,
+    },
 }
 
 impl CLIAgentSessionsModelEvent {
@@ -269,6 +281,9 @@ impl CLIAgentSessionsModelEvent {
                 terminal_view_id, ..
             }
             | CLIAgentSessionsModelEvent::SessionUpdated {
+                terminal_view_id, ..
+            }
+            | CLIAgentSessionsModelEvent::ModelChanged {
                 terminal_view_id, ..
             } => *terminal_view_id,
         }
@@ -368,6 +383,7 @@ impl CLIAgentSessionsModel {
                 remote_host,
                 draft_text: None,
                 custom_command_prefix: None,
+                current_model: None,
             },
             ctx,
         );
@@ -414,6 +430,15 @@ impl CLIAgentSessionsModel {
                 terminal_view_id,
                 agent: session.agent,
             });
+        }
+        if matches!(event_type, CLIAgentEventType::ModelChange) {
+            if let Some(model) = event.payload.model.clone() {
+                ctx.emit(CLIAgentSessionsModelEvent::ModelChanged {
+                    terminal_view_id,
+                    agent: session.agent,
+                    model,
+                });
+            }
         }
     }
 
