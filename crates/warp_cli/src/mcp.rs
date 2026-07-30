@@ -19,6 +19,7 @@ pub enum MCPCommand {
 pub enum MCPSpec {
     /// Existing server by UUID.
     Uuid(uuid::Uuid),
+
     /// JSON string (full config, server map, or single server).
     /// Parsing deferred to app layer.
     Json(String),

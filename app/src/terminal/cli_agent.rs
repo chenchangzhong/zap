@@ -317,6 +317,12 @@ impl CLIAgent {
         )
     }
 
+    /// Whether Warp should show its CLI-agent footer for this agent.
+    /// Zap doesn't have WarpTui, so this is true for all variants.
+    pub fn supports_cli_agent_footer(&self) -> bool {
+        true
+    }
+
     /// Returns the brand color for this CLI agent, or `None` for unknown/custom agents.
     pub fn brand_color(&self) -> Option<ColorU> {
         match self {

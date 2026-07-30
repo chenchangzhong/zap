@@ -1,3 +1,5 @@
+pub use ai::LLMProvider;
+
 use parking_lot::FairMutex;
 use serde::{de, Deserialize, Serialize};
 use settings::Setting as _;
@@ -5,7 +7,6 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
-use warp_core::ui::icons::Icon;
 use warp_core::user_preferences::GetUserPreferences;
 use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity};
 
@@ -81,27 +82,9 @@ pub struct LLMSpec {
     pub speed: f32,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum LLMProvider {
-    OpenAI,
-    Anthropic,
-    Google,
-    Xai,
-    Unknown,
-}
-
-impl LLMProvider {
-    /// Maps an LLMProvider to its corresponding icon.
-    pub fn icon(&self) -> Option<Icon> {
-        match self {
-            LLMProvider::OpenAI => Some(Icon::OpenAILogo),
-            LLMProvider::Anthropic => Some(Icon::ClaudeLogo),
-            LLMProvider::Google => Some(Icon::GeminiLogo),
-            LLMProvider::Xai => None,
-            LLMProvider::Unknown => None,
-        }
-    }
-}
+/// LLMProvider is now defined in the `ai` crate.
+/// Re-exported here for backward compatibility.
+// Re-exported above: pub use ai::LLMProvider;
 
 /// The host where an LLM can be routed to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
