@@ -1816,6 +1816,8 @@ keybinding-desc-input-clear-and-reset-ai-context-menu-query = 清空并重置 AI
 # 终端视图相关 binding
 keybinding-desc-terminal-alternate-paste = 终端备用粘贴
 keybinding-desc-terminal-toggle-cli-agent-rich-input = 切换 CLI 智能体富文本输入
+keybinding-desc-terminal-focus-cli-agent-terminal = 聚焦终端
+keybinding-desc-terminal-focus-cli-agent-rich-input = 聚焦富文本输入
 keybinding-desc-terminal-warpify-subshell = Warpify 子 shell
 keybinding-desc-terminal-warpify-ssh-session = Warpify SSH 会话
 keybinding-desc-terminal-accept-prompt-suggestion = 接受 Prompt 建议

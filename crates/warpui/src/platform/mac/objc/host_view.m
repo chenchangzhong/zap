@@ -31,6 +31,7 @@ void warp_marked_text_cleared(WarpHostView *);
     return paths;
 }
 
+
 @end
 
 @implementation WarpHostView {
@@ -518,6 +519,18 @@ void warp_marked_text_cleared(WarpHostView *);
 
 - (NSArray<NSString *> *)validAttributesForMarkedText {
     return [NSArray array];
+}
+
+- (void)moveToBeginningOfDocument:(id)sender {
+    // Cmd-Up: force dispatch through Warp's keybinding system.
+    // NSTextView's native implementation moves the cursor at the AppKit
+    // level, bypassing Warp's EditorAction::CmdUp. Override as a no-op
+    // so the subsequent call to warp_handle_view_event in keyDownImpl
+    // can route the key through the normal dispatch flow.
+}
+
+- (void)moveToEndOfDocument:(id)sender {
+    // Cmd-Down: same rationale as above.
 }
 
 @end

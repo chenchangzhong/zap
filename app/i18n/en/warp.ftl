@@ -1893,6 +1893,8 @@ keybinding-desc-input-clear-and-reset-ai-context-menu-query = Clear and reset AI
 # Terminal view bindings
 keybinding-desc-terminal-alternate-paste = Alternate terminal paste
 keybinding-desc-terminal-toggle-cli-agent-rich-input = Toggle CLI Agent Rich Input
+keybinding-desc-terminal-focus-cli-agent-terminal = Focus Terminal
+keybinding-desc-terminal-focus-cli-agent-rich-input = Focus Rich Input
 keybinding-desc-terminal-warpify-subshell = Warpify subshell
 keybinding-desc-terminal-warpify-ssh-session = Warpify ssh session
 keybinding-desc-terminal-accept-prompt-suggestion = Accept Prompt Suggestion

@@ -398,6 +398,10 @@ pub enum TerminalAction {
     /// Open the rich input editor for composing a prompt to send to a CLI agent.
     /// Triggered by Ctrl-G when a CLI agent is detected, or from the footer button.
     OpenCLIAgentRichInput,
+    /// 在 CLI agent rich input 打开时，用 cmd-up 把焦点切到终端 TUI。
+    FocusCLIAgentTerminal,
+    /// 在 CLI agent rich input 打开时，用 cmd-down 把焦点切回 rich input。
+    FocusCLIAgentRichInput,
 }
 
 // Manually implementing Debug to avoid leaking sensitive information in logs
@@ -646,6 +650,8 @@ impl fmt::Debug for TerminalAction {
             RevealChildAgent { .. } => write!(f, "RevealChildAgent"),
             ToggleSessionRecording => write!(f, "ToggleSessionRecording"),
             OpenCLIAgentRichInput => write!(f, "OpenCLIAgentRichInput"),
+            FocusCLIAgentTerminal => write!(f, "FocusCLIAgentTerminal"),
+            FocusCLIAgentRichInput => write!(f, "FocusCLIAgentRichInput"),
         }
     }
 }

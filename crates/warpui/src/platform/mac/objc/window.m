@@ -537,6 +537,15 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
     });
 }
 
+/// Warp 的 performKeyEquivalent: 重写。
+///
+/// 当某个 keystroke 有 with_key_binding 注册（keystrokeIsAssigned=true），
+/// 不管是否有 CustomAction 菜单绑定，都优先走 keyDownImpl: 让 Rust 
+/// dispatch 通过 context predicate 决定实际触发哪个 action。
+///
+/// 这样就避免了 CustomAction 菜单 item 在 context 变化后 isEnabled 
+/// 缓存脏的问题（e.g. CLI_AGENT_RICH_INPUT_OPEN 在菜单未打开时变化，
+/// 导致 performKeyEquivalent: 仍命中旧的菜单绑定）。
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
     // We need to bypass the default performKeyEquivalent implementation which, in the case of
     // having keybinding conflicts with MacOS itself, yields priority to the OS.
@@ -552,11 +561,13 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
 
         NSApplication *application = [NSApplication sharedApplication];
 
-        // If we are recording a keystroke for an EditableBinding.
-        BOOL keyBindingsDisabled = warp_app_are_key_bindings_disabled_for_window(application, self);
-        // If Warp has assigned a binding for this keystroke.
+        // If Warp has assigned a key binding (not a custom action) for this keystroke.
         BOOL keystrokeIsAssigned = warp_app_has_binding_for_keystroke(application, event);
 
+        // If we are recording a keystroke for an EditableBinding.
+        BOOL keyBindingsDisabled = warp_app_are_key_bindings_disabled_for_window(application, self);
+
+        // If Warp has registered a CustomAction for this keystroke.
         BOOL triggersCustomAction = warp_app_has_custom_action_for_keystroke(application, event);
 
         if (keyBindingsDisabled || (keystrokeIsAssigned && !triggersCustomAction)) {

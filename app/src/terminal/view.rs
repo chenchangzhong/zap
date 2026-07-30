@@ -3454,6 +3454,10 @@ impl TerminalView {
         ctx.subscribe_to_view(&input, move |me, _, event, ctx| {
             me.handle_input_event(event, ctx);
         });
+        let editor = input.as_ref(ctx).editor().clone();
+        ctx.subscribe_to_view(&editor, move |me, _, event, ctx| {
+            me.handle_editor_focus_intercept(event, ctx);
+        });
 
         let ai_status_bar = input.as_ref(ctx).agent_status_bar().clone();
         ctx.subscribe_to_view(&ai_status_bar, |me, _, event, ctx| match event {
@@ -17982,6 +17986,22 @@ impl TerminalView {
         ctx.notify();
     }
 
+    fn handle_editor_focus_intercept(
+        &mut self,
+        event: &crate::editor::Event,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            crate::editor::Event::FocusTerminalRequested => {
+                self.focus_terminal(ctx);
+            }
+            crate::editor::Event::FocusInputBoxRequested => {
+                self.focus_input_box(ctx);
+            }
+            _ => {}
+        }
+    }
+
     fn focus_terminal(&mut self, ctx: &mut ViewContext<Self>) {
         ctx.focus_self();
         ctx.notify();
@@ -23661,6 +23681,8 @@ impl TypedActionView for TerminalView {
             | ToggleUsageFooter
             | RevealChildAgent { .. }
             | OpenCLIAgentRichInput
+            | FocusCLIAgentTerminal
+            | FocusCLIAgentRichInput
             | ToggleSessionRecording => Empty,
         }
     }
@@ -24617,6 +24639,22 @@ impl TypedActionView for TerminalView {
                     self.open_cli_agent_rich_input(CLIAgentInputEntrypoint::CtrlG, ctx);
                 }
             }
+            FocusCLIAgentTerminal => {
+                if self.is_cli_agent_rich_input_open(ctx) {
+                    self.focus_terminal(ctx);
+                } else {
+                    // Forward to EditorView for normal cursor movement
+                    let editor = self.input.as_ref(ctx).editor().clone();
+                    editor.update(ctx, |editor, ctx| {
+                        editor.cmd_up(ctx);
+                    });
+                }
+            },
+            FocusCLIAgentRichInput => {
+                if self.is_cli_agent_rich_input_open(ctx) {
+                    self.focus_input_box(ctx);
+                }
+            },
         }
     }
 }

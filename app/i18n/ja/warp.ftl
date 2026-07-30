@@ -1811,6 +1811,8 @@ keybinding-desc-input-clear-and-reset-ai-context-menu-query = AI コンテキス
 # Terminal view bindings
 keybinding-desc-terminal-alternate-paste = 代替ターミナルペースト
 keybinding-desc-terminal-toggle-cli-agent-rich-input = CLI エージェントのリッチ入力を切り替え
+keybinding-desc-terminal-focus-cli-agent-terminal = ターミナルにフォーカス
+keybinding-desc-terminal-focus-cli-agent-rich-input = リッチ入力にフォーカス
 keybinding-desc-terminal-warpify-subshell = サブシェルを Warpify
 keybinding-desc-terminal-warpify-ssh-session = SSH セッションを Warpify
 keybinding-desc-terminal-accept-prompt-suggestion = プロンプトサジェストを承認

@@ -338,7 +338,7 @@ pub fn init(app: &mut AppContext) {
                 & (id!("LongRunningCommand") | id!("AltScreen"))
                 & id!(flags::CLI_AGENT_FOOTER_ENABLED)
                 & id!(flags::CLI_AGENT_RICH_INPUT_CHIP_ENABLED))
-                | (id!("EditorView") & !id!("IMEOpen") & id!(flags::CLI_AGENT_RICH_INPUT_OPEN))
+                | (id!("Terminal") & !id!("IMEOpen") & id!(flags::CLI_AGENT_RICH_INPUT_OPEN))
                 | (id!("Terminal") & !id!("IMEOpen") & id!(flags::CLI_AGENT_RICH_INPUT_OPEN)),
         ),
         EditableBinding::new(
@@ -572,7 +572,7 @@ pub fn init(app: &mut AppContext) {
         )
         .with_custom_action(CustomAction::SelectBlockAbove)
         .with_context_predicate(
-            id!("Terminal") & id!("TerminalView_NonEmptyBlockList") & !id!("AltScreen"),
+            id!("Terminal") & id!("TerminalView_NonEmptyBlockList") & !id!("AltScreen") & !id!(flags::CLI_AGENT_RICH_INPUT_OPEN),
         ),
         EditableBinding::new(
             SELECT_NEXT_BLOCK_ACTION_NAME,
@@ -581,7 +581,7 @@ pub fn init(app: &mut AppContext) {
         )
         .with_custom_action(CustomAction::SelectBlockBelow)
         .with_context_predicate(
-            id!("Terminal") & id!("TerminalView_NonEmptyBlockList") & !id!("AltScreen"),
+            id!("Terminal") & id!("TerminalView_NonEmptyBlockList") & !id!("AltScreen") & !id!(flags::CLI_AGENT_RICH_INPUT_OPEN),
         ),
         // Zap:删除 terminal:open_share_block_modal keybinding(云端 share block)
         EditableBinding::new(
@@ -1047,6 +1047,8 @@ pub fn init(app: &mut AppContext) {
     )
     .with_enabled(|| FeatureFlag::Projects.is_enabled())
     .with_context_predicate(id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED))]);
+
+    register_cli_agent_focus_keybindings(app);
 }
 
 /// Registers bindings related to input modes.
@@ -1129,6 +1131,30 @@ fn register_input_mode_bindings(app: &mut AppContext) {
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
             id!(flags::IS_ANY_AI_ENABLED) & !id!(LONG_RUNNING_AGENT_REQUESTED_COMMAND_CONTEXT_KEY),
+        ),
+    ]);
+}
+
+/// 在 editor::init 之后注册,确保优先级高于 EditorView 的 cmd-up/cmd-down。
+pub fn register_cli_agent_focus_keybindings(app: &mut AppContext) {
+    use warpui::keymap::macros::*;
+
+    app.register_editable_bindings([
+        EditableBinding::new(
+            "terminal:focus_cli_agent_terminal",
+            crate::t!("keybinding-desc-terminal-focus-cli-agent-terminal"),
+            crate::terminal::view::action::TerminalAction::FocusCLIAgentTerminal,
+        )
+        .with_key_binding("cmd-up")
+        .with_context_predicate(id!("Terminal") & !id!("IMEOpen") & id!(flags::CLI_AGENT_RICH_INPUT_OPEN)),
+        EditableBinding::new(
+            "terminal:focus_cli_agent_rich_input",
+            crate::t!("keybinding-desc-terminal-focus-cli-agent-rich-input"),
+            crate::terminal::view::action::TerminalAction::FocusCLIAgentRichInput,
+        )
+        .with_key_binding("cmd-down")
+        .with_context_predicate(
+            id!("Terminal") & !id!("IMEOpen") & id!(flags::CLI_AGENT_RICH_INPUT_OPEN),
         ),
     ]);
 }

@@ -5831,7 +5831,12 @@ impl EditorView {
     }
 
     pub fn cmd_up(&mut self, ctx: &mut ViewContext<Self>) {
+        log::info!("[CMD_UP] called");
         if self.can_edit(ctx) {
+            if self.keymap_context(ctx).set.contains("CLIAgentRichInputOpen") {
+                ctx.emit(Event::FocusTerminalRequested);
+                return;
+            }
             let point = Point::new(0, 0);
             let buffer = self.editor_model.as_ref(ctx).buffer(ctx);
             if self.single_cursor_on_first_row(ctx)
@@ -8392,6 +8397,10 @@ pub enum Event {
     },
     BufferReplaced,
     BufferReinitialized,
+    /// Cmd-Up pressed while CLI agent rich input is open — request parent to focus terminal TUI.
+    FocusTerminalRequested,
+    /// Cmd-Down pressed while CLI agent rich input is open — request parent to focus input box.
+    FocusInputBoxRequested,
     CmdUpOnFirstRow,
     Copy,
     Escape,
@@ -8559,10 +8568,10 @@ impl TypedActionView for EditorView {
             MoveToVisualLineEnd => self.move_to_visual_line_end(ctx),
             PageUp => self.page_up(ctx),
             PageDown => self.page_down(ctx),
-            CmdUp => self.cmd_up(ctx),
-            CmdDown => self.cursor_bottom(ctx),
-            ClearLines => self.clear_lines(ctx),
+            CmdUp => { log::info!("[EDITOR_HANDLE] CmdUp action received"); self.cmd_up(ctx); }
+            CmdDown => { ctx.emit(Event::FocusInputBoxRequested); self.cursor_bottom(ctx); }
             ClearAndCopyLines => self.clear_and_copy_lines(ctx),
+            ClearLines => self.clear_lines(ctx),
             CtrlC => self.handle_ctrl_c(ctx),
             MoveToLineStart => self.move_to_line_start(ctx),
             MoveToParagraphStart => self.move_to_paragraph_start(ctx),

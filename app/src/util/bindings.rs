@@ -132,6 +132,8 @@ pub enum CustomAction {
     GoToLine,
     ToggleGlobalSearch,
     ToggleConversationListView,
+    FocusCLIAgentTerminal,
+    FocusCLIAgentRichInput,
 }
 
 lazy_static! {
@@ -348,6 +350,8 @@ pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
         CustomAction::LaunchConfigPalette => mac_only_keystroke("ctrl-cmd-l"),
         CustomAction::FilesPalette => Keystroke::parse(cmd_or_ctrl_shift("o")).ok(),
         CustomAction::ClearBlocks => Keystroke::parse(cmd_or_ctrl_shift("k")).ok(),
+        CustomAction::FocusCLIAgentTerminal => Keystroke::parse("cmd-up").ok(),
+        CustomAction::FocusCLIAgentRichInput => Keystroke::parse("cmd-down").ok(),
         CustomAction::SelectBlockAbove => Keystroke::parse("cmdorctrl-up").ok(),
         CustomAction::SelectBlockBelow => Keystroke::parse("cmdorctrl-down").ok(),
         // Set this to mac-only. On Linux this conflicts with the binding to save a workflow.
