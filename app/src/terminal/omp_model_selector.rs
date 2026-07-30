@@ -69,6 +69,10 @@ pub struct OmpModelSelector {
     button: ViewHandle<ActionButton>,
     filter_editor: ViewHandle<EditorView>,
     dropdown: ViewHandle<Menu<OmpModelSelectorAction>>,
+    /// 模型切换失败时显示的临时错误信息。
+    switch_error: Option<String>,
+    /// 递增计数器，用于检测快速连选时的竞态条件。
+    switch_seq: u64,
 }
 impl OmpModelSelector {
     pub fn new(omp_binary: String, terminal_view_id: EntityId, ctx: &mut ViewContext<Self>) -> Self {
@@ -121,7 +125,7 @@ impl OmpModelSelector {
         });
         Self { terminal_view_id, registry: OmpModelRegistry::new(&omp_binary), omp_binary,
             selected_model: None, loading: false, menu_is_open: false, filter_query: String::new(),
-            button, filter_editor, dropdown }
+            button, filter_editor, dropdown, switch_error: None, switch_seq: 0 }
     }
 
     fn trigger_refresh(&mut self, ctx: &mut ViewContext<Self>) {
@@ -214,6 +218,9 @@ impl OmpModelSelector {
     }
 
     fn display_label(&self) -> String {
+        if let Some(err) = &self.switch_error {
+            return format!("✗ {err}");
+        }
         let Some(ref selector) = self.selected_model else { return "Select model".into(); };
         if selector.is_empty() { return "No model selected".into(); }
         self.registry.models().iter().find(|m| m.selector == *selector)
@@ -288,6 +295,7 @@ impl TypedActionView for OmpModelSelector {
                 let was_open = self.menu_is_open;
                 self.menu_is_open = !self.menu_is_open;
                 if self.menu_is_open && !was_open {
+                    self.switch_error = None;
                     if !CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.terminal_view_id) {
                         ctx.dispatch_typed_action(&AgentInputFooterAction::ToggleRichInput);
                     }
@@ -305,8 +313,12 @@ impl TypedActionView for OmpModelSelector {
             }
             OmpModelSelectorAction::SelectModel { selector } => {
                 let sel = selector.clone();
+                let old_selection = self.selected_model.clone();
                 self.selected_model = Some(sel.clone());
                 self.menu_is_open = false;
+                self.switch_error = None;
+                self.switch_seq += 1;
+                let seq = self.switch_seq;
                 self.rebuild_menu_items(ctx);
                 ctx.emit(OmpModelSelectorEvent::ModelSelected { selector: sel.clone() });
                 // 通过该 session 专属的 socket 通知运行中的 omp 进行进程内切换（不回显、按 session 定向）。
@@ -314,8 +326,25 @@ impl TypedActionView for OmpModelSelector {
                     .session(self.terminal_view_id)
                     .and_then(|s| s.session_context.session_id.clone());
                 ctx.spawn(async move {
-                    notify_running_omp(&sel, session_id.as_deref()).await;
-                }, |_me, _result, ctx| {
+                    let result = notify_running_omp(&sel, session_id.as_deref()).await;
+                    (result, old_selection, seq)
+                }, |me, (result, old_selection, seq), ctx| {
+                    // 如果 seq 不匹配，说明有更新的切换已发起，忽略过期的回调
+                    if seq != me.switch_seq { return; }
+                    if let Err(e) = result {
+                        log::warn!("OmpModelSelector: switch model failed: {e}");
+                        me.selected_model = old_selection;
+                        me.switch_error = Some(e);
+                        me.rebuild_menu_items(ctx);
+                        // 3 秒后自动清除错误提示
+                        ctx.spawn(
+                            warpui::r#async::Timer::after(Duration::from_secs(3)),
+                            |me, _, ctx| {
+                                me.switch_error = None;
+                                ctx.notify();
+                            },
+                        );
+                    }
                     ctx.notify();
                 });
                 ctx.notify();
@@ -325,26 +354,24 @@ impl TypedActionView for OmpModelSelector {
 }
 
 #[cfg(unix)]
-async fn notify_running_omp(selector: &str, session_id: Option<&str>) {
-    let Some(home) = dirs::home_dir() else { return };
+async fn notify_running_omp(selector: &str, session_id: Option<&str>) -> Result<(), String> {
+    let Some(home) = dirs::home_dir() else { return Err("no home directory".into()) };
     // 优先连该 session 专属 socket；缺 session_id 时回退到全局 socket（兼容旧扩展）。
     let path = match session_id {
         Some(id) => home.join(format!(".omp/agent/model-switch-{id}.sock")),
         None => home.join(".omp/agent/model-switch.sock"),
     };
-    if !path.exists() { return }
+    if !path.exists() { return Err("socket not found (omp not running?)".into()) }
     let msg = serde_json::json!({"model": selector}).to_string() + "\n";
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
         use std::io::Write;
-        let Ok(mut stream) = UnixStream::connect(&path) else { return Err("connect failed".into()) };
-        stream.write_all(msg.as_bytes()).map_err(|e| format!("{e}"))
+        let mut stream = UnixStream::connect(&path).map_err(|e| format!("connect: {e}"))?;
+        stream.write_all(msg.as_bytes()).map_err(|e| format!("write: {e}"))
     }).await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => log::debug!("OmpModelSelector: socket notify: {e}"),
-        Err(e) => log::debug!("OmpModelSelector: spawn_blocking: {e}"),
-    }
+    result.map_err(|e| format!("spawn_blocking: {e}"))?
 }
 
 #[cfg(not(unix))]
-async fn notify_running_omp(_selector: &str, _session_id: Option<&str>) {}
+async fn notify_running_omp(_selector: &str, _session_id: Option<&str>) -> Result<(), String> {
+    Err("socket notify not supported on this platform".into())
+}
