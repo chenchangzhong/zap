@@ -2,6 +2,7 @@ pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod deepseek;
 pub(crate) mod gemini;
+pub(crate) mod oh_my_pi;
 pub(crate) mod opencode;
 
 use std::cmp::Ordering;
@@ -20,6 +21,7 @@ use claude::ClaudeCodePluginManager;
 use codex::CodexPluginManager;
 use deepseek::DeepSeekPluginManager;
 use gemini::GeminiPluginManager;
+use oh_my_pi::OhMyPiPluginManager;
 use opencode::OpenCodePluginManager;
 
 /// Distinguishes whether the plugin instructions modal should show install or update steps.
@@ -251,6 +253,9 @@ pub(crate) fn plugin_manager_for_with_shell(
         CLIAgent::DeepSeek if FeatureFlag::HOANotifications.is_enabled() => {
             Some(Box::new(DeepSeekPluginManager))
         }
+        CLIAgent::OhMyPi => {
+            Some(Box::new(OhMyPiPluginManager))
+        }
         CLIAgent::OpenCode
         | CLIAgent::Codex
         | CLIAgent::Gemini
@@ -265,7 +270,6 @@ pub(crate) fn plugin_manager_for_with_shell(
         | CLIAgent::Vibe
         | CLIAgent::Hermes
         | CLIAgent::Antigravity
-        | CLIAgent::OhMyPi
         | CLIAgent::Unknown => None,
     }
 }

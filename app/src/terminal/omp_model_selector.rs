@@ -28,6 +28,14 @@ use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, ButtonSize, TooltipAlignment,
 };
 
+/// OMP 模型切换扩展源码，编译进二进制。
+/// 安装到 ~/.omp/agent/extensions/switch-model.ts 供 OMP agent 加载。
+const OMP_SWITCH_EXTENSION_SRC: &str = include_str!("../../resources/omp/switch-model.ts");
+
+/// 目标安装路径（相对于 home 目录）。
+/// 写入 switch-model.ts 供 OMP agent 的扩展加载器发现。
+const OMP_EXTENSION_REL_PATH: &str = ".omp/agent/extensions/switch-model.ts";
+
 const MENU_WIDTH: f32 = 280.;
 const LABEL_FONT_SIZE: f32 = 11.;
 
@@ -73,6 +81,11 @@ pub struct OmpModelSelector {
     switch_error: Option<String>,
     /// 递增计数器，用于检测快速连选时的竞态条件。
     switch_seq: u64,
+    /// 模型加载完成后自动打开菜单（在扩展安装场景下使用）。
+    open_on_load: bool,
+    /// `~/.omp/agent/extensions/switch-model.ts` 是否存在。
+    /// 该扩展负责接收 Zap 的 socket 消息执行模型切换。
+    extension_ok: bool,
 }
 impl OmpModelSelector {
     pub fn new(omp_binary: String, terminal_view_id: EntityId, ctx: &mut ViewContext<Self>) -> Self {
@@ -125,11 +138,17 @@ impl OmpModelSelector {
         });
         Self { terminal_view_id, registry: OmpModelRegistry::new(&omp_binary), omp_binary,
             selected_model: None, loading: false, menu_is_open: false, filter_query: String::new(),
-            button, filter_editor, dropdown, switch_error: None, switch_seq: 0 }
+            button, filter_editor, dropdown, switch_error: None, switch_seq: 0,
+            open_on_load: false, extension_ok: omp_switch_extension_exists(),
+        }
     }
 
     fn trigger_refresh(&mut self, ctx: &mut ViewContext<Self>) {
         if self.loading { return; }
+        if !self.extension_ok {
+            log::info!("OmpModelSelector: switch-model.ts not found, skipping refresh");
+            return;
+        }
         self.loading = true;
         let omp_binary = self.omp_binary.clone();
         ctx.spawn(async move {
@@ -142,9 +161,17 @@ impl OmpModelSelector {
             if let Ok(()) = r {
                 log::info!("OmpModelSelector: refresh success, {} models loaded", me.registry.models().len());
                 if me.selected_model.is_none() { me.selected_model = model; }
-                me.rebuild_menu_items(ctx);
+                if me.open_on_load {
+                    me.open_on_load = false;
+                    me.menu_is_open = true;
+                    me.rebuild_menu_items(ctx);
+                    ctx.focus(&me.filter_editor);
+                } else {
+                    me.rebuild_menu_items(ctx);
+                }
             } else if let Err(e) = r {
                 log::warn!("OmpModelSelector: refresh failed: {e}");
+                me.open_on_load = false;
             }
             ctx.notify();
         });
@@ -159,18 +186,19 @@ impl OmpModelSelector {
             })
             .cloned()
             .collect();
+
         let items: Vec<MenuItem<OmpModelSelectorAction>> = filtered.iter()
             .map(|m| {
-                MenuItem::Item(
-                    MenuItemFields::new(format!("{} ({})", m.name, m.provider))
-                        .with_font_size_override(14.)
-                        .no_highlight_on_hover()
-                        .with_on_select_action(OmpModelSelectorAction::SelectModel {
-                            selector: m.selector.clone(),
-                        }),
-                )
-            })
-            .collect();
+                    MenuItem::Item(
+                        MenuItemFields::new(format!("{} ({})", m.name, m.provider))
+                            .with_font_size_override(14.)
+                            .no_highlight_on_hover()
+                            .with_on_select_action(OmpModelSelectorAction::SelectModel {
+                                selector: m.selector.clone(),
+                            }),
+                    )
+                })
+                .collect();
         let selected = self.selected_model.as_deref()
             .and_then(|s| filtered.iter().position(|m| m.selector == s));
         self.dropdown.update(ctx, |menu, ctx| {
@@ -218,6 +246,9 @@ impl OmpModelSelector {
     }
 
     fn display_label(&self) -> String {
+        if !self.extension_ok && !self.loading {
+            return crate::t!("omp-model-selector-not-installed");
+        }
         if let Some(err) = &self.switch_error {
             return format!("✗ {err}");
         }
@@ -238,6 +269,7 @@ impl View for OmpModelSelector {
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
         let font_family = appearance.ui_font_family();
+
         let label: String = if self.loading { "Loading...".into() } else { self.display_label() };
         let button_row = Flex::row().with_spacing(4.).with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -267,12 +299,13 @@ impl View for OmpModelSelector {
         )
         .with_padding_left(8.).with_padding_right(8.).with_vertical_padding(6.)
         .finish();
+        let menu_content: Box<dyn Element> = ChildView::new(&self.dropdown).finish();
         let menu_column = ConstrainedBox::new(
             Flex::column().with_main_axis_alignment(MainAxisAlignment::Start)
                 .with_main_axis_size(MainAxisSize::Min)
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                 .with_child(filter_bar)
-                .with_child(ChildView::new(&self.dropdown).finish()).finish(),
+                .with_child(menu_content).finish(),
         )
         .with_width(MENU_WIDTH).finish();
         stack.add_positioned_overlay_child(
@@ -295,11 +328,42 @@ impl TypedActionView for OmpModelSelector {
                 let was_open = self.menu_is_open;
                 self.menu_is_open = !self.menu_is_open;
                 if self.menu_is_open && !was_open {
+                    // 扩展缺失时：自动安装 → loading（按钮变 Loading…）→ 关闭菜单（等模型加载完再弹）。
+                    if !self.extension_ok && !self.loading {
+                        if let Some(home) = dirs::home_dir() {
+                            let path = home.join(OMP_EXTENSION_REL_PATH);
+                            if let Some(parent) = path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if std::fs::write(&path, OMP_SWITCH_EXTENSION_SRC).is_ok() {
+                                log::info!("Auto-installed OMP switch-model.ts to {path:?}");
+                                self.extension_ok = true;
+                            } else {
+                                log::warn!("Failed to auto-install OMP switch-model.ts");
+                            }
+                        }
+                        if self.extension_ok {
+                            self.menu_is_open = false;
+                            self.open_on_load = true;
+                            self.trigger_refresh(ctx);
+                        }
+                        ctx.notify();
+                        return;
+                    }
                     self.switch_error = None;
                     if !CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.terminal_view_id) {
                         ctx.dispatch_typed_action(&AgentInputFooterAction::ToggleRichInput);
                     }
-                    if self.registry.models().is_empty() { self.trigger_refresh(ctx); }
+                    if self.registry.models().is_empty() {
+                        if self.loading {
+                            // 模型仍在加载中，等 refresh callback 完成后弹菜单。
+                            self.menu_is_open = false;
+                            self.open_on_load = true;
+                            ctx.notify();
+                            return;
+                        }
+                        self.trigger_refresh(ctx);
+                    }
                     self.filter_query.clear();
                     self.filter_editor.update(ctx, |editor, ctx| {
                         editor.clear_buffer(ctx);
@@ -351,6 +415,32 @@ impl TypedActionView for OmpModelSelector {
             }
         }
     }
+}
+
+/// OMP 模型切换扩展源码中的唯一标记，用于检测是否已安装。
+const OMP_EXTENSION_MARKER: &str = "zap-omp-switch-model";
+
+/// 检查 `~/.omp/agent/extensions/` 下是否有包含标记的扩展文件。
+/// 读每个 .ts 文件头几字节匹配标记，避免大文件误读。
+fn omp_switch_extension_exists() -> bool {
+    let Some(home) = dirs::home_dir() else { return false };
+    let dir = home.join(".omp/agent/extensions");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return false };
+    let mut buf = [0u8; 64];
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("ts") {
+            continue;
+        }
+        if let Ok(mut f) = std::fs::File::open(&path) {
+            use std::io::Read;
+            let n = f.read(&mut buf).unwrap_or(0);
+            if n > 0 && buf[..n].windows(OMP_EXTENSION_MARKER.len()).any(|w| w == OMP_EXTENSION_MARKER.as_bytes()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(unix)]

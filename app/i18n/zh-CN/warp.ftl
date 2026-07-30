@@ -25,6 +25,7 @@ common-continue = 继续
 common-approve = 批准
 common-deny = 拒绝
 common-import = 导入
+common-install = 安装
 common-upgrade = 升级
 common-default = 默认
 common-editing = 正在编辑
@@ -427,6 +428,8 @@ terminal-input-search-prompts = 搜索提示
 terminal-input-search-indexed-repos = 搜索已索引仓库
 terminal-input-search-plans = 搜索计划
 terminal-input-choose-agent-model = 选择智能体模型
+
+omp-model-selector-not-installed = 安装 OMP 模型扩展
 terminal-message-new-agent-conversation = {" "}新建 /agent 对话
 terminal-message-agent-for-new-conversation = /agent 用于新建对话
 terminal-message-selected-text-attached = 已将所选文本附加为上下文
@@ -3007,6 +3010,13 @@ cli-agent-plugin-opencode-update-title = 更新 OpenCode 的 Warp 插件
 cli-agent-plugin-opencode-update-subtitle = 在 opencode.json 中将插件固定到最新版本。OpenCode 会按版本规格缓存插件，修改固定版本会强制它在重启时重新拉取。
 cli-agent-plugin-opencode-replace-plugin-step = 将 "plugin" 数组中现有的 "@warp-dot-dev/opencode-warp" 条目替换为显式版本：
 cli-agent-plugin-opencode-restart-update-note = 重启 OpenCode 以加载更新后的插件。
+
+# oh-my-pi
+cli-agent-plugin-oh-my-pi-install-title = 安装 oh-my-pi CLI
+cli-agent-plugin-oh-my-pi-install-subtitle = oh-my-pi CLI 是模型切换所必需的。选择一种安装方式：
+cli-agent-plugin-oh-my-pi-install-step-brew = Homebrew
+cli-agent-plugin-oh-my-pi-install-step-cargo = Cargo
+cli-agent-plugin-oh-my-pi-restart-note = 安装后重启终端会话。
 
 # Remaining visible UI strings
 ai-ask-user-questions-unavailable = 问题不可用

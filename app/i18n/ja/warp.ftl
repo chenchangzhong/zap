@@ -28,6 +28,7 @@ common-continue = 続行
 common-approve = 承認
 common-deny = 拒否
 common-import = インポート
+common-install = インストール
 common-upgrade = アップグレード
 common-default = デフォルト
 common-editing = 編集中
@@ -383,6 +384,8 @@ terminal-input-search-prompts = プロンプトを検索
 terminal-input-search-indexed-repos = インデックス済みリポジトリを検索
 terminal-input-search-plans = プランを検索
 terminal-input-choose-agent-model = エージェントモデルを選択
+
+omp-model-selector-not-installed = OMP モデル拡張をインストール
 terminal-message-new-agent-conversation = {" "}新しい /agent 会話
 terminal-message-agent-for-new-conversation = 新しい会話には /agent
 terminal-message-selected-text-attached = 選択テキストをコンテキストとして添付
@@ -2923,6 +2926,13 @@ cli-agent-plugin-opencode-update-title = OpenCode 用 Warp プラグインを更
 cli-agent-plugin-opencode-update-subtitle = opencode.json でプラグインを最新バージョンにピン留めします。OpenCode はバージョン指定ごとにプラグインをキャッシュするため、ピンを変更すると再起動時に再取得されます。
 cli-agent-plugin-opencode-replace-plugin-step = "plugin" 配列の既存の "@warp-dot-dev/opencode-warp" エントリを明示的なバージョン指定に置き換えます:
 cli-agent-plugin-opencode-restart-update-note = 更新されたプラグインを読み込むため OpenCode を再起動します。
+
+# oh-my-pi
+cli-agent-plugin-oh-my-pi-install-title = oh-my-pi CLI をインストール
+cli-agent-plugin-oh-my-pi-install-subtitle = oh-my-pi CLI はモデル切り替えに必要です。以下のいずれかを選択:
+cli-agent-plugin-oh-my-pi-install-step-brew = Homebrew
+cli-agent-plugin-oh-my-pi-install-step-cargo = Cargo
+cli-agent-plugin-oh-my-pi-restart-note = インストール後にターミナルセッションを再起動してください。
 
 # Remaining visible UI strings
 ai-ask-user-questions-unavailable = 質問を利用できません

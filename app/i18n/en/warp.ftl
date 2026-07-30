@@ -28,6 +28,7 @@ common-continue = Continue
 common-approve = Approve
 common-deny = Deny
 common-import = Import
+common-install = Install
 common-upgrade = Upgrade
 common-default = Default
 common-editing = Editing
@@ -432,6 +433,8 @@ terminal-input-search-prompts = Search prompts
 terminal-input-search-indexed-repos = Search indexed repos
 terminal-input-search-plans = Search plans
 terminal-input-choose-agent-model = Choose agent model
+
+omp-model-selector-not-installed = Install OMP model extension
 terminal-message-new-agent-conversation = {" "}new /agent conversation
 terminal-message-agent-for-new-conversation = /agent for new conversation
 terminal-message-selected-text-attached = selected text attached as context
@@ -3113,6 +3116,13 @@ cli-agent-plugin-opencode-update-title = Update Zap Plugin for OpenCode
 cli-agent-plugin-opencode-update-subtitle = Pin the plugin to the latest version in your opencode.json. OpenCode caches plugins per version spec, so changing the pin forces it to re-fetch on restart.
 cli-agent-plugin-opencode-replace-plugin-step = Replace the existing "@warp-dot-dev/opencode-warp" entry in the "plugin" array with the explicit version:
 cli-agent-plugin-opencode-restart-update-note = Restart OpenCode to load the updated plugin.
+
+# oh-my-pi
+cli-agent-plugin-oh-my-pi-install-title = Install oh-my-pi CLI
+cli-agent-plugin-oh-my-pi-install-subtitle = oh-my-pi CLI is required for model switching. Choose one:
+cli-agent-plugin-oh-my-pi-install-step-brew = Homebrew
+cli-agent-plugin-oh-my-pi-install-step-cargo = Cargo
+cli-agent-plugin-oh-my-pi-restart-note = Restart the terminal session after installation.
 
 # Remaining visible UI strings
 ai-ask-user-questions-unavailable = Questions unavailable
