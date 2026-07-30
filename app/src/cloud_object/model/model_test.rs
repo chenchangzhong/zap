@@ -639,7 +639,7 @@ fn test_shared_team_object() {
             },
             mock_stored_metadata(),
             StoredObjectPermissions {
-                owner: Owner::Team { team_uid },
+                owner: Owner::mock_current_user(),
                 guests: Vec::new(),
                 permissions_last_updated_ts: None,
                 anyone_with_link: None,
@@ -678,7 +678,7 @@ fn test_unshared_team_object() {
             },
             mock_stored_metadata(),
             StoredObjectPermissions {
-                owner: Owner::Team { team_uid },
+                owner: Owner::mock_current_user(),
                 guests: Vec::new(),
                 permissions_last_updated_ts: None,
                 anyone_with_link: None,
@@ -692,7 +692,7 @@ fn test_unshared_team_object() {
                 .get_notebook(&shared_notebook_id)
                 .expect("Notebook is in ObjectStoreModel")
                 .space(ctx);
-            assert_eq!(space, Space::Team { team_uid });
+            assert_eq!(space, Space::Personal);
         });
     });
 }

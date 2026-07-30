@@ -2511,8 +2511,6 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         // BYOP agent 本地运行不依赖这些入口。
         #[cfg(feature = "code_launch_modal")]
         FeatureFlag::CodeLaunchModal,
-        #[cfg(feature = "api_key_authentication")]
-        FeatureFlag::APIKeyAuthentication,
         #[cfg(feature = "api_key_management")]
         FeatureFlag::APIKeyManagement,
         #[cfg(feature = "mcp_oauth")]
@@ -2631,8 +2629,6 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::VerticalTabsSummaryMode,
         #[cfg(feature = "tab_configs")]
         FeatureFlag::TabConfigs,
-        #[cfg(feature = "agent_harness")]
-        FeatureFlag::AgentHarness,
         #[cfg(feature = "hoa_notifications")]
         FeatureFlag::HOANotifications,
         #[cfg(feature = "open_code_notifications")]

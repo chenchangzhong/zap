@@ -181,7 +181,7 @@ impl ObjectStoreViewModel {
         match object.space(app) {
             // For now, users have full access to all objects in their own drives. We may introduce
             // drive-level ACLs in the future.
-            Space::Personal | Space::Team { .. } => SharingAccessLevel::Full,
+            Space::Personal => SharingAccessLevel::Full,
             Space::Shared => {
                 let mut access_level = SharingAccessLevel::View;
 

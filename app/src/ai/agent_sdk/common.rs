@@ -13,25 +13,44 @@ use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::auth::AuthStateProvider;
 use crate::cloud_object::model::persistence::ObjectStoreModel;
 use crate::cloud_object::Owner;
-use crate::workspaces::user_workspaces::UserWorkspaces;
+
 
 pub fn validate_agent_mode_base_model_id(
     model_id: &str,
     ctx: &AppContext,
 ) -> anyhow::Result<LLMId> {
     let llm_prefs = LLMPreferences::as_ref(ctx);
-
-    let llm_id: LLMId = model_id.into();
     let valid_ids = llm_prefs
         .get_base_llm_choices_for_agent_mode()
         .map(|info| info.id.clone())
         .collect::<Vec<_>>();
 
+    classify_agent_mode_base_model_id(
+        model_id,
+        &valid_ids,
+        llm_prefs.agent_mode_models_unavailable(),
+    )
+}
+
+/// Classifies a user-supplied agent-mode model id against the available model
+/// list, distinguishing "the model list fetch failed (so the list is empty or
+/// stale)" from "the id is genuinely not in a valid list".
+fn classify_agent_mode_base_model_id(
+    model_id: &str,
+    valid_ids: &[LLMId],
+    list_unavailable: bool,
+) -> anyhow::Result<LLMId> {
+    let llm_id: LLMId = model_id.into();
     if valid_ids.contains(&llm_id) {
         Ok(llm_id)
+    } else if list_unavailable {
+        Err(anyhow::anyhow!(
+            "Could not retrieve the agent-mode model list from the server \
+             (the request failed or returned no models). Try again later."
+        ))
     } else {
         let suggestions = valid_ids
-            .into_iter()
+            .iter()
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(", ");
@@ -46,28 +65,7 @@ pub fn validate_agent_mode_base_model_id(
 /// If `team_flag` is true, attempts to get the current team UID (errors if not on a team).
 /// If `user_flag` is true, gets the current user's UID.
 /// Otherwise, defaults to team if available, falling back to user.
-pub fn resolve_owner(team_flag: bool, user_flag: bool, ctx: &AppContext) -> anyhow::Result<Owner> {
-    if team_flag {
-        let team_id = UserWorkspaces::as_ref(ctx)
-            .current_team_uid()
-            .ok_or_else(|| anyhow::anyhow!("User is not on a team"))?;
-        return Ok(Owner::Team { team_uid: team_id });
-    }
-
-    if user_flag {
-        let user_id = AuthStateProvider::as_ref(ctx)
-            .get()
-            .user_id()
-            .ok_or_else(|| anyhow::anyhow!("User should be logged in"))?;
-        return Ok(Owner::User { user_uid: user_id });
-    }
-
-    // Default: try team first, fall back to user
-    if let Some(team_uid) = UserWorkspaces::as_ref(ctx).current_team_uid() {
-        return Ok(Owner::Team { team_uid });
-    }
-
-    log::warn!("Tried to default to creating team object, team could not be found.");
+pub fn resolve_owner(_team_flag: bool, _user_flag: bool, ctx: &AppContext) -> anyhow::Result<Owner> {
     let user_id = AuthStateProvider::as_ref(ctx)
         .get()
         .user_id()
@@ -99,7 +97,6 @@ pub fn format_owner(owner: &Owner) -> &'static str {
     // TODO: For potentially-shared objects, consider looking up the particular user/team name.
     match owner {
         Owner::User { .. } => "Personal",
-        Owner::Team { .. } => "Team",
     }
 }
 

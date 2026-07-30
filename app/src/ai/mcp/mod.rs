@@ -82,10 +82,13 @@ impl MCPProvider {
 
     pub fn icon(&self) -> Icon {
         match self {
-            MCPProvider::Zap => Icon::Zap,
+            // Zap's own agent MCP config — use the agent brand mark.
+            MCPProvider::Zap => Icon::Agent,
             MCPProvider::Claude => Icon::ClaudeLogo,
             MCPProvider::Codex => Icon::OpenAILogo,
-            MCPProvider::Agents => Icon::Zap,
+            // "Other Agents" is the cross-tool .agents/.mcp.json convention for
+            // third-party agent tooling (not Zap-branded). Use a neutral AI icon.
+            MCPProvider::Agents => Icon::Agent,
         }
     }
 

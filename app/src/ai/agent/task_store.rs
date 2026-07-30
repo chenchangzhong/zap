@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use warp_multi_agent_api as api;
 
@@ -294,6 +294,48 @@ impl TaskStore {
         }
 
         refs
+    }
+    pub fn prune_unreachable_subtasks(&mut self) {
+        let reachable = self.reachable_task_ids();
+        let root_task_id = &self.root_task_id.clone();
+        let to_remove: Vec<TaskId> = self
+            .tasks
+            .keys()
+            .filter(|id| **id != *root_task_id && !reachable.contains(*id))
+            .cloned()
+            .collect();
+        if to_remove.is_empty() {
+            return;
+        }
+        for id in &to_remove {
+            self.tasks.remove(id);
+        }
+        self.linearized_refs
+            .retain(|r| self.tasks.contains_key(&r.task_id));
+    }
+
+    fn reachable_task_ids(&self) -> HashSet<TaskId> {
+        let mut reachable: HashSet<TaskId> = HashSet::new();
+        let mut queue = vec![self.root_task_id.clone()];
+        while let Some(task_id) = queue.pop() {
+            if !reachable.insert(task_id.clone()) {
+                continue;
+            }
+            let Some(task) = self.tasks.get(&task_id) else {
+                continue;
+            };
+            for message in task.messages() {
+                let tc = message.tool_call();
+                if let Some(tc) = tc {
+                    if let Some(subagent) = tc.subagent() {
+                        if !subagent.task_id.is_empty() {
+                            queue.push(TaskId::new(subagent.task_id.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        reachable
     }
 }
 

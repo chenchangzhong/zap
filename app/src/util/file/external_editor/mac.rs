@@ -395,6 +395,12 @@ fn get_default_app_bundle_for_file(file_path: &NSString) -> Option<Retained<NSSt
     app_bundle.bundleIdentifier()
 }
 
+
+/// Check if a bundle identifier belongs to Zap or upstream Warp family.
+#[cfg(test)]
+fn is_zap_bundle(bundle_id: &str) -> bool {
+    bundle_id.starts_with("dev.zap.") || bundle_id.starts_with("dev.warp.")
+}
 #[cfg(test)]
 #[path = "mac_tests.rs"]
 mod tests;

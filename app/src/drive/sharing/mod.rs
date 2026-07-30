@@ -125,7 +125,6 @@ impl Subject {
     pub fn from_owner(owner: Owner) -> Self {
         match owner {
             Owner::User { user_uid } => Subject::User(UserKind::Account(user_uid)),
-            Owner::Team { team_uid } => Subject::Team(TeamKind::Team { team_uid }),
         }
     }
 

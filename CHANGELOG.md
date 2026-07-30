@@ -9,6 +9,14 @@
 - **平台**:修复 Spotlight/Finder/Launchpad 启动 macOS 时的 panic;`run_shell_command` stdout 兜底回退至 command grid
 - **基建**:`.gitattributes` 强制 LF;新增 stale bot 与 Claude Code GitHub workflow
 - **编辑器**:代码/Markdown 查看器新增 15 种语言语法高亮(Dart、Zig、SCSS、R、Julia、OCaml、Erlang、Nix、Groovy、Solidity、GraphQL、Protobuf、Clojure、Elm、CMake)
+-
+- **上游同步 (`89f742fa6` → `ddba1684e`)**:73 commit 合并
+  - Phase 1: 构建基础设施 — workspace/profile/feature 同步
+  - Phase 2: 低风险模块 — Settings、Editor、Vim、Persistence、TUI、Scripts
+  - Phase 3: 新增 `crates/warp_tui/` TUI crate
+  - Phase 4: 高风险模块 — Terminal 基础设施、SSH RemoteServerSupport、AI MCP/MOD、CLIAgent Hermes+Vibe 支持
+  - 保留本地 OMP 实现，仅 cherry-pick 上游非冲突增量
+  - 预存测试编译错误（cloud/teams 代码）待后续清理
 
 ## [v2026.05.06.preview] — 2026-05-06
 

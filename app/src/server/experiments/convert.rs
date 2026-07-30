@@ -22,8 +22,6 @@ impl Display for ServerExperiment {
             Self::PromptSuggestionsViaMaaOutOfBandExperiment => {
                 "PROMPT_SUGGESTIONS_VIA_MAA_OOB_EXPERIMENT"
             }
-            Self::OzMultiHarnessControl => "OZ_MULTI_HARNESS_CONTROL",
-            Self::OzMultiHarnessExperiment => "OZ_MULTI_HARNESS_EXPERIMENT",
             #[cfg(test)]
             Self::TestExperiment => "TEST_EXPERIMENT",
         };
@@ -44,8 +42,6 @@ impl ServerExperiment {
             "SUGGESTED_CODE_DIFFS_EXPERIMENT" => Ok(Self::SuggestedCodeDiffsExperiment),
             "PROMPT_SUGGESTIONS_VIA_MAA_CONTROL" => Ok(Self::PromptSuggestionsViaMaaControl),
             "PROMPT_SUGGESTIONS_VIA_MAA_EXPERIMENT" => Ok(Self::PromptSuggestionsViaMaaExperiment),
-            "OZ_MULTI_HARNESS_CONTROL" => Ok(Self::OzMultiHarnessControl),
-            "OZ_MULTI_HARNESS_EXPERIMENT" => Ok(Self::OzMultiHarnessExperiment),
             s => Err(anyhow::anyhow!(
                 "String doesn't match any server experiment variant {s}"
             )),

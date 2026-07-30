@@ -1,4 +1,6 @@
 use std::sync::Arc;
+
+use warp_core::SessionId;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle};
 
 use crate::{
@@ -58,10 +60,12 @@ impl ActiveSession {
     }
 
     pub fn session(&self, app: &AppContext) -> Option<Arc<Session>> {
-        self.model_event_dispatcher
-            .as_ref(app)
-            .active_session_id()
+        self.session_id(app)
             .and_then(|session_id| self.sessions.as_ref(app).get(session_id))
+    }
+
+    pub fn session_id(&self, app: &AppContext) -> Option<SessionId> {
+        self.model_event_dispatcher.as_ref(app).active_session_id()
     }
 
     pub fn session_type(&self, app: &AppContext) -> Option<SessionType> {

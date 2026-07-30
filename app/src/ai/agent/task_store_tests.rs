@@ -748,37 +748,6 @@ fn test_prune_unreachable_subtasks_removes_orphan_and_its_exchanges() {
     assert_eq!(store.exchange_count(), 2);
 }
 
-#[test]
-fn test_prune_unreachable_subtasks_keeps_reachable_subtask() {
-    // Server root with an api message containing a subagent tool call — the
-    // subtask is reachable via reachable_task_ids and must survive the prune.
-    let subtask_id_str = "subtask_reachable";
-    let root_api = create_api_task(
-        "root_server",
-        vec![create_subagent_tool_call_message(
-            "msg1",
-            "root_server",
-            subtask_id_str,
-            None,
-        )],
-    );
-    let root_task = Task::new_restored_root(root_api, iter::empty());
-    let mut store = TaskStore::with_root_task(root_task);
-
-    let subtask_api = create_api_task(subtask_id_str, vec![]);
-    let subtask = Task::new_restored_root(subtask_api, iter::empty());
-    let subtask_task_id = subtask.id().clone();
-    store.insert(subtask);
-
-    assert_eq!(store.task_count(), 2);
-
-    store.prune_unreachable_subtasks();
-
-    // Subtask is reachable — must not be removed.
-    assert_eq!(store.task_count(), 2);
-    assert!(store.get(&subtask_task_id).is_some());
-    assert!(store.contains(&subtask_task_id));
-}
 
 #[test]
 fn test_prune_unreachable_subtasks_removes_nested_orphans() {

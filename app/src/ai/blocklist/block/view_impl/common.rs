@@ -3025,6 +3025,9 @@ pub fn render_failed_output(props: FailedOutputProps, app: &AppContext) -> Box<d
                  Please refresh your AWS credentials."
             )
         }
+        RenderableAIError::CloudStartupFailed(message) => {
+            format!("{ERROR_APOLOGY_TEXT}\n\n{message}")
+        }
     };
 
     Flex::row()

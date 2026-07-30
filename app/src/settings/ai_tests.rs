@@ -5,6 +5,7 @@ use crate::{
     test_util::settings::initialize_settings_for_tests,
 };
 use chrono::Utc;
+use settings::schema::SettingSchemaEntry;
 use warpui::{App, SingletonEntity};
 
 fn create_test_request_limit_info(
@@ -26,6 +27,25 @@ fn create_test_request_limit_info(
         max_files_per_repo: 5000,
         embedding_generation_batch_size: 100,
     }
+}
+
+#[test]
+fn auto_approve_denylist_bypass_defaults_on_and_is_available_in_gui_and_tui_settings() {
+    let setting = AutoApproveBypassesCommandDenylist::new(None);
+    assert!(*setting.value());
+    assert_eq!(
+        AutoApproveBypassesCommandDenylist::toml_path(),
+        Some("agents.warp_agent.other.auto_approve_bypasses_command_denylist")
+    );
+
+    let entry = inventory::iter::<SettingSchemaEntry>
+        .into_iter()
+        .find(|entry| {
+            entry.hierarchy == Some("agents.warp_agent.other")
+                && entry.storage_key == "auto_approve_bypasses_command_denylist"
+        })
+        .expect("expected auto-approve denylist bypass schema entry");
+    assert!(!entry.is_private);
 }
 
 // FocusedTerminalInfo Tests

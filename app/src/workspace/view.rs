@@ -15553,14 +15553,6 @@ impl Workspace {
         // - open_workflow_modal_with_temporary
         // - open_workflow_modal_with_command
         let owner = match space {
-            Space::Team { team_uid } => {
-                if !UserWorkspaces::has_capacity_for_shared_workflows(team_uid, ctx, 1) {
-                    // Zap:云端配额拒绝弹窗已删除,直接 return
-                    return;
-                }
-
-                Owner::Team { team_uid }
-            }
             Space::Shared => {
                 // TODO(ben): Use an owner-or-folder API, so we can check on creating an object in
                 // the folder.

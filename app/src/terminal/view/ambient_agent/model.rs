@@ -96,10 +96,7 @@ pub struct AmbientAgentViewModel {
     harness: Harness,
     /// Whether the optimistic InitialUserQuery block has been inserted for the current run.
     has_inserted_ambient_agent_user_query_block: bool,
-    /// Whether the harness CLI (e.g. `claude`, `gemini`) has started running for a non-oz run.
-    /// Used to transition the ambient-agent setup UI out of the pre-first-exchange phase when
-    /// there is no oz `AppendedExchange` to key off of.
-    harness_command_started: bool,
+
 }
 
 impl AmbientAgentViewModel {
@@ -121,7 +118,6 @@ impl AmbientAgentViewModel {
             conversation_id: None,
             harness: Harness::default(),
             has_inserted_ambient_agent_user_query_block: false,
-            harness_command_started: false,
         }
     }
 
@@ -153,30 +149,7 @@ impl AmbientAgentViewModel {
         ctx.emit(AmbientAgentViewModelEvent::HarnessSelected);
     }
 
-    /// True when the run is configured to use a non-Oz execution harness and the
-    /// required feature flags are enabled.
-    pub(super) fn is_third_party_harness(&self) -> bool {
-        FeatureFlag::AgentHarness.is_enabled() && self.harness != Harness::Oz
-    }
 
-    /// Whether the harness CLI has started running. Only meaningful for non-oz runs.
-    pub(super) fn harness_command_started(&self) -> bool {
-        self.harness_command_started
-    }
-
-    /// Marks the harness CLI as started and emits `HarnessCommandStarted`.
-    /// Idempotent: subsequent calls after the first are no-ops and do not re-emit.
-    pub(super) fn mark_harness_command_started(&mut self, ctx: &mut ModelContext<Self>) {
-        debug_assert!(
-            self.harness != Harness::Oz,
-            "harness_command_started is only meaningful for non-oz runs"
-        );
-        if self.harness_command_started {
-            return;
-        }
-        self.harness_command_started = true;
-        ctx.emit(AmbientAgentViewModelEvent::HarnessCommandStarted);
-    }
 
     /// Whether or not this terminal session is for an ambient agent.
     pub fn is_ambient_agent(&self) -> bool {
@@ -314,7 +287,6 @@ impl AmbientAgentViewModel {
         self.task_id = None;
         self.conversation_id = None;
         self.has_inserted_ambient_agent_user_query_block = false;
-        self.harness_command_started = false;
         self.stop_progress_timer();
         ctx.notify();
     }
@@ -734,10 +706,7 @@ pub enum AmbientAgentViewModelEvent {
     Cancelled,
     /// The selected execution harness (Oz / Claude Code) changed.
     HarnessSelected,
-    /// The harness CLI (for non-oz runs) has started executing in the shared session.
-    /// Fires once per run and signals the transition out of the pre-first-exchange phase
-    /// for claude / gemini / other third-party harnesses.
-    HarnessCommandStarted,
+
 }
 
 impl Entity for AmbientAgentViewModel {

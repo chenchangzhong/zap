@@ -92,7 +92,6 @@ impl TerminalView {
             AmbientAgentViewModelEvent::Failed { .. }
                 | AmbientAgentViewModelEvent::NeedsGithubAuth
                 | AmbientAgentViewModelEvent::Cancelled
-                | AmbientAgentViewModelEvent::HarnessCommandStarted
         ) {
             self.remove_pending_user_query_block(ctx);
         }
@@ -120,56 +119,36 @@ impl TerminalView {
                     ctx.notify();
                     return;
                 }
-                if false {
-                    if self
-                        .ambient_agent_view_model
-                        .as_ref(ctx)
-                        .is_third_party_harness()
-                    {
-                        // Non-oz runs: render the submitted prompt via the queued-prompt UI.
-                        // The block is removed later by `HarnessCommandStarted` / failure /
-                        // cancel / auth handlers.
-                        let prompt = self
-                            .ambient_agent_view_model
-                            .as_ref(ctx)
-                            .request()
-                            .map(|request| request.prompt.clone())
-                            .unwrap_or_default();
-                        if !prompt.is_empty() {
-                            self.insert_ambient_agent_queued_user_query_block(prompt, ctx);
-                        }
-                    } else {
-                        let initial_user_query = ctx.add_view(|ctx| {
-                            AmbientAgentInitialUserQuery::new(
-                                self.ambient_agent_view_model.clone(),
-                                ctx,
-                            )
-                        });
-                        self.insert_rich_content(
-                            None,
-                            initial_user_query,
-                            None,
-                            RichContentInsertionPosition::Append {
-                                insert_below_long_running_block: true,
-                            },
-                            ctx,
-                        );
-                        self.ambient_agent_view_model.update(ctx, |model, _| {
-                            model.set_has_inserted_ambient_agent_user_query_block(true);
-                        });
-                    }
-                } else {
-                    // Reset tip cooldown so the first tip shows for 60 seconds
-                    let tip_model = self
-                        .ambient_agent_view_model
-                        .as_ref(ctx)
-                        .ui_state
-                        .tip_model
-                        .clone();
-                    tip_model.update(ctx, |model, model_ctx| {
-                        model.reset_cooldown(model_ctx);
-                    });
-                }
+                // Zap 仅支持 Oz 内置 agent，直接插入初始 query 块。
+                let initial_user_query = ctx.add_view(|ctx| {
+                    AmbientAgentInitialUserQuery::new(
+                        self.ambient_agent_view_model.clone(),
+                        ctx,
+                    )
+                });
+                self.insert_rich_content(
+                    None,
+                    initial_user_query,
+                    None,
+                    RichContentInsertionPosition::Append {
+                        insert_below_long_running_block: true,
+                    },
+                    ctx,
+                );
+                self.ambient_agent_view_model.update(ctx, |model, _| {
+                    model.set_has_inserted_ambient_agent_user_query_block(true);
+                });
+
+                // Reset tip cooldown so the first tip shows for 60 seconds
+                let tip_model = self
+                    .ambient_agent_view_model
+                    .as_ref(ctx)
+                    .ui_state
+                    .tip_model
+                    .clone();
+                tip_model.update(ctx, |model, model_ctx| {
+                    model.reset_cooldown(model_ctx);
+                });
                 // Re-render to show loading state.
                 ctx.notify();
             }
@@ -230,102 +209,8 @@ impl TerminalView {
                 ctx.notify();
             }
             AmbientAgentViewModelEvent::HarnessSelected => {
-                self.maybe_enter_agent_view_for_shared_third_party_viewer(ctx);
                 ctx.notify();
             }
-            AmbientAgentViewModelEvent::HarnessCommandStarted => {
-                // Stop classifying new blocks as environment setup commands, mirroring the
-                // Oz path in the `AppendedExchange` handler. Flipping this flag to `false`
-                // also un-hides and un-marks the active block so it renders like a normal
-                // CLI-agent session.
-                {
-                    let mut model = self.model.lock();
-                    if model
-                        .block_list()
-                        .is_executing_oz_environment_startup_commands()
-                    {
-                        model
-                            .block_list_mut()
-                            .set_is_executing_oz_environment_startup_commands(false);
-                    }
-                }
-                // Force a fresh viewer size report to the sharer so the harness CLI (e.g.
-                // the claude TUI) starts at our terminal's actual dimensions instead of
-                // whatever the sandbox PTY was sized to during setup.
-                self.force_report_viewer_terminal_size(ctx);
-                ctx.notify();
-            }
-        }
-    }
-
-    /// Enters agent view for a live shared-session viewer of a non-Oz ambient-agent run, so every
-    /// viewer lands in the same agent-view chrome regardless of which entry point opened the
-    /// conversation. Called from the `HarnessSelected` handler once the viewer has resolved
-    /// the run's harness asynchronously.
-    ///
-    /// Transcript viewer entry is handled directly in `load_data_into_transcript_viewer` so
-    /// the snapshot block exists before we retag — we intentionally do not trigger that path
-    /// here.
-    ///
-    /// The viewer-context guard is load-bearing: `HarnessSelected` also fires when the local
-    /// spawner picks a harness from the dropdown, and in that case the ambient-agent setup flow
-    /// handles agent view entry instead.
-    fn maybe_enter_agent_view_for_shared_third_party_viewer(
-        &mut self,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        if self
-            .agent_view_controller
-            .as_ref(ctx)
-            .agent_view_state()
-            .is_active()
-        {
-            return;
-        }
-        if !self
-            .ambient_agent_view_model
-            .as_ref(ctx)
-            .is_third_party_harness()
-        {
-            return;
-        }
-        if !self.is_shared_ambient_agent_session() {
-            return;
-        }
-
-        self.enter_agent_view_for_new_conversation(
-            None,
-            AgentViewEntryOrigin::ExternalAmbientAgent,
-            ctx,
-        );
-
-        let Some(vehicle_conversation_id) = self
-            .agent_view_controller
-            .as_ref(ctx)
-            .agent_view_state()
-            .active_conversation_id()
-        else {
-            return;
-        };
-
-        // Retag existing non-setup blocks so the harness content passes the agent view filter.
-        self.model
-            .lock()
-            .block_list_mut()
-            .attach_non_startup_blocks_to_conversation(vehicle_conversation_id);
-
-        // Retag rich content inserted in terminal mode (setup-commands summary, tombstone, …)
-        // so it stays visible under the vehicle conversation. Rich content with
-        // `agent_view_conversation_id == None` is hidden in full-screen agent view by
-        // `RichContentItem::should_hide_for_agent_view_state`.
-        let ids_to_retag: Vec<EntityId> = self
-            .rich_content_views
-            .iter()
-            .filter(|rc| rc.agent_view_conversation_id().is_none())
-            .map(|rc| rc.view_id())
-            .collect();
-        for view_id in ids_to_retag {
-            self.set_rich_content_agent_view_conversation_id(view_id, vehicle_conversation_id);
         }
     }
 

@@ -86,6 +86,8 @@ fn create_handler(agent: &CLIAgent) -> Option<Box<dyn CLIAgentSessionHandler>> {
         | CLIAgent::Gemini
         | CLIAgent::Auggie
         | CLIAgent::Pi
+        | CLIAgent::Vibe
+        | CLIAgent::Hermes
         | CLIAgent::Antigravity => Some(Box::new(DefaultSessionListener)),
         CLIAgent::Codex => Some(Box::new(CodexSessionHandler)),
         CLIAgent::DeepSeek => Some(Box::new(DeepSeekSessionHandler)),

@@ -274,8 +274,7 @@ impl VimHandler for CodeEditorView {
                             );
                         }
 
-                        let include_newline = operator != &VimOperator::Change
-                            && operator != &VimOperator::ToggleComment;
+                        let include_newline = operator.includes_trailing_newline();
                         model.vim_extend_selection_linewise(include_newline, ctx);
                     }
                     VimOperand::TextObject(text_object) => {
@@ -427,16 +426,42 @@ impl VimHandler for CodeEditorView {
                     }
                 });
             }
+            VimOperator::Indent | VimOperator::Dedent => {}
         }
     }
 
-    fn replace_char(&mut self, c: char, char_count: u32, ctx: &mut ViewContext<Self>) {
+    fn replace_char(
+        &mut self,
+        c: char,
+        char_count: u32,
+        advance: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
         self.model.update(ctx, |model, ctx| {
             model.replace_char(c, char_count, ctx);
         });
 
         // Explicit call to ctx.notify() in the case that we don't make any updates to the model
         ctx.notify();
+    }
+
+    fn replace_text(
+        &mut self,
+        text: &str,
+        count: u32,
+        already_applied: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        for _ in 0..count {
+            for c in text.chars() {
+                self.model.update(ctx, |model, ctx| {
+                    model.replace_char(c, 1, ctx);
+                });
+            }
+        }
+        if !already_applied {
+            self.change_mode(&VimMode::Replace, &VimMode::Normal.into(), ctx);
+        }
     }
 
     fn search(&mut self, direction: &Direction, ctx: &mut ViewContext<Self>) {
@@ -573,6 +598,7 @@ impl VimHandler for CodeEditorView {
                         model.vim_clear_selections(ctx);
                     }
                 }
+                VimOperator::Indent | VimOperator::Dedent => {}
             }
         });
 

@@ -39,7 +39,7 @@ use crate::settings::{PrivacySettings, SshSettings};
 
 use crate::terminal::model::session::Sessions;
 
-use crate::terminal::model_events::ModelEventDispatcher;
+use crate::terminal::model_events::{ModelEventDispatcher, SshRemoteServerSupport};
 use crate::terminal::safe_mode_settings::get_secret_obfuscation_mode;
 use crate::terminal::session_settings::SessionSettings;
 use crate::terminal::shared_session::SharedSessionStatus;
@@ -192,7 +192,14 @@ impl TerminalManager {
         let sessions = ctx.add_model(|ctx| Sessions::new(executor_command_tx.clone(), ctx));
 
         let model_events =
-            ctx.add_model(|ctx| ModelEventDispatcher::new(events_rx, sessions.clone(), ctx));
+            ctx.add_model(|ctx| {
+            ModelEventDispatcher::new_with_ssh_remote_server_support(
+                events_rx,
+                sessions.clone(),
+                SshRemoteServerSupport::Enabled,
+                ctx,
+            )
+        });
 
         // Have ApiKeyManager subscribe to block completion events for AWS credential refresh
         ai::api_keys::ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {

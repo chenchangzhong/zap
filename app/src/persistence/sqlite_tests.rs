@@ -2,8 +2,8 @@
 use std::fs;
 use std::{path::PathBuf, sync::Arc};
 
-use ai::workspace::WorkspaceMetadata;
-use chrono::Utc;
+
+use chrono::{Local, Utc};
 use diesel::connection::SimpleConnection;
 use pathfinder_geometry::{rect::RectF, vector::Vector2F};
 use warp_core::features::FeatureFlag;
@@ -17,7 +17,7 @@ use crate::{
     code::editor_management::CodeSource,
     notebooks::{NotebookObject, NotebookObjectModel},
     persistence::{model::ObjectPermissions, BlockCompleted, ModelEvent},
-    server::ids::ClientId,
+    server::ids::{ClientId, ServerId},
     server_time::ServerTimestamp,
     tab::SelectedTabColor,
     terminal::model::block::SerializedBlock,
@@ -195,6 +195,7 @@ fn test_sqlite_round_trips_vertical_tabs_panel_open() {
         vec![false, true]
     );
 }
+
 
 #[test]
 fn test_sqlite_round_trips_custom_vertical_tabs_title() {
@@ -422,9 +423,7 @@ fn test_migrate_zap_app_group_sqlite_copies_newer_legacy_files() {
         fs::read_to_string(target_db.with_extension("sqlite-shm")).unwrap(),
         "legacy-shm"
     );
-    assert!(state_dir
-        .join(".zap-app-group-sqlite-migrated")
-        .exists());
+    assert!(state_dir.join(".zap-app-group-sqlite-migrated").exists());
 }
 
 #[cfg(target_os = "macos")]
@@ -510,8 +509,8 @@ fn test_deserialize_corrupted_guests() {
     assert_eq!(
         cloud_permissions,
         Some(StoredObjectPermissions {
-            owner: Owner::Team {
-                team_uid: crate::server::ids::ServerId::from_string_lossy("team_uid12345678912345"),
+            owner: Owner::User {
+                user_uid: crate::auth::UserUid::new("team_uid12345678912345".into()),
             },
             permissions_last_updated_ts: Some(permissions_ts),
             anyone_with_link: None,

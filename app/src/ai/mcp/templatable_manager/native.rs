@@ -24,7 +24,7 @@ use crate::auth::AuthStateProvider;
 use crate::cloud_object::model::persistence::{ObjectStoreEvent, ObjectStoreModel};
 use crate::cloud_object::update_manager::{InitiatedBy, UpdateManager};
 use crate::cloud_object::{Space, StoredObject, StoredObjectLocation, StoredObjectMetadataExt};
-use crate::server::ids::{ClientId, ServerId};
+use crate::server::ids::ClientId;
 use crate::server::telemetry::{
     MCPServerModel, MCPServerTelemetryError, MCPServerTelemetryTransportType,
     MCPTemplateCreationSource,
@@ -402,7 +402,6 @@ impl TemplatableMCPServerManager {
     pub fn is_server_template_shared(&self, template_uuid: Uuid, app: &AppContext) -> bool {
         match self.get_space(template_uuid, app) {
             Some(Space::Personal) => false,
-            Some(Space::Team { team_uid: _ }) => true,
             Some(Space::Shared) => true,
             None => false,
         }
@@ -1438,32 +1437,10 @@ impl TemplatableMCPServerManager {
 
     pub fn share_templatable_mcp_server(
         &mut self,
-        template_uuid: Uuid,
-        ctx: &mut ModelContext<Self>,
+        _template_uuid: Uuid,
+        _ctx: &mut ModelContext<Self>,
     ) {
-        let sync_id = self
-            .get_templatable_mcp_server_object(template_uuid)
-            .map(|server| server.sync_id());
-        let team_uid = TemplatableMCPServerManager::get_first_team_space_id(ctx);
-
-        if let Some(sync_id) = sync_id {
-            if let Some(team_uid) = team_uid {
-                let object_type_and_id = ObjectTypeAndId::GenericStringObject {
-                    object_type: GenericStringObjectFormat::Json(
-                        JsonObjectType::TemplatableMCPServer,
-                    ),
-                    id: sync_id,
-                };
-                UpdateManager::handle(ctx).update(ctx, |update_manager, ctx| {
-                    update_manager.move_object_to_location(
-                        object_type_and_id,
-                        StoredObjectLocation::Space(Space::Team { team_uid }),
-                        ctx,
-                    );
-                });
-                send_telemetry_from_ctx!(TelemetryEvent::MCPTemplateShared, ctx);
-            }
-        }
+        // Team sharing is not supported in Zap
     }
 
     pub fn share_templatable_mcp_server_installation(
@@ -1510,15 +1487,6 @@ impl TemplatableMCPServerManager {
         if let Some(template_uuid) = template_uuid {
             self.unshare_templatable_mcp_server(template_uuid, ctx);
         }
-    }
-
-    pub fn get_first_team_space_id(app: &AppContext) -> Option<ServerId> {
-        let user_workspaces = UserWorkspaces::as_ref(app);
-        let all_user_spaces = user_workspaces.all_user_spaces(app);
-        all_user_spaces.into_iter().find_map(|space| match space {
-            Space::Team { team_uid } => Some(team_uid),
-            _ => None,
-        })
     }
 
     pub fn has_oauth_credentials_for_server(&self, template_uuid: Uuid) -> bool {

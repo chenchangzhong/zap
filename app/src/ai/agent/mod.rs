@@ -628,6 +628,7 @@ pub enum RenderableAIError {
     AwsBedrockCredentialsExpiredOrInvalid {
         model_name: String,
     },
+    CloudStartupFailed(String),
     Other {
         error_message: String,
         will_attempt_resume: bool,
@@ -697,6 +698,7 @@ impl Display for RenderableAIError {
                     "AWS Bedrock credentials expired or invalid for {model_name}"
                 )
             }
+            Self::CloudStartupFailed(message) => write!(f, "{message}"),
             Self::Other { error_message, .. } => write!(f, "{error_message}"),
         }
     }

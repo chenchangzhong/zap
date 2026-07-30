@@ -1412,7 +1412,6 @@ impl NotebookView {
                         }));
                     }
                     Space::Shared => {} // TODO: Revisit these menu items with sharing in mind
-                    Space::Team { .. } => {} // TODO: When we do team -> personal sharing
                 }
             }
         }
@@ -1821,10 +1820,7 @@ impl NotebookView {
         let notebook_id = self.server_id(ctx);
         let source = workflow.source.unwrap_or_else(|| {
             let owner = self.active_notebook_data.as_ref(ctx).owner(ctx);
-            let team_uid = match owner {
-                Some(Owner::Team { team_uid }) => Some(team_uid),
-                _ => None,
-            };
+            let team_uid = None;
             WorkflowSource::Notebook {
                 notebook_id,
                 team_uid,

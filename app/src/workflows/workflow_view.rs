@@ -899,15 +899,12 @@ impl WorkflowView {
             object_type: TelemetryObjectType::Workflow,
             object_uid: self.workflow_id.into_server(),
             space: space.map(Into::into),
-            team_uid: match self.owner {
-                Some(Owner::Team { team_uid, .. }) => Some(team_uid),
-                _ => None,
-            },
+            team_uid: None,
         }
     }
 
     pub fn is_team_workflow(&self) -> bool {
-        matches!(self.owner, Some(Owner::Team { .. }))
+        false
     }
 
     /// The current user's access level for this workflow.

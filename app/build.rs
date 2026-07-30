@@ -127,6 +127,12 @@ fn main() -> Result<()> {
         // See https://github.com/rust-lang/cargo/issues/9661.
         //
         // Cargo defaults to the `debug` profile.
+        // These values change copied assets and embedded version metadata without changing sources.
+        println!("cargo:rerun-if-env-changed=CARGO_FULL_PROFILE");
+        println!("cargo:rerun-if-env-changed=CARGO_BIN_NAME");
+        println!("cargo:rerun-if-env-changed=GIT_RELEASE_TAG");
+        println!("cargo:rerun-if-env-changed=WARP_APP_NAME");
+
         let cargo_full_profile = env::var("CARGO_FULL_PROFILE").unwrap_or(String::from("debug"));
         let target_dir =
             app_target_dir(&cargo_full_profile).expect("Could not get app target directory");

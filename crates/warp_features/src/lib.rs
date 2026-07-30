@@ -619,10 +619,6 @@ pub enum FeatureFlag {
     /// from code review + code editor for House Of Agents work
     HoaCodeReview,
 
-    /// Enables the `--harness` flag for `oz agent run`, allowing external agent
-    /// CLIs (e.g. `claude`) to execute prompts instead of Zap's agent harness.
-    AgentHarness,
-
     /// Enables the upgraded CLI agent session tracking and notifications infrastructure.
     HOANotifications,
 
@@ -817,7 +813,6 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::DirectoryTabColors,
     FeatureFlag::EditableMarkdownMermaid,
     FeatureFlag::CodeReviewScrollPreservation,
-    FeatureFlag::AgentHarness,
     FeatureFlag::RememberFastForwardState,
     FeatureFlag::HOANotifications,
     FeatureFlag::GeminiNotifications,

@@ -3,13 +3,9 @@ use std::{collections::HashMap, ffi::OsString, path::PathBuf};
 use shell_words::quote as shell_quote;
 use uuid::Uuid;
 use warp_cli::agent::Harness;
-use warp_managed_secrets::ManagedSecretValue;
 
 use crate::ai::{
-    agent_sdk::{
-        driver::AgentDriverError, task_env_vars, validate_cli_installed, ClaudeHarness,
-        ThirdPartyHarness,
-    },
+    agent_sdk::{driver::AgentDriverError, task_env_vars, validate_cli_installed},
     ambient_agents::{task::HarnessConfig, AgentConfigSnapshot, AmbientAgentTaskId},
 };
 use crate::terminal::cli_agent_sessions::plugin_manager::plugin_manager_for;
@@ -56,14 +52,10 @@ pub(super) fn build_local_opencode_child_command(prompt: &str) -> String {
     format!("opencode --prompt {quoted_prompt}")
 }
 
-fn local_child_task_config(harness: Harness) -> Option<AgentConfigSnapshot> {
-    match harness {
-        Harness::Oz | Harness::OpenCode | Harness::Gemini | Harness::Unknown => None,
-        Harness::Claude => Some(AgentConfigSnapshot {
-            harness: Some(HarnessConfig::from_harness_type(harness)),
-            ..Default::default()
-        }),
-    }
+fn local_child_task_config(_harness: Harness) -> Option<AgentConfigSnapshot> {
+    // Zap 移除了第三方 harness 执行路径，Claude、Gemini 不再需要 task config。
+    // 上游 Harness 枚举变体保留供序列化兼容。
+    None
 }
 
 pub(super) async fn prepare_local_harness_child_launch(
@@ -86,29 +78,13 @@ pub(super) async fn prepare_local_harness_child_launch(
         Harness::Oz => unreachable!("normalize_local_child_harness filters out Oz"),
         Harness::Unknown => unreachable!("normalize_local_child_harness filters out Unknown"),
         Harness::Claude => {
-            let working_dir = startup_directory
-                .or_else(|| std::env::current_dir().ok())
-                .ok_or_else(|| {
-                    "Could not resolve a working directory for the local Claude child.".to_string()
-                })?;
-            let claude_harness = ClaudeHarness;
-            claude_harness
-                .validate()
-                .map_err(|error: AgentDriverError| error.to_string())?;
-            // Local child harness panes inherit the user's existing local Claude
-            // auth/session state. We still prepare Claude's config files here,
-            // but there are no Zap-managed secrets to materialize into the
-            // hidden child pane.
-            let managed_secrets: HashMap<String, ManagedSecretValue> = HashMap::new();
-            claude_harness
-                .prepare_environment_config(&working_dir, None, &managed_secrets)
-                .map_err(|error: AgentDriverError| error.to_string())?;
-            if let Some(manager) = plugin_manager_for(claude_harness.cli_agent()) {
+            validate_cli_installed("claude", None)
+                .map_err(|e| e.to_string())?;
+            if let Some(manager) = plugin_manager_for(crate::terminal::CLIAgent::Claude) {
                 if let Err(error) = manager.install().await {
                     log::warn!("Claude plugin installation failed for child harness: {error}");
                 }
             }
-
             build_local_claude_child_command(&prompt)
         }
         Harness::OpenCode => {

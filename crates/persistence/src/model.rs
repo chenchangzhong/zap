@@ -43,6 +43,7 @@ pub struct Window {
     pub left_panel_open: Option<bool>,
     pub vertical_tabs_panel_open: Option<bool>,
     pub theme_override: Option<String>,
+    pub team_uid: Option<String>,
 }
 
 #[derive(Identifiable, Insertable, Queryable)]

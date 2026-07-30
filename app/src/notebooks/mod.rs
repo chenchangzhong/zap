@@ -151,7 +151,6 @@ impl From<Owner> for NotebookLocation {
         // TODO(ben): Account for shared objects in notebook telemetry.
         match owner {
             Owner::User { .. } => NotebookLocation::PersonalCloud,
-            Owner::Team { .. } => NotebookLocation::Team,
         }
     }
 }

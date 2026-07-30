@@ -46,7 +46,6 @@ pub fn upsert_stored_object(
     let (subject_type_value, subject_id_value, subject_uid_value) =
         match cloud_object_permissions.owner {
             Owner::User { user_uid } => ("USER", Some(user_uid.to_string()), user_uid.to_string()),
-            Owner::Team { team_uid } => ("TEAM", None, team_uid.to_string()),
         };
     let permissions_ts = cloud_object_permissions
         .permissions_last_updated_ts

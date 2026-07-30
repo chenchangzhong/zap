@@ -356,37 +356,6 @@ impl DrivePanel {
             ObjectStoreViewModel::as_ref(ctx).object_space(&object_type_and_id.uid(), ctx)
         {
             match space {
-                Space::Team { team_uid } => {
-                    match object_type_and_id {
-                        ObjectTypeAndId::Notebook(_) => {
-                            if !UserWorkspaces::has_capacity_for_shared_notebooks(team_uid, ctx, 1)
-                            {
-                                // If team has reached the limit for notebooks, show the modal
-                                // and return early.
-                                ctx.emit(DrivePanelEvent::OpenSharedObjectsCreationDeniedModal(
-                                    DriveObjectType::Notebook {
-                                        is_ai_document: false,
-                                    },
-                                    team_uid,
-                                ));
-                                return;
-                            }
-                        }
-                        ObjectTypeAndId::Workflow(_) => {
-                            if !UserWorkspaces::has_capacity_for_shared_workflows(team_uid, ctx, 1)
-                            {
-                                // If team has reached the limit for workflows, show the modal
-                                // and return early.
-                                ctx.emit(DrivePanelEvent::OpenSharedObjectsCreationDeniedModal(
-                                    DriveObjectType::Workflow,
-                                    team_uid,
-                                ));
-                                return;
-                            }
-                        }
-                        _ => (),
-                    }
-                }
                 Space::Personal => match object_type_and_id {
                     ObjectTypeAndId::Notebook(_) => {
                         if has_feature_gated_anonymous_user_reached_notebook_limit(ctx) {

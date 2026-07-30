@@ -207,6 +207,7 @@ warp_ssh_manager.workspace = true
 zap_sftp = { path = "../crates/zap_sftp" }
 warp_util.workspace = true
 warpui = { workspace = true, features = ["schema_gen", "settings_value"] }
+
 voice_input = { workspace = true, optional = true }
 warpui_extras = { workspace = true, features = ["default", "user_preferences-toml"] }
 syntax_tree.workspace = true
@@ -513,7 +514,6 @@ default = [
     "mcp_oauth",
     "expand_edit_to_pane",
     "fallback_model_load_output_messaging",
-    "api_key_authentication",
     "api_key_management",
     "summarization_cancellation_confirmation",
     "ui_zoom",
@@ -589,6 +589,8 @@ default = [
     "settings_file",
     "ssh_tmux_wrapper",
     "onekey_prompt",
+    "gemini_enterprise",
+    "file_backed_execution_profiles",
 ]
 # Enable this feature to automatically perform heap profiling.  NOTE: This will
 # substantially slow down program execution.
@@ -608,6 +610,7 @@ fast_dev = ["skip_login"]
 full_screen_zen_mode = []
 grab_the_baton_editing = []
 grep_tool = []
+gemini_enterprise = []
 # This feature is enabled in graphical builds of Warp, and groups together other features
 # that are not needed in headless builds. Because Cargo features are additive, the default
 # feature set is for a minimal build of Warp, and we add on GUI-specific features here.
@@ -711,6 +714,12 @@ voice_input = ["dep:voice_input"]
 system_theme = []
 tab_close_button_on_left = []
 toggle_bootstrap_block = []
+
+test-util = [
+    "http_client/test-util",
+    "warp_core/test-util",
+    "ai/test-util",
+]
 # Feature enabled only when app is compiled for integration tests.
 integration_tests = [
     "warp_cli/integration_tests",
@@ -746,12 +755,10 @@ validate_autosuggestions = []
 autoupdate_ui_revamp = []
 warp_packs = []
 suggested_rules = []
+reload_stale_conversation_files = []
 command_correction_key = []
 use_tantivy_search = []
 agent_management_popup = []
-simulate_github_unauthed = []
-reload_stale_conversation_files = []
-nld_fasttext_model = ["input_classifier/fasttext"]
 nld_onnx_model = ["input_classifier/onnx_candle"]
 retry_truncated_code_responses = []
 ai_context_menu = []
@@ -788,7 +795,6 @@ code_review_save_changes = []
 file_tree = []
 server_file_browser = []
 code_launch_modal = []
-api_key_authentication = []
 api_key_management = []
 diff_set_as_context = []
 discard_per_file_and_all_changes = []
@@ -825,6 +831,7 @@ oz_platform_skills = []
 open_warp_launch_modal = []
 new_tab_styling = []
 file_based_mcp = []
+file_backed_execution_profiles = []
 skill_arguments = []
 active_conversation_requires_interaction = []
 incremental_auto_reload = []
@@ -837,7 +844,6 @@ hoa_code_review = []
 vertical_tabs = []
 vertical_tabs_summary_mode = []
 tab_configs = []
-agent_harness = []
 hoa_notifications = []
 open_code_notifications = []
 transfer_control_tool = []

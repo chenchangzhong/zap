@@ -129,6 +129,8 @@ fn rich_input_submit_strategy(agent: CLIAgent) -> RichInputSubmitStrategy {
         | CLIAgent::Gemini
         | CLIAgent::Auggie
         | CLIAgent::CursorCli
+        | CLIAgent::Vibe
+        | CLIAgent::Hermes
         | CLIAgent::Antigravity => RichInputSubmitStrategy::DelayedEnter,
         CLIAgent::Amp
         | CLIAgent::Droid

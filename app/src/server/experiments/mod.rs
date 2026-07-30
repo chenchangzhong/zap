@@ -35,8 +35,6 @@ pub enum ServerExperiment {
     PromptSuggestionsViaMaaControl,
     PromptSuggestionsViaMaaExperiment,
     PromptSuggestionsViaMaaOutOfBandExperiment,
-    OzMultiHarnessControl,
-    OzMultiHarnessExperiment,
     /// A test-only experiment.
     /// Does not correspond to a real server-side experiment.
     #[cfg(test)]
@@ -91,12 +89,6 @@ impl ServerExperiment {
             }
             // The normal experiment arm is no longer used.
             Self::PromptSuggestionsViaMaaExperiment => {}
-            Self::OzMultiHarnessControl => {
-                FeatureFlag::AgentHarness.set_enabled(false);
-            }
-            Self::OzMultiHarnessExperiment => {
-                FeatureFlag::AgentHarness.set_enabled(true);
-            }
             #[cfg(test)]
             Self::TestExperiment => {
                 model::TestModel::handle(_ctx).update(_ctx, |model, _| {

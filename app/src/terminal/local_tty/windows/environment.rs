@@ -5,6 +5,9 @@ use crate::terminal::cli_agent_sessions::event::current_protocol_version;
 use crate::terminal::local_tty::shell::{extra_path_entries, ssh_socket_dir};
 use itertools::Itertools;
 use warp_core::channel::ChannelState;
+use warp_core::cli_agent_protocol::{
+    WARP_CLI_AGENT_PROTOCOL_VERSION_ENV, WARP_CLIENT_VERSION_ENV,
+};
 use warp_core::features::FeatureFlag;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
@@ -102,18 +105,18 @@ pub(super) fn get_shell_environment_variables(options: &PtyOptions) -> Vec<u16> 
 
     let client_version = ChannelState::app_version().unwrap_or("local");
     env.insert(
-        map_key("WARP_CLIENT_VERSION".into()),
+        map_key(WARP_CLIENT_VERSION_ENV.into()),
         EnvEntry {
-            preferred_key: "WARP_CLIENT_VERSION".into(),
+            preferred_key: WARP_CLIENT_VERSION_ENV.into(),
             value: client_version.into(),
         },
     );
 
     if FeatureFlag::HOANotifications.is_enabled() {
         env.insert(
-            map_key("WARP_CLI_AGENT_PROTOCOL_VERSION".into()),
+            map_key(WARP_CLI_AGENT_PROTOCOL_VERSION_ENV.into()),
             EnvEntry {
-                preferred_key: "WARP_CLI_AGENT_PROTOCOL_VERSION".into(),
+                preferred_key: WARP_CLI_AGENT_PROTOCOL_VERSION_ENV.into(),
                 value: current_protocol_version().to_string().into(),
             },
         );

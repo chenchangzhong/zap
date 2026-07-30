@@ -6,13 +6,12 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
-use crate::ai::agent_sdk::driver::harness::{harness_kind, HarnessKind};
+use crate::ai::agent_sdk::driver::harness;
 use crate::ai::agent_sdk::driver::{AgentDriverOptions, AgentRunPrompt, Task};
 use crate::ai::agent_sdk::mcp_config::build_mcp_servers_from_specs;
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::aws_credentials::refresh_aws_credentials;
 use crate::ai::llms::LLMId;
-use crate::auth::OwnerType;
 use crate::cloud_object::model::persistence::ObjectStoreModel;
 use crate::workflows::workflow::Workflow;
 use ai::api_keys::{ApiKeyManager, AwsCredentialsRefreshStrategy};
@@ -39,9 +38,7 @@ use crate::ai::skills::{
     clone_repo_for_skill, resolve_skill_spec, ResolveSkillError, ResolvedSkill,
 };
 
-pub(crate) use driver::harness::{
-    task_env_vars, validate_cli_installed, ClaudeHarness, ThirdPartyHarness,
-};
+pub(crate) use driver::harness::{task_env_vars, validate_cli_installed};
 pub use driver::AgentDriver;
 use warp_cli::agent::{Harness, Prompt, RunAgentArgs};
 
@@ -60,17 +57,8 @@ mod test_support;
 mod text_layout;
 
 /// Prints a non-blocking warning to stderr when the CLI is invoked with a team-scoped API key.
-fn maybe_warn_team_api_key(ctx: &AppContext) {
-    let auth_state = AuthStateProvider::handle(ctx).as_ref(ctx).get();
-    let owner_type = auth_state.api_key_owner_type();
-    if !matches!(owner_type, Some(OwnerType::Team)) {
-        return;
-    }
-
-    eprintln!(
-        "\x1b[33mWarning: Personal credits apply to personal runs only but this run uses \
-         a team API key. If you want to use personal credits, consider using a personal API key instead.\x1b[0m"
-    );
+fn maybe_warn_team_api_key(_ctx: &AppContext) {
+    // Zap does not support teams, so this is always a no-op.
 }
 
 /// Run a Zap CLI command.
@@ -145,9 +133,6 @@ fn run_agent(
         AgentCommand::Run(args) => {
             if args.skill.is_some() && !FeatureFlag::OzPlatformSkills.is_enabled() {
                 return Err(anyhow::anyhow!("unexpected argument '--skill' found"));
-            }
-            if args.harness != Harness::Oz && !FeatureFlag::AgentHarness.is_enabled() {
-                return Err(anyhow::anyhow!("unexpected argument '--harness' found"));
             }
             if args.harness == Harness::OpenCode {
                 return Err(anyhow::anyhow!(
@@ -264,7 +249,6 @@ fn build_merged_config_and_task(
         model: model_override,
         profile: args.profile.clone(),
         mcp_specs: runtime_mcp_specs,
-        harness: harness_kind(args.harness)?,
     };
 
     Ok((merged_config, task))
@@ -350,23 +334,6 @@ impl AgentDriverRunner {
                 refresh_future
                     .await
                     .map_err(AgentDriverError::AwsBedrockCredentialsFailed)?;
-            }
-
-            match &task.harness {
-                HarnessKind::Unsupported(harness) => {
-                    return Err(AgentDriverError::HarnessSetupFailed {
-                        harness: harness.to_string(),
-                        reason: format!(
-                            "The {harness} harness is only supported for local child agent launches."
-                        ),
-                    });
-                }
-                HarnessKind::Oz | HarnessKind::ThirdParty(_) => {}
-            }
-
-            // Validate that the third-party harness is installed and authed.
-            if let HarnessKind::ThirdParty(harness) = &task.harness {
-                harness.validate()?;
             }
 
             if let Some(task_id) = driver_options.task_id {

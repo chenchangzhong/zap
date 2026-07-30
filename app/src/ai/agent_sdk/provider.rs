@@ -1,5 +1,4 @@
 //! Provider command for linking third-party services.
-use crate::workspaces::user_workspaces::UserWorkspaces;
 use comfy_table::Cell;
 use serde::Serialize;
 use warp_cli::{
@@ -37,27 +36,14 @@ impl ProviderCommandRunner {
         personal: bool,
         ctx: &mut ModelContext<Self>,
     ) -> anyhow::Result<()> {
-        let mut use_team_auth = team;
-        if !team && !personal {
-            if provider_type.allowed_in_team_context()
-                && provider_type.allowed_in_personal_context()
-            {
-                return Err(anyhow::anyhow!(
-                    "Provider '{}' must be setup for either a team or personal account",
-                    provider_type.slug()
-                ));
-            }
-            use_team_auth = provider_type.allowed_in_team_context();
-        } else if personal {
-            use_team_auth = false;
+        if team {
+            return Err(anyhow::anyhow!(
+                "Provider '{}' must be setup for a personal account",
+                provider_type.slug()
+            ));
         }
 
-        let slug = provider_type.slug();
-        if use_team_auth && UserWorkspaces::as_ref(ctx).current_team_uid().is_none() {
-            return Err(anyhow::anyhow!("User is not on a team"));
-        }
-
-        println!("Provider OAuth setup for {slug} is disabled in Zap.");
+        println!("Provider OAuth setup for {} is disabled in Zap.", provider_type.slug());
 
         ctx.terminate_app(TerminationMode::ForceTerminate, None);
 

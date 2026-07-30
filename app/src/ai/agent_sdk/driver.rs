@@ -16,9 +16,7 @@ use std::{
 use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::ai::mcp::MCPServerState;
 
-use crate::ai::agent_sdk::driver::harness::{
-    task_env_vars, HarnessKind, HarnessRunner, SavePoint, ThirdPartyHarness,
-};
+use crate::ai::agent_sdk::driver::harness::task_env_vars;
 use crate::terminal::cli_agent_sessions::plugin_manager::{
     plugin_manager_for, CliAgentPluginManager,
 };
@@ -73,7 +71,6 @@ pub(crate) mod terminal;
 use terminal::TerminalDriverEvent;
 
 const MCP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
-const HARNESS_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const WARP_DRIVE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const SETUP_FAILED_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Maximum time to wait for an automatic error resume before propagating the error.
@@ -204,12 +201,6 @@ pub struct AgentDriver {
     // The associated task ID for this agent run, if any.
     task_id: Option<AmbientAgentTaskId>,
 
-    /// Harness adapter for the running agent. This is only set if:
-    /// - The harness has started successfully.
-    /// - We're using a third-party harness.
-    /// In the future, we _may_ use the harness abstraction for the Oz agent as well.
-    harness: Option<Arc<dyn HarnessRunner>>,
-
     // Optional idle timeout after completion. If set, the process will stay alive for follow-ups
     // and exit after this period of inactivity.
     idle_on_complete: Option<Duration>,
@@ -250,8 +241,6 @@ pub struct Task {
     pub profile: Option<String>,
     /// MCP server specifications to start prior to execution.
     pub mcp_specs: Vec<MCPSpec>,
-    /// Which harness to use for executing the agent run.
-    pub harness: HarnessKind,
 }
 
 /// Prompt that we initialize an agent driver with.
@@ -462,7 +451,6 @@ impl AgentDriver {
             secrets: Arc::new(secrets),
             output_format: OutputFormat::default(),
             task_id,
-            harness: None,
             idle_on_complete,
         })
     }
@@ -922,8 +910,8 @@ impl AgentDriver {
             .await?
             .await?;
 
-        // For the Oz harness only: set up MCP servers, model overrides, and profile information.
-        if matches!(task.harness, HarnessKind::Oz) {
+        // Set up MCP servers, model overrides, and profile information.
+        {
             // Resolve MCP specs into existing server UUIDs and ephemeral installations.
             let mcp_specs = task.mcp_specs.clone();
             let (existing_uuids, ephemeral_installations) = foreground
@@ -970,189 +958,25 @@ impl AgentDriver {
                 .await?;
         }
 
-        // Run the harness with a prompt
-        match task.harness {
-            HarnessKind::Oz => {
-                let conversation_status = foreground
-                    .spawn(move |me, ctx| me.execute_run(task.prompt, ctx))
-                    .await?
-                    .await
-                    .map_err(|_| {
-                        log::error!("Subscription dropped before agent finished");
-                        AgentDriverError::InvalidRuntimeState
-                    })?;
+        // Run the Oz agent
+        let conversation_status = foreground
+            .spawn(move |me, ctx| me.execute_run(task.prompt, ctx))
+            .await?
+            .await
+            .map_err(|_| {
+                log::error!("Subscription dropped before agent finished");
+                AgentDriverError::InvalidRuntimeState
+            })?;
 
-                // Pause before returning to make sure that all conversation events are transmitted before the session is closed.
-                // TODO: This is a bit of a bandaid fix, and it would be better if we explicitly waited for the session to end before terminating.
-                // The way we could do that is through having the driver wait for all in-flight streams to be finished before terminating
-                // and then call stop_sharing_session when they're done. To know when streams are finished, we would need to modify start_ordered_terminal_events_listener
-                // to send a message when the streams are finished, flushed, and the websocket is disconnected. For now, we'll just sleep for a second, as this seems
-                // to be enough time for the streams to be finished and the events to be flushed.
-                warpui::r#async::Timer::after(Duration::from_secs(1)).await;
+        // Pause before returning to make sure that all conversation events are transmitted before the session is closed.
+        warpui::r#async::Timer::after(Duration::from_secs(1)).await;
 
-                conversation_status.into_result()
-            }
-            HarnessKind::ThirdParty(harness) => {
-                let harness_exit_rx = Self::setup_harness(harness.as_ref(), &foreground).await?;
-                let runner =
-                    Self::prepare_harness(&task.prompt, harness.as_ref(), &foreground).await?;
-                Self::run_harness(runner, &foreground, harness_exit_rx).await
-            }
-            HarnessKind::Unsupported(harness) => Err(AgentDriverError::HarnessSetupFailed {
-                harness: harness.to_string(),
-                reason: format!(
-                    "The {harness} harness is only supported for local child agent launches."
-                ),
-            }),
-        }
+        conversation_status.into_result()
     }
 
     /// Sets up the third-party harness by subscribing to CLI session events and
     /// installing the Zap plugin and platform plugin, if applicable.
     ///
-    /// Returns a oneshot receiver that fires when the harness should exit
-    /// (either immediately on completion or after the idle-on-complete timeout).
-    async fn setup_harness(
-        harness: &dyn ThirdPartyHarness,
-        foreground: &ModelSpawner<Self>,
-    ) -> Result<oneshot::Receiver<()>, AgentDriverError> {
-        let (exit_tx, exit_rx) = oneshot::channel();
-        let harness_exit = IdleTimeoutSender::new(exit_tx);
-
-        // Subscribe to CLI agent session events so we can update the task
-        // state as the harness emits stop/blocked notifications.
-        foreground
-            .spawn(move |me, ctx| me.subscribe_to_cli_agent_session_events(harness_exit, ctx))
-            .await?;
-
-        // Install plugins before running the harness command.
-        let plugin_manager: Option<Box<dyn CliAgentPluginManager>> =
-            plugin_manager_for(harness.cli_agent());
-        if let Some(manager) = plugin_manager {
-            if let Err(e) = manager.install().await {
-                log::warn!("Plugin installation failed (continuing): {e}");
-            }
-        }
-
-        Ok(exit_rx)
-    }
-
-    /// Configure a third-party harness for execution. This will set `self.harness` and
-    /// return a handle to the harness runner.
-    async fn prepare_harness(
-        prompt: &AgentRunPrompt,
-        harness: &dyn ThirdPartyHarness,
-        foreground: &ModelSpawner<Self>,
-    ) -> Result<Arc<dyn harness::HarnessRunner>, AgentDriverError> {
-        let (working_dir, task_id, agent_event_stream_client, terminal_driver) = foreground
-            .spawn(|me, _| {
-                if me.harness.is_some() {
-                    log::error!(
-                        "Attempted to prepare a third-party harness, but one was already configured"
-                    );
-                    return Err(AgentDriverError::InvalidRuntimeState);
-                }
-
-                Ok((
-                    me.working_dir.clone(),
-                    me.task_id,
-                    Arc::new(DisabledAgentEventStreamClient),
-                    me.terminal_driver.clone(),
-                ))
-            })
-            .await
-            .map_err(|_| AgentDriverError::InvalidRuntimeState)
-            .flatten()?;
-
-        let AgentRunPrompt::Local(prompt_text) = prompt;
-        let system_prompt: Option<String> = None;
-        let resumption_prompt: Option<String> = None;
-
-        // Prepare harness config files (onboarding, trust dialog, API-key approval, etc.).
-        let secrets = foreground
-            .spawn(|me, _| Arc::clone(&me.secrets))
-            .await
-            .map_err(|_| AgentDriverError::InvalidRuntimeState)?;
-        harness.prepare_environment_config(&working_dir, system_prompt.as_deref(), &secrets)?;
-
-        let runner: Arc<dyn HarnessRunner> = harness
-            .build_runner(
-                prompt_text,
-                system_prompt.as_deref(),
-                resumption_prompt.as_deref(),
-                &working_dir,
-                task_id,
-                agent_event_stream_client,
-                terminal_driver,
-            )?
-            .into();
-
-        let stored_runner = runner.clone();
-        foreground
-            .spawn(move |me, _| me.harness = Some(stored_runner))
-            .await?;
-
-        Ok(runner)
-    }
-
-    /// Execute a configured external harness in the terminal.
-    ///
-    /// The `harness_exit_rx` oneshot fires when the subscription determines it's
-    /// time to exit (either immediately on completion or after the idle timeout).
-    async fn run_harness(
-        runner: Arc<dyn harness::HarnessRunner>,
-        foreground: &ModelSpawner<Self>,
-        harness_exit_rx: oneshot::Receiver<()>,
-    ) -> Result<(), AgentDriverError> {
-        // Start the third-party harness.
-        let mut command_handle = runner.start(foreground).await?.fuse();
-        let mut harness_exit_rx = harness_exit_rx.fuse();
-
-        // Periodically save the conversation while the command is running and handle
-        // exiting gracefully once the idle timeout elapses.
-        let command_result = loop {
-            futures::select! {
-                exit_code = command_handle => break exit_code,
-                _ = warpui::r#async::Timer::after(HARNESS_SAVE_INTERVAL).fuse() => {
-                    log::debug!("Triggering periodic save of harness conversation data");
-                    report_if_error!(runner
-                        .save_conversation(SavePoint::Periodic, foreground)
-                        .await
-                        .context("Failed to save harness conversation (periodic)"));
-                }
-                _ = harness_exit_rx => {
-                    log::debug!("Requesting harness exit");
-                    report_if_error!(runner
-                        .exit(foreground)
-                        .await
-                        .context("Failed to exit harness"));
-                }
-            }
-        };
-
-        // Final save after the command finishes.
-        log::debug!("Triggering final save of harness conversation data");
-        report_if_error!(runner
-            .save_conversation(SavePoint::Final, foreground)
-            .await
-            .context("Failed to save harness conversation (final)"));
-        report_if_error!(runner
-            .cleanup(foreground)
-            .await
-            .context("Failed to clean up harness runtime state"));
-
-        let exit_code = command_result?;
-        log::debug!("Agent harness exited with status {exit_code}");
-
-        if exit_code.was_successful() {
-            Ok(())
-        } else {
-            Err(AgentDriverError::HarnessCommandFailed {
-                exit_code: exit_code.value(),
-            })
-        }
-    }
-
     /// Configure the active terminal session with the specified profile.
     fn configure_terminal(
         &self,
@@ -1436,83 +1260,6 @@ impl AgentDriver {
             OutputFormat::Json | OutputFormat::Ndjson => output::json::format_output(output, w),
             OutputFormat::Text | OutputFormat::Pretty => output::text::format_output(output, w),
         }
-    }
-
-    /// Subscribe to the singleton `CLIAgentSessionsModel` so that idle-on-complete
-    /// timers are driven by CLI agent session status changes.
-    ///
-    /// Task state reporting is handled centrally by `TaskStatusSyncModel`;
-    /// the driver only registers the `terminal_view_id → task_id` mapping
-    /// so that the sync model can look up the task for each session.
-    fn subscribe_to_cli_agent_session_events(
-        &self,
-        harness_exit: IdleTimeoutSender<()>,
-        ctx: &mut ModelContext<Self>,
-    ) {
-        let terminal_view_id = self.terminal_driver.as_ref(ctx).terminal_view().id();
-
-        ctx.subscribe_to_model(
-            &CLIAgentSessionsModel::handle(ctx),
-            move |me, event, ctx| match event {
-                CLIAgentSessionsModelEvent::StatusChanged {
-                    terminal_view_id: event_tid,
-                    status,
-                    ..
-                } => {
-                    if *event_tid != terminal_view_id {
-                        return;
-                    }
-
-                    // Drive idle-on-complete timer for the harness exit signal.
-                    match status {
-                        CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Blocked { .. } => {
-                            if let Some(idle_timeout) = me.idle_on_complete {
-                                harness_exit.end_run_after(idle_timeout, ());
-                            } else {
-                                harness_exit.end_run_now(());
-                            }
-                        }
-                        CLIAgentSessionStatus::InProgress => {
-                            harness_exit.cancel_idle_timeout();
-                        }
-                    }
-                }
-                CLIAgentSessionsModelEvent::SessionUpdated {
-                    terminal_view_id: event_tid,
-                    ..
-                } => {
-                    if *event_tid != terminal_view_id {
-                        return;
-                    }
-
-                    let Some(runner) = me.harness.clone() else {
-                        return;
-                    };
-                    let spawner = ctx.spawner();
-                    ctx.spawn(
-                        async move {
-                            log::debug!(
-                                "Triggering post-turn harness session update from CLI agent event"
-                            );
-                            report_if_error!(runner
-                                .handle_session_update(&spawner)
-                                .await
-                                .context("Failed to update harness state from CLI session event"));
-                            log::debug!("Triggering post-turn save of harness conversation data");
-                            report_if_error!(runner
-                                .save_conversation(SavePoint::PostTurn, &spawner)
-                                .await
-                                .context("Failed to save harness conversation (post-turn)"));
-                        },
-                        |_, _, _| {},
-                    );
-                }
-                CLIAgentSessionsModelEvent::Started { .. }
-                | CLIAgentSessionsModelEvent::InputSessionChanged { .. }
-                | CLIAgentSessionsModelEvent::ModelChanged { .. }
-                | CLIAgentSessionsModelEvent::Ended { .. } => {}
-            },
-        );
     }
 
     /// Handle events re-emitted by the `TerminalDriver`.

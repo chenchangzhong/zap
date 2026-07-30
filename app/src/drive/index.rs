@@ -1253,8 +1253,7 @@ impl DriveIndex {
         let DriveIndexSection::Space(section_space) = section;
         let can_create_objects = match section_space {
             Space::Personal => true,
-            Space::Team { .. } => self.is_online(app),
-            Space::Shared => false,
+            Space::Shared => self.is_online(app),
         };
         if can_create_objects {
             let create_object_button =
@@ -1998,9 +1997,9 @@ impl DriveIndex {
                                         app,
                                     );
 
-                                    // If we are rendering an empty team state in the base index, render the zero state
+                                    // If we are rendering an empty shared state in the base index, render the zero state
                                     if space_items.is_empty()
-                                        && matches!(space, Space::Team { .. })
+                                        && matches!(space, Space::Shared)
                                         && matches!(
                                             self.index_variant,
                                             DriveIndexVariant::MainIndex
@@ -2813,37 +2812,7 @@ impl DriveIndex {
             return;
         }
 
-        // Check if object is being moved into team space, if it is, then check
-        // corresponding object limits for that team.
-        if let StoredObjectLocation::Space(Space::Team { team_uid }) = new_location {
-            match *object_type_and_id {
-                ObjectTypeAndId::Notebook(_) => {
-                    if !UserWorkspaces::has_capacity_for_shared_notebooks(team_uid, ctx, 1) {
-                        // If team has reached the limit for notebooks, show the modal
-                        // and return early.
-                        ctx.emit(DriveIndexEvent::OpenSharedObjectsCreationDeniedModal(
-                            DriveObjectType::Notebook {
-                                is_ai_document: false,
-                            },
-                            team_uid,
-                        ));
-                        return;
-                    }
-                }
-                ObjectTypeAndId::Workflow(_) => {
-                    if !UserWorkspaces::has_capacity_for_shared_workflows(team_uid, ctx, 1) {
-                        // If team has reached the limit for workflows, show the modal
-                        // and return early.
-                        ctx.emit(DriveIndexEvent::OpenSharedObjectsCreationDeniedModal(
-                            DriveObjectType::Workflow,
-                            team_uid,
-                        ));
-                        return;
-                    }
-                }
-                _ => (),
-            }
-        }
+
 
         // Otherwise allow object move to go through.
         UpdateManager::handle(ctx).update(ctx, move |update_manager, ctx| {
@@ -2919,19 +2888,6 @@ impl DriveIndex {
                     return;
                 }
 
-                // If the new notebook is being created in the team space, check if the team has
-                // reached the limit for notebooks.
-                if let Space::Team { team_uid } = space {
-                    if !UserWorkspaces::has_capacity_for_shared_notebooks(team_uid, ctx, 1) {
-                        // If team has reached the limit for notebooks, show the modal
-                        // and return early.
-                        ctx.emit(DriveIndexEvent::OpenSharedObjectsCreationDeniedModal(
-                            object_type,
-                            team_uid,
-                        ));
-                        return;
-                    }
-                }
                 ctx.emit(DriveIndexEvent::CreateNotebook {
                     space,
                     title,
@@ -3031,101 +2987,16 @@ impl DriveIndex {
         ctx.notify();
     }
 
-    pub fn untrash_object(
+        pub fn untrash_object(
         &mut self,
         object_type_and_id: &ObjectTypeAndId,
         ctx: &mut ViewContext<Self>,
     ) {
-        // Check if object being untrashed is in team space, if it is, then check
-        // corresponding object limits for that team.
+        // Check object limits for personal and shared spaces.
         if let Some(space) =
             ObjectStoreViewModel::as_ref(ctx).object_space(&object_type_and_id.uid(), ctx)
         {
             match space {
-                Space::Team { team_uid } => {
-                    match object_type_and_id {
-                        ObjectTypeAndId::Notebook(_) => {
-                            if !UserWorkspaces::has_capacity_for_shared_notebooks(team_uid, ctx, 1)
-                            {
-                                // If team has reached the limit for notebooks, show the modal
-                                // and return early.
-                                ctx.emit(DriveIndexEvent::OpenSharedObjectsCreationDeniedModal(
-                                    DriveObjectType::Notebook {
-                                        is_ai_document: false,
-                                    },
-                                    team_uid,
-                                ));
-                                return;
-                            }
-                        }
-                        ObjectTypeAndId::Workflow(_) => {
-                            if !UserWorkspaces::has_capacity_for_shared_workflows(team_uid, ctx, 1)
-                            {
-                                // If team has reached the limit for workflows, show the modal
-                                // and return early.
-                                ctx.emit(DriveIndexEvent::OpenSharedObjectsCreationDeniedModal(
-                                    DriveObjectType::Workflow,
-                                    team_uid,
-                                ));
-                                return;
-                            }
-                        }
-                        ObjectTypeAndId::Folder(folder_id) => {
-                            let object_store_model = ObjectStoreModel::handle(ctx);
-
-                            // When untrashing a folder, check to see if there are any notebooks or workflows
-                            // in the trashed folder and make sure they are within limits.
-                            let trashed_object_types = object_store_model
-                                .as_ref(ctx)
-                                .trashed_cloud_object_types_in_location_with_descendants(
-                                    StoredObjectLocation::Folder(*folder_id),
-                                    ctx,
-                                );
-                            let notebooks_in_trashed_folder = trashed_object_types
-                                .clone()
-                                .into_iter()
-                                .filter(|object_type| *object_type == ObjectType::Notebook)
-                                .count();
-
-                            // Check # of notebooks in the trashed folder and make sure they are within limits
-                            if !UserWorkspaces::has_capacity_for_shared_notebooks(
-                                team_uid,
-                                ctx,
-                                notebooks_in_trashed_folder,
-                            ) {
-                                // If team has reached the limit for notebooks, show the modal
-                                // and return early.
-                                ctx.emit(DriveIndexEvent::OpenSharedObjectsCreationDeniedModal(
-                                    DriveObjectType::Notebook {
-                                        is_ai_document: false,
-                                    },
-                                    team_uid,
-                                ));
-                                return;
-                            }
-
-                            // Check # of workflows in the trashed folder and make sure they are within limits
-                            let workflows_in_trashed_folder = trashed_object_types
-                                .into_iter()
-                                .filter(|object_type| *object_type == ObjectType::Workflow)
-                                .count();
-                            if !UserWorkspaces::has_capacity_for_shared_workflows(
-                                team_uid,
-                                ctx,
-                                workflows_in_trashed_folder,
-                            ) {
-                                // If team has reached the limit for workflows, show the modal
-                                // and return early.
-                                ctx.emit(DriveIndexEvent::OpenSharedObjectsCreationDeniedModal(
-                                    DriveObjectType::Workflow,
-                                    team_uid,
-                                ));
-                                return;
-                            }
-                        }
-                        _ => (),
-                    }
-                }
                 Space::Personal => match object_type_and_id {
                     ObjectTypeAndId::Notebook(_) => {
                         if has_feature_gated_anonymous_user_reached_notebook_limit(ctx) {
@@ -4029,24 +3900,11 @@ impl DriveIndex {
                             let DriveIndexSection::Space(space) = section;
                             match space {
                                 Space::Personal | Space::Shared => None,
-                                Space::Team { .. } => Some(
-                                    MenuItemFields::new(crate::t!(
-                                        "drive-move-to-space",
-                                        space = space.name(app)
-                                    ))
-                                    .with_on_select_action(DriveIndexAction::MoveObject {
-                                        object_type_and_id: *object_type_and_id,
-                                        new_space: *space,
-                                    })
-                                    .with_icon(Icon::Move)
-                                    .into_item(),
-                                ),
                             }
                         }));
                     }
                 }
                 Space::Shared => {} // TODO: Revisit these menu items with sharing in mind
-                Space::Team { .. } => {} // TODO: When we do team -> personal sharing
             }
 
             if let Some(object) = object {
@@ -4087,9 +3945,9 @@ impl DriveIndex {
                                 }
                             }
                         }
-                        // Only allow duplicate if in Personal space, or Team space when online
+                        // Only allow duplicate if in Personal space, or Shared space when online
                         if matches!(space, Space::Personal)
-                            || (self.is_online(app) && matches!(space, Space::Team { .. }))
+                            || (self.is_online(app) && matches!(space, Space::Shared))
                         {
                             menu_items.push(
                                 MenuItemFields::new(crate::t!("drive-duplicate"))

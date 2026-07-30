@@ -1042,24 +1042,14 @@ pub enum Space {
     /// The current user's personal drive.
     #[default]
     Personal,
-    /// A team that the current user belongs to.
-    Team { team_uid: ServerId },
     /// An object shared from a drive the user is not a member of.
     Shared,
 }
 
 impl Space {
-    pub fn name(&self, app: &AppContext) -> String {
+    pub fn name(&self, _app: &AppContext) -> String {
         match self {
             Space::Personal => "Personal".to_string(),
-            Space::Team { team_uid, .. } => {
-                let user_workspaces = UserWorkspaces::as_ref(app);
-                if let Some(team) = user_workspaces.team_from_uid(*team_uid) {
-                    team.name.clone()
-                } else {
-                    "Team".to_string()
-                }
-            }
             Space::Shared => "Shared with me".to_string(),
         }
     }
@@ -1078,8 +1068,6 @@ impl From<Space> for WorkflowSource {
     fn from(space: Space) -> Self {
         match space {
             Space::Personal => WorkflowSource::PersonalCloud,
-            Space::Team { team_uid } => WorkflowSource::Team { team_uid },
-            // TODO(ben): Model sharing in workflow telemetry.
             Space::Shared => WorkflowSource::PersonalCloud,
         }
     }
@@ -1088,9 +1076,8 @@ impl From<Space> for WorkflowSource {
 impl From<Owner> for WorkflowSource {
     fn from(owner: Owner) -> WorkflowSource {
         match owner {
-            // TODO(ben): Represent shared objects in telemetry.
             Owner::User { .. } => Self::PersonalCloud,
-            Owner::Team { team_uid } => Self::Team { team_uid },
         }
     }
 }
+

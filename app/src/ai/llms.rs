@@ -516,6 +516,8 @@ struct AvailableLLMsUpdate {
 /// use as well as the user's preferred LLM for Agent Mode.
 pub struct LLMPreferences {
     models_by_feature: ModelsByFeature,
+    /// Whether the most recent authed agent-mode model-list fetch failed.
+    agent_mode_models_unavailable: bool,
     last_update: Option<AvailableLLMsUpdate>,
     // Stores temporary model overrides for a given terminal view.
     // NOTE: We only store an override if the model selected by the user is different
@@ -603,6 +605,7 @@ impl LLMPreferences {
 
         let me = Self {
             models_by_feature,
+            agent_mode_models_unavailable: false,
             last_update: None,
             base_llm_for_terminal_view,
             reasoning_effort_per_terminal: HashMap::new(),
@@ -1030,6 +1033,20 @@ impl LLMPreferences {
     pub fn refresh_authed_models(&self, _ctx: &mut ModelContext<Self>) {}
 
     fn refresh_public_models(&self, _ctx: &mut ModelContext<Self>) {}
+
+    /// Returns `true` when the most recent authed agent-mode model-list fetch
+    /// failed, so the server-provided model list is currently unavailable.
+    pub fn agent_mode_models_unavailable(&self) -> bool {
+        self.agent_mode_models_unavailable
+    }
+
+    /// Sets whether the authed agent-mode model list is currently unavailable.
+    /// Called from the authed fetch path on failure, from
+    /// [`Self::on_server_update`] on any successful model-list update, and
+    /// from tests.
+    pub(crate) fn set_agent_mode_models_unavailable(&mut self, unavailable: bool) {
+        self.agent_mode_models_unavailable = unavailable;
+    }
 
     /// 从 settings.agent_providers + AgentProviderSecrets 重建 `models_by_feature`,
     /// 在 settings 或 secrets 变化时调用。

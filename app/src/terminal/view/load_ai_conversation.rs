@@ -259,13 +259,7 @@ impl TerminalView {
                         );
                     }
                     LoadedConversationData::CLIAgent(cli_conversation) => {
-                        if FeatureFlag::AgentHarness.is_enabled() {
-                            me.restore_cli_agent_block_snapshot(cli_conversation.block);
-                        } else {
-                            log::warn!(
-                                "AgentHarness flag is disabled; ignoring CLI agent block snapshot"
-                            );
-                        }
+                        me.restore_cli_agent_block_snapshot(cli_conversation.block);
                     }
                 }
 
@@ -723,9 +717,7 @@ impl TerminalView {
                 vec![RestoredAIConversation::new(conversation)]
             }
             ConversationRestorationInNewPaneType::HistoricalCLIAgent { conversation, .. } => {
-                if FeatureFlag::AgentHarness.is_enabled() {
-                    self.restore_cli_agent_block_snapshot(conversation.block);
-                }
+                self.restore_cli_agent_block_snapshot(conversation.block);
                 return;
             }
         };

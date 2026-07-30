@@ -129,6 +129,22 @@ const GOOSE_COLOR: ColorU = ColorU {
     a: 255,
 };
 
+/// Hermes brand color (#8B5CF6, purple)
+const HERMES_PURPLE: ColorU = ColorU {
+    r: 0x8B,
+    g: 0x5C,
+    b: 0xF6,
+    a: 255,
+};
+
+/// Mistral Vibe brand color (#FF7A00, orange)
+const MISTRAL_ORANGE: ColorU = ColorU {
+    r: 0xFF,
+    g: 0x7A,
+    b: 0x00,
+    a: 255,
+};
+
 
 /// Represents a CLI agent (e.g., Claude Code, Gemini CLI, Codex, Amp, Droid, OpenCode, Copilot, Pi, Auggie, Cursor, Goose)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Sequence, Serialize, Deserialize)]
@@ -143,6 +159,8 @@ pub enum CLIAgent {
     Pi,
     Auggie,
     CursorCli,
+    Vibe,
+    Hermes,
     Goose,
     DeepSeek,
     Antigravity,
@@ -153,37 +171,38 @@ pub enum CLIAgent {
 
 impl CLIAgent {
     /// The command prefix used to invoke this CLI agent.
-    pub fn command_prefix(&self) -> &'static str {
+    /// Command prefixes that identify this CLI agent.
+    pub(crate) fn command_prefixes(&self) -> &'static [&'static str] {
         match self {
-            CLIAgent::Claude => "claude",
-            CLIAgent::Gemini => "gemini",
-            CLIAgent::Codex => "codex",
-            CLIAgent::Amp => "amp",
-            CLIAgent::Droid => "droid",
-            CLIAgent::OpenCode => "opencode",
-            CLIAgent::Copilot => "copilot",
-            CLIAgent::Pi => "pi",
-            CLIAgent::Auggie => "auggie",
-            CLIAgent::CursorCli => "agent",
-            CLIAgent::Goose => "goose",
-            CLIAgent::DeepSeek => "deepseek",
-            CLIAgent::Antigravity => "agy",
-            CLIAgent::OhMyPi => "omp",
-            CLIAgent::Unknown => "",
+            CLIAgent::Claude => &["claude"],
+            CLIAgent::Gemini => &["gemini"],
+            CLIAgent::Codex => &["codex"],
+            CLIAgent::Amp => &["amp"],
+            CLIAgent::Droid => &["droid"],
+            CLIAgent::OpenCode => &["opencode"],
+            CLIAgent::Copilot => &["copilot"],
+            CLIAgent::Pi => &["pi"],
+            CLIAgent::OhMyPi => &["omp"],
+            CLIAgent::Auggie => &["auggie"],
+            CLIAgent::CursorCli => &["agent"],
+            CLIAgent::Goose => &["goose"],
+            CLIAgent::DeepSeek => &["deepseek"],
+            CLIAgent::Hermes => &["hermes"],
+            CLIAgent::Antigravity => &["agy"],
+            CLIAgent::Vibe => &["vibe", "vibe-acp"],
+            CLIAgent::Unknown => &[],
         }
     }
 
-    fn command_prefix_aliases(&self) -> &'static [&'static str] {
-        match self {
-            CLIAgent::DeepSeek => &["deepseek-tui"],
-            _ => &[],
-        }
+    /// The canonical command prefix used to identify this CLI agent in places
+    /// that require one stable value.
+    pub fn command_prefix(&self) -> &'static str {
+        self.command_prefixes().first().copied().unwrap_or_default()
     }
 
     fn matches_command_prefix(&self, command: &str) -> bool {
-        command == self.command_prefix() || self.command_prefix_aliases().contains(&command)
+        self.command_prefixes().contains(&command)
     }
-
     /// Serialized version of the CLIAgent name (e.g. "Claude", "Gemini"). Used for the
     /// session-sharing protocol's opaque `cli_agent` string field.
     pub fn to_serialized_name(&self) -> String {
@@ -212,6 +231,8 @@ impl CLIAgent {
             CLIAgent::CursorCli => "Cursor",
             CLIAgent::Goose => "Goose",
             CLIAgent::DeepSeek => "DeepSeek",
+            CLIAgent::Vibe => "Mistral Vibe",
+            CLIAgent::Hermes => "Hermes",
             CLIAgent::Antigravity => "Antigravity",
             CLIAgent::OhMyPi => "oh-my-pi",
             CLIAgent::Unknown => "CLI Agent",
@@ -233,6 +254,8 @@ impl CLIAgent {
             CLIAgent::CursorCli => Some(Icon::CursorLogo),
             CLIAgent::Goose => Some(Icon::GooseLogo),
             CLIAgent::DeepSeek => Some(Icon::DeepSeekLogo),
+            CLIAgent::Vibe => None,
+            CLIAgent::Hermes => None,
             CLIAgent::Antigravity => Some(Icon::AntigravityLogo),
             CLIAgent::OhMyPi => Some(Icon::OhMyPiLogo),
             CLIAgent::Unknown => None,
@@ -264,6 +287,8 @@ impl CLIAgent {
             CLIAgent::CursorCli => &[SkillProvider::Agents],
             CLIAgent::Goose => &[SkillProvider::Agents],
             CLIAgent::DeepSeek => &[SkillProvider::Agents],
+            CLIAgent::Vibe => &[SkillProvider::Agents],
+            CLIAgent::Hermes => &[SkillProvider::Agents],
             CLIAgent::Antigravity => &[SkillProvider::Agents],
             CLIAgent::OhMyPi => &[SkillProvider::OhMyPi, SkillProvider::Agents],
             CLIAgent::Unknown => &[],
@@ -307,6 +332,8 @@ impl CLIAgent {
             CLIAgent::CursorCli => Some(CURSOR_COLOR),
             CLIAgent::Goose => Some(GOOSE_COLOR),
             CLIAgent::DeepSeek => Some(DEEPSEEK_COLOR),
+            CLIAgent::Vibe => Some(MISTRAL_ORANGE),
+            CLIAgent::Hermes => Some(HERMES_PURPLE),
             CLIAgent::Antigravity => Some(ANTIGRAVITY_PURPLE),
             CLIAgent::OhMyPi => Some(PI_COLOR),
             CLIAgent::Unknown => None,
@@ -571,6 +598,8 @@ impl From<CLIAgent> for CLIAgentType {
             CLIAgent::CursorCli => CLIAgentType::Cursor,
             CLIAgent::Goose => CLIAgentType::Goose,
             CLIAgent::DeepSeek => CLIAgentType::DeepSeek,
+            CLIAgent::Vibe => CLIAgentType::Vibe,
+            CLIAgent::Hermes => CLIAgentType::Hermes,
             CLIAgent::Antigravity => CLIAgentType::Antigravity,
             CLIAgent::OhMyPi => CLIAgentType::OhMyPi,
             CLIAgent::Unknown => CLIAgentType::Unknown,

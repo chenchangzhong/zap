@@ -3193,10 +3193,6 @@ impl PaneGroup {
                 });
             }
             LoadedConversationData::CLIAgent(cli_conversation) => {
-                if !FeatureFlag::AgentHarness.is_enabled() {
-                    log::warn!("AgentHarness flag is disabled; ignoring CLI agent conversation");
-                    return;
-                }
                 let harness = match cli_conversation.metadata.harness {
                     AIAgentHarness::ClaudeCode => Some(Harness::Claude),
                     AIAgentHarness::Gemini => Some(Harness::Gemini),
@@ -5046,10 +5042,6 @@ impl PaneGroup {
                 }
             }
             LoadedConversationData::CLIAgent(cli_conversation) => {
-                if !FeatureFlag::AgentHarness.is_enabled() {
-                    log::warn!("AgentHarness flag is disabled; ignoring CLI agent conversation");
-                    return false;
-                }
                 ConversationRestorationInNewPaneType::HistoricalCLIAgent {
                     conversation: *cli_conversation,
                     should_use_live_appearance: true,

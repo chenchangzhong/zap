@@ -224,7 +224,6 @@ impl From<DateTime<Utc>> for Revision {
 #[derivative(PartialEq)]
 pub enum Owner {
     User { user_uid: UserUid },
-    Team { team_uid: ServerId },
 }
 
 impl Owner {
@@ -240,11 +239,9 @@ impl From<Owner> for Option<ServerId> {
     fn from(owner: Owner) -> Option<ServerId> {
         match owner {
             Owner::User { .. } => None,
-            Owner::Team { team_uid, .. } => Some(team_uid),
         }
     }
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerObjectContainer {
     Folder { folder_uid: ServerId },

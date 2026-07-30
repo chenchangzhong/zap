@@ -1,6 +1,5 @@
 //! Harness selector: an "options menu" (`ActionButton` + generic `Menu<A>`) shown
-//! in a row above the ambient-agent input that lets the user switch between the Oz
-//! and Claude Code harnesses.
+//! in a row above the ambient-agent input. Zap 仅支持 Oz 内置 agent。
 
 use std::sync::Arc;
 
@@ -236,8 +235,6 @@ fn build_menu_items(
     vec![
         header,
         item_for(Harness::Oz),
-        item_for(Harness::Claude),
-        item_for(Harness::Gemini),
     ]
 }
 

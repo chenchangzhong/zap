@@ -1094,6 +1094,7 @@ fn save_app_state(conn: &mut SqliteConnection, app_state: &AppState) -> Result<(
                     .theme_override
                     .as_ref()
                     .and_then(|k| serde_json::to_string(k).ok()),
+
             };
             diesel::insert_into(schema::windows::dsl::windows)
                 .values(new_window)
@@ -3402,9 +3403,6 @@ fn owner_for_permissions(
                 .or(default_user_id)?;
             Some(Owner::User { user_uid })
         }
-        "TEAM" => Some(Owner::Team {
-            team_uid: ServerId::from_string_lossy(&permissions.subject_uid),
-        }),
         _ => None,
     }
 }

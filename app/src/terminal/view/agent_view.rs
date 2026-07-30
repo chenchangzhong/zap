@@ -144,10 +144,6 @@ impl TerminalView {
                         );
                     })
                 } else {
-                    if !FeatureFlag::AgentHarness.is_enabled() {
-                        log::warn!("AgentHarness flag is disabled; ignoring CLI agent conversation {conversation_id}");
-                        return;
-                    }
                     Box::new(|_, _| {})
                 };
                 me.restore_conversation_and_directory_context(
