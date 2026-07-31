@@ -8,8 +8,8 @@ use pathfinder_geometry::vector::vec2f;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::color::internal_colors;
 use warpui::elements::{
-    ChildAnchor, ChildView, Clipped, ConstrainedBox, Container, CrossAxisAlignment, Flex,
-    MainAxisAlignment, MainAxisSize, OffsetPositioning, ParentElement as _, PositionedElementAnchor,
+    Border, ChildAnchor, ChildView, ConstrainedBox, Container, CrossAxisAlignment, Flex,
+    MainAxisSize, OffsetPositioning, ParentElement as _, PositionedElementAnchor,
     PositionedElementOffsetBounds, SavePosition, Shrinkable, Stack, Text,
 };
 use warpui::{AppContext, Element, Entity, EntityId, SingletonEntity, TypedActionView, View,
@@ -123,6 +123,11 @@ impl OmpModelSelector {
         });
         ctx.subscribe_to_view(&filter_editor, |me, _, event, ctx| {
             me.handle_filter_editor_event(event, ctx);
+        });
+        // 搜索条放进菜单 pinned header,继承菜单背景(surface_2),避免透明悬浮在终端内容上。
+        let search_editor = filter_editor.clone();
+        dropdown.update(ctx, |menu, _ctx| {
+            menu.set_pinned_header_builder(move |app| render_search_header(&search_editor, app));
         });
         ctx.subscribe_to_model(&CLIAgentSessionsModel::handle(ctx), |me, _, event, ctx| {
             if let CLIAgentSessionsModelEvent::ModelChanged { terminal_view_id, model, .. } = event {
@@ -282,34 +287,9 @@ impl View for OmpModelSelector {
         let saved = SavePosition::new(content, "omp_selector_btn").finish();
         let mut stack = Stack::new();
         stack.add_child(saved);
-        let search_icon = ConstrainedBox::new(
-            Icon::SearchSmall
-                .to_warpui_icon(theme.active_ui_text_color())
-                .finish(),
-        )
-        .with_width(12.).with_height(12.).finish();
-        let filter_editor = Container::new(
-            Clipped::new(ChildView::new(&self.filter_editor).finish()).finish(),
-        ).with_margin_left(4.).finish();
-        let filter_bar = Container::new(
-            Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_child(search_icon)
-                .with_child(Shrinkable::new(1., filter_editor).finish()).finish(),
-        )
-        .with_padding_left(8.).with_padding_right(8.).with_vertical_padding(6.)
-        .finish();
-        let menu_content: Box<dyn Element> = ChildView::new(&self.dropdown).finish();
-        let menu_column = ConstrainedBox::new(
-            Flex::column().with_main_axis_alignment(MainAxisAlignment::Start)
-                .with_main_axis_size(MainAxisSize::Min)
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(filter_bar)
-                .with_child(menu_content).finish(),
-        )
-        .with_width(MENU_WIDTH).finish();
+        // 搜索条作为 pinned header 由 Menu 内部渲染(继承菜单背景)。
         stack.add_positioned_overlay_child(
-            menu_column,
+            ChildView::new(&self.dropdown).finish(),
             OffsetPositioning::offset_from_save_position_element(
                 "omp_selector_btn", vec2f(0., -4.),
                 PositionedElementOffsetBounds::WindowByPosition,
@@ -389,31 +369,72 @@ impl TypedActionView for OmpModelSelector {
                 let session_id = CLIAgentSessionsModel::as_ref(ctx)
                     .session(self.terminal_view_id)
                     .and_then(|s| s.session_context.session_id.clone());
-                ctx.spawn(async move {
-                    let result = notify_running_omp(&sel, session_id.as_deref()).await;
-                    (result, old_selection, seq)
-                }, |me, (result, old_selection, seq), ctx| {
-                    // 如果 seq 不匹配，说明有更新的切换已发起，忽略过期的回调
-                    if seq != me.switch_seq { return; }
-                    if let Err(e) = result {
-                        log::warn!("OmpModelSelector: switch model failed: {e}");
-                        me.selected_model = old_selection;
-                        me.switch_error = Some(e);
-                        me.rebuild_menu_items(ctx);
-                        // 3 秒后自动清除错误提示
-                        ctx.spawn(
-                            warpui::r#async::Timer::after(Duration::from_secs(3)),
-                            |me, _, ctx| {
-                                me.switch_error = None;
-                                ctx.notify();
-                            },
-                        );
-                    }
-                    ctx.notify();
-                });
+                if let Some(session_id) = session_id {
+                    self.send_notification(sel, session_id, old_selection, seq, ctx);
+                } else {
+                    // 多开/刚启动时 session_start 事件可能晚于用户操作，轮询等待 session_id 就绪。
+                    self.notify_when_ready(sel, old_selection, seq, 12, ctx);
+                }
                 ctx.notify();
             }
         }
+    }
+}
+
+impl OmpModelSelector {
+    /// 通过 session 专属 socket 发送模型切换通知。
+    fn send_notification(&mut self, selector: String, session_id: String, old_selection: Option<String>, seq: u64, ctx: &mut ViewContext<Self>) {
+        ctx.spawn(async move {
+            let result = notify_running_omp(&selector, Some(&session_id)).await;
+            (result, old_selection, seq)
+        }, |me, (result, old_selection, seq), ctx| {
+            me.finish_notify(result, old_selection, seq, ctx);
+        });
+    }
+
+    /// session_id 未就绪时的轮询通知：每 250ms 重取一次，最多 attempts_left 次（约 3 秒）。
+    fn notify_when_ready(&mut self, selector: String, old_selection: Option<String>, seq: u64, attempts_left: u32, ctx: &mut ViewContext<Self>) {
+        let session_id = CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.terminal_view_id)
+            .and_then(|s| s.session_context.session_id.clone());
+        if let Some(session_id) = session_id {
+            self.send_notification(selector, session_id, old_selection, seq, ctx);
+        } else if attempts_left > 0 {
+            ctx.spawn(
+                warpui::r#async::Timer::after(Duration::from_millis(250)),
+                move |me, _, ctx| {
+                    // 期间用户又切换了模型，放弃过期轮询。
+                    if seq != me.switch_seq { return; }
+                    me.notify_when_ready(selector, old_selection, seq, attempts_left - 1, ctx);
+                },
+            );
+        } else {
+            self.finish_notify(
+                Err("omp session not ready yet, try again".into()),
+                old_selection, seq, ctx,
+            );
+        }
+    }
+
+    /// socket 通知结果回调：seq 过期则忽略；失败恢复旧选择并显示临时错误（3 秒后清除）。
+    fn finish_notify(&mut self, result: Result<(), String>, old_selection: Option<String>, seq: u64, ctx: &mut ViewContext<Self>) {
+        // 如果 seq 不匹配，说明有更新的切换已发起，忽略过期的回调
+        if seq != self.switch_seq { return; }
+        if let Err(e) = result {
+            log::warn!("OmpModelSelector: switch model failed: {e}");
+            self.selected_model = old_selection;
+            self.switch_error = Some(e);
+            self.rebuild_menu_items(ctx);
+            // 3 秒后自动清除错误提示
+            ctx.spawn(
+                warpui::r#async::Timer::after(Duration::from_secs(3)),
+                |me, _, ctx| {
+                    me.switch_error = None;
+                    ctx.notify();
+                },
+            );
+        }
+        ctx.notify();
     }
 }
 
@@ -451,6 +472,12 @@ async fn notify_running_omp(selector: &str, session_id: Option<&str>) -> Result<
         Some(id) => home.join(format!(".omp/agent/model-switch-{id}.sock")),
         None => home.join(".omp/agent/model-switch.sock"),
     };
+    // omp 启动后 socket 文件创建有时序，短暂重试后再报错。
+    let mut attempts = 0;
+    while !path.exists() && attempts < 5 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        attempts += 1;
+    }
     if !path.exists() { return Err("socket not found (omp not running?)".into()) }
     let msg = serde_json::json!({"model": selector}).to_string() + "\n";
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -464,4 +491,31 @@ async fn notify_running_omp(selector: &str, session_id: Option<&str>) -> Result<
 #[cfg(not(unix))]
 async fn notify_running_omp(_selector: &str, _session_id: Option<&str>) -> Result<(), String> {
     Err("socket notify not supported on this platform".into())
+}
+
+/// 渲染菜单顶部的搜索 header（pinned header builder 调用），继承菜单背景，
+/// 与模型列表视觉连成一体，避免搜索条透明悬浮在终端内容上。
+fn render_search_header(editor: &ViewHandle<EditorView>, app: &AppContext) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let search_icon = ConstrainedBox::new(
+        Icon::SearchSmall
+            .to_warpui_icon(theme.sub_text_color(theme.surface_2()))
+            .finish(),
+    )
+    .with_width(16.)
+    .with_height(16.)
+    .finish();
+    let search_row = Flex::row()
+        .with_child(Container::new(search_icon).with_margin_right(8.).finish())
+        .with_child(Shrinkable::new(1., ChildView::new(editor).finish()).finish())
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .finish();
+    Container::new(search_row)
+        .with_padding_left(8.)
+        .with_padding_right(8.)
+        .with_padding_top(6.)
+        .with_padding_bottom(6.)
+        .with_border(Border::bottom(1.).with_border_fill(theme.surface_3()))
+        .finish()
 }
