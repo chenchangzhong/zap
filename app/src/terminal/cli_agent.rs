@@ -718,7 +718,7 @@ fn is_on_path_in_dirs(cmd: &str, search_dirs: &[PathBuf]) -> bool {
 }
 
 #[cfg(unix)]
-fn cli_agent_search_dirs() -> impl Iterator<Item = PathBuf> {
+pub(crate) fn cli_agent_search_dirs() -> impl Iterator<Item = PathBuf> {
     let mut dirs = Vec::new();
 
     if let Some(path_var) = std::env::var_os("PATH") {

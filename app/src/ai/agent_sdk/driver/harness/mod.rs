@@ -16,11 +16,18 @@ use super::{
 
 /// Check that `cli` is installed and on PATH, returning a `HarnessSetupFailed`
 /// error with an optional install-docs link when it isn't.
+///
+/// Resolution is consistent with the CLI-agent install scan
+/// ([`crate::terminal::cli_agent::cli_agent_search_dirs`]): when the process
+/// `PATH` misses the binary, common install dirs are probed as a fallback.
+/// macOS GUI apps launched from Finder/Dock inherit launchd's short `PATH`,
+/// so a Homebrew-installed CLI would otherwise show as installed in settings
+/// but fail here at launch time (issue #253).
 pub(crate) fn validate_cli_installed(
     cli: &str,
     install_docs_url: Option<&str>,
 ) -> Result<(), AgentDriverError> {
-    if resolve_executable(cli).is_none() {
+    if resolve_cli_command(cli).is_none() {
         let mut reason = format!("'{cli}' CLI not found on your machine.");
         if let Some(url) = install_docs_url {
             reason.push_str(&format!(" Install it first: {url}"));
@@ -31,6 +38,24 @@ pub(crate) fn validate_cli_installed(
         });
     }
     Ok(())
+}
+
+/// Resolves a CLI command against the process `PATH`, falling back to the
+/// common install dirs probed by the CLI-agent install scan.
+fn resolve_cli_command(cli: &str) -> Option<std::path::PathBuf> {
+    if let Some(resolved) = resolve_executable(cli) {
+        return Some(resolved.into_owned());
+    }
+    #[cfg(unix)]
+    {
+        crate::terminal::cli_agent::cli_agent_search_dirs()
+            .map(|dir| dir.join(cli))
+            .find(|path| path.is_file())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 fn insert_non_empty_task_env_var(
@@ -132,3 +157,7 @@ pub(crate) fn task_env_vars(
 }
 
 
+
+#[cfg(test)]
+#[path = "harness_tests.rs"]
+mod tests;
