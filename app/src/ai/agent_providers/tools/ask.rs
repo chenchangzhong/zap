@@ -42,34 +42,34 @@ fn parameters() -> Value {
         "properties": {
             "questions": {
                 "type": "array",
-                "description": "要向用户提的问题列表(通常 1 个就够,确实有多维需澄清才发多个)。",
+                "description": "Questions to ask the user (usually one is enough; only send more when multiple dimensions genuinely need clarification).",
                 "items": {
                     "type": "object",
                     "properties": {
                         "question": {
                             "type": "string",
-                            "description": "问题文本(中文,简短具体)。"
+                            "description": "Question text, written in the user's language, short and specific."
                         },
                         "options": {
                             "type": "array",
                             "items": {"type": "string"},
                             "minItems": 2,
                             "maxItems": 4,
-                            "description": "可选项标签列表,2-4 个,具体描述每条选项后果。"
+                            "description": "Option labels, 2-4 of them, each describing the consequence of choosing it."
                         },
                         "recommended_index": {
                             "type": "integer",
-                            "description": "0-based 推荐选项的下标。",
+                            "description": "0-based index of the recommended option.",
                             "default": 0
                         },
                         "multi_select": {
                             "type": "boolean",
-                            "description": "是否允许用户多选。",
+                            "description": "Whether the user may select multiple options.",
                             "default": false
                         },
                         "supports_other": {
                             "type": "boolean",
-                            "description": "是否允许用户输入 \"其他\" 自由文本。",
+                            "description": "Whether the user may type in an \"Other\" free-text answer.",
                             "default": false
                         }
                     },

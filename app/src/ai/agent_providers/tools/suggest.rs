@@ -27,7 +27,7 @@ fn new_conv_parameters() -> Value {
         "properties": {
             "message_id": {
                 "type": "string",
-                "description": "可选: 从哪条 assistant message 处分支新对话(留空则用当前 message)。"
+                "description": "Optional: branch a new conversation from this assistant message (leave empty to use the current message)."
             }
         },
         "additionalProperties": false
@@ -66,10 +66,9 @@ fn new_conv_result_to_json(result: &api::message::tool_call_result::Result) -> O
 
 pub static SUGGEST_NEW_CONVERSATION: OpenAiTool = OpenAiTool {
     name: "suggest_new_conversation",
-    description: "建议用户从当前 message 处分支出一个新对话。\
-                  适用场景:当前对话上下文已经很长且即将切换主题,或当前任务结束、\
-                  下一个任务与之无关时。UI 会弹出确认框,用户接受才真正分支。\
-                  **不要滥用** — 只在上下文切换收益明显时调。",
+    description: "Suggest branching a new conversation from the current message.\
+                  Use when the current conversation context is already long and the topic is about to switch, or when the current task is done and the next task is unrelated. The UI shows a confirmation; the branch only happens if the user accepts.\
+                  **Don't overuse** — only call when the context switch clearly benefits.",
     parameters: new_conv_parameters,
     from_args: new_conv_from_args,
     result_to_json: new_conv_result_to_json,
@@ -94,11 +93,11 @@ fn prompt_parameters() -> Value {
         "properties": {
             "prompt": {
                 "type": "string",
-                "description": "建议给用户的下一条 prompt(用户点击后实际发给 agent)。"
+                "description": "Next prompt to suggest to the user (sent to the agent as-is when clicked)."
             },
             "label": {
                 "type": "string",
-                "description": "可选: chip 上显示的短标签(prompt 较长时建议提供)。"
+                "description": "Optional: short label shown on the chip (recommended when the prompt is long)."
             }
         },
         "required": ["prompt"],
@@ -138,9 +137,9 @@ fn prompt_result_to_json(result: &api::message::tool_call_result::Result) -> Opt
 
 pub static SUGGEST_PROMPT: OpenAiTool = OpenAiTool {
     name: "suggest_prompt",
-    description: "在回答末尾给用户提议下一条 prompt(以 chip 形式展示)。\
-                  适用场景:任务自然延伸出明显的 follow-up(测试通过后建议跑 lint;读完代码建议补单测等)。\
-                  避免给重复或显而易见的建议。",
+    description: "Propose a next prompt to the user at the end of your answer (shown as a chip).\
+                  Use when the task naturally extends into an obvious follow-up (run lint after tests pass; add unit tests after reading code, etc.).\
+                  Avoid repetitive or obvious suggestions.",
     parameters: prompt_parameters,
     from_args: prompt_from_args,
     result_to_json: prompt_result_to_json,
