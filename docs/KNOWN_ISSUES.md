@@ -54,11 +54,13 @@
 
 ## 4. 8 个共享会话测试挂(Zap 切断共享会话网络链路)
 
-- **状态**:未修复(记录于 2026-07-31,`#[ignore]` 中)
+- **状态**:已解决(2026-07-31)—— 采纳方案 (b),8 个测试及共享会话 mock helper 已删除
+  (`app/src/workspace/view_test.rs`,commit 见本轮 `test: 删除共享会话遗留测试`);
+  `workspace::view` 恢复 105 passed / 0 failed / 6 ignored(仅剩既有 ignore)
 - **现象**:`workspace::view` 修复问题 2 后暴露,8 个测试失败:
   - `test_close_last_tab_skip_confirmation`、`test_close_other_tabs_confirmation_dialog`、`test_close_pane_confirmation_dialog`、`test_close_tab_confirmation_dialog`、`test_close_tabs_right_confirmation_dialog`、`test_confirmation_dialog_dont_show_again`、`test_reopen_closed_shared_tab`(均在 `setup_session_sharing_test` 的 `number_of_shared_sessions_in_tab == 0` 断言,view_test.rs:930)
   - `test_view_only_session`(terminal/input.rs:10191,`shared_session_status().is_viewer()` 断言)
 - **根因**:Zap 本地化切断了 Shared Session 网络入口,`TerminalView::attempt_to_share_session`(app/src/terminal/view/shared_session/view_impl.rs:211)整体 no-op;测试 setup 调用它后不产生共享会话,后续断言无法成立。测试是上游共享会话功能的遗留,功能切断后未同步删除/重写。
 - **影响**:低。仅测试失效;共享会话 UI 入口已随功能下线。
-- **建议修复**:二选一 —— (a) 重写测试:绕过 no-op,直接调 `on_session_share_started` 构造共享会话状态(工程量中等);(b) 删除这 8 个测试(功能已下线,回归价值低)。
+- **处理**:选 (b) 删除(功能已下线,回归价值低;mock 链路依赖 no-op 入口,重写成本高收益低)。
 - **涉及文件**:`app/src/workspace/view_test.rs`(8 个被 ignore 的测试)、`app/src/terminal/view/shared_session/view_impl.rs`(`attempt_to_share_session`)

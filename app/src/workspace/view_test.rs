@@ -7,12 +7,10 @@ use crate::ai::llms::LLMPreferences;
 use crate::ai::restored_conversations::RestoredAgentConversations;
 use crate::ai::skills::SkillManager;
 use crate::ai::AIRequestUsageModel;
-use crate::auth::UserUid;
 use crate::cloud_object::model::persistence::ObjectStoreModel;
 use crate::cloud_object::model::view::ObjectStoreViewModel;
 use crate::context_chips::prompt::Prompt;
 use crate::editor::Event;
-use crate::editor::ReplicaId;
 use crate::gpu_state::GPUState;
 use crate::network::NetworkStatus;
 use crate::notebooks::editor::keys::NotebookKeybindings;
@@ -20,8 +18,6 @@ use crate::notebooks::notebook::NotebookView;
 use crate::pane_group::{Direction, PaneGroupAction, PaneId};
 use crate::pricing::PricingInfoModel;
 use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
-use crate::terminal::shared_session::protocol::SessionSourceType;
-use crate::terminal::shared_session::protocol::{ParticipantId, ParticipantList};
 #[cfg(feature = "local_fs")]
 use crate::user_config::tab_configs_dir;
 use repo_metadata::repositories::DetectedRepositories;
@@ -48,7 +44,6 @@ use crate::workspaces::user_profiles::UserProfiles;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 
 use crate::terminal::local_tty::spawner::PtySpawner;
-use crate::terminal::shared_session::{SharedSessionScrollbackType, SharedSessionStatus};
 
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::ambient_agents::github_auth_notifier::GitHubAuthNotifier;
@@ -67,7 +62,6 @@ use crate::{experiments, workspace, GlobalResourceHandlesProvider};
 
 // Zap(本地化,Phase 5):`PreferencesSyncer` 已物理删除。
 
-use crate::terminal::shared_session::protocol::SessionId;
 use ai::project_context::model::ProjectContextModel;
 use pane_group::{NotebookPane, PaneState, SplitPaneState, TerminalPaneId};
 use terminal::view::ActiveSessionState;
@@ -452,87 +446,7 @@ impl Drop for TabConfigCleanupGuard {
     }
 }
 
-/// Creates a workspace with a single, shared session.
-fn mock_workspace_with_shared_session(app: &mut App) -> ViewHandle<Workspace> {
-    // Create the workspace as a session-sharing sharer.
-    let global_resource_handles = GlobalResourceHandles::mock(app);
-    let (_, workspace) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
-        Workspace::new(
-            global_resource_handles,
-            None,
-            NewWorkspaceSource::Empty {
-                previous_active_window: None,
-                shell: None,
-            },
-            ctx,
-        )
-    });
 
-    // Get the single terminal view in the workspace.
-    let terminal_view = workspace.read(app, |workspace, ctx| {
-        assert_eq!(workspace.tabs.len(), 1);
-        workspace
-            .active_tab_pane_group()
-            .as_ref(ctx)
-            .focused_session_view(ctx)
-            .unwrap()
-    });
-
-    terminal_view.update(app, |view, ctx| {
-        view.model.lock().block_list_mut().set_bootstrapped();
-        view.attempt_to_share_session(
-            SharedSessionScrollbackType::All,
-            None,
-            SessionSourceType::default(),
-            false,
-            ctx,
-        );
-    });
-
-    workspace
-}
-
-// Creates a workspace as a viewer of a shared session.
-fn mock_workspace_viewing_shared_session(app: &mut App) -> ViewHandle<Workspace> {
-    // Create the workspace as a session-sharing sharer.
-    let global_resource_handles = GlobalResourceHandles::mock(app);
-
-    let (_, workspace) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
-        Workspace::new(
-            global_resource_handles,
-            None,
-            NewWorkspaceSource::Empty {
-                previous_active_window: None,
-                shell: None,
-            },
-            ctx,
-        )
-    });
-
-    // Get the single terminal view in the workspace.
-    let terminal_view = workspace.read(app, |workspace, ctx| {
-        assert_eq!(workspace.tabs.len(), 1);
-        workspace
-            .active_tab_pane_group()
-            .as_ref(ctx)
-            .focused_session_view(ctx)
-            .unwrap()
-    });
-
-    terminal_view.update(app, |view, ctx| {
-        view.on_session_share_joined(
-            ParticipantId::new(),
-            UserUid::new("mock_user_uid"),
-            ReplicaId::random(),
-            Box::new(ParticipantList::default()),
-            SessionId::new(),
-            SessionSourceType::default(),
-            ctx,
-        );
-    });
-
-    workspace
-}
 
 /// Disable the warn-before-quit setting. Because we don't fully bootstrap the shell in tests, this
 /// is generally needed in tests that close tabs.
@@ -887,372 +801,14 @@ fn test_workspace_sessions_retrieves_panes() {
     });
 }
 
-fn number_of_shared_sessions_in_tab(
-    workspace: &Workspace,
-    index: usize,
-    ctx: &AppContext,
-) -> usize {
-    workspace
-        .get_pane_group_view(index)
-        .map_or(0, |view| view.as_ref(ctx).number_of_shared_sessions(ctx))
-}
 
-/// Sets up the workspace with three tabs. The middle tab has two panes, where one is shared.
-fn setup_session_sharing_test(workspace: &ViewHandle<Workspace>, app: &mut App) -> PaneId {
-    let shared_pane_id = workspace.update(app, |workspace, ctx| {
-        workspace.add_terminal_tab(false, ctx);
-        workspace.add_terminal_tab(false, ctx);
 
-        let tab_view = workspace.get_pane_group_view(1).unwrap();
 
-        tab_view.update(ctx, |view, ctx| {
-            assert_eq!(view.pane_count(), 1);
-            view.focused_session_view(ctx)
-                .unwrap()
-                .update(ctx, |terminal, ctx| {
-                    terminal.attempt_to_share_session(
-                        SharedSessionScrollbackType::None,
-                        None,
-                        SessionSourceType::default(),
-                        false,
-                        ctx,
-                    );
-                });
 
-            view.handle_action(&PaneGroupAction::Add(Direction::Right), ctx);
-            assert_eq!(view.pane_count(), 2);
 
-            view.pane_id_by_index(0).unwrap()
-        })
-    });
 
-    workspace.read(app, |workspace, ctx| {
-        assert_eq!(number_of_shared_sessions_in_tab(workspace, 1, ctx), 1);
 
-        // Confirmation dialog starts not open.
-        assert!(
-            !workspace
-                .current_workspace_state
-                .is_close_session_confirmation_dialog_open
-        );
-    });
 
-    shared_pane_id
-}
-
-#[test]
-#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
-fn test_close_tab_confirmation_dialog() {
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-        app.update(disable_quit_warning);
-
-        let workspace = mock_workspace(&mut app);
-        setup_session_sharing_test(&workspace, &mut app);
-
-        workspace.update(&mut app, |workspace, ctx| {
-            let first_tab_id = workspace.get_pane_group_view(0).unwrap().id();
-
-            // Trying to close tab with a shared pane opens dialog.
-            workspace.handle_action(&WorkspaceAction::CloseTab(1), ctx);
-            assert!(
-                workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-
-            // User clicking cancel closes dialog.
-            workspace.handle_close_session_confirmation_dialog_event(
-                &CloseSessionConfirmationEvent::Cancel,
-                ctx,
-            );
-            assert!(
-                !workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-
-            // Trying to close tab without a shared pane goes through without dialog.
-            workspace.handle_action(&WorkspaceAction::CloseTab(2), ctx);
-            assert_eq!(workspace.tab_count(), 2);
-            assert!(
-                !workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-
-            // Close the tab with the shared pane.
-            workspace.handle_action(&WorkspaceAction::CloseTab(1), ctx);
-            assert!(
-                workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-            workspace.handle_close_session_confirmation_dialog_event(
-                &CloseSessionConfirmationEvent::CloseSession {
-                    dont_show_again: false,
-                    open_confirmation_source: OpenDialogSource::CloseTab { tab_index: 1 },
-                },
-                ctx,
-            );
-            assert!(
-                !workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-            assert_eq!(workspace.tab_count(), 1);
-            assert_eq!(workspace.get_pane_group_view(0).unwrap().id(), first_tab_id);
-        });
-    });
-}
-
-#[test]
-#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
-fn test_close_pane_confirmation_dialog() {
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-
-        let workspace = mock_workspace(&mut app);
-        let shared_pane_id = setup_session_sharing_test(&workspace, &mut app);
-
-        workspace.update(&mut app, |workspace, ctx| {
-            let shared_pane_group_id = workspace.get_pane_group_view(1).unwrap().id();
-
-            // User tries to close shared pane, dialog comes up.
-            workspace.handle_file_tree_event(
-                workspace.get_pane_group_view(1).unwrap().clone(),
-                &pane_group::Event::CloseSharedSessionPaneRequested {
-                    pane_id: shared_pane_id,
-                },
-                ctx,
-            );
-            assert!(
-                workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-
-            // User confirms.
-            workspace.handle_close_session_confirmation_dialog_event(
-                &CloseSessionConfirmationEvent::CloseSession {
-                    dont_show_again: false,
-                    open_confirmation_source: OpenDialogSource::ClosePane {
-                        pane_group_id: shared_pane_group_id,
-                        pane_id: shared_pane_id,
-                    },
-                },
-                ctx,
-            );
-            assert!(
-                !workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-            assert_eq!(number_of_shared_sessions_in_tab(workspace, 1, ctx), 0);
-            let remaining_pane_id = workspace
-                .get_pane_group_view_with_id(shared_pane_group_id)
-                .unwrap()
-                .as_ref(ctx)
-                .pane_id_by_index(0)
-                .unwrap();
-            assert_ne!(remaining_pane_id, shared_pane_id);
-            assert_eq!(workspace.tab_count(), 3);
-        });
-    });
-}
-
-#[test]
-#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
-fn test_reopen_closed_shared_tab() {
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-
-        let workspace = mock_workspace(&mut app);
-        setup_session_sharing_test(&workspace, &mut app);
-
-        workspace.update(&mut app, |workspace, ctx| {
-            let shared_pane_group = workspace.get_pane_group_view(1).unwrap().clone();
-
-            // Close the tab with the shared pane.
-            workspace.close_tab(1, true, true, ctx);
-            assert_eq!(workspace.tab_count(), 2);
-
-            // Restore the shared tab.
-            workspace.restore_closed_tab(1, TabData::new(shared_pane_group.to_owned()), ctx);
-        });
-        // Restored tab should no longer be shared.
-        workspace.read(&app, |workspace, ctx| {
-            let pane_group = workspace.get_pane_group_view(1).unwrap();
-            assert!(!pane_group.as_ref(ctx).is_terminal_pane_being_shared(ctx));
-            assert_eq!(workspace.tab_count(), 3);
-        })
-    });
-}
-
-#[test]
-#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
-fn test_close_other_tabs_confirmation_dialog() {
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-
-        let workspace = mock_workspace(&mut app);
-        setup_session_sharing_test(&workspace, &mut app);
-
-        workspace.update(&mut app, |workspace, ctx| {
-            let last_tab_id = workspace.get_pane_group_view(2).unwrap().id();
-
-            // User tries to close other tabs choosing non-shared tab, dialog comes up.
-            workspace.handle_action(&WorkspaceAction::CloseOtherTabs(2), ctx);
-            assert!(
-                workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-
-            // User confirms.
-            workspace.handle_close_session_confirmation_dialog_event(
-                &CloseSessionConfirmationEvent::CloseSession {
-                    dont_show_again: false,
-                    open_confirmation_source: OpenDialogSource::CloseOtherTabs { tab_index: 2 },
-                },
-                ctx,
-            );
-            assert!(
-                !workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-            assert_eq!(workspace.tab_count(), 1);
-            assert_eq!(workspace.get_pane_group_view(0).unwrap().id(), last_tab_id);
-        });
-    });
-}
-
-#[test]
-#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
-fn test_close_tabs_right_confirmation_dialog() {
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-
-        let workspace = mock_workspace(&mut app);
-        setup_session_sharing_test(&workspace, &mut app);
-
-        workspace.update(&mut app, |workspace, ctx| {
-            let first_tab_id = workspace.get_pane_group_view(0).unwrap().id();
-
-            // User tries to close all tabs right of the left-most tab, dialog comes up.
-            workspace.handle_action(&WorkspaceAction::CloseTabsRight(0), ctx);
-            assert!(
-                workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-
-            // User confirms.
-            workspace.handle_close_session_confirmation_dialog_event(
-                &CloseSessionConfirmationEvent::CloseSession {
-                    dont_show_again: false,
-                    open_confirmation_source: OpenDialogSource::CloseTabsDirection {
-                        tab_index: 0,
-                        direction: TabMovement::Right,
-                    },
-                },
-                ctx,
-            );
-            assert!(
-                !workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-            assert_eq!(workspace.tab_count(), 1);
-            assert_eq!(workspace.get_pane_group_view(0).unwrap().id(), first_tab_id);
-        });
-    });
-}
-
-#[test]
-#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
-fn test_confirmation_dialog_dont_show_again() {
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-        app.update(disable_quit_warning);
-
-        let workspace = mock_workspace(&mut app);
-        setup_session_sharing_test(&workspace, &mut app);
-
-        workspace.update(&mut app, |workspace, ctx| {
-            // Close the tab with the shared pane, dialog comes up
-            workspace.handle_action(&WorkspaceAction::CloseTab(1), ctx);
-            assert!(
-                workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-
-            // User confirms, checking "Don't show again".
-            workspace.handle_close_session_confirmation_dialog_event(
-                &CloseSessionConfirmationEvent::CloseSession {
-                    dont_show_again: true,
-                    open_confirmation_source: OpenDialogSource::CloseTab { tab_index: 1 },
-                },
-                ctx,
-            );
-            assert!(
-                !workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-            assert_eq!(workspace.tab_count(), 2);
-
-            // Share the first tab
-            let tab_view = workspace.get_pane_group_view(0).unwrap();
-            tab_view.update(ctx, |view, ctx| {
-                view.terminal_manager(0, ctx)
-                    .unwrap()
-                    .as_ref(ctx)
-                    .model()
-                    .lock()
-                    .set_shared_session_status(SharedSessionStatus::ActiveSharer);
-            });
-
-            // Close the shared tab. No dialog should come up and action should go through.
-            workspace.handle_action(&WorkspaceAction::CloseActiveTab, ctx);
-            assert!(
-                !workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-            assert_eq!(workspace.tab_count(), 1);
-        });
-    });
-}
-
-#[test]
-#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
-fn test_close_last_tab_skip_confirmation() {
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-        app.update(disable_quit_warning);
-
-        let workspace = mock_workspace(&mut app);
-        setup_session_sharing_test(&workspace, &mut app);
-
-        workspace.update(&mut app, |workspace, ctx| {
-            // Close the non-shared tabs so there's just one shared tab left.
-            workspace.handle_action(&WorkspaceAction::CloseTab(2), ctx);
-            workspace.handle_action(&WorkspaceAction::CloseTab(0), ctx);
-            assert_eq!(workspace.tab_count(), 1);
-            // Close the last remaining tab with the shared pane, no dialog should come up because
-            // we're going to close the window and there's already a confirmation on window close.
-            workspace.handle_action(&WorkspaceAction::CloseActiveTab, ctx);
-            assert!(
-                !workspace
-                    .current_workspace_state
-                    .is_close_session_confirmation_dialog_open
-            );
-        });
-    });
-}
 
 #[test]
 fn test_notebook_pane_tracking() {
@@ -1486,24 +1042,6 @@ fn test_open_or_toggle_warp_drive() {
     });
 }
 
-#[test]
-#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
-fn test_view_only_session() {
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-
-        // Trying to open command search
-        let workspace = mock_workspace_viewing_shared_session(&mut app);
-        workspace.update(&mut app, |workspace: &mut Workspace, ctx| {
-            workspace.handle_action(&WorkspaceAction::ShowCommandSearch(Default::default()), ctx);
-        });
-
-        // Ensure command search doesn't work for read-only shared sessions
-        workspace.read(&app, |workspace, _ctx| {
-            assert!(!workspace.current_workspace_state.is_command_search_open);
-        });
-    });
-}
 
 #[test]
 fn test_server_token_compatibility_finds_restored_local_conversation() {
