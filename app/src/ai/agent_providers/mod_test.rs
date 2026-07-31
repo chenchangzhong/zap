@@ -11,6 +11,8 @@ use crate::network::NetworkStatus;
 use crate::settings::{AISettings, AgentProvider, AgentProviderApiType, AgentProviderModel};
 use crate::test_util::settings::initialize_settings_for_tests;
 use crate::workspaces::user_workspaces::UserWorkspaces;
+use crate::ObjectStoreModel;
+use crate::ai::mcp::TemplatableMCPServerManager;
 
 fn sample_provider(id: &str) -> AgentProvider {
     AgentProvider {
@@ -30,7 +32,15 @@ fn init_byop_test_app(app: &mut warpui::App) {
     app.add_singleton_model(|_| NetworkStatus::new());
     app.add_singleton_model(|_| AuthStateProvider::new_for_test());
     app.add_singleton_model(AuthManager::new_for_test);
+    app.add_singleton_model(ObjectStoreModel::mock);
+    app.add_singleton_model(|_| TemplatableMCPServerManager::default());
     app.add_singleton_model(UserWorkspaces::default_mock);
+    app.add_singleton_model(|ctx| {
+        crate::ai::execution_profiles::profiles::AIExecutionProfilesModel::new(
+            &crate::LaunchMode::new_for_unit_test(),
+            ctx,
+        )
+    });
     app.add_singleton_model(LLMPreferences::new);
 }
 

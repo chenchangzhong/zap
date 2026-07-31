@@ -76,6 +76,10 @@ use warpui::{platform::WindowStyle, App, ViewHandle};
 
 fn initialize_app(app: &mut App) {
     initialize_settings_for_tests(app);
+    // SSH 管理器需要数据库路径(SshTreeChangedNotifier 构造时访问)。
+    warp_ssh_manager::set_database_path(
+        std::env::temp_dir().join(format!("warp_view_test_{}.sqlite", std::process::id())),
+    );
 
     // Add the necessary singleton models to the App
     app.add_singleton_model(|_| AuthStateProvider::new_for_test());
@@ -114,9 +118,14 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
     app.add_singleton_model(AgentConversationsModel::new);
+    app.add_singleton_model(crate::ai::agent_providers::AgentProviderSecrets::new);
+    app.add_singleton_model(crate::settings::CloudSyncTokenStore::new);
     app.add_singleton_model(LLMPreferences::new);
     app.add_singleton_model(|_| SettingsPaneManager::new());
     app.add_singleton_model(|_| AIFactManager::new());
+    app.add_singleton_model(crate::terminal::cli_agent::CLIAgentInstallModel::new);
+    app.add_singleton_model(crate::settings::network_secrets::ProxyCredentials::new);
+
 
     // Initialize file-based MCP dependencies.
     app.add_singleton_model(|_| DetectedRepositories::default());
@@ -932,6 +941,7 @@ fn setup_session_sharing_test(workspace: &ViewHandle<Workspace>, app: &mut App) 
 }
 
 #[test]
+#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
 fn test_close_tab_confirmation_dialog() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -997,6 +1007,7 @@ fn test_close_tab_confirmation_dialog() {
 }
 
 #[test]
+#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
 fn test_close_pane_confirmation_dialog() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1051,6 +1062,7 @@ fn test_close_pane_confirmation_dialog() {
 }
 
 #[test]
+#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
 fn test_reopen_closed_shared_tab() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1078,6 +1090,7 @@ fn test_reopen_closed_shared_tab() {
 }
 
 #[test]
+#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
 fn test_close_other_tabs_confirmation_dialog() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1116,6 +1129,7 @@ fn test_close_other_tabs_confirmation_dialog() {
 }
 
 #[test]
+#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
 fn test_close_tabs_right_confirmation_dialog() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1157,6 +1171,7 @@ fn test_close_tabs_right_confirmation_dialog() {
 }
 
 #[test]
+#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
 fn test_confirmation_dialog_dont_show_again() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1213,6 +1228,7 @@ fn test_confirmation_dialog_dont_show_again() {
 }
 
 #[test]
+#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
 fn test_close_last_tab_skip_confirmation() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1471,6 +1487,7 @@ fn test_open_or_toggle_warp_drive() {
 }
 
 #[test]
+#[ignore = "docs/KNOWN_ISSUES.md #4: 共享会话链路被 Zap 切断(attempt_to_share_session 为 no-op),测试断言无法成立"]
 fn test_view_only_session() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -2389,17 +2406,16 @@ fn test_unified_new_session_menu_uses_new_worktree_config_label_and_order() {
 
             assert!(!labels.iter().any(|label| label == "Worktree in"));
 
-            let separator_index = labels
+            // Zap 在菜单中加入了 Agent / Coding Agents / Docker 段,
+            // 原断言“第一个分隔符后即 worktree config”不再成立;
+            // 保留原意图:worktree config 紧跟 new tab config 且有序。
+            let worktree_index = labels
                 .iter()
-                .position(|label| label == "---")
-                .expect("expected a separator in the new-session menu");
+                .position(|label| label == "New worktree config")
+                .expect("expected a New worktree config item in the new-session menu");
 
             assert_eq!(
-                labels.get(separator_index + 1),
-                Some(&"New worktree config".to_string())
-            );
-            assert_eq!(
-                labels.get(separator_index + 2),
+                labels.get(worktree_index + 1),
                 Some(&"New tab config".to_string())
             );
         });

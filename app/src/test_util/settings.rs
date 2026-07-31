@@ -17,15 +17,21 @@ pub fn initialize_settings_for_tests_with_mode(
         drive::settings::WarpDriveSettings,
         search::command_search::settings::CommandSearchSettings,
         settings::{
-            app_icon::AppIconSettings, init_and_register_user_preferences,
+            app_icon::AppIconSettings,
+            app_installation_detection::UserAppInstallDetectionSettings, AutoupdateSettings,
+            CloudSyncSettings,
+            init_and_register_user_preferences,
             manager::SettingsManager, AISettings, AccessibilitySettings, AliasExpansionSettings,
             AppEditorSettings, BlockVisibilitySettings, CodeSettings, DebugSettings,
             EmacsBindingsSettings, FontSettings, GPUSettings, InputModeSettings, InputSettings,
             NativePreferenceSettings, PaneSettings, PreferencesSettings,
+            language::LanguageSettings, network::NetworkSettings,
             SameLinePromptBlockSettings, ScrollSettings, SelectionSettings, SshSettings,
-            ThemeSettings, VimBannerSettings,
+            ThemeSettings, VimBannerSettings, WarpDrivePrivacySettings,
+
         },
         terminal::{
+
             general_settings::GeneralSettings, keys_settings::KeysSettings,
             ligature_settings::LigatureSettings, safe_mode_settings::SafeModeSettings,
             session_settings::SessionSettings, settings::TerminalSettings,
@@ -33,6 +39,7 @@ pub fn initialize_settings_for_tests_with_mode(
             BlockListSettings,
         },
         undo_close::UndoCloseSettings,
+        workflows::aliases::WorkflowAliases,
         user_config::WarpConfig,
         window_settings::WindowSettings,
         workspace::tab_settings::TabSettings,
@@ -40,6 +47,9 @@ pub fn initialize_settings_for_tests_with_mode(
     use warp_core::{execution_mode::AppExecutionMode, semantic_selection::SemanticSelection};
     app.add_singleton_model(|ctx| AppExecutionMode::new(mode, is_sandboxed, ctx));
 
+    // i18n 未初始化时 t!() 返回 key 本身,会让断言本地化文案的测试
+    // 随执行顺序 flaky;统一在这里初始化英文 bundle。
+    crate::i18n::init(Some("en"));
     app.update(init_and_register_user_preferences);
     app.add_singleton_model(|_ctx| SettingsManager::default());
     app.add_singleton_model(WarpConfig::mock);
@@ -65,10 +75,18 @@ pub fn initialize_settings_for_tests_with_mode(
     FontSettings::register(app);
     GeneralSettings::register(app);
     GPUSettings::register(app);
+    AutoupdateSettings::register(app);
     InputModeSettings::register(app);
     InputSettings::register(app);
+    LanguageSettings::register(app);
+    NetworkSettings::register(app);
     KeysSettings::register(app);
     LigatureSettings::register(app);
+
+    CloudSyncSettings::register(app);
+    UserAppInstallDetectionSettings::register(app);
+    WarpDrivePrivacySettings::register(app);
+    WorkflowAliases::register(app);
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
