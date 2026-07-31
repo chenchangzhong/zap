@@ -1004,24 +1004,30 @@ impl AIConversation {
     /// This filters the full task list using DFS linearization to determine
     /// which tasks have open subagent tool calls without corresponding results.
     pub fn compute_active_tasks(&self) -> Vec<warp_multi_agent_api::Task> {
-        use std::collections::HashMap;
-
         let root_task_id = self.get_root_task_id().to_string();
-        let all_tasks: HashMap<&str, &warp_multi_agent_api::Task> = self
+        let all_tasks: Vec<(&Task, &warp_multi_agent_api::Task)> = self
             .all_tasks()
             .filter_map(|task| {
                 let source = task.source()?;
-                Some((source.id.as_str(), source))
+                Some((task, source))
             })
             .collect();
+        let all_task_map: HashMap<&str, &warp_multi_agent_api::Task> = all_tasks
+            .iter()
+            .map(|(_, source)| (source.id.as_str(), *source))
+            .collect();
         let active_task_ids =
-            crate::ai::agent::linearization::compute_active_task_ids(&root_task_id, &all_tasks);
+            crate::ai::agent::linearization::compute_active_task_ids(&root_task_id, &all_task_map);
         all_tasks
-            .into_values()
-            .filter(|task| active_task_ids.contains(task.id.as_str()))
-            .cloned()
+            .into_iter()
+            .filter(|(task, source)| {
+                active_task_ids.contains(source.id.as_str())
+                    || is_silent_lrc_cli_subtask(task, &all_task_map)
+            })
+            .map(|(_, source)| source.clone())
             .collect()
     }
+
 
     /// Returns the titles from the CreateDocuments request corresponding to the given action ID (if any).
     /// This is used by shared-session viewers to use the correct document titles from the original CreateDocuments action.
@@ -3825,6 +3831,34 @@ impl AIConversation {
 /// 任何其它 mask path(tool_call.* / web_search / web_fetch / update_todos
 /// 等)走原 slow path,保持原行为。多 path mask 只要有一条非文本/推理就走
 /// slow path,稳健起见。
+/// Zap BYOP 专用:silent LRC 的 CLI subtask 由 `Task::new_byop_silent_cli_subtask`
+/// 本地合成,父任务消息里没有对应的 Subagent ToolCall(`tool_call_id` 只挂在
+/// `SubagentParams` 上)。`compute_active_task_ids` 的 DFS 只沿真实 ToolCall 扩展,
+/// 这类 subtask 永远不会入队 → 请求快照漏掉它 → 异步工具结果到达时被判
+/// `OrphanToolResult`,对话永久卡死(#328)。这里按"任务树中无匹配 ToolCall"
+/// 识别,强制纳入 active,让它的消息进入快照。
+fn is_silent_lrc_cli_subtask(
+    task: &Task,
+    all_tasks: &HashMap<&str, &warp_multi_agent_api::Task>,
+) -> bool {
+    if !task.is_cli_subagent() {
+        return false;
+    }
+    let Some(params) = task.subagent_params() else {
+        return false;
+    };
+    let has_matching_tool_call = all_tasks.values().any(|task| {
+        task.messages.iter().any(|message| {
+            matches!(
+                &message.message,
+                Some(warp_multi_agent_api::message::Message::ToolCall(tool_call))
+                    if tool_call.tool_call_id == params.tool_call_id
+            )
+        })
+    });
+    !has_matching_tool_call
+}
+
 fn is_pure_text_or_reasoning_mask(mask: &prost_types::FieldMask) -> bool {
     !mask.paths.is_empty()
         && mask

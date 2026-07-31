@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::{
     artifact_from_fork_proto, AIConversation, AIConversationAutoexecuteMode, AIConversationId,
-    TaskId,
+    Task, TaskId,
 };
 use crate::ai::artifacts::Artifact;
 use crate::ai::blocklist::{
@@ -932,4 +932,124 @@ fn fork_artifacts_adds_file_artifacts_to_conversation() {
             size_bytes: Some(42),
         })
     );
+}
+#[test]
+fn silent_lrc_cli_subtask_is_included_in_active_tasks() {
+    // #328 回归:BYOP silent LRC subtask 由 `create_optimistic_cli_subagent_task_silent`
+    // 本地合成,父任务消息里没有对应 Subagent ToolCall,DFS 线性化不会把它加入
+    // active 集。修复前请求快照漏掉它 → 异步工具结果到达时被判 OrphanToolResult,
+    // 对话永久卡死。
+    let mut conversation = AIConversation::new(false);
+    let subtask_id = conversation
+        .create_optimistic_cli_subagent_task_silent(&BlockId::from("block-1".to_string()));
+    // 注意:测试里的 root 还是 Optimistic(source 为 None),不会出现在快照;
+    // 真实运行场景 root 首轮已被 CreateTask 升级为 Server,快照同时含 root 与 subtask。
+    let active = conversation.compute_active_tasks();
+    assert!(
+        active.iter().any(|t| t.id == subtask_id.to_string()),
+        "silent LRC subtask 必须进入快照"
+    );
+}
+
+#[test]
+fn silent_lrc_cli_subtask_detection_requires_no_matching_tool_call() {
+    let subtask =
+        Task::new_byop_silent_cli_subtask(BlockId::from("block-1".to_string()), "root-task".to_string());
+    let subtask_source = subtask.source().expect("silent subtask 直接 Server-backed");
+    let root = api::Task {
+        id: "root-task".to_string(),
+        messages: vec![],
+        dependencies: None,
+        description: String::new(),
+        summary: String::new(),
+        server_data: String::new(),
+    };
+    let all_tasks: HashMap<&str, &api::Task> = HashMap::from([
+        ("root-task", &root),
+        (subtask_source.id.as_str(), subtask_source),
+    ]);
+    // 树中无匹配 ToolCall → 判定为 silent,必须保留在快照里。
+    assert!(super::is_silent_lrc_cli_subtask(&subtask, &all_tasks));
+}
+
+#[test]
+fn cli_subtask_with_matching_tool_call_is_not_flagged_silent() {
+    // 有真实 Subagent ToolCall 的 CLI subtask 走 DFS 语义,不能误判为 silent。
+    let subtask =
+        Task::new_byop_silent_cli_subtask(BlockId::from("block-1".to_string()), "root-task".to_string());
+    let params = subtask.subagent_params().expect("silent subtask 带 SubagentParams");
+    let subtask_source = subtask.source().expect("silent subtask 直接 Server-backed");
+    let root = api::Task {
+        id: "root-task".to_string(),
+        messages: vec![tool_call_message_with_tool(
+            "call-msg",
+            &params.tool_call_id,
+            cli_subagent_tool(subtask_source.id.as_str(), "block-1"),
+        )],
+        dependencies: None,
+        description: String::new(),
+        summary: String::new(),
+        server_data: String::new(),
+    };
+    let all_tasks: HashMap<&str, &api::Task> = HashMap::from([
+        ("root-task", &root),
+        (subtask_source.id.as_str(), subtask_source),
+    ]);
+    assert!(!super::is_silent_lrc_cli_subtask(&subtask, &all_tasks));
+}
+
+#[test]
+fn finished_cli_subtask_stays_excluded_from_active_tasks() {
+    // 回归:有真实 Subagent ToolCall + Result 的 CLI subtask 完成后不在 active 集。
+    let sub_id = "cli-subtask";
+    let root = api::Task {
+        id: "root-task".to_string(),
+        messages: vec![
+            tool_call_message_with_tool(
+                "tool-call-1",
+                "call-1",
+                cli_subagent_tool(sub_id, "block-1"),
+            ),
+            tool_call_result_message_with_result(
+                "tool-result-1",
+                "call-1",
+                api::message::tool_call_result::Result::RunShellCommand(
+                    api::RunShellCommandResult {
+                        command: "echo hi".to_string(),
+                        output: String::new(),
+                        exit_code: 0,
+                        result: Some(api::run_shell_command_result::Result::CommandFinished(
+                            api::ShellCommandFinished {
+                                command_id: "block-1".to_string(),
+                                output: "hi".to_string(),
+                                exit_code: 0,
+                            },
+                        )),
+                    },
+                ),
+            ),
+        ],
+        dependencies: None,
+        description: String::new(),
+        summary: String::new(),
+        server_data: String::new(),
+    };
+    let subtask = api::Task {
+        id: sub_id.to_string(),
+        messages: vec![user_query_message("user-1", "request-1", "run cli")],
+        dependencies: Some(api::task::Dependencies {
+            parent_task_id: "root-task".to_string(),
+        }),
+        description: String::new(),
+        summary: String::new(),
+        server_data: String::new(),
+    };
+    let conversation = AIConversation::new_restored(
+        AIConversationId::new(),
+        vec![root, subtask],
+        None,
+    )
+    .unwrap();
+    let active = conversation.compute_active_tasks();
+    assert!(!active.iter().any(|t| t.id == sub_id));
 }
