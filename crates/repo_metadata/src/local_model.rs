@@ -254,7 +254,6 @@ impl LocalRepoMetadataModel {
         self.emit_incremental_updates = enabled;
     }
 
-
     /// Handles events from the BulkFilesystemWatcher.
     #[cfg(feature = "local_fs")]
     fn handle_watcher_event(

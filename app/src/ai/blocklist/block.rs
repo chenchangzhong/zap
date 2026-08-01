@@ -3392,7 +3392,6 @@ impl AIBlock {
         ctx.notify();
     }
 
-
     pub fn accept_pending_unit_test_suggestion(
         &mut self,
         interaction_source: InteractionSource,
