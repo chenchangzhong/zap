@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use warp_util::path::EscapeChar;
-use warpui::{App, EntityId, ModelHandle};
+use warpui::{App, EntityId, ModelHandle, SingletonEntity};
 
 use warp_core::execution_mode::ExecutionMode;
+use warp_core::settings::Setting;
 
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::{
@@ -29,7 +30,7 @@ use crate::{
     cloud_object::model::persistence::ObjectStoreModel,
     cloud_object::update_manager::UpdateManager,
     network::NetworkStatus,
-    settings::{AgentModeCommandExecutionPredicate, PrivacySettings},
+    settings::{AISettings, AgentModeCommandExecutionPredicate, PrivacySettings},
     test_util::settings::initialize_settings_for_tests_with_mode,
     workspaces::{user_workspaces::UserWorkspaces, workspace::SandboxedAgentSettings},
     GlobalResourceHandles, GlobalResourceHandlesProvider, LaunchMode,
@@ -774,7 +775,7 @@ fn test_can_autoexecute_command_allowlist_precedence() {
 }
 
 #[test]
-fn test_can_autoexecute_command_denylist_beats_run_to_completion() {
+fn test_can_autoexecute_command_auto_approve_bypasses_user_denylist() {
     App::test((), |mut app| async move {
         let PermissionsTestState {
             convo_id,
@@ -792,6 +793,62 @@ fn test_can_autoexecute_command_denylist_beats_run_to_completion() {
                 &AgentModeCommandExecutionPredicate::new_regex("rm .*").unwrap(),
                 ctx,
             );
+        });
+
+        // Toggle run-to-completion override for this conversation.
+        history.update(&mut app, |history, ctx| {
+            history.toggle_autoexecute_override(&convo_id, terminal_view_id, ctx);
+        });
+
+        // With auto-approve enabled and the bypass setting on (the default),
+        // the user-configured denylist is bypassed and the command runs.
+        permissions.read(&app, |model, ctx| {
+            let result = model.can_autoexecute_command(
+                &convo_id,
+                "rm important.txt",
+                EscapeChar::Backslash,
+                false,
+                None,
+                Some(terminal_view_id),
+                ctx,
+            );
+            assert!(matches!(
+                result,
+                CommandExecutionPermission::Allowed(
+                    CommandExecutionPermissionAllowedReason::RunToCompletion
+                )
+            ));
+        });
+    })
+}
+
+#[test]
+fn test_can_autoexecute_command_denylist_beats_run_to_completion_without_bypass() {
+    App::test((), |mut app| async move {
+        let PermissionsTestState {
+            convo_id,
+            permissions,
+            history,
+            profile_model,
+            terminal_view_id,
+            ..
+        } = initialize_permissions_test(&mut app);
+
+        // Add a denylist rule that matches the test command.
+        profile_model.update(&mut app, |model, ctx| {
+            model.add_to_command_denylist(
+                *model.active_profile(Some(terminal_view_id), ctx).id(),
+                &AgentModeCommandExecutionPredicate::new_regex("rm .*").unwrap(),
+                ctx,
+            );
+        });
+
+        // Disable the bypass: auto-approve must not override the user denylist.
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .auto_approve_bypasses_command_denylist
+                .set_value(false, ctx)
+                .unwrap();
         });
 
         // Toggle run-to-completion override for this conversation.

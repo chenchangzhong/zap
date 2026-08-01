@@ -53,6 +53,13 @@ pub struct TemplatableMCPServerManager {
     /// we use them instead of going through the OAuth flow again.
     #[cfg(not(target_family = "wasm"))]
     server_credentials: oauth::PersistedCredentialsMap,
+    /// Loggers for spawned server instances, keyed by installation UUID.
+    ///
+    /// Kept so `shutdown_server`/`reconnect_server` can close the log stream
+    /// synchronously; otherwise an immediate respawn of the same server could
+    /// race the old instance's async teardown for the log path.
+    #[cfg(not(target_family = "wasm"))]
+    server_loggers: HashMap<Uuid, simple_logger::SimpleLogger>,
     /// Cached credentials for file-based servers, keyed by installation hash.
     #[cfg(not(target_family = "wasm"))]
     file_based_server_credentials: oauth::FileBasedPersistedCredentialsMap,

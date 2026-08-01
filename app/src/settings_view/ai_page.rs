@@ -22,13 +22,13 @@ use crate::settings::InputSettings;
 use crate::settings::{
     AIAutoDetectionEnabled, AICommandDenylist, AISettingsChangedEvent,
     AgentModeCodingPermissionsType, AgentModeCommandExecutionDenylist,
-    AgentModeCommandExecutionPredicate, AgentModeQuerySuggestionsEnabled, AwsBedrockAutoLogin,
-    AwsBedrockCredentialsEnabled, FileBasedMcpEnabled, GitOperationsAutogenEnabled,
-    IncludeAgentCommandsInHistory, IntelligentAutosuggestionsEnabled, MemoryEnabled,
-    NLDInTerminalEnabled, NaturalLanguageAutosuggestionsEnabled, RuleSuggestionsEnabled,
-    ShouldRenderCLIAgentToolbar, ShouldRenderUseAgentToolbarForUserCommands, ShowAgentTips,
-    ShowAgentZeroStateHints, ShowConversationHistory, ShowHintText, ThinkingDisplayMode,
-    VoiceInputEnabled,
+    AgentModeCommandExecutionPredicate, AgentModeQuerySuggestionsEnabled,
+    AutoApproveBypassesCommandDenylist, AwsBedrockAutoLogin, AwsBedrockCredentialsEnabled,
+    FileBasedMcpEnabled, GitOperationsAutogenEnabled, IncludeAgentCommandsInHistory,
+    IntelligentAutosuggestionsEnabled, MemoryEnabled, NLDInTerminalEnabled,
+    NaturalLanguageAutosuggestionsEnabled, RuleSuggestionsEnabled, ShouldRenderCLIAgentToolbar,
+    ShouldRenderUseAgentToolbarForUserCommands, ShowAgentTips, ShowAgentZeroStateHints,
+    ShowConversationHistory, ShowHintText, ThinkingDisplayMode, VoiceInputEnabled,
 };
 use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::cli_agent::{CLIAgentInstallEvent, CLIAgentInstallModel};
@@ -2253,6 +2253,7 @@ pub enum AISettingsPageAction {
     RefreshAwsBedrockCredentials,
     ToggleFileBasedMcp,
     ToggleIncludeAgentCommandsInHistory,
+    ToggleAutoApproveBypassesCommandDenylist,
     #[cfg(feature = "local_fs")]
     SetConversationLayout(crate::util::file::external_editor::settings::OpenConversationPreference),
     ToggleShowConversationHistory,
@@ -3043,6 +3044,14 @@ impl TypedActionView for AISettingsPageView {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(settings
                         .include_agent_commands_in_history
+                        .toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::ToggleAutoApproveBypassesCommandDenylist => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .auto_approve_bypasses_command_denylist
                         .toggle_and_save_value(ctx));
                 });
                 ctx.notify();
@@ -5265,6 +5274,7 @@ struct AIInputWidget {
     // 「显示 Agent 快捷键提示」开关对应的 switch 状态句柄。
     show_agent_zero_state_hints_toggle: SwitchStateHandle,
     include_agent_commands_in_history_toggle: SwitchStateHandle,
+    auto_approve_bypasses_command_denylist_toggle: SwitchStateHandle,
 }
 
 impl SettingsWidget for AIInputWidget {
@@ -5348,6 +5358,16 @@ impl SettingsWidget for AIInputWidget {
             *ai_settings.include_agent_commands_in_history,
             is_any_ai_enabled,
             self.include_agent_commands_in_history_toggle.clone(),
+            &view.local_only_icon_tooltip_states,
+            app,
+        ));
+
+        widget_children.push(render_ai_setting_toggle::<AutoApproveBypassesCommandDenylist>(
+            crate::t!("settings-ai-auto-approve-bypasses-command-denylist"),
+            AISettingsPageAction::ToggleAutoApproveBypassesCommandDenylist,
+            *ai_settings.auto_approve_bypasses_command_denylist,
+            is_any_ai_enabled,
+            self.auto_approve_bypasses_command_denylist_toggle.clone(),
             &view.local_only_icon_tooltip_states,
             app,
         ));

@@ -286,6 +286,7 @@ impl TemplatableMCPServerManager {
             active_servers: Default::default(),
             spawned_servers: Default::default(),
             server_credentials: Default::default(),
+            server_loggers: Default::default(),
             file_based_server_credentials: Default::default(),
             locally_installed_servers,
             database_connection,
@@ -796,9 +797,18 @@ impl TemplatableMCPServerManager {
                     safe: ("Failed to register MCP log file: {}", e.safe_message()),
                     full: ("Failed to register MCP log file for {template_uuid}: {e}")
                 );
+                self.change_server_state(installation_uuid, MCPServerState::FailedToStart, ctx);
+                if mode.is_reconnect() {
+                    self.notify_reconnect_waiters(
+                        installation_uuid,
+                        Err("Failed to register MCP log file".to_string()),
+                    );
+                }
                 return;
             }
         };
+        self.server_loggers
+            .insert(installation_uuid, logger.clone());
         let logger_clone = logger.clone();
 
         // Create channel that we can use to send OAuth callback results
@@ -874,6 +884,7 @@ impl TemplatableMCPServerManager {
                         logger_clone
                             .log(format!("[error] MCP: Failed to connect to server: {e:#}"));
                         // Close the logger to make sure we flush any remaining data.
+                        me.server_loggers.remove(&installation_uuid);
                         logger_clone.close();
                         log::warn!("Failed to spawn MCP server: {e:#}");
 
@@ -941,6 +952,12 @@ impl TemplatableMCPServerManager {
         // We do both to avoid race conditions and have to do it in this order to avoid the server connecting between the shutdown_server and cancel_spawn calls
         if let Some(spawned_info) = self.spawned_servers.remove(&installation_uuid) {
             spawned_info.abort_handle.abort();
+        }
+        // Close the log stream now rather than when async teardown drops the
+        // last logger clone, so an immediate respawn of the same server can
+        // re-register its log path.
+        if let Some(logger) = self.server_loggers.remove(&installation_uuid) {
+            logger.close();
         }
         self.pending_oauth_csrf
             .retain(|_, v| *v != installation_uuid);
@@ -1543,6 +1560,11 @@ impl TemplatableMCPServerManager {
         // Cancel any in-flight spawn.
         if let Some(spawned_info) = self.spawned_servers.remove(&installation_uuid) {
             spawned_info.abort_handle.abort();
+        }
+        // Close the outgoing instance's log stream synchronously so the
+        // replacement spawn can re-register the log path deterministically.
+        if let Some(logger) = self.server_loggers.remove(&installation_uuid) {
+            logger.close();
         }
         self.pending_oauth_csrf
             .retain(|_, v| *v != installation_uuid);

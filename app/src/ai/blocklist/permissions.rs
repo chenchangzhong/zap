@@ -854,8 +854,21 @@ impl BlocklistAIPermissions {
         // break it up first.
         let (commands, contains_redirection) = decompose_command(&normalized_command, escape_char);
 
-        // The denylist takes precedence over all other conditions.
-        let denylist = self.get_execute_commands_denylist(ctx, terminal_view_id);
+        // Auto-approve may bypass the user-configured denylist (see
+        // `auto_approve_bypasses_command_denylist`). Zap has no
+        // organization/workspace policy denylist, so when bypassing there is
+        // nothing else to enforce; otherwise the user denylist takes
+        // precedence over all remaining conditions.
+        let auto_approve_enabled = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(conversation_id)
+            .is_some_and(|convo| convo.autoexecute_any_action());
+        let bypass_user_denylist = auto_approve_enabled
+            && *AISettings::as_ref(ctx).auto_approve_bypasses_command_denylist;
+        let denylist = if bypass_user_denylist {
+            Vec::new()
+        } else {
+            self.get_execute_commands_denylist(ctx, terminal_view_id)
+        };
         if commands
             .iter()
             .any(|c| denylist.iter().any(|d| d.matches(c)))
@@ -865,10 +878,7 @@ impl BlocklistAIPermissions {
             );
         }
 
-        if BlocklistAIHistoryModel::as_ref(ctx)
-            .conversation(conversation_id)
-            .is_some_and(|convo| convo.autoexecute_any_action())
-        {
+        if auto_approve_enabled {
             return CommandExecutionPermission::Allowed(
                 CommandExecutionPermissionAllowedReason::RunToCompletion,
             );

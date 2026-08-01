@@ -923,6 +923,7 @@ settings-ai-show-input-hint-text = 入力ヒントを表示
 settings-ai-show-agent-tips = エージェントのヒントを表示
 settings-ai-show-agent-zero-state-hints = エージェントのショートカットヒントを表示
 settings-ai-include-agent-commands-in-history = エージェントが実行したコマンドを履歴に含める
+settings-ai-auto-approve-bypasses-command-denylist = 自動承認がコマンド拒否リストをバイパスすることを許可
 settings-ai-autodetect-agent-prompts = ターミナル入力中のエージェントプロンプトを自動検出
 settings-ai-autodetect-terminal-commands = エージェント入力中のターミナルコマンドを自動検出
 settings-ai-natural-language-detection = 自然言語の検出

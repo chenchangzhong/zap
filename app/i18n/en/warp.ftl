@@ -987,6 +987,7 @@ settings-ai-show-input-hint-text = Show input hint text
 settings-ai-show-agent-tips = Show agent tips
 settings-ai-show-agent-zero-state-hints = Show Agent shortcut hints
 settings-ai-include-agent-commands-in-history = Include agent-executed commands in history
+settings-ai-auto-approve-bypasses-command-denylist = Allow auto-approve to bypass command denylist
 settings-ai-autodetect-agent-prompts = Autodetect agent prompts in terminal input
 settings-ai-autodetect-terminal-commands = Autodetect terminal commands in agent input
 settings-ai-natural-language-detection = Natural language detection

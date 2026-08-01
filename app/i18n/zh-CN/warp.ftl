@@ -969,6 +969,7 @@ settings-ai-show-input-hint-text = 显示输入提示文本
 settings-ai-show-agent-tips = 显示智能体提示
 settings-ai-show-agent-zero-state-hints = 显示 Agent 快捷键提示
 settings-ai-include-agent-commands-in-history = 将智能体执行的命令纳入历史
+settings-ai-auto-approve-bypasses-command-denylist = 允许自动批准模式绕过命令拒绝列表
 settings-ai-autodetect-agent-prompts = 在终端输入中自动检测智能体提示
 settings-ai-autodetect-terminal-commands = 在智能体输入中自动检测终端命令
 settings-ai-natural-language-detection = 自然语言检测
