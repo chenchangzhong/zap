@@ -46,6 +46,7 @@ fn create_test_task(
         updated_at,
         status_message: None,
         source: None,
+        execution_location: None,
         session_id: None,
         session_link: None,
         creator: Some(TaskCreatorInfo {

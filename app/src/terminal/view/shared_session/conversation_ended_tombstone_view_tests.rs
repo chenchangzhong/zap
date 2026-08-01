@@ -29,6 +29,7 @@ fn task_with_run_time_and_credits() -> AmbientAgentTask {
         updated_at,
         status_message: None,
         source: None,
+        execution_location: None,
         session_id: None,
         session_link: None,
         creator: Some(TaskCreatorInfo {

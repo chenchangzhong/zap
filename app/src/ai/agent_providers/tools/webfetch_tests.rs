@@ -318,7 +318,6 @@ fn blocked_ip_ipv4_basics() {
         "192.0.2.1",       // TEST-NET-1
         "198.51.100.1",    // TEST-NET-2
         "203.0.113.1",     // TEST-NET-3
-        "198.18.0.1",      // 性能测试地址
         "224.0.0.1",       // 组播
         "239.255.255.255", // 组播上界
         "240.0.0.1",       // 保留地址
@@ -327,7 +326,9 @@ fn blocked_ip_ipv4_basics() {
         assert!(is_blocked_ip(ip), "should block {blocked}");
     }
     // 公网 IP 不能被误拦截。
-    for allowed in ["8.8.8.8", "1.1.1.1", "93.184.216.34"] {
+    // 198.18.0.0/15(RFC 2544 性能测试段)也放行：Clash/Surge fake-ip 代理
+    // 把公网域名解析到该段，由 TUN 层 NAT 转发，阻止会误杀 webfetch/websearch。
+    for allowed in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "198.18.0.1"] {
         let ip: IpAddr = allowed.parse().unwrap();
         assert!(!is_blocked_ip(ip), "should allow {allowed}");
     }
