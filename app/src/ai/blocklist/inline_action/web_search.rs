@@ -6,6 +6,7 @@ use warpui::{AppContext, Entity, SingletonEntity, TypedActionView, View, ViewCon
 use super::search_results_common::{
     render_collapsible_search_results, CollapsibleSearchResultsState,
 };
+use crate::ai::agent::icons::failed_icon;
 use crate::ai::agent::WebSearchStatus;
 use crate::ai::blocklist::block::view_impl::WithContentItemSpacing;
 use crate::ui_components::spinner::SpinnerStateHandle;
@@ -38,7 +39,21 @@ impl WebSearchView {
     }
 
     pub fn set_status(&mut self, status: &WebSearchStatus) {
-        self.status = status.clone();
+        // 对齐上游:proto error status 不带 query,保留上一次的 query 用于失败卡标题。
+        self.status = match status {
+            WebSearchStatus::Error { query } if query.is_empty() => WebSearchStatus::Error {
+                query: self.current_query(),
+            },
+            other => other.clone(),
+        };
+    }
+
+    fn current_query(&self) -> String {
+        match &self.status {
+            WebSearchStatus::Searching { query } => query.clone().unwrap_or_default(),
+            WebSearchStatus::Success { query, .. } => query.clone(),
+            WebSearchStatus::Error { query } => query.clone(),
+        }
     }
 
     fn render_loading(&self, query: &Option<String>, app: &AppContext) -> Box<dyn Element> {
@@ -169,11 +184,21 @@ impl View for WebSearchView {
                 .with_agent_output_item_spacing(app)
                 .finish(),
             WebSearchStatus::Error { query } => {
-                // For now, render as if search completed with no results
-                // TODO(advait): Add proper error rendering
-                self.render_success(query, &[], app)
-                    .with_agent_output_item_spacing(app)
-                    .finish()
+                // 对齐上游 warpdotdev/warp:失败卡显示明确 header + 失败图标,
+                // 不再伪装成空结果。具体错误信息在模型的 tool_result 消息里。
+                let appearance = Appearance::as_ref(app);
+                let text = if query.is_empty() {
+                    "Web search failed".to_string()
+                } else {
+                    format!("Web search failed for \"{query}\"")
+                };
+                super::search_results_common::render_status_header(
+                    text,
+                    failed_icon(appearance),
+                    app,
+                )
+                .with_agent_output_item_spacing(app)
+                .finish()
             }
         }
     }

@@ -219,6 +219,50 @@ pub fn render_terminal_header_strikethrough(
         .finish()
 }
 
+/// 终态 header(loading / error 等):icon 为静态,标题正常色。
+/// 对齐上游 warpdotdev/warp 的 `render_status_header`(web_fetch / web_search
+/// 的 Error 卡用它表达"操作失败",与 `render_terminal_header_strikethrough`
+/// 的"被取消/被驳回"删除线语义区分)。
+pub fn render_status_header(
+    text: String,
+    icon: warpui::elements::Icon,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let header_background = theme.surface_2();
+
+    let mut header_row = Flex::row()
+        .with_main_axis_alignment(MainAxisAlignment::Start)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center);
+
+    let icon_box = ConstrainedBox::new(icon.finish())
+        .with_width(icon_size(app))
+        .with_height(icon_size(app))
+        .finish();
+    header_row.add_child(
+        Container::new(icon_box)
+            .with_margin_right(ICON_MARGIN)
+            .finish(),
+    );
+
+    let title = Text::new_inline(
+        text,
+        appearance.ui_font_family(),
+        appearance.monospace_font_size(),
+    )
+    .with_color(appearance.theme().main_text_color(header_background).into())
+    .finish();
+    header_row.add_child(Shrinkable::new(1.0, title).finish());
+
+    Container::new(header_row.finish())
+        .with_horizontal_padding(INLINE_ACTION_HORIZONTAL_PADDING)
+        .with_vertical_padding(INLINE_ACTION_HEADER_VERTICAL_PADDING)
+        .with_background(header_background)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .finish()
+}
+
 enum IconOrSpinner {
     Icon(warpui::elements::Icon),
     Spinner(SpinnerStateHandle),
