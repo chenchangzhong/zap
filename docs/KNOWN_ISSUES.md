@@ -52,15 +52,27 @@
 
 ---
 
-## 4. 8 个共享会话测试挂(Zap 切断共享会话网络链路)
+## 4. 共享会话测试挂(Zap 切断共享会话网络链路)
 
-- **状态**:已解决(2026-07-31)—— 采纳方案 (b),8 个测试及共享会话 mock helper 已删除
-  (`app/src/workspace/view_test.rs`,commit 见本轮 `test: 删除共享会话遗留测试`);
-  `workspace::view` 恢复 105 passed / 0 failed / 6 ignored(仅剩既有 ignore)
-- **现象**:`workspace::view` 修复问题 2 后暴露,8 个测试失败:
-  - `test_close_last_tab_skip_confirmation`、`test_close_other_tabs_confirmation_dialog`、`test_close_pane_confirmation_dialog`、`test_close_tab_confirmation_dialog`、`test_close_tabs_right_confirmation_dialog`、`test_confirmation_dialog_dont_show_again`、`test_reopen_closed_shared_tab`(均在 `setup_session_sharing_test` 的 `number_of_shared_sessions_in_tab == 0` 断言,view_test.rs:930)
-  - `test_view_only_session`(terminal/input.rs:10191,`shared_session_status().is_viewer()` 断言)
-- **根因**:Zap 本地化切断了 Shared Session 网络入口,`TerminalView::attempt_to_share_session`(app/src/terminal/view/shared_session/view_impl.rs:211)整体 no-op;测试 setup 调用它后不产生共享会话,后续断言无法成立。测试是上游共享会话功能的遗留,功能切断后未同步删除/重写。
-- **影响**:低。仅测试失效;共享会话 UI 入口已随功能下线。
-- **处理**:选 (b) 删除(功能已下线,回归价值低;mock 链路依赖 no-op 入口,重写成本高收益低)。
-- **涉及文件**:`app/src/workspace/view_test.rs`(8 个被 ignore 的测试)、`app/src/terminal/view/shared_session/view_impl.rs`(`attempt_to_share_session`)
+- **状态**:已解决(2026-07-31)—— 云服务相关测试全部删除(用户拍板:Zap 无云服务功能)
+- **首批删除**(commit `89040c1f6`):`workspace::view_test.rs` 8 个共享会话测试 + 4 个 mock helper;
+  `workspace::view` 恢复 105 passed / 0 failed / 6 ignored。
+- **根因**:Zap 本地化切断了 Shared Session 网络入口,`TerminalView::attempt_to_share_session`
+  (app/src/terminal/view/shared_session/view_impl.rs:211)整体 no-op;共享会话测试 setup 依赖它
+  建立共享会话,功能切断后断言无法成立。
+- **本批删除(commit 见本轮)**:`terminal::shared_session` 与 `terminal::view::shared_session`
+  全部测试文件(5 个:mod_test / view_impl_test / presence_manager_test / selections_test /
+  test_utils),30+ 测试:
+  - web URL → shared session intent 改写 3 个(web_intent_parser 已无 shared_session 分支)
+  - viewer UI 5 个(banner / resize / context menu / tombstone;viewer 链路生产不可达,
+    且 on_session_share_ended 的 tombstone 插入已随 CloudModeSetupV2 退役删除)
+  - presence manager / selections 测试(共享会话组件,云功能)
+  - 同步清理:`max_session_size` 的 `#[cfg(test)]` 版本与 `pub use tests::MAX_BYTES_SHAREABLE`(死桥)
+- **云相关单测清理**:
+  - 删 `cloud_object::model::persistence::tests::test_shared_team_object`(Owner::mock_current_user
+    断言 Shared,与 Zap 语义矛盾:本地 Owner 归 Personal;团队空间语义 has_teams=false 已死)
+  - 适配 `drive::index::tests::test_retry_menu_item_visibility`(Zap 删 drive-share 菜单项、加
+    Trash 项;断言改为 Edit / Copy workflow text / Duplicate / Export / Trash,Retry 可见性逻辑保留)
+- **涉及文件**:`app/src/terminal/shared_session/*`(5 个测试文件删除 + 3 处声明清理)、
+  `app/src/terminal/view/shared_session/*`、`app/src/cloud_object/model/model_test.rs`、
+  `app/src/drive/index_test.rs`

@@ -1182,7 +1182,4 @@ impl TerminalView {
     }
 }
 
-#[cfg(test)]
-#[path = "view_impl_test.rs"]
-mod tests;
 use crate::auth::UserUid;

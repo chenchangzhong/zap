@@ -780,6 +780,3 @@ impl Entity for PresenceManager {
     type Event = Event;
 }
 
-#[cfg(test)]
-#[path = "presence_manager_test.rs"]
-mod tests;

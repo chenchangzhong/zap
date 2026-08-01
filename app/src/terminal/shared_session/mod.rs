@@ -24,8 +24,7 @@ pub mod settings;
 // Zap:删除 share_modal(云端 shared session 弹窗)
 pub mod viewer;
 
-#[cfg(test)]
-pub use tests::MAX_BYTES_SHAREABLE;
+
 
 /// The toast copy when copying a shared session link.
 pub const COPY_LINK_TEXT: &str = "Sharing link copied";
@@ -250,10 +249,6 @@ pub fn max_session_size(ctx: &AppContext) -> Byte {
         .unwrap_or(Byte::from_u64_with_unit(100, byte_unit::Unit::MB).unwrap())
 }
 
-#[cfg(test)]
-pub fn max_session_size(_ctx: &AppContext) -> Byte {
-    Byte::from_u64(MAX_BYTES_SHAREABLE as u64)
-}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum SharedSessionActionSource {
@@ -361,6 +356,3 @@ pub(crate) fn decode_scrollback(scrollback: &Scrollback) -> Vec<SerializedBlock>
         .collect()
 }
 
-#[cfg(test)]
-#[path = "mod_test.rs"]
-mod tests;

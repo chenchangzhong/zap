@@ -619,44 +619,6 @@ fn test_unshared_personal_object() {
     });
 }
 
-#[test]
-fn test_shared_team_object() {
-    let _guard = FeatureFlag::SharedWithMe.override_enabled(true);
-    App::test((), |mut app| async move {
-        initialize_app(&mut app, Vec::new());
-
-        // The user is not on this team.
-        let team_uid = ServerId::from(456);
-
-        let shared_notebook_id = SyncId::ServerId(123.into());
-        let shared_notebook = NotebookObject::new(
-            shared_notebook_id,
-            NotebookObjectModel {
-                title: "Shared Notebook".to_string(),
-                data: "Hello".to_string(),
-                ai_document_id: None,
-                conversation_id: None,
-            },
-            mock_stored_metadata(),
-            StoredObjectPermissions {
-                owner: Owner::mock_current_user(),
-                guests: Vec::new(),
-                permissions_last_updated_ts: None,
-                anyone_with_link: None,
-            },
-        );
-
-        ObjectStoreModel::handle(&app).update(&mut app, |object_store_model, ctx| {
-            object_store_model.add_object(shared_notebook_id, shared_notebook);
-
-            let space = object_store_model
-                .get_notebook(&shared_notebook_id)
-                .expect("Notebook is in ObjectStoreModel")
-                .space(ctx);
-            assert_eq!(space, Space::Shared);
-        });
-    });
-}
 
 #[test]
 fn test_unshared_team_object() {
