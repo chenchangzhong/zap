@@ -1,4 +1,4 @@
-// zap-omp-switch-model v1 — 此标记用于检测扩展是否已安装
+// zap-omp-switch-model-v2 — 此标记用于检测扩展是否已安装(v2:上报 socket 就绪事件)
 import { unlinkSync, existsSync } from "node:fs";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -8,7 +8,7 @@ const isWin = process.platform === "win32";
 // socket 路径按 session 命名，避免多 omp 进程抢占同一 socket 导致串号。
 // session_id 在 session_start 时确定；缺失时回退到全局路径（兼容旧客户端）。
 function sockPathFor(sessionId) {
-  const name = sessionId ? `omp-model-switch-${sessionId}.sock` : "omp-model-switch.sock";
+  const name = sessionId ? `model-switch-${sessionId}.sock` : "model-switch.sock";
   return isWin ? join(tmpdir(), name)
     : join(homedir(), ".omp", "agent", sessionId ? `model-switch-${sessionId}.sock` : "model-switch.sock");
 }
@@ -46,6 +46,15 @@ function reportModelChange(model) {
   const body = JSON.stringify({ v: 1, agent: "omp", event: "model_change", model: key });
   process.stdout.write(`\x1b]777;notify;warp://cli-agent;${body}\x07`);
   lastReportedModel = key;
+}
+
+// 通过 OSC 777 向 Zap 上报模型切换 socket 已就绪（携带扩展实际使用的
+// session_id）。Zap 侧据此精确找到本进程的 socket；omp 恢复旧会话时
+// OSC777 session_start 的 session_id 与扩展 socket 命名可能不一致，
+// 只信 OSC777 会连到不存在的 socket 文件。
+function reportModelSwitchReady(sessionId) {
+  const body = JSON.stringify({ v: 1, agent: "omp", event: "model_switch_ready", session_id: sessionId ?? null });
+  process.stdout.write(`\x1b]777;notify;warp://cli-agent;${body}\x07`);
 }
 
 async function switchTo(selector, ctx) {
@@ -141,6 +150,7 @@ export default function (ext) {
     try { sessionId = ctx?.sessionManager?.getSessionId?.() ?? null; } catch { /* ignore */ }
     sockPath = sockPathFor(sessionId);
     startSocket();
+    reportModelSwitchReady(sessionId);
     // 初始化基线，避免启动时误报。
     lastReportedModel = modelKey(currentModel(ctx));
   });

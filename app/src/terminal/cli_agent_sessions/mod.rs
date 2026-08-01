@@ -40,6 +40,10 @@ pub struct CLIAgentSessionContext {
     pub cwd: Option<String>,
     pub project: Option<String>,
     pub session_id: Option<String>,
+    /// OMP 扩展上报的模型切换 socket 命名 id（`model-switch-<id>.sock`）。
+    /// 与 `session_id` 独立：omp 恢复旧会话时 OSC777 session_start 的
+    /// session_id 可能没有对应 socket，切换模型时应优先用这个 id。
+    pub model_switch_socket_id: Option<String>,
     pub tool_name: Option<String>,
     pub tool_input_preview: Option<String>,
     pub summary: Option<String>,
@@ -153,15 +157,19 @@ impl CLIAgentSession {
     /// Applies an event to this session, updating context and status.
     /// Returns the new status if it changed, or `None` if the event was irrelevant.
     fn apply_event(&mut self, event: &CLIAgentEvent) -> Option<CLIAgentSessionStatus> {
-        self.session_context.cwd = event.cwd.clone().or(self.session_context.cwd.take());
-        self.session_context.project = event
-            .project
-            .clone()
-            .or(self.session_context.project.take());
-        self.session_context.session_id = event
-            .session_id
-            .clone()
-            .or(self.session_context.session_id.take());
+        // model_switch_ready 只更新 socket 绑定 id，不覆盖 session_id / cwd / project
+        //（其 session_id 是扩展侧 socket 命名，与 OSC777 通知的会话 id 可能不同）。
+        if !matches!(event.event, CLIAgentEventType::ModelSwitchReady) {
+            self.session_context.cwd = event.cwd.clone().or(self.session_context.cwd.take());
+            self.session_context.project = event
+                .project
+                .clone()
+                .or(self.session_context.project.take());
+            self.session_context.session_id = event
+                .session_id
+                .clone()
+                .or(self.session_context.session_id.take());
+        }
 
         let new_status = match &event.event {
             CLIAgentEventType::PromptSubmit => {
@@ -210,6 +218,10 @@ impl CLIAgentSession {
             CLIAgentEventType::IdlePrompt => return None,
             CLIAgentEventType::ModelChange => {
                 self.current_model = event.payload.model.clone();
+                return None;
+            }
+            CLIAgentEventType::ModelSwitchReady => {
+                self.session_context.model_switch_socket_id = event.session_id.clone();
                 return None;
             }
             CLIAgentEventType::SessionStart => {

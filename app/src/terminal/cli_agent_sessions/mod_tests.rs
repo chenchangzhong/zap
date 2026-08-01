@@ -115,6 +115,18 @@ fn parse_session_start_notification() {
 }
 
 #[test]
+fn parse_model_switch_ready_notification() {
+    let body = r#"{"v":1,"agent":"omp","event":"model_switch_ready","session_id":"019fbc91-a15f-7000-8c72-742b83d1eb0b"}"#;
+    let notif = parse_event(Some("warp://cli-agent"), body).unwrap();
+
+    assert_eq!(notif.event, CLIAgentEventType::ModelSwitchReady);
+    assert_eq!(
+        notif.session_id.as_deref(),
+        Some("019fbc91-a15f-7000-8c72-742b83d1eb0b")
+    );
+}
+
+#[test]
 fn returns_none_for_wrong_sentinel() {
     let body = r#"{"v":1,"agent":"claude","event":"stop"}"#;
     assert!(parse_event(Some("Claude Code"), body).is_none());
@@ -395,6 +407,50 @@ fn failure_tracking_is_independent_per_agent() {
 
     assert!(model.has_plugin_auto_failed(CLIAgent::Claude, &None));
     assert!(!model.has_plugin_auto_failed(CLIAgent::Gemini, &None));
+}
+
+#[test]
+fn model_switch_ready_updates_socket_id_without_overwriting_session_id() {
+    let mut session = CLIAgentSession {
+        agent: CLIAgent::OhMyPi,
+        status: CLIAgentSessionStatus::InProgress,
+        session_context: CLIAgentSessionContext {
+            session_id: Some("019fbc8d-d85c-7000-99b8-25884842611d".to_owned()),
+            ..Default::default()
+        },
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        current_model: None,
+    };
+
+    let event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::ModelSwitchReady,
+        session_id: Some("019fbc91-a15f-7000-8c72-742b83d1eb0b".to_owned()),
+        cwd: Some("/tmp".to_owned()),
+        project: Some("proj".to_owned()),
+        payload: CLIAgentEventPayload::default(),
+    };
+
+    session.apply_event(&event);
+
+    // 只更新 socket 绑定 id，不覆盖 OSC777 的会话 id / cwd / project
+    assert_eq!(
+        session.session_context.model_switch_socket_id.as_deref(),
+        Some("019fbc91-a15f-7000-8c72-742b83d1eb0b")
+    );
+    assert_eq!(
+        session.session_context.session_id.as_deref(),
+        Some("019fbc8d-d85c-7000-99b8-25884842611d")
+    );
+    assert_eq!(session.session_context.cwd, None);
+    assert_eq!(session.session_context.project, None);
 }
 
 #[test]

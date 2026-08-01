@@ -363,12 +363,9 @@ impl TypedActionView for OmpModelSelector {
                 self.switch_error = None;
                 self.switch_seq += 1;
                 let seq = self.switch_seq;
-                self.rebuild_menu_items(ctx);
                 ctx.emit(OmpModelSelectorEvent::ModelSelected { selector: sel.clone() });
                 // 通过该 session 专属的 socket 通知运行中的 omp 进行进程内切换（不回显、按 session 定向）。
-                let session_id = CLIAgentSessionsModel::as_ref(ctx)
-                    .session(self.terminal_view_id)
-                    .and_then(|s| s.session_context.session_id.clone());
+                let session_id = self.current_socket_id(ctx);
                 if let Some(session_id) = session_id {
                     self.send_notification(sel, session_id, old_selection, seq, ctx);
                 } else {
@@ -382,6 +379,21 @@ impl TypedActionView for OmpModelSelector {
 }
 
 impl OmpModelSelector {
+    /// 取当前会话用于 socket 通知的 id：优先扩展上报的 model_switch_socket_id
+    /// （该 id 一定对应存在的 socket），缺失时才回退到 OSC777 session_id
+    /// （omp 恢复旧会话时 OSC777 的 session_id 可能没有对应 socket）。
+    fn current_socket_id(&self, ctx: &AppContext) -> Option<String> {
+        CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.terminal_view_id)
+            .and_then(|s| {
+                s.session_context
+                    .model_switch_socket_id
+                    .clone()
+                    .or_else(|| s.session_context.session_id.clone())
+            })
+    }
+
+
     /// 通过 session 专属 socket 发送模型切换通知。
     fn send_notification(&mut self, selector: String, session_id: String, old_selection: Option<String>, seq: u64, ctx: &mut ViewContext<Self>) {
         ctx.spawn(async move {
@@ -393,10 +405,9 @@ impl OmpModelSelector {
     }
 
     /// session_id 未就绪时的轮询通知：每 250ms 重取一次，最多 attempts_left 次（约 3 秒）。
+    /// 优先使用扩展上报的 model_switch_socket_id（该 id 一定对应存在的 socket），
     fn notify_when_ready(&mut self, selector: String, old_selection: Option<String>, seq: u64, attempts_left: u32, ctx: &mut ViewContext<Self>) {
-        let session_id = CLIAgentSessionsModel::as_ref(ctx)
-            .session(self.terminal_view_id)
-            .and_then(|s| s.session_context.session_id.clone());
+        let session_id = self.current_socket_id(ctx);
         if let Some(session_id) = session_id {
             self.send_notification(selector, session_id, old_selection, seq, ctx);
         } else if attempts_left > 0 {
@@ -439,7 +450,8 @@ impl OmpModelSelector {
 }
 
 /// OMP 模型切换扩展源码中的唯一标记，用于检测是否已安装。
-const OMP_EXTENSION_MARKER: &str = "zap-omp-switch-model";
+/// v2 起包含 socket 就绪上报，旧版扩展检测不到会触发重新安装。
+const OMP_EXTENSION_MARKER: &str = "zap-omp-switch-model-v2";
 
 /// 检查 `~/.omp/agent/extensions/` 下是否有包含标记的扩展文件。
 /// 读每个 .ts 文件头几字节匹配标记，避免大文件误读。
@@ -519,3 +531,7 @@ fn render_search_header(editor: &ViewHandle<EditorView>, app: &AppContext) -> Bo
         .with_border(Border::bottom(1.).with_border_fill(theme.surface_3()))
         .finish()
 }
+
+#[cfg(test)]
+#[path = "omp_model_selector_tests.rs"]
+mod tests;

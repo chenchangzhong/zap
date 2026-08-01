@@ -24,6 +24,7 @@ pub(super) fn parse(body: &str) -> Option<CLIAgentEvent> {
         "question_asked" => CLIAgentEventType::QuestionAsked,
         "idle_prompt" => CLIAgentEventType::IdlePrompt,
         "model_change" => CLIAgentEventType::ModelChange,
+        "model_switch_ready" => CLIAgentEventType::ModelSwitchReady,
         other => CLIAgentEventType::Unknown(other.to_string()),
     };
 

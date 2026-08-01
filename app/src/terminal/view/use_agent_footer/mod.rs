@@ -589,6 +589,12 @@ impl TerminalView {
             );
         }
 
+        // Rich input may have been open, which hides the use-agent footer
+        // (both `should_render_use_agent_footer` and `UseAgentToolbar::render`
+        // check the rich input session state). Re-evaluate so the footer
+        // reappears now that the rich input is closed.
+        self.maybe_show_use_agent_footer_in_blocklist(ctx);
+
         self.redetermine_terminal_focus(ctx);
         ctx.notify();
     }

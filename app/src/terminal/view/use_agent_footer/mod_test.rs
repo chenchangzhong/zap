@@ -21,8 +21,8 @@ use crate::{
     features::FeatureFlag,
     settings::AISettings,
     terminal::cli_agent_sessions::{
-        CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus,
-        CLIAgentSessionsModel,
+        CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentRichInputCloseReason, CLIAgentSession,
+        CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
     },
     terminal::model::ansi::{BootstrappedValue, Handler as _, InitShellValue},
     terminal::CLIAgent,
@@ -387,6 +387,76 @@ fn cli_agent_footer_renders_for_viewer_of_shared_ambient_agent_session() {
                 view.should_render_use_agent_footer(&model, ctx),
                 "footer should render for viewer of shared ambient agent session with CLI agent",
             );
+            let active_block_index = model.block_list().active_block_index();
+            let rendered_footer_view_id = model
+                .block_list()
+                .last_non_hidden_rich_content_block_after_block(Some(active_block_index))
+                .map(|(_, item)| item.view_id);
+            assert_eq!(rendered_footer_view_id, Some(view.use_agent_footer.id()));
+        });
+    })
+}
+
+/// 回归测试:rich input 打开期间 footer 被从 blocklist 移除后,关闭 rich input
+/// 必须重新评估并恢复 footer。修复前 close 路径不触发重评估,footer 永久丢失。
+#[test]
+fn closing_cli_agent_rich_input_restores_use_agent_footer() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        FeatureFlag::AgentView.set_enabled(true);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            simulate_user_started_long_running_command(view);
+
+            // 创建 CLI agent 会话(input_state 保持 Closed,不自动打开 rich input)
+            let view_id = view.id();
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view_id,
+                    CLIAgentSession {
+                        agent: CLIAgent::Claude,
+                        status: CLIAgentSessionStatus::InProgress,
+                        session_context: CLIAgentSessionContext::default(),
+                        input_state: CLIAgentInputState::Closed,
+                        should_auto_toggle_input: false,
+                        listener: None,
+                        remote_host: None,
+                        plugin_version: None,
+                        draft_text: None,
+                        custom_command_prefix: None,
+                        current_model: None,
+                    },
+                    ctx,
+                );
+            });
+
+            // 初始状态:footer 应已插入 blocklist
+            view.maybe_show_use_agent_footer_in_blocklist(ctx);
+            {
+                let model = view.model.lock();
+                let active_block_index = model.block_list().active_block_index();
+                let rendered_footer_view_id = model
+                    .block_list()
+                    .last_non_hidden_rich_content_block_after_block(Some(active_block_index))
+                    .map(|(_, item)| item.view_id);
+                assert_eq!(rendered_footer_view_id, Some(view.use_agent_footer.id()));
+            }
+
+            // 打开 rich input
+            view.open_cli_agent_rich_input(CLIAgentInputEntrypoint::FooterButton, ctx);
+            assert!(view.has_active_cli_agent_input_session(ctx));
+
+            // 模拟 rich input 打开期间 footer 因重评估被从 blocklist 移除
+            view.hide_use_agent_footer_in_blocklist(ctx);
+
+            // 关闭 rich input:修复前不会重插 footer,修复后会恢复
+            view.close_cli_agent_rich_input(CLIAgentRichInputCloseReason::Manual, ctx);
+            assert!(!view.has_active_cli_agent_input_session(ctx));
+
+            let model = view.model.lock();
             let active_block_index = model.block_list().active_block_index();
             let rendered_footer_view_id = model
                 .block_list()

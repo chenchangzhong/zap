@@ -23,6 +23,8 @@ pub enum CLIAgentEventType {
     QuestionAsked,
     IdlePrompt,
     ModelChange,
+    /// OMP 扩展上报：模型切换 socket 已就绪，`session_id` 为该 socket 的命名 id。
+    ModelSwitchReady,
     Unknown(String),
 }
 
