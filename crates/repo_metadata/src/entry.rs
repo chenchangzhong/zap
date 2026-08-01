@@ -481,6 +481,27 @@ pub fn path_passes_filters(path: &Path, gitignores: &[Gitignore]) -> bool {
     ) && !should_ignore_git_path(&to_check_path)
 }
 
+/// Returns whether `path` is a symlink or is below one.
+///
+/// The recursive watcher requires this check to be monotonic: if a symlinked
+/// directory is rejected, its descendants must be rejected as well even
+/// though their individual paths are not themselves symlinks.
+/// 上游 6465abf58 移植:阻止 watcher 跟随目录 symlink(如 Nix 项目
+/// `result -> /nix/store/...`)遍历仓库外的大树。
+pub fn is_within_symlink(path: &Path, repo_root: &Path) -> bool {
+    // A valid path beneath a symlink can only be reached through a directory
+    // symlink, so avoid a second `metadata` syscall to resolve its target.
+    path.ancestors()
+        // The watched root itself may be a symlink (for example, a workspace
+        // opened through a user-created alias). It is the boundary of this
+        // check, not a symlinked directory to prune.
+        .take_while(|ancestor| *ancestor != repo_root && ancestor.starts_with(repo_root))
+        .any(|ancestor| {
+            std::fs::symlink_metadata(ancestor)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        })
+}
+
 /// Determines whether a file should be parsed by a treesitter query. For now the main criteria is it shouldn't
 /// exceed the given file size limit.
 pub fn is_file_parsable(path: &Path) -> Result<bool, io::Error> {

@@ -254,6 +254,7 @@ impl LocalRepoMetadataModel {
         self.emit_incremental_updates = enabled;
     }
 
+
     /// Handles events from the BulkFilesystemWatcher.
     #[cfg(feature = "local_fs")]
     fn handle_watcher_event(
@@ -392,9 +393,13 @@ impl LocalRepoMetadataModel {
                 if !is_unsafe_watch_root(&local_path) {
                     let watch_path = local_path.clone();
                     watcher.update(ctx, |watcher, _ctx| {
-                        use crate::entry::should_ignore_git_path;
+                        use crate::entry::{is_within_symlink, should_ignore_git_path};
+                        // 上游 6465abf58 移植:拒绝目录 symlink 及其后代,
+                        // 避免 watcher 跟随仓库外的大树(如 Nix 的 result -> /nix/store)。
+                        let filter_root = watch_path.clone();
                         let watch_filter = WatchFilter::with_filter(Arc::new(move |watch_path| {
                             !should_ignore_git_path(watch_path)
+                                && !is_within_symlink(watch_path, &filter_root)
                         }));
                         std::mem::drop(watcher.register_path(
                             &watch_path,

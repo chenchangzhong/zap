@@ -450,6 +450,7 @@ crash_reporting = [
 ]
 default = [
     "agent_mode",
+    "osc_hyperlinks",
     "render_continuous_block_selections_with_single_border",
     "settings_import",
     "shared_with_me",
@@ -528,6 +529,7 @@ default = [
     "mcp_grouped_server_context",
     "fork_from_command",
     "context_window_usage_v2",
+    "context_window_usage_breakdown",
     "v4a_file_diffs",
     "classic_completions",
     "force_classic_completions",
@@ -810,6 +812,7 @@ web_search_ui = []
 web_fetch_ui = []
 fork_from_command = []
 context_window_usage_v2 = []
+context_window_usage_breakdown = []
 global_search = []
 file_and_diff_set_comments = []
 revert_to_checkpoints = []
@@ -829,6 +832,7 @@ summarization_via_message_replacement = []
 inline_model_selector = ["agent_view"]
 inline_profile_selector = ["agent_view"]
 oz_platform_skills = []
+osc_hyperlinks = []
 open_warp_launch_modal = []
 new_tab_styling = []
 file_based_mcp = []
