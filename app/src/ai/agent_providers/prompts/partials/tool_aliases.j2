@@ -5,4 +5,7 @@ These are the tools registered for this turn. Use these exact names when emittin
 
 {% for name in available_tools %}- `{{ name }}`
 {% endfor %}
+{% if "webfetch" in available_tools %}
+When fetching a webpage or URL, prefer the `webfetch` tool over shell commands (`curl` / `wget`): `webfetch` runs through the built-in web tool path and requires no command permission; shell network commands do.
+{% endif %}
 {% endif %}

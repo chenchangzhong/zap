@@ -992,4 +992,50 @@ mod tests {
             "thinking_language 应在 tool_aliases 之前: thinking={pos_thinking}, tools={pos_tools}\n{out}"
         );
     }
+    #[test]
+    fn render_webfetch_preference_across_all_template_families() {
+        // webfetch 工具可用时,所有 system 模板族都必须注入"优先用 webfetch 而非 curl"
+        // 规则(footer.j2 → tool_aliases.j2),防止某族漏注入导致模型继续用 curl。
+        for id in [
+            "claude-sonnet-4-5",
+            "gpt-3.5-turbo",
+            "gpt-4o",
+            "gpt-5-codex",
+            "gemini-2.5-pro",
+            "kimi-k2",
+            "trinity-v1",
+            "weird-model",
+        ] {
+            let out = render_system(
+                AgentProviderApiType::OpenAi,
+                &LLMId::from(format!("byop:p:{id}").as_str()),
+                &[],
+                &["webfetch".to_string()],
+                false,
+                &[],
+            );
+            assert!(
+                out.contains("prefer the `webfetch` tool over shell commands"),
+                "id={id} 应注入 webfetch 优先规则: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_omits_webfetch_preference_when_tool_unavailable() {
+        // webfetch 不在工具列表(web_search_enabled=false)时不得注入规则,
+        // 避免模型引用不可用工具。
+        let out = render_system(
+            AgentProviderApiType::OpenAi,
+            &LLMId::from("byop:p:deepseek-chat"),
+            &[],
+            &["read_files".to_string()],
+            false,
+            &[],
+        );
+        assert!(
+            !out.contains("prefer the `webfetch` tool"),
+            "无 webfetch 时不应注入优先规则: {out}"
+        );
+    }
 }
