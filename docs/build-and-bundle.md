@@ -5,6 +5,19 @@
 - Rust 工具链（`rustup`）
 - Xcode + Command Line Tools
 - 签名证书（Apple Development / Distribution）
+- `create-dmg`（bundle 脚本制作 DMG 必需）：
+
+  ```bash
+  brew install create-dmg
+  ```
+
+- `cargo-about`（生成 `THIRD_PARTY_LICENSES.txt`，缺失会导致脚本中止）：
+
+  ```bash
+  cargo install cargo-about --features cli
+  ```
+
+  > 注意：必须带 `--features cli`，否则 cargo-about 0.9+ 默认不安装二进制。
 
 ## 快速构建（debug 运行）
 
@@ -20,7 +33,7 @@ cargo run --bin zap-oss
 cargo clean
 ```
 
-清理约 21.6GB 编译缓存，构建时长约 6–8 分钟。
+清理编译缓存（实测本机约 149GB），随后构建时长约 6–8 分钟（增量约 3 分钟）。
 
 ### 2. 构建 DockTilePlugin
 
@@ -45,21 +58,27 @@ cp -R app/DockTilePlugin/ZapDockTilePlugin.docktileplugin target/release-lto/
 
 如需兼容 Intel Mac，去掉 `--nouniversal`。
 
-产出的 .app 和 .dmg：
+产出的 .app 和 .dmg（最终产物在 `target/release-lto/bundle/osx/`）：
 
 ```
-target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app
-target/aarch64-apple-darwin/release-lto/bundle/dmg/Zap.dmg
+target/release-lto/bundle/osx/Zap.app
+target/release-lto/bundle/osx/Zap.dmg
 ```
+
+> 脚本内部构建目录为 `target/aarch64-apple-darwin/release-lto/bundle/osx/`
+> （含签名完整的 .app），步骤 6 会把 .app 和 .dmg 拷贝到上面的最终位置。
 
 ### 4. 验证
 
 ```bash
 # 检查签名（正常应输出 Signature size=xxxx，不是 adhoc）
-codesign -dv target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app
+codesign -dv target/release-lto/bundle/osx/Zap.app
 
 # 检查自适应图标
-ls -l target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app/Contents/Resources/Assets.car
+ls -l target/release-lto/bundle/osx/Zap.app/Contents/Resources/Assets.car
+
+# 校验签名完整
+codesign --verify --deep --strict target/release-lto/bundle/osx/Zap.app
 ```
 
 ## 环境变量说明
@@ -109,7 +128,7 @@ codesign --force --deep --options runtime \
 检查 `Contents/Resources/Assets.car` 是否存在。若缺失，运行：
 
 ```bash
-script/compile_icon oss target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.app
+script/compile_icon oss target/release-lto/bundle/osx/Zap.app
 ```
 
 图标源文件位于 `app/channels/oss/icon/AppIcon.icon/`，若该目录不存在 `compile_icon` 会静默跳过。
@@ -133,13 +152,28 @@ script/compile_icon oss target/aarch64-apple-darwin/release-lto/bundle/osx/Zap.a
 error: no such command: `about`
 ```
 
-需安装 `cargo-about`，否则 bundle 脚本会继续但跳过许可证生成：
+需安装 `cargo-about`（**必须带 `--features cli`**）：
 
 ```bash
-cargo install cargo-about
+cargo install cargo-about --features cli
 ```
 
-不影响 app 构建，仅 `THIRD_PARTY_LICENSES.txt` 缺失。
+注意：许可证生成失败不会只跳过该步骤——`prepare_bundled_resources` 内的
+`set -e` 会让整个 bundle 脚本**提前中止**，后续的图标编译、签名、DMG 制作
+全部被跳过（脚本 exit 101）。安装 cargo-about 后重跑即可。
+
+### create-dmg 找不到
+
+```text
+./script/macos/bundle: line 867: create-dmg: command not found
+```
+
+`--selfsign` 分支用 `create-dmg` 制作带背景图与 Applications 拖放链接的 DMG，
+缺失时脚本 exit 127。安装：
+
+```bash
+brew install create-dmg
+```
 ### `--skip-build` 的问题
 
 `--skip-build` 会导致 bundle 脚本跳过 `compile_icon`，产出的 .app 没有自适应图标。
@@ -152,7 +186,7 @@ cargo install cargo-about
 内容仍是旧版 .app。需要重新打包：
 
 ```bash
-BUNDLE=target/aarch64-apple-darwin/release-lto/bundle
-rm -f "$BUNDLE/dmg/Zap.dmg"
-hdiutil create -volname "Zap" -srcfolder "$BUNDLE/osx/Zap.app" -ov -format UDZO "$BUNDLE/dmg/Zap.dmg"
+BUNDLE=target/release-lto/bundle
+rm -f "$BUNDLE/osx/Zap.dmg"
+hdiutil create -volname "Zap" -srcfolder "$BUNDLE/osx/Zap.app" -ov -format UDZO "$BUNDLE/osx/Zap.dmg"
 ```
