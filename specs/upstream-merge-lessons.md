@@ -54,6 +54,7 @@
 |------|------|
 | **品牌字符串替换** | 所有用户可见 "Warp" → "Zap"、"Oz" → "Zap"、"Oz CLI" → "Zap Agent CLI" |
 | **Zap 本地功能禁止覆盖** | OMP 集成（`CLIAgent::OhMyPi`、CLI agent session）、OhMyPi 模型选择器（`OmpModelSelector`）等 Zap 自研功能，上游 cherry-pick **不得覆盖**。合并时若冲突，取本地版本 |
+| **DeepSeek CLI agent 已移除** | `CLIAgent::DeepSeek` 整条集成于 2026-08-03 删除（上游改名 CodeWhale 且 v0.9.0 移除 `deepseek`/`deepseek-tui` shim）。上游若新增 DeepSeek CLI agent 相关改动**一律跳过**，详见 Section 15。BYOP 侧 `AgentProviderApiType::DeepSeek`（模型提供商）**保留**，两者是独立实体 |
 | **第三方 Harness 已删除** | `ThirdPartyHarness`、`HarnessRunner`、`FeatureFlag::AgentHarness`、Claude/Gemini harness 执行路径已全部清理。上游 `Harness` 枚举变体保留（序列化兼容），`ClaudeHarness`/`GeminiHarness` struct 已删 |
 | **云服务代码不合并** | 上游 workspace/team/云同步/Drive/Notebook sync 等 SaaS 功能 Zap 不需要，仅保留 struct 兼容字段 |
 | **无 merge-base** | 采用分阶段手动 cherry-pick，非标准 git merge |
@@ -126,6 +127,7 @@
 | `app/src/ai/execution_profiles/config.rs` + `config_tests.rs` | 2026-07-30 | `config.rs`、`config_tests.rs` | 未编译的孤立文件（`execution_profiles/mod.rs` 无 `pub mod config`） |
 | `script/windows/test_tui_installer.ps1` + `tui-installer.iss` | 2026-07-30 | 两个文件 | Windows TUI 安装脚本，Zap 不需要 |
 | `agent/task_store.rs` 的 `prune_unreachable_subtasks()` | 2026-07-30 | `task_store.rs`、`task_store_tests.rs` | 函数 + 测试完整但无生产调用者，保留待后续观察 |
+| `CLIAgent::DeepSeek` 整条 CLI agent 集成 | 2026-08-03 | 见 Section 15 明细（14 文件 + 2 删除） | 上游改名 CodeWhale，`deepseek`/`deepseek-tui` 二进制在 v0.9.0 消失，集成失去目标 |
 
 ## 6. 误删/遗漏恢复记录
 
@@ -152,6 +154,7 @@
 - [ ] 运行 `cargo nextest run --workspace --exclude command-signatures-v2`（需安装 nextest）
 - [ ] 检查 `git diff HEAD --stat` 无异常大文件
 - [ ] 搜索残留 `warp_tui`/`warp_search_core`/`warp_errors` 引用
+- [ ] 搜索残留 `CLIAgent::DeepSeek`/`DeepSeekLogo`/`deepseek.svg` 引用（BYOP 的 `AgentProviderApiType::DeepSeek` 是保留项，勿误删）
 
 ### 7.3 可选
 - [ ] 处理 Phase 4 遗留 cherry-pick（按优先级）
@@ -172,6 +175,7 @@
 | `FeatureFlag` 编译错误 | 上游新增 flag 本地无 | 在 `crates/warp_core/src/features.rs` 加 variant + 对应 FLAGS 列表 |
 | `FeatureFlag::AgentHarness` 引用 | 上游 cherry-pick 引用此 flag | **跳过**，Zap 已删除此 flag 及其 6 处门控 |
 | `ThirdPartyHarness` / `HarnessRunner` | 上游改动 driver/harness 模块 | **跳过**，Zap 已清理全部第三方 harness 执行路径 |
+| `CLIAgent::DeepSeek` 引用 | 上游改动 DeepSeek CLI agent 路径 | **跳过**，Zap 已删除整条集成（枚举变体、handler、plugin manager、logo）。注意区分 BYOP 的 `AgentProviderApiType::DeepSeek`（保留） |
 | 终端死锁 | `TerminalModel::lock()` 重入 | 检查调用栈，传已锁引用而非再次加锁 |
 
 ---
@@ -383,5 +387,159 @@
 
 ---
 
-*文档版本：v1.1*
+## 14. 第五轮核对记录（2026-08-03）：CLI agent 事件链路 5 项差异
+
+以 `app/src/terminal/cli_agent_sessions/` 为范围，对 HEAD 与 `upstream/master` 逐文件比对，共发现 5 项差异。
+
+### 前置：先定 fork 点，别用裸 diff
+
+本轮最大的方法论收获。裸 `git diff upstream/master HEAD` 无法区分三种情形：
+
+1. **真滤合**——fork 时上游已有，Zap 没同步
+2. **fork 后上游新增**——不是滤合，是不同步进度
+3. **Zap 有意改**——不能动
+
+`git merge-base HEAD upstream/master` 返回空（历史断开，`.git/shallow` 存在，upstream 是浅克隆）。正确定位方法：
+
+```
+git rev-parse --is-shallow-repository        # 确认浅克隆
+git log HEAD | tail                          # 找 HEAD 最早可见提交 → fork 点
+git merge-base --is-ancestor <特性提交> HEAD  # 逐特性判定是否在 HEAD 祖先链
+```
+
+结论：**fork 点 = `0dbd3d567`（2026-04-28，"Initial public release of Warp"）**，是 HEAD 最早可见提交。5 项差异全部**不在** HEAD 祖先链 → 全部是 fork 后上游新增，**没有真滤合**。
+
+### 5 项差异与处置
+
+| # | 项 | 上游提交 | 日期 | 性质 | 处置 |
+|---|---|---|---|---|---|
+| 1 | `StopFailure` 事件 | `a5242e603` (#13784) | 07-15 | fork 后新增 | **已合入**（纯加法） |
+| 2 | `clear_permission_scoped_state` | `abf98bffd` (#12341) | 06-25 | fork 后新增 | **跳过**（在 Zap 会退化，见下） |
+| 3 | Codex 双通道去重 | `63fe72858` (#11871) | 06-03 | fork 后新增 | **跳过**（双发场景在 Zap 不成立） |
+| 4 | rich status latch | `b9d1c0ebd` (#12640) | 06-24 | fork 后新增 | **跳过**（Zap 已有等效实现，且更早） |
+| 5 | `vibe-acp` 别名不解析 | `43ee27303` (#14238) | 07-25 | **Zap 自身 bug** | **已修**（1 行） |
+
+### 关键判断：为什么 2/3/4 跳过
+
+> **⚠️ 2026-08-03 注记**：第 2 项与第 4 项的跳过论证以 `CLIAgent::DeepSeek` 存在为前置。该集成已于 2026-08-03 整条移除（Section 15），故：
+> - **第 2 项**（`clear_permission_scoped_state`）的原退化路径（DeepSeek OSC9 合成 `Stop` → `query` 为 `None` → 回落 `summary`）已不存在。当前唯一 OSC9 路径是 Codex，其 `parse_osc9_text` **无条件** `query: Some(body)`（与上游前置假设一致），故 `summary` 回落不会被触发 —— 上游修复现已**无退化风险**，可作为后续同步候选。但 `tool_name`/`tool_input_preview` 在 Zap 仍是零消费点，同步收益仅为「清理无人读的字段」，优先级低。
+> - **第 4 项**（rich status latch）「换成上游 latch 会破坏 DeepSeek」的理由已失效。`session_supports_rich_status` 中的 `session_id.is_some()` 特判随移除一并删除，函数现退化为 `agent_supports_rich_status` 直传。上游 latch 现已**无冲突**，可作为后续同步候选。
+> - 第 3 项（Codex 双通道去重）论证不依赖 DeepSeek，**仍然有效**。
+
+#### 第 2 项：同步会造成功能退化
+
+上游在 `Stop` 分支调 `clear_permission_scoped_state()` 清空 `summary`/`tool_name`/`tool_input_preview`。上游能这么做，因为它的 `Stop` 分支**无条件**赋值 `query`。
+
+Zap 不同——`Stop` 分支是**条件赋值**（`2fe1e963e`，DeepSeek 集成时的修复，比上游正确）。而 `summary` 在 Zap 是桌面通知标题的**回落链**一环（`view.rs` 中 `send_agent_desktop_notification_or_show_banner` 调用前的 title 构造：`query` → `summary` → `agent.command_prefix()`）。
+
+真实退化路径：DeepSeek 走 OSC9，合成 `Stop` 的 `query` 由 `notification_title_from_body()` 产出，可能为 `None` → 条件赋值保持原值 → 回落到 `summary`。若清空 `summary`，通知标题退化为 `"deepseek"`。
+
+另：`tool_name`/`tool_input_preview` 在 Zap **零消费点**（只写不读），残留无害。所以上游那个 bug 在 Zap 当前架构下**不存在**。
+
+#### 第 3 项：双发场景不成立
+
+上游 `plugin_already_active` 解决的是 Codex 同时发 OSC777（插件）+ OSC9（TUI 通知）导致事件翻倍。Zap 的 `plugin_manager/codex.rs` 给的是 **OSC9 开关配置**（`[tui] notification_condition = "always"`），不引导安装 OSC777 插件。用户要双发需主动装 warp 官方插件，动机弱。
+
+且 Zap 已有 OSC9 桌面通知去重（`view.rs` 的 `ModelEvent::PluggableNotification` 分支里 `has_osc9_listener` 判定）。
+
+#### 第 4 项：Zap 已有等效实现，且更早
+
+同一个问题（区分「有真实 rich status」vs「仅 OSC9 legacy」）Zap 和上游**各自独立解决**：
+
+| | 上游（06-03） | Zap（05-06，`2fe1e963e`） |
+|---|---|---|
+| 机制 | `received_rich_notification` latch | `session_id.is_some()` 特判 |
+| 覆盖 | 所有 agent | 仅 DeepSeek |
+
+换成上游 latch 会**破坏 DeepSeek**：Zap 的 `session_id` 可从 OSC777 之外的来源填入（`register_listener` 建会话时、任何带 session_id 的事件经 `or(take())` 链），而 latch 只认 `source == RichPlugin`。任何现在靠 session_id 走通而 latch 不认的路径，DeepSeek 就从「有 rich status」退化成「没有」。
+
+符合核心原则「Zap 本地功能禁止覆盖」→ 保持现状。
+
+### 本轮教训
+
+- **浅克隆下 `git merge-base` 返回空不代表无从判定**：改用「HEAD 最早可见提交 = fork 点」+ `merge-base --is-ancestor` 逐特性判定，比裸 diff 精确得多。裸 diff 只能告诉你「不一样」，不能告诉你「为什么不一样」。
+- **「上游有 Zap 没有」≠ 滤合**：本轮 5 项差异中 4 项是 fork 后上游新增（不同步进度），只有 1 项是 Zap 自身 bug。先定 fork 点再谈滤合。
+- **上游的 bug 修复可能在 fork 里是行为退化**：第 2 项是典型——上游修的 bug 依赖上游自己的前置条件（`Stop` 无条件赋值 `query`），Zap 改过那个前置条件后，同步修复反而引入退化。**移植修复前必须验证其前置假设在本地是否成立。**
+- **同一问题的两套解法不要合并**：第 4 项 Zap 和上游各自独立解决同一问题。同形化（换成上游实现）看似便于后续 cherry-pick，实际是删除已验证的本地功能换取假想的未来便利。
+- **字段消费点决定改动风险**：`tool_name` 零消费点（改动无风险）vs `summary` 有消费点且在回落链（改动高风险）。同一个提交里的字段，风险可以完全不同——`grep` 消费点是移植前的必要步骤。
+
+### 本轮改动
+
+| 项 | 文件 | 内容 |
+|---|---|---|
+| 5 | `cli_agent.rs` | ~~`command_prefixes()` 的 `DeepSeek` 从 `&["deepseek"]` 改为 `&["deepseek", "deepseek-tui"]`~~ —— **2026-08-03 随整条集成移除而撤销**（Section 15）。`event/v1.rs` 的 `command_prefixes().contains()` 修复**保留**，仍服务 `vibe-acp` 等别名 |
+| 5 | `event/v1.rs` | `resolve_agent` 从 `command_prefix() == agent` 改为 `command_prefixes().contains(&agent)`，修复 `vibe-acp` 等非首别名不解析 |
+| 1 | `event/mod.rs` | `CLIAgentEventType::StopFailure` 变体 + `CLIAgentEventPayload.error_type` 字段 |
+| 1 | `event/v1.rs` | `"stop_failure"` 分派 + `RawEvent.error_type` 反序列化 |
+| 1 | `cli_agent_sessions/mod.rs` | `CLIAgentSessionStatus::Failed { error_type, message }` 变体 + `StopFailure` 分支（沿用 Zap 的条件赋值）+ `to_conversation_status` 映射到 `ConversationStatus::Error` |
+| 1 | `notifications/model.rs` | `Failed` 分支 → `NotificationCategory::Error` |
+| 1 | `terminal/view.rs` | `Failed` 归入自动开 rich input 与 `AgentTaskCompleted(false)` 通知 |
+
+**修复 1 的意义**：omp 在轮次以错误结束时（rate limit、provider 报错、非静默 abort）发 `stop_failure`。此前 Zap 落到 `Unknown("stop_failure")` → `apply_event` 返回 `None` → **状态永远卡在 `InProgress`**。这是真 bug。
+
+**修复 5 的意义**：`resolve_agent` 与 `command_prefixes()` 都只认首个别名，导致两类失效：OSC777 事件里 `agent` 字段填非首别名（如 `vibe-acp`）解析成 `Unknown`；用户用非首别名的二进制名启动时 `CLIAgent::detect` 完全不识别，footer / rich input / 通知全部不可用。当时的既存断言（`cli_agent_tests.rs` 的 `test_detect_known_agents`）用 `deepseek-tui` 覆盖后者，该断言已随 Section 15 移除；`vibe-acp` 路径仍由 `event/v1.rs` 的修复保障。
+
+**行号引用约定**：本节刻意不写硬行号——同一批改动内 `view.rs` 就漂移了 20 行。定位一律用符号锚点（函数名、match 分支名）。
+
+---
+
+## 15. DeepSeek CLI agent 集成移除（2026-08-03）
+
+### 触发原因
+
+上游项目 `Hmbown/DeepSeek-TUI` 已改名 **`Hmbown/CodeWhale`**（GitHub API 核实：repo id `1137711311`，description "Open-source, community-driven agent harness"，homepage codewhale.net）。据其 `docs/REBRAND.md`：
+
+| surface | 旧 | 新 |
+|---|---|---|
+| CLI dispatcher 二进制 | `deepseek` | `codewhale` |
+| TUI runtime 二进制 | `deepseek-tui` | `codewhale-tui` / `codew` |
+| npm 包 | `deepseek-tui`（已 deprecated） | `codewhale` |
+
+关键：`deepseek` / `deepseek-tui` 兼容 shim 二进制**在 v0.9.0 已移除**。Zap 的 `command_prefixes()` 只认这两个名字，对新装用户命令检测必然失效。用户决策：不做 CodeWhale 迁移，直接移除整条集成。
+
+### 删除明细
+
+| 层 | 文件 | 内容 |
+|---|---|---|
+| 枚举与行为 | `terminal/cli_agent.rs` | `CLIAgent::DeepSeek` 变体、`command_prefixes`、`display_name`、`icon`、`supported_skill_providers`、`supports_bash_mode`、`brand_color`、`CLIAgentType` 映射、2 处 PATH 探测特例、`DEEPSEEK_COLOR` 常量 |
+| 会话监听 | `cli_agent_sessions/listener/mod.rs` | `DeepSeekSessionHandler`（含 OSC 9 `deepseek: turn complete` 解析与 `notification_title_from_body`）、`create_handler` / `is_agent_supported` 分支、6 个测试 |
+| 插件 | `plugin_manager/deepseek.rs` | **整文件删除**；`plugin_manager/mod.rs` 摘 mod 声明 / import / dispatch 分支（含 `HOANotifications` gate） |
+| UI | `ui_components/icon_with_status.rs`、`workspace/view/vertical_tabs.rs`、`crates/warp_core/src/ui/icons.rs` | logo path 常量、2 处背景色特例、`Icon::DeepSeekLogo` + 资源路径 |
+| 资源 | `app/assets/bundled/svg/deepseek.svg` | **整文件删除** |
+| 其余 | `terminal/view.rs`、`server/telemetry.rs`、`notifications/model.rs`、`view/use_agent_footer/` | 2 处 OSC 9 特例、`CLIAgentType::DeepSeek`、通知文案、`RichInputSubmitStrategy` 分支 + 测试 |
+| i18n | `app/i18n/{en,zh-CN,ja}/warp.ftl` | 12 条 `cli-agent-plugin-deepseek-*` |
+| 文档 | `README.md` / `.zh-CN` / `.ja`、`CHANGELOG.md`、3 处 doc 注释 | 移除集成宣称与鸣谢条目 |
+
+### 保留项（不要误删）
+
+`AgentProviderApiType::DeepSeek` 及其全部关联 —— `settings/ai.rs`、`ai/agent_providers/{chat_stream,reasoning,attachment_caps}.rs`、i18n provider 文案、`lib/rust-genai` fork（`reasoning_effort` 解锁）、`Cargo.toml` patch 注释。这是 **BYOP 模型提供商**，与 CLI agent 是两个独立实体。
+
+`website/design/*.html` 中 `Hmbown/DeepSeek-TUI` 鸣谢链接为静态设计稿（"姊妹项目"语境），非代码集成点，未动。
+
+### 验证方法
+
+| 手段 | 结果 |
+|---|---|
+| `cargo check -p warp --tests` | 零 error。**这是漏删的权威判据**——`CLIAgent` 按 AGENTS.md 5.2 禁用 `_` 通配，任何 match 漏改必触发 `E0004` |
+| 全仓 `(?i)deepseek` | 无 CLI-agent 语境残留 |
+| `git diff -U0` 逐 hunk 复核 | 10 文件 15 hunk 全部精确落在 DeepSeek 行，无附带删除 |
+| 资源悬空引用 | `deepseek.svg` 唯二引用点已同删；无全目录枚举清单（资源引用均为按需字符串路径） |
+| 相关测试 | 154 个 cli_agent / plugin 测试通过 |
+
+`mod_tests.rs` 的 `stop_without_query_preserves_previous_prompt` 迁到 `CLIAgent::Codex` —— 它测的是通用 `Stop` 条件赋值语义，非 DeepSeek 特性，不应随集成删除。
+
+既存失败（与本次无关，已 stash 比对确认）：`terminal::view::tests::cli_agent_rich_input_hint_text_mentions_active_cli_agent`。
+
+### 本轮教训
+
+- **上游改名要查 API 而非猜**：`https://api.github.com/repos/<owner>/<old-name>` 会 302 到新名并在 `full_name` 里返回真名。GitHub 旧 URL 永久重定向，靠浏览器看不出改名，`git remote` 也照样能拉。
+- **改名 ≠ 只改显示名**：真正的爆点是二进制名与 shim 的**移除时间表**（CodeWhale v0.9.0 删 shim）。判断一个 CLI agent 集成是否还活着，看的是 `command_prefixes()` 里的名字在上游最新版是否还存在，不是仓库能否访问。
+- **穷尽匹配是删除工作的免费保险**：AGENTS.md 5.2 禁用 `_` 通配这条纪律，让「删枚举变体」这类改动的漏删检测从人工 grep 降级为编译器义务。反过来说，任何用了 `_` 的 match 都是删除时的盲区，值得优先消除。
+- **删除会让此前的「跳过」论证过期**：Section 14 第 2、4 项的跳过理由全建立在 DeepSeek 存在之上。删功能时必须回查文档里引用该功能作为**论据**的地方，否则下轮合并会拿失效结论做决策。这比漏删代码更隐蔽——代码有编译器兜底，文档没有。
+- **`git stash push -u` 会把 staged 降级为 unstaged**：本轮用 stash 往返验证「测试失败是否既存」时，把在途的 staged 改动（StopFailure 工作）打回工作区。内容零丢失，但暗存区标记丢了。验证基线更安全的做法是 `git stash create` + `git worktree`，或直接在临时 worktree 里 checkout 基线。
+
+---
+
+
+*文档版本：v1.3*
 *下次合并前必读*

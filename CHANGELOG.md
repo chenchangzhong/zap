@@ -21,7 +21,7 @@
 ## [v2026.05.06.preview] — 2026-05-06
 
 - **AI**
-  - 集成 DeepSeek CLI agent,提升 LSP 安装可靠性
+  - 提升 LSP 安装可靠性
   - LSP 改为全局 `enabled_lsp_servers` setting,移除 `/index` 命令与 codebase indexing runtime
   - `/plan` 真实复刻 Plan Mode(system prompt + 工具硬护栏)
   - Agent dynamic tool whitelist、`persist_conversations` setting、auto-approve 下 `ask_user_question` 始终询问

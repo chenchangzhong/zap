@@ -122,7 +122,7 @@ enum RichInputSubmitStrategy {
 fn rich_input_submit_strategy(agent: CLIAgent) -> RichInputSubmitStrategy {
     match agent {
         CLIAgent::OhMyPi => RichInputSubmitStrategy::BracketedPaste,
-        CLIAgent::Codex | CLIAgent::DeepSeek => RichInputSubmitStrategy::BracketedPaste,
+        CLIAgent::Codex => RichInputSubmitStrategy::BracketedPaste,
         CLIAgent::Copilot => RichInputSubmitStrategy::BracketedPasteDelayedEnter,
         CLIAgent::Claude
         | CLIAgent::OpenCode

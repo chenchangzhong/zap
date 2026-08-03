@@ -3776,16 +3776,12 @@ fn render_summary_pane_kind_icon_circle(
             );
             (
                 icon_element,
-                if matches!(agent, CLIAgent::DeepSeek) {
-                    theme.background().into()
-                } else {
-                    ThemeFill::Solid(
-                        agent
-                            .brand_color()
-                            .unwrap_or(ColorU::new(100, 100, 100, 255)),
-                    )
-                    .into()
-                },
+                ThemeFill::Solid(
+                    agent
+                        .brand_color()
+                        .unwrap_or(ColorU::new(100, 100, 100, 255)),
+                )
+                .into(),
             )
         }
         SummaryPaneKind::Code { title } => (

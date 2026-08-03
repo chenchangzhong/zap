@@ -5,10 +5,12 @@ use crate::terminal::CLIAgent;
 use super::{CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventType};
 
 /// Resolves a CLI agent from the `"agent"` string in a CLI agent event.
+/// Matches against all command prefixes, not just the canonical one, so
+/// aliases like `"vibe-acp"` resolve correctly.
 /// Returns `None` if the string doesn't match any known agent.
 fn resolve_agent(agent: &str) -> Option<CLIAgent> {
     enum_iterator::all::<CLIAgent>()
-        .find(|a| !matches!(a, CLIAgent::Unknown) && a.command_prefix() == agent)
+        .find(|a| !matches!(a, CLIAgent::Unknown) && a.command_prefixes().contains(&agent))
 }
 
 pub(super) fn parse(body: &str) -> Option<CLIAgentEvent> {
@@ -19,6 +21,7 @@ pub(super) fn parse(body: &str) -> Option<CLIAgentEvent> {
         "prompt_submit" => CLIAgentEventType::PromptSubmit,
         "tool_complete" => CLIAgentEventType::ToolComplete,
         "stop" => CLIAgentEventType::Stop,
+        "stop_failure" => CLIAgentEventType::StopFailure,
         "permission_request" => CLIAgentEventType::PermissionRequest,
         "permission_replied" => CLIAgentEventType::PermissionReplied,
         "question_asked" => CLIAgentEventType::QuestionAsked,
@@ -57,6 +60,7 @@ pub(super) fn parse(body: &str) -> Option<CLIAgentEvent> {
             tool_input_preview,
             plugin_version: raw.plugin_version,
             model: raw.model,
+            error_type: raw.error_type,
         },
     })
 }
@@ -77,4 +81,5 @@ struct RawEvent {
     tool_input: Option<serde_json::Value>,
     plugin_version: Option<String>,
     model: Option<String>,
+    error_type: Option<String>,
 }

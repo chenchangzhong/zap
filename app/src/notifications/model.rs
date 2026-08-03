@@ -2,7 +2,7 @@
 //!
 //! 002ce467 cloud-removal 删除 `agent_management` 时把这个 model 一并清掉了,但
 //! - 软件本体的 BYOP agent (Oz) 完成/出错通知
-//! - 第三方 CLI agent (Claude / Codex / DeepSeek 等) 状态通知
+//! - 第三方 CLI agent (Claude / Codex / Antigravity 等) 状态通知
 //!
 //! 仍需要走通知中心。本模块是删前 `AgentNotificationsModel` 的精简版:
 //! - 去掉了 `ActiveAgentViewsModel` 订阅(该 model 是云端管理 view 的状态来源,已删)。
@@ -145,7 +145,6 @@ impl NotificationsModel {
                         .unwrap_or_else(|| format!("{} completed", agent.display_name()));
                     let message = match agent {
                         CLIAgent::Codex => "Notification from Codex",
-                        CLIAgent::DeepSeek => "Notification from DeepSeek",
                         CLIAgent::Antigravity => "Notification from Antigravity",
                         _ => "Task completed.",
                     };
@@ -170,6 +169,23 @@ impl NotificationsModel {
                             .clone()
                             .unwrap_or_else(|| "Waiting for input.".to_owned()),
                         NotificationCategory::Request,
+                        NotificationSourceAgent::CLI(*agent),
+                        NotificationOrigin::CLISession(*terminal_view_id),
+                        *terminal_view_id,
+                        vec![],
+                        ctx,
+                    );
+                }
+                CLIAgentSessionStatus::Failed { message, .. } => {
+                    let title = session_context
+                        .display_title()
+                        .unwrap_or_else(|| format!("{} failed", agent.display_name()));
+                    self.add_notification(
+                        title,
+                        message
+                            .clone()
+                            .unwrap_or_else(|| "Task failed.".to_owned()),
+                        NotificationCategory::Error,
                         NotificationSourceAgent::CLI(*agent),
                         NotificationOrigin::CLISession(*terminal_view_id),
                         *terminal_view_id,

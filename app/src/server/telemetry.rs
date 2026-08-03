@@ -446,7 +446,6 @@ pub enum CLIAgentType {
     Vibe,
     Hermes,
     Goose,
-    DeepSeek,
     Antigravity,
     OhMyPi,
     Unknown,

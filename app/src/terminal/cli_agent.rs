@@ -114,14 +114,6 @@ const ANTIGRAVITY_PURPLE: ColorU = ColorU {
     a: 255,
 };
 
-/// Goose brand color (#101010, from Block's official Goose logo)
-const DEEPSEEK_COLOR: ColorU = ColorU {
-    r: 53,
-    g: 120,
-    b: 229,
-    a: 255,
-};
-
 const GOOSE_COLOR: ColorU = ColorU {
     r: 16,
     g: 16,
@@ -162,7 +154,6 @@ pub enum CLIAgent {
     Vibe,
     Hermes,
     Goose,
-    DeepSeek,
     Antigravity,
     OhMyPi,
     /// Represents an unknown/custom CLI agent matched by user-configured regex patterns.
@@ -186,7 +177,6 @@ impl CLIAgent {
             CLIAgent::Auggie => &["auggie"],
             CLIAgent::CursorCli => &["agent"],
             CLIAgent::Goose => &["goose"],
-            CLIAgent::DeepSeek => &["deepseek"],
             CLIAgent::Hermes => &["hermes"],
             CLIAgent::Antigravity => &["agy"],
             CLIAgent::Vibe => &["vibe", "vibe-acp"],
@@ -230,7 +220,6 @@ impl CLIAgent {
             CLIAgent::Auggie => "Auggie",
             CLIAgent::CursorCli => "Cursor",
             CLIAgent::Goose => "Goose",
-            CLIAgent::DeepSeek => "DeepSeek",
             CLIAgent::Vibe => "Mistral Vibe",
             CLIAgent::Hermes => "Hermes",
             CLIAgent::Antigravity => "Antigravity",
@@ -253,7 +242,6 @@ impl CLIAgent {
             CLIAgent::Auggie => Some(Icon::AuggieLogo),
             CLIAgent::CursorCli => Some(Icon::CursorLogo),
             CLIAgent::Goose => Some(Icon::GooseLogo),
-            CLIAgent::DeepSeek => Some(Icon::DeepSeekLogo),
             CLIAgent::Vibe => None,
             CLIAgent::Hermes => None,
             CLIAgent::Antigravity => Some(Icon::AntigravityLogo),
@@ -286,7 +274,6 @@ impl CLIAgent {
             CLIAgent::Auggie => &[SkillProvider::Agents],
             CLIAgent::CursorCli => &[SkillProvider::Agents],
             CLIAgent::Goose => &[SkillProvider::Agents],
-            CLIAgent::DeepSeek => &[SkillProvider::Agents],
             CLIAgent::Vibe => &[SkillProvider::Agents],
             CLIAgent::Hermes => &[SkillProvider::Agents],
             CLIAgent::Antigravity => &[SkillProvider::Agents],
@@ -313,7 +300,7 @@ impl CLIAgent {
     pub fn supports_bash_mode(&self) -> bool {
         matches!(
             self,
-            CLIAgent::OhMyPi | CLIAgent::Claude | CLIAgent::Codex | CLIAgent::OpenCode | CLIAgent::DeepSeek
+            CLIAgent::OhMyPi | CLIAgent::Claude | CLIAgent::Codex | CLIAgent::OpenCode
         )
     }
 
@@ -337,7 +324,6 @@ impl CLIAgent {
             CLIAgent::Auggie => Some(AUGGIE_COLOR),
             CLIAgent::CursorCli => Some(CURSOR_COLOR),
             CLIAgent::Goose => Some(GOOSE_COLOR),
-            CLIAgent::DeepSeek => Some(DEEPSEEK_COLOR),
             CLIAgent::Vibe => Some(MISTRAL_ORANGE),
             CLIAgent::Hermes => Some(HERMES_PURPLE),
             CLIAgent::Antigravity => Some(ANTIGRAVITY_PURPLE),
@@ -603,7 +589,6 @@ impl From<CLIAgent> for CLIAgentType {
             CLIAgent::Auggie => CLIAgentType::Auggie,
             CLIAgent::CursorCli => CLIAgentType::Cursor,
             CLIAgent::Goose => CLIAgentType::Goose,
-            CLIAgent::DeepSeek => CLIAgentType::DeepSeek,
             CLIAgent::Vibe => CLIAgentType::Vibe,
             CLIAgent::Hermes => CLIAgentType::Hermes,
             CLIAgent::Antigravity => CLIAgentType::Antigravity,
@@ -703,10 +688,6 @@ fn cli_agent_is_on_path_with_dirs(agent: CLIAgent, search_dirs: &[PathBuf]) -> b
     match agent {
         CLIAgent::Unknown => false,
         CLIAgent::CursorCli => is_on_path_in_dirs("cursor-agent", search_dirs),
-        CLIAgent::DeepSeek => {
-            is_on_path_in_dirs("deepseek", search_dirs)
-                || is_on_path_in_dirs("deepseek-tui", search_dirs)
-        }
         other => is_on_path_in_dirs(other.command_prefix(), search_dirs),
     }
 }
@@ -774,7 +755,6 @@ fn cli_agent_is_on_path(agent: CLIAgent) -> bool {
     match agent {
         CLIAgent::Unknown => false,
         CLIAgent::CursorCli => is_on_path("cursor-agent"),
-        CLIAgent::DeepSeek => is_on_path("deepseek") || is_on_path("deepseek-tui"),
         other => is_on_path(other.command_prefix()),
     }
 }

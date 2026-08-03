@@ -10073,7 +10073,7 @@ impl TerminalView {
 
                                     // 使用 OSC 9 通知的 agent 不会发结构化 SessionStart 事件，
                                     // 因此在命令检测时主动创建监听器。
-                                    if let Some((agent @ (CLIAgent::Codex | CLIAgent::DeepSeek), _)) =
+                                    if let Some((agent @ CLIAgent::Codex, _)) =
                                         detection
                                     {
                                         me.register_cli_agent_listener_without_session_start_event(
@@ -10916,7 +10916,7 @@ impl TerminalView {
                     let has_osc9_listener = CLIAgentSessionsModel::as_ref(ctx)
                         .session(self.view_id)
                         .is_some_and(|s| {
-                            matches!(s.agent, CLIAgent::Codex | CLIAgent::DeepSeek)
+                            matches!(s.agent, CLIAgent::Codex)
                                 && s.listener.is_some()
                         });
                     if has_osc9_listener {
@@ -11445,8 +11445,11 @@ impl TerminalView {
                             ctx,
                         );
                     }
-                    CLIAgentSessionStatus::InProgress | CLIAgentSessionStatus::Success => {
-                        // Auto-open rich input when the agent resumes or completes.
+                    CLIAgentSessionStatus::InProgress
+                    | CLIAgentSessionStatus::Success
+                    | CLIAgentSessionStatus::Failed { .. } => {
+                        // Auto-open rich input when the agent resumes or when a
+                        // turn ends (success or failure).
                         if !self.has_active_cli_agent_input_session(ctx) {
                             self.open_cli_agent_rich_input(CLIAgentInputEntrypoint::AutoShow, ctx);
                         }
@@ -11469,16 +11472,24 @@ impl TerminalView {
             .or(session_context.summary.as_deref().filter(|s| !s.is_empty()))
             .unwrap_or(agent.command_prefix())
             .to_owned();
-        let description = if let CLIAgentSessionStatus::Blocked { message } = status {
-            message.clone().unwrap_or_default()
-        } else {
-            session_context.response.clone().unwrap_or_default()
+        let description = match status {
+            CLIAgentSessionStatus::Blocked { message }
+            | CLIAgentSessionStatus::Failed { message, .. } => {
+                message.clone().unwrap_or_default()
+            }
+            CLIAgentSessionStatus::InProgress | CLIAgentSessionStatus::Success => {
+                session_context.response.clone().unwrap_or_default()
+            }
         };
 
-        let trigger = if matches!(status, CLIAgentSessionStatus::Blocked { .. }) {
-            NotificationsTrigger::NeedsAttention
-        } else {
-            NotificationsTrigger::AgentTaskCompleted(true)
+        let trigger = match status {
+            CLIAgentSessionStatus::Blocked { .. } => NotificationsTrigger::NeedsAttention,
+            CLIAgentSessionStatus::Failed { .. } => {
+                NotificationsTrigger::AgentTaskCompleted(false)
+            }
+            CLIAgentSessionStatus::InProgress | CLIAgentSessionStatus::Success => {
+                NotificationsTrigger::AgentTaskCompleted(true)
+            }
         };
         self.send_agent_desktop_notification_or_show_banner(
             trigger,

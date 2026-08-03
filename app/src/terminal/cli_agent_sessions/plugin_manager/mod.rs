@@ -1,6 +1,5 @@
 pub(crate) mod claude;
 pub(crate) mod codex;
-pub(crate) mod deepseek;
 pub(crate) mod gemini;
 pub(crate) mod oh_my_pi;
 pub(crate) mod opencode;
@@ -19,7 +18,6 @@ use crate::terminal::shell::ShellType;
 use crate::terminal::CLIAgent;
 use claude::ClaudeCodePluginManager;
 use codex::CodexPluginManager;
-use deepseek::DeepSeekPluginManager;
 use gemini::GeminiPluginManager;
 use oh_my_pi::OhMyPiPluginManager;
 use opencode::OpenCodePluginManager;
@@ -250,16 +248,12 @@ pub(crate) fn plugin_manager_for_with_shell(
                 path_env_var,
             )))
         }
-        CLIAgent::DeepSeek if FeatureFlag::HOANotifications.is_enabled() => {
-            Some(Box::new(DeepSeekPluginManager))
-        }
         CLIAgent::OhMyPi => {
             Some(Box::new(OhMyPiPluginManager))
         }
         CLIAgent::OpenCode
         | CLIAgent::Codex
         | CLIAgent::Gemini
-        | CLIAgent::DeepSeek
         | CLIAgent::Amp
         | CLIAgent::Droid
         | CLIAgent::Copilot

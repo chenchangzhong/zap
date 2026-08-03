@@ -16,7 +16,7 @@ Zap 是一个开放、本地优先的终端,带一等公民的 AI 与 Agent 体�
 
 - **无强制云端** —— 不需要账号、登录、Drive 同步或云端 Agent 历史。
 - **BYOP 自定义 AI 提供商** —— 任意 OpenAI 兼容端点,以及 OpenAI / Anthropic / Gemini / DeepSeek / Ollama 等原生协议,密钥仅存本地。
-- **第三方 CLI Agent 接入** —— DeepSeek-TUI / Codex CLI / Claude Code / Google Antigravity(`agy`)接入 Block 与通知中心。
+- **第三方 CLI Agent 接入** —— Codex CLI / Claude Code / Google Antigravity(`agy`)接入 Block 与通知中心。
 - **内置 SSH 主机管理器** —— 在终端内管理主机、配置与会话,集成 tmux。
 - **可编辑系统提示词** —— 基于 minijinja 模板,客户端实时渲染。
 - **渲染优化** —— Markdown 管线优化;CJK 软换行 caret 与加粗子像素修复。
@@ -36,4 +36,3 @@ Zap 是一个开放、本地优先的终端,带一等公民的 AI 与 Agent 体�
 ## 鸣谢
 
 - [Warp](https://github.com/warpdotdev/warp) —— Zap 所基于的上游终端。
-- [DeepSeek-TUI](https://github.com/Hmbown/DeepSeek-TUI) —— 深度适配的 CLI Agent 合作伙伴。

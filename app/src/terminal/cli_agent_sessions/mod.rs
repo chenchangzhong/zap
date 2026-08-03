@@ -18,7 +18,14 @@ use event::{CLIAgentEvent, CLIAgentEventType};
 pub enum CLIAgentSessionStatus {
     InProgress,
     Success,
-    Blocked { message: Option<String> },
+    Blocked {
+        message: Option<String>,
+    },
+    /// 轮次以错误结束。`error_type` 为 agent 上报的错误类别。
+    Failed {
+        error_type: Option<String>,
+        message: Option<String>,
+    },
 }
 
 impl CLIAgentSessionStatus {
@@ -30,6 +37,7 @@ impl CLIAgentSessionStatus {
             CLIAgentSessionStatus::Blocked { message } => ConversationStatus::Blocked {
                 blocked_action: message.clone().unwrap_or_default(),
             },
+            CLIAgentSessionStatus::Failed { .. } => ConversationStatus::Error,
         }
     }
 }
@@ -191,6 +199,28 @@ impl CLIAgentSession {
                     self.session_context.response = event.payload.response.clone();
                 }
                 CLIAgentSessionStatus::Success
+            }
+            // 与 Stop 保持一致：仅当事件携带 query/response 时才覆写，避免不带
+            // 这些字段的 agent 把 PromptSubmit 存下的 query 冲掉。
+            CLIAgentEventType::StopFailure => {
+                if event.payload.query.is_some() {
+                    self.session_context.query = event.payload.query.clone();
+                }
+                if event.payload.response.is_some() {
+                    self.session_context.response = event.payload.response.clone();
+                }
+                CLIAgentSessionStatus::Failed {
+                    error_type: event.payload.error_type.clone(),
+                    // omp 在无错误正文时会发空串，此处过滤掉，让下游回落到
+                    // "Task failed." 而不是显示空白通知。
+                    message: event
+                        .payload
+                        .response
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned),
+                }
             }
             CLIAgentEventType::PermissionRequest => {
                 self.session_context.summary = event.payload.summary.clone();

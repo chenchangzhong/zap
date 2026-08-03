@@ -16,7 +16,7 @@ Zap はオープンでローカルファーストなターミナルで、AI と 
 
 - **クラウド必須なし** —— アカウント、ログイン、Drive 同期、クラウド Agent 履歴のいずれも不要。
 - **BYOP な AI プロバイダー** —— 任意の OpenAI 互換エンドポイントに加え、OpenAI / Anthropic / Gemini / DeepSeek / Ollama のネイティブプロトコル。API キーはローカルに保持。
-- **サードパーティ CLI Agent** —— DeepSeek-TUI / Codex CLI / Claude Code / Google Antigravity (`agy`) を Block と通知センターに統合。
+- **サードパーティ CLI Agent** —— Codex CLI / Claude Code / Google Antigravity (`agy`) を Block と通知センターに統合。
 - **内蔵 SSH ホストマネージャー** —— ターミナル内でホスト・設定・セッションを管理、tmux と連携。
 - **編集可能なシステムプロンプト** —— minijinja テンプレートをクライアント側でレンダリング。
 - **レンダリング改善** —— Markdown パイプラインのチューニング、CJK ソフトラップ caret と太字サブピクセルの修正。
@@ -37,4 +37,3 @@ Zap はオープンでローカルファーストなターミナルで、AI と 
 ## 謝辞
 
 - [Warp](https://github.com/warpdotdev/warp) —— Zap がベースとしている上流のターミナル。
-- [DeepSeek-TUI](https://github.com/Hmbown/DeepSeek-TUI) —— 深く統合された CLI Agent パートナー。

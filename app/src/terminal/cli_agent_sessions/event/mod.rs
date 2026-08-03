@@ -18,6 +18,8 @@ pub enum CLIAgentEventType {
     PromptSubmit,
     ToolComplete,
     Stop,
+    /// 轮次以错误结束（provider 报错、rate limit、非静默 abort）。
+    StopFailure,
     PermissionRequest,
     PermissionReplied,
     QuestionAsked,
@@ -40,6 +42,8 @@ pub struct CLIAgentEventPayload {
     pub tool_input_preview: Option<String>,
     pub plugin_version: Option<String>,
     pub model: Option<String>,
+    /// `stop_failure` 事件的错误类别（如 `"error"` / `"aborted"`）。
+    pub error_type: Option<String>,
 }
 
 /// A parsed event from a CLI agent plugin.

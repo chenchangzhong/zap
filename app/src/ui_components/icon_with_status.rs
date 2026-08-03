@@ -30,7 +30,6 @@ pub(crate) struct IconWithStatusSizing {
     pub(crate) badge_offset: (f32, f32),
 }
 
-const DEEPSEEK_LOGO_PATH: &str = "bundled/svg/deepseek.svg";
 const ANTIGRAVITY_LOGO_PATH: &str = "bundled/svg/antigravity.svg";
 const OH_MY_PI_LOGO_PATH: &str = "bundled/svg/oh_my_pi.svg";
 
@@ -40,7 +39,6 @@ pub(crate) fn render_cli_agent_logo(
     fallback_icon_color: WarpThemeFill,
 ) -> Box<dyn Element> {
     let multi_color_logo_path = match agent {
-        CLIAgent::DeepSeek => Some(DEEPSEEK_LOGO_PATH),
         CLIAgent::Antigravity => Some(ANTIGRAVITY_LOGO_PATH),
         CLIAgent::OhMyPi => Some(OH_MY_PI_LOGO_PATH),
         _ => None,
@@ -160,7 +158,7 @@ pub(crate) fn render_icon_with_status(
                 .with_height(sizing.icon_size)
                 .finish();
             let background: ElementFill =
-                if matches!(agent, CLIAgent::DeepSeek | CLIAgent::Antigravity | CLIAgent::OhMyPi) {
+                if matches!(agent, CLIAgent::Antigravity | CLIAgent::OhMyPi) {
                     theme.background().into()
                 } else {
                     ThemeFill::Solid(brand_color).into()

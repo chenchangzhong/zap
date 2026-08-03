@@ -289,7 +289,7 @@ fn apply_event_preserves_input_session() {
 
 #[test]
 fn stop_without_query_preserves_previous_prompt() {
-    let mut session = CLIAgentSession { agent: CLIAgent::DeepSeek,
+    let mut session = CLIAgentSession { agent: CLIAgent::Codex,
     status: CLIAgentSessionStatus::InProgress,
     session_context: CLIAgentSessionContext {
         query: Some("explain the diff".to_owned()),
@@ -305,13 +305,13 @@ fn stop_without_query_preserves_previous_prompt() {
 
     let event = CLIAgentEvent {
         v: 1,
-        agent: CLIAgent::DeepSeek,
+        agent: CLIAgent::Codex,
         event: CLIAgentEventType::Stop,
         session_id: None,
         cwd: None,
         project: None,
         payload: CLIAgentEventPayload {
-            response: Some("deepseek: turn complete".to_owned()),
+            response: Some("codex: turn complete".to_owned()),
             ..Default::default()
         },
     };
@@ -324,7 +324,7 @@ fn stop_without_query_preserves_previous_prompt() {
     );
     assert_eq!(
         session.session_context.response.as_deref(),
-        Some("deepseek: turn complete")
+        Some("codex: turn complete")
     );
 }
 
@@ -508,4 +508,257 @@ fn session_start_without_plugin_version_leaves_none() {
 
     session.apply_event(&event);
     assert_eq!(session.plugin_version, None);
+}
+
+#[test]
+fn parse_stop_failure_notification() {
+    let body = r#"{"v":1,"agent":"omp","event":"stop_failure","query":"here is another test","response":"There is an issue with the selected model","error_type":"error"}"#;
+    let notif = parse_event(Some("warp://cli-agent"), body).unwrap();
+
+    assert_eq!(notif.event, CLIAgentEventType::StopFailure);
+    assert_eq!(notif.agent, CLIAgent::OhMyPi);
+    assert_eq!(notif.payload.error_type.as_deref(), Some("error"));
+}
+
+#[test]
+fn stop_failure_sets_failed_status_with_error_type() {
+    let mut session = CLIAgentSession { agent: CLIAgent::OhMyPi,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext::default(),
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    remote_host: None,
+    plugin_version: None,
+    draft_text: None,
+    custom_command_prefix: None, current_model: None };
+
+    let event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::StopFailure,
+        session_id: None,
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload {
+            response: Some("rate limit exceeded".to_owned()),
+            error_type: Some("error".to_owned()),
+            ..Default::default()
+        },
+    };
+
+    let new_status = session.apply_event(&event).expect("status should change");
+
+    assert_eq!(
+        new_status,
+        CLIAgentSessionStatus::Failed {
+            error_type: Some("error".to_owned()),
+            message: Some("rate limit exceeded".to_owned()),
+        }
+    );
+    assert_eq!(session.status, new_status);
+}
+
+#[test]
+fn stop_failure_without_query_preserves_previous_prompt() {
+    let mut session = CLIAgentSession { agent: CLIAgent::OhMyPi,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext {
+        query: Some("explain the diff".to_owned()),
+        ..Default::default()
+    },
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    remote_host: None,
+    plugin_version: None,
+    draft_text: None,
+    custom_command_prefix: None, current_model: None };
+
+    let event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::StopFailure,
+        session_id: None,
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+
+    session.apply_event(&event);
+
+    assert_eq!(
+        session.session_context.query.as_deref(),
+        Some("explain the diff")
+    );
+}
+
+#[test]
+fn prompt_submit_after_failure_returns_to_in_progress() {
+    // 上一轮失败后重新提问，状态必须回到 InProgress，否则 UI 会一直显示失败态
+    let mut session = CLIAgentSession { agent: CLIAgent::OhMyPi,
+    status: CLIAgentSessionStatus::Failed {
+        error_type: Some("error".to_owned()),
+        message: Some("rate limit exceeded".to_owned()),
+    },
+    session_context: CLIAgentSessionContext {
+        query: Some("explain the diff".to_owned()),
+        ..Default::default()
+    },
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    remote_host: None,
+    plugin_version: None,
+    draft_text: None,
+    custom_command_prefix: None, current_model: None };
+
+    let event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::PromptSubmit,
+        session_id: None,
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload {
+            query: Some("retry after cooldown".to_owned()),
+            ..Default::default()
+        },
+    };
+
+    let new_status = session.apply_event(&event).expect("status should change");
+
+    assert_eq!(new_status, CLIAgentSessionStatus::InProgress);
+    assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+    assert_eq!(
+        session.session_context.query.as_deref(),
+        Some("retry after cooldown")
+    );
+}
+
+#[test]
+fn stop_failure_with_blank_response_leaves_message_none() {
+    // omp 无错误正文时发 response:""，必须过滤成 None，否则下游 fallback 失效
+    let mut empty_session = CLIAgentSession { agent: CLIAgent::OhMyPi,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext::default(),
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    remote_host: None,
+    plugin_version: None,
+    draft_text: None,
+    custom_command_prefix: None, current_model: None };
+
+    let empty_event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::StopFailure,
+        session_id: None,
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload {
+            response: Some("".to_owned()),
+            error_type: Some("error".to_owned()),
+            ..Default::default()
+        },
+    };
+
+    let empty_status = empty_session
+        .apply_event(&empty_event)
+        .expect("status should change");
+
+    assert_eq!(
+        empty_status,
+        CLIAgentSessionStatus::Failed {
+            error_type: Some("error".to_owned()),
+            message: None,
+        }
+    );
+
+    // 纯空白符同样要被 trim 掉
+    let mut blank_session = CLIAgentSession { agent: CLIAgent::OhMyPi,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext::default(),
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    remote_host: None,
+    plugin_version: None,
+    draft_text: None,
+    custom_command_prefix: None, current_model: None };
+
+    let blank_event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::StopFailure,
+        session_id: None,
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload {
+            response: Some("   ".to_owned()),
+            error_type: Some("error".to_owned()),
+            ..Default::default()
+        },
+    };
+
+    let blank_status = blank_session
+        .apply_event(&blank_event)
+        .expect("status should change");
+
+    assert_eq!(
+        blank_status,
+        CLIAgentSessionStatus::Failed {
+            error_type: Some("error".to_owned()),
+            message: None,
+        }
+    );
+}
+
+#[test]
+fn stop_failure_without_error_type_still_leaves_in_progress() {
+    // 报文缺 error_type 时仍须解析成 StopFailure 并结束 InProgress，
+    // 否则事件被丢弃、会话永远转圈
+    let body = r#"{"v":1,"agent":"omp","event":"stop_failure","response":"provider unreachable"}"#;
+    let event = parse_event(Some("warp://cli-agent"), body).unwrap();
+
+    assert_eq!(event.event, CLIAgentEventType::StopFailure);
+
+    let mut session = CLIAgentSession { agent: CLIAgent::OhMyPi,
+    status: CLIAgentSessionStatus::InProgress,
+    session_context: CLIAgentSessionContext::default(),
+    input_state: CLIAgentInputState::Closed,
+    should_auto_toggle_input: false,
+    listener: None,
+    remote_host: None,
+    plugin_version: None,
+    draft_text: None,
+    custom_command_prefix: None, current_model: None };
+
+    let new_status = session.apply_event(&event).expect("status should change");
+
+    assert_eq!(
+        new_status,
+        CLIAgentSessionStatus::Failed {
+            error_type: None,
+            message: Some("provider unreachable".to_owned()),
+        }
+    );
+    assert_eq!(session.status, new_status);
+}
+
+#[test]
+fn resolve_agent_matches_non_canonical_alias() {
+    let body = r#"{"v":1,"agent":"vibe-acp","event":"stop"}"#;
+    let notif = parse_event(Some("warp://cli-agent"), body).unwrap();
+
+    assert_eq!(notif.agent, CLIAgent::Vibe);
+}
+
+#[test]
+fn resolve_agent_falls_back_to_unknown_for_unrecognized_name() {
+    let body = r#"{"v":1,"agent":"not-a-real-agent","event":"stop"}"#;
+    let notif = parse_event(Some("warp://cli-agent"), body).unwrap();
+
+    assert_eq!(notif.agent, CLIAgent::Unknown);
 }

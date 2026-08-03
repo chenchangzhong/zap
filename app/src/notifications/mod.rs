@@ -2,7 +2,7 @@
 //!
 //! 由 002ce467 cloud-removal 误删后重建,只保留与云端无关的本地路径:
 //! - 软件本体的 BYOP agent (Oz) 完成/出错通知
-//! - 第三方 CLI agent (Claude Code / Codex / DeepSeek 等) 状态通知
+//! - 第三方 CLI agent (Claude Code / Codex / Antigravity 等) 状态通知
 //!
 //! 模块布局:
 //! - `item`         数据模型 (`NotificationItem` / `NotificationItems` 等)
