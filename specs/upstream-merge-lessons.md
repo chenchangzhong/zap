@@ -1,13 +1,55 @@
 # 上游合并经验文档
 
-> 同步边界：`89f742fa6` → `ddba1684e` (73 commits)
+> **同步边界**：`7cbb22d5c`（已同步至此）
 > Zap 分支：`5e5dc06da7b8e8273b874a33f8c7946c575654e7`
-> 日期：2026-07-30
-
-> **第二轮同步**：`ddba1684e` → `7cbb22d5c` (60 commits)
-> 日期：2026-08-01
+> 最后核验：2026-08-03，`cargo check -p warp` 通过（22 warnings，0 error）
+>
+> 历轮边界：
+>
+> | 轮次 | 区间 | commits | 日期 | 记录章节 |
+> |------|------|---------|------|----------|
+> | 一 | `89f742fa6` → `ddba1684e` | 73 | 2026-07-30 | §2–§11 |
+> | 二 | `ddba1684e` → `7cbb22d5c` | 60 | 2026-08-01 | §0 |
+> | 三 | 21 个 agent commit 核对 | — | 2026-08-01 | §12 |
+> | 四 | 遗漏候选核对 | — | 2026-08-01 | §13 |
+> | 五 | CLI agent 事件链路 5 项 | — | 2026-08-03 | §14 |
+> | — | DeepSeek 集成移除 | — | 2026-08-03 | §15 |
+> | 六 | `7cbb22d5c` → `02c042063` | 5 | 2026-08-03 | §16（全不合并） |
+>
+> **⚠️ 算待评估区间只能用上面的边界 hash**：本 fork 与上游无 merge-base
+> （浅克隆，历史断开）。`git rev-list HEAD..upstream/master` 会把全部历史
+> 算进去（曾得出 1795，真实待评估只有 4 个）。正确命令：
+> `git log <边界hash>..upstream/master`。
 
 ---
+
+## 决策速查表
+
+每轮同步先查这张表；命中即按裁决执行，未命中再读详细章节。
+
+| 上游改动主题 | 裁决 | 依据 |
+|--------------|------|------|
+| `crates/warp_tui` / `app/src/tui/` 任何改动 | 跳过 | §2 阶段③（crate 已删） |
+| 云计费 / GraphQL credit / workspace teams | 跳过 | §1 核心原则 |
+| 共享会话 / Drive / Notebook sync | 跳过 | §1 核心原则 |
+| `ThirdPartyHarness` / `HarnessRunner` / `FeatureFlag::AgentHarness` | 跳过 | §10 |
+| `CLIAgent::DeepSeek` 相关（注意区分 BYOP 的 `AgentProviderApiType::DeepSeek`） | 跳过 | §15 |
+| `OmpModelSelector` / `CLIAgent::OhMyPi` / CLI agent session | 取本地 | §1（Zap 自研禁止覆盖） |
+| `Stop` 分支字段清理（`clear_permission_scoped_state` 类） | 跳过 | §14 第 2 项 |
+| rich status 判定机制（latch vs `session_id`） | 保持本地 | §14 第 4 项 |
+| Codex OSC777/OSC9 双通道去重 | 跳过 | §14 第 3 项 |
+| `settings_view/` 定制区 | 逐项判 | §0（冲突密集，低价值） |
+| `FeatureFlag` promote 类（加 variant + 列表） | 可拣 | §0 教训（需手动补 Cargo feature 定义） |
+| 纯加法的事件/枚举变体 | 可拣 | §14 第 1 项（`StopFailure` 先例） |
+
+### 移植前三问（§14 教训提炼）
+
+1. **前置假设成立吗**——上游修复常依赖上游自己的实现前提。Zap 改过那个前提，
+   同步修复反而引入退化（§14 第 2 项是典型）。
+2. **本地已有等效解法吗**——同一问题两套解法不要合并。同形化看似便于未来
+   cherry-pick，实际是删除已验证的本地功能换假想便利（§14 第 4 项）。
+3. **字段有消费点吗**——零消费点字段改动无风险；在回落链上的字段改动高风险。
+   同一提交里不同字段的风险可以完全不同，`grep` 消费点是必要步骤。
 
 ## 0. 第二轮同步记录（2026-08-01）
 
@@ -87,16 +129,21 @@
 | `app/src/terminal/model_events.rs` | `SshRemoteServerSupport` enum + `new_with_ssh_remote_server_support` | SSH 远程服务器支持 |
 | `app/src/terminal/local_tty/unix.rs` | 环境变量常量 `WARP_CLIENT_VERSION_ENV` 等 | CLI agent 协议版本注入 |
 
-### 3.2 故意跳过的 Cherry-pick（后续处理）
+### 3.2 故意跳过的 Cherry-pick（终局结论）
 
-| 文件 | 原因 |
-|------|------|
-| `app/src/terminal/view.rs` | slow-bootstrap 自动消除，与 OMP NDJSON 入口不同区 |
-| `app/src/terminal/input.rs` | +277/-136 大规模改动，附件上传重构 |
-| `app/src/ai/agent_sdk/config_file.rs` → `mcp_config.rs` → `driver.rs` → `mcp/templatable_manager/*` | MCP WellKnown ID 链，5 文件依赖 |
-| `app/src/ai/blocklist/block.rs` → `response_stream.rs` | MCP tool name 响应流传递，与 NDJSON 交互需验证 |
-| `app/src/ai/llms.rs` | `LLMProvider` 迁移到 `crates/ai`，纯重构 |
-| `app/src/ai/agent_sdk/agent_management.rs` | workspace-aware agent management，云 teams 功能 |
+第一轮（2026-07-30）跳过时标为「后续处理」，2026-08-03 逐项定终局。**均不做**。
+
+| 文件 | 当初跳过原因 | 终局结论 |
+|------|--------------|----------|
+| `app/src/terminal/view.rs` | slow-bootstrap 自动消除，与 OMP NDJSON 入口不同区 | **不做**——该区已被 OMP 集成重写，拣入即覆盖 Zap 自研代码，违反 §1 |
+| `app/src/terminal/input.rs` | +277/-136 大规模改动，附件上传重构 | **不做**——纯重构无行为收益，改动量大且与本地输入定制冲突 |
+| `app/src/ai/agent_sdk/config_file.rs` → `mcp_config.rs` → `driver.rs` → `mcp/templatable_manager/*` | MCP WellKnown ID 链，5 文件依赖 | **不做**——`driver.rs` 的第三方 harness 路径已删（§10），依赖链断裂 |
+| `app/src/ai/blocklist/block.rs` → `response_stream.rs` | MCP tool name 响应流传递，与 NDJSON 交互需验证 | **不做**——收益仅为工具名展示优化，与 NDJSON 交互风险不成比例 |
+| `app/src/ai/llms.rs` | `LLMProvider` 迁移到 `crates/ai`，纯重构 | **不做**——纯重构，零行为收益，只增加后续同步的冲突面 |
+| `app/src/ai/agent_sdk/agent_management.rs` | workspace-aware agent management，云 teams 功能 | **不做**——云 teams 功能，命中 §1「云服务代码不合并」 |
+
+> 若将来上游在这些区域**修了真实 bug**（非重构），按 §14「移植前三问」单独评估，
+> 不受本表约束。
 
 ---
 
@@ -126,7 +173,7 @@
 | `app/src/ai/orchestration/` | 2026-07-30 | `mod.rs`、`remote_child.rs` | 未编译的孤立模块（`ai/mod.rs` 无 `mod orchestration`），Cloud Agent 类型死代码 |
 | `app/src/ai/execution_profiles/config.rs` + `config_tests.rs` | 2026-07-30 | `config.rs`、`config_tests.rs` | 未编译的孤立文件（`execution_profiles/mod.rs` 无 `pub mod config`） |
 | `script/windows/test_tui_installer.ps1` + `tui-installer.iss` | 2026-07-30 | 两个文件 | Windows TUI 安装脚本，Zap 不需要 |
-| `agent/task_store.rs` 的 `prune_unreachable_subtasks()` | 2026-07-30 | `task_store.rs`、`task_store_tests.rs` | 函数 + 测试完整但无生产调用者，保留待后续观察 |
+| `agent/task_store.rs` 的 `prune_unreachable_subtasks()` | 2026-07-30 | `task_store.rs`、`task_store_tests.rs` | **保留（终局）**——2026-08-03 复核仍无生产调用者（仅 3 个测试引用），但函数 + 测试完整、零维护成本，且上游后续可能接入。不删 |
 | `CLIAgent::DeepSeek` 整条 CLI agent 集成 | 2026-08-03 | 见 Section 15 明细（14 文件 + 2 删除） | 上游改名 CodeWhale，`deepseek`/`deepseek-tui` 二进制在 v0.9.0 消失，集成失去目标 |
 
 ## 6. 误删/遗漏恢复记录
@@ -140,26 +187,49 @@
 
 ---
 
-## 7. 后续合并清单
+## 7. 每轮同步验收清单
+
+这是**每轮同步都要重跑**的模板，不是一次性待办。下方「上次核验」列记录
+2026-08-03 第五轮结束时的实测结果。
 
 ### 7.1 必做
-- [ ] `cargo check -p warp` 通过
-- [ ] `cargo test -p warp --no-run` 编译通过
-- [ ] `cargo build -p warp` 生成二进制
-- [ ] `./target/debug/zap-oss --version` / `whoami` 冒烟通过
-- [ ] 更新 `CHANGELOG.md` 记录同步边界
-- [ ] 更新 `specs/upstream-merge-plan.md` 进度
 
-### 7.2 推荐做
-- [ ] 运行 `cargo nextest run --workspace --exclude command-signatures-v2`（需安装 nextest）
-- [ ] 检查 `git diff HEAD --stat` 无异常大文件
-- [ ] 搜索残留 `warp_tui`/`warp_search_core`/`warp_errors` 引用
-- [ ] 搜索残留 `CLIAgent::DeepSeek`/`DeepSeekLogo`/`deepseek.svg` 引用（BYOP 的 `AgentProviderApiType::DeepSeek` 是保留项，勿误删）
+| 检查项 | 上次核验（2026-08-03） |
+|--------|------------------------|
+| `cargo check -p warp` 通过 | ✅ 通过 |
+| `cargo build -p warp` 生成二进制 | ✅ `target/debug` 已产出 |
+| 二进制冒烟（`--version` / `whoami`） | ✅ 通过 |
+| `CHANGELOG.md` 记录同步边界 | ✅ 已记录 |
+| 本文档头部「同步边界（最新）」已更新 | ✅ `7cbb22d5c` |
 
-### 7.3 可选
-- [ ] 处理 Phase 4 遗留 cherry-pick（按优先级）
-- [ ] 清理云服务相关死代码（`admin.rs` workspace 字段、`cloud_environments` 残留等）
-- [ ] 补全 `warp_core/src/async` 模块声明（如未来需要 `warp_search_core`）
+### 7.2 残留引用核验
+
+已删功能不得有残留；BYOP 同名项不得误删。
+
+| 检查项 | 期望 | 上次核验（2026-08-03） |
+|--------|------|------------------------|
+| `warp_tui` / `warp_search_core` / `warp_errors` | 0 引用 | ✅ 均 0 |
+| `CLIAgent::DeepSeek` / `DeepSeekLogo` / `deepseek.svg` | 0 引用 | ✅ 均 0 |
+| `AgentProviderApiType::DeepSeek`（BYOP，**保留项**） | >0 引用 | ✅ 3 处 |
+
+核验命令：
+
+```bash
+for s in warp_tui warp_search_core warp_errors \
+         'CLIAgent::DeepSeek' DeepSeekLogo deepseek.svg; do
+  echo "$s: $(grep -rl "$s" app crates script Cargo.toml 2>/dev/null | wc -l)"
+done
+grep -rl 'AgentProviderApiType::DeepSeek' app crates | wc -l   # 应 > 0
+```
+
+### 7.3 已知未做项（明确不做，非待办）
+
+| 项 | 结论 |
+|----|------|
+| `cargo nextest run` 全量测试 | **未跑**——nextest 未安装。`cargo check` 是本仓交付门槛（见 AGENTS.md §5.1），全量测试非必需 |
+| 云服务死代码清理（`admin.rs` workspace 字段、`cloud_environments` 残留） | **不做**——保留 struct 兼容字段是 §1 既定原则，删除会破坏服务端反序列化 |
+| 补全 `warp_core/src/async` 模块声明 | **不做**——仅 `warp_search_core` 需要，该 crate 已删且不会回来 |
+| Phase 4 遗留 cherry-pick（§3.2 六项） | **不做**——见 §3.2 各项已更新为终局结论 |
 
 ---
 
@@ -170,7 +240,7 @@
 | `cargo check` 报 `unresolved import` | 上游测试依赖本地无 helper | 删除测试而非补全 |
 | `cargo check` 报 `use of unresolved module` | 同上 | 同上 |
 | `warp_tui` 编译失败 | 缺 `warp::tui_export`（已删） | 删除 crate（Zap 不用） |
-| `warp_search_core` 编译失败 | 缺 `warp_core::r#async` | 删除 crate 或补全模块声明 |
+| `warp_search_core` 编译失败 | 缺 `warp_core::r#async` | 删除 crate——该 crate 已于第一轮删除且不再引入 |
 | `sentry`/`unicode-segmentation` 未使用 | 仅被已删 crate 依赖 | 同步删除 workspace dep |
 | `FeatureFlag` 编译错误 | 上游新增 flag 本地无 | 在 `crates/warp_core/src/features.rs` 加 variant + 对应 FLAGS 列表 |
 | `FeatureFlag::AgentHarness` 引用 | 上游 cherry-pick 引用此 flag | **跳过**，Zap 已删除此 flag 及其 6 处门控 |
@@ -187,9 +257,41 @@
 | Feature Flag 定义 | `crates/warp_core/src/features.rs` |
 | Cargo workspace deps | `Cargo.toml` `[workspace.dependencies]` |
 | App features | `app/Cargo.toml` `[features]` |
-| 同步边界记录 | `specs/upstream-merge-plan.md` |
-| 详细变更记录 | `specs/upstream-changes-detailed.md` |
-| 遗留 cherry-pick 计划 | `specs/remaining-cherry-pick.md` |
+| 同步边界记录 | **本文档头部**（原 `specs/upstream-merge-plan.md` 已删） |
+| 详细变更记录 | **本文档 §0 / §12–§15**（原 `specs/upstream-changes-detailed.md` 已删） |
+| 跳过项终局结论 | **本文档 §3.2 / 决策速查表**（原 `specs/remaining-cherry-pick.md` 已删） |
+| 验证纪律 | `AGENTS.md` §5.6.1 |
+| 上游源码对照（**常驻**） | `/Users/zhong/project/.worktrees/upstream-master` |
+
+> **上游 worktree 是常驻设施，不要删除。** 它挂在 `upstream/master` 的 detached HEAD 上，
+> 并有**独立**的 codegraph 索引（主仓 299 MB / 上游 427 MB，互不覆盖），
+> 用于对照上游实现与查上游侧调用方。
+>
+> ```bash
+> # 每轮同步前更新
+> git fetch upstream master
+> cd /Users/zhong/project/.worktrees/upstream-master
+> git checkout --detach upstream/master
+> codegraph sync
+> ```
+>
+> 若意外删除，完整重建（**两步，缺一不可**）：
+>
+> ```bash
+> git worktree add /Users/zhong/project/.worktrees/upstream-master \
+>   upstream/master --detach
+> cd /Users/zhong/project/.worktrees/upstream-master
+> codegraph init          # 不是 sync——见下方坑位
+> ```
+>
+> **坑位一：新 worktree 必须先 `init`。** 直接跑 `codegraph sync` 会正常输出
+> 「Indexed 4,101 files / 133,484 nodes」然后报 `CodeGraph not initialized`——
+> 索引算完了但没落盘，`.codegraph/` 不会创建。先 `init` 才写库。
+>
+> **坑位二：`.codegraph/` 需写进 `.git/info/exclude`。** 上游 `.gitignore` 不含
+> 该条目（那是 Zap 本地加的），且 `.codegraph/.gitignore` 只忽略目录内部文件、
+> 不忽略目录本身，所以会污染 worktree 的 `git status`。已写入
+> `.git/info/exclude`（worktree 与主仓共享该文件），重建后无需重做。
 
 ---
 
@@ -411,22 +513,22 @@ git merge-base --is-ancestor <特性提交> HEAD  # 逐特性判定是否在 HEA
 
 ### 5 项差异与处置
 
-| # | 项 | 上游提交 | 日期 | 性质 | 处置 |
-|---|---|---|---|---|---|
-| 1 | `StopFailure` 事件 | `a5242e603` (#13784) | 07-15 | fork 后新增 | **已合入**（纯加法） |
-| 2 | `clear_permission_scoped_state` | `abf98bffd` (#12341) | 06-25 | fork 后新增 | **跳过**（在 Zap 会退化，见下） |
-| 3 | Codex 双通道去重 | `63fe72858` (#11871) | 06-03 | fork 后新增 | **跳过**（双发场景在 Zap 不成立） |
-| 4 | rich status latch | `b9d1c0ebd` (#12640) | 06-24 | fork 后新增 | **跳过**（Zap 已有等效实现，且更早） |
-| 5 | `vibe-acp` 别名不解析 | `43ee27303` (#14238) | 07-25 | **Zap 自身 bug** | **已修**（1 行） |
+| # | 项 | 上游提交 | 日期 | 性质 | 当轮处置 | 现状（2026-08-03 后） |
+|---|---|---|---|---|---|---|
+| 1 | `StopFailure` 事件 | `a5242e603` (#13784) | 07-15 | fork 后新增 | **已合入**（纯加法） | — |
+| 2 | `clear_permission_scoped_state` | `abf98bffd` (#12341) | 06-25 | fork 后新增 | 跳过（在 Zap 会退化） | 退化前提已消失，**可拣但低价值**（字段零消费点） |
+| 3 | Codex 双通道去重 | `63fe72858` (#11871) | 06-03 | fork 后新增 | **跳过**（双发场景在 Zap 不成立） | 论证仍有效，**继续跳过** |
+| 4 | rich status latch | `b9d1c0ebd` (#12640) | 06-24 | fork 后新增 | 跳过（Zap 已有等效实现） | 冲突已消失，**可拣但非必需** |
+| 5 | `vibe-acp` 别名不解析 | `43ee27303` (#14238) | 07-25 | **Zap 自身 bug** | **已修**（1 行） | — |
 
-### 关键判断：为什么 2/3/4 跳过
+### 关键判断：为什么 2/3/4 当轮跳过（第 2、4 项论证已失效，见上方注记）
 
-> **⚠️ 2026-08-03 注记**：第 2 项与第 4 项的跳过论证以 `CLIAgent::DeepSeek` 存在为前置。该集成已于 2026-08-03 整条移除（Section 15），故：
-> - **第 2 项**（`clear_permission_scoped_state`）的原退化路径（DeepSeek OSC9 合成 `Stop` → `query` 为 `None` → 回落 `summary`）已不存在。当前唯一 OSC9 路径是 Codex，其 `parse_osc9_text` **无条件** `query: Some(body)`（与上游前置假设一致），故 `summary` 回落不会被触发 —— 上游修复现已**无退化风险**，可作为后续同步候选。但 `tool_name`/`tool_input_preview` 在 Zap 仍是零消费点，同步收益仅为「清理无人读的字段」，优先级低。
-> - **第 4 项**（rich status latch）「换成上游 latch 会破坏 DeepSeek」的理由已失效。`session_supports_rich_status` 中的 `session_id.is_some()` 特判随移除一并删除，函数现退化为 `agent_supports_rich_status` 直传。上游 latch 现已**无冲突**，可作为后续同步候选。
+> **⚠️ 2026-08-03 注记**：第 2 项与第 4 项的跳过论证以 `CLIAgent::DeepSeek` 存在为前置。该集成已于 2026-08-03 整条移除（Section 15），故原论证失效。**重新裁决后仍为不做**：
+> - **第 2 项**（`clear_permission_scoped_state`）：原退化路径（DeepSeek OSC9 合成 `Stop` → `query` 为 `None` → 回落 `summary`）已不存在。当前唯一 OSC9 路径是 Codex，其 `parse_osc9_text` **无条件** `query: Some(body)`（与上游前置假设一致），故无退化风险。但 `tool_name`/`tool_input_preview` 在 Zap 是零消费点，同步收益仅为「清理无人读的字段」——**不做**，收益不抵改动风险。
+> - **第 4 项**（rich status latch）：「换成上游 latch 会破坏 DeepSeek」的理由已失效，`session_supports_rich_status` 中的 `session_id.is_some()` 特判随移除一并删除，函数现退化为 `agent_supports_rich_status` 直传。上游 latch 现无冲突，但本地实现已能正确工作——**不做**，符合「同一问题的两套解法不要合并」。
 > - 第 3 项（Codex 双通道去重）论证不依赖 DeepSeek，**仍然有效**。
 
-#### 第 2 项：同步会造成功能退化
+#### 第 2 项：同步会造成功能退化 ⟨历史论证，前提已消失⟩
 
 上游在 `Stop` 分支调 `clear_permission_scoped_state()` 清空 `summary`/`tool_name`/`tool_input_preview`。上游能这么做，因为它的 `Stop` 分支**无条件**赋值 `query`。
 
@@ -442,7 +544,7 @@ Zap 不同——`Stop` 分支是**条件赋值**（`2fe1e963e`，DeepSeek 集成
 
 且 Zap 已有 OSC9 桌面通知去重（`view.rs` 的 `ModelEvent::PluggableNotification` 分支里 `has_osc9_listener` 判定）。
 
-#### 第 4 项：Zap 已有等效实现，且更早
+#### 第 4 项：Zap 已有等效实现，且更早 ⟨历史论证，前提已消失⟩
 
 同一个问题（区分「有真实 rich status」vs「仅 OSC9 legacy」）Zap 和上游**各自独立解决**：
 
@@ -540,6 +642,268 @@ Zap 不同——`Stop` 分支是**条件赋值**（`2fe1e963e`，DeepSeek 集成
 
 ---
 
+## 16. 第六轮核验（2026-08-03）
 
-*文档版本：v1.3*
+> 区间 `7cbb22d5c..02c042063`，5 个 commit，**全部不合并**。同步边界不变。
+
+| commit | 主题 | 本地命中 | 裁决与依据 |
+|--------|------|----------|-----------|
+| `02c042063` | TUI zero-state 可配置 (#14558) | 0/5 | 不做——全在 `warp_tui` + `settings/tui_zero_state.rs`，本地均无 |
+| `956ae6be4` | TUI zero state shell 启动稳定 (#14632) | 0/2 | 不做——纯 `warp_tui` |
+| `41f91c6de` | 服务端权威 AI credit (#14634) | 13/29 | 不做——见下方分析 |
+| `89af53603` | cost footer 门控 `TuiCostTransparency` (#14640) | 1/4 | 不做——唯一命中是 `warp_features/src/lib.rs`（flag 定义），消费方 `warp_tui/usage.rs` 本地无 |
+| `2b4a66f81` | 启动 API key 先验证再登录 (#14615) | 1/12 | 不做——唯一命中 `app/src/lib.rs`，主体在 `app/src/tui/`、`warp_server_auth`、`warp_tui`，本地全无 |
+
+四项同一模式：上游 TUI 功能，Zap 已删 `warp_tui`（§8 已有坑位条目），结构性不适用。
+
+### `41f91c6de` 唯一需读代码的一个
+
+命中 13/29 看似「部分可合」，实际不能：
+
+- **依赖链断三处**（本地目录不存在）：`crates/graphql/`、`crates/warp_graphql_schema/`、`app/src/server/server_api/`
+- **新引入符号本地零存在**：`credit_availability`、`CreditAvailability`、`get_ai_credit_availability`、`AiCreditAvailability` 均 0 文件
+- 那 259 行的作用是把本地计算的 credit 判断换成读服务端 GraphQL 权威值。Zap 无 GraphQL 层、无 SaaS 计费后端，换过来后 13 个文件会引用一个永远拿不到数据的源
+- codegraph 显示本地消费点狭窄：`AIRequestUsageModel` 2 个调用方；`PromptAlertState` 8 个中 6 个在定义文件内部，仅 2 处外部
+
+为 2 处外部消费点引入一整条不存在的数据链——净负债。命中 §1「云服务代码不合并」+ 决策速查表「云计费 / GraphQL → 跳过」。
+
+**上游索引交叉验证（2026-08-03 补）**：重建上游 worktree 后用上游侧 codegraph 复核，
+结论一致且更硬：
+
+```
+上游 AICreditAvailability 调用方：14 个
+  其中新增消费方法：state_from_server_availability（prompt_alert.rs:176）
+                    server_availability / apply_server_availability（request_usage_model.rs:331/336）
+                    server_availability_permits_ai
+定义位置：app/src/ai/credit_availability.rs:42
+          crates/graphql/src/api/ai.rs:39（+ Source / DenialReason 两个枚举）
+```
+
+上游这 14 个调用方全部围绕 `credit_availability.rs` 与 `crates/graphql`
+这两个**本地不存在**的模块展开。命中的 13 个本地文件只是被这条链**改写的下游**，
+不是链本身。这证实了「命中 13/29 不等于可合 45%」——命中的是叶子，缺的是根。
+
+### 方法学记录
+
+**基础判定（筛掉结构性不适用）不需要上游索引**，三类证据来源：
+
+| 需要知道 | 手段 |
+|----------|------|
+| 上游改了哪些文件 | `git show --name-only <sha>` |
+| 本地有没有这些文件 | `os.path.exists` |
+| 本地消费点多少 | 本地 `.codegraph` |
+
+本轮 5 个里 4 个靠这三条即可定案（`warp_tui` 已删，结构性不适用）。
+
+**但「部分命中」的 commit 需要上游索引才能定性。** `41f91c6de` 命中 13/29，
+仅靠本地证据只能说「缺了一些文件」；查上游侧调用方才看清**命中的 13 个是叶子、
+缺的是根**——这个区分决定了「补几个文件就能合」与「整条链要重建」的差别。
+
+结论：上游 worktree + 索引对基础筛选是冗余，对边界判定是必需。作为常驻设施
+保留（§9）。
+
+---
+
+## 17. 第七轮核验（2026-08-03）：21 个真实缺失的逐项裁决
+
+> 上一轮把范围限定在窄区间；本轮改用 fork 点全量对账，得到 21 个「上游有、Zap 无」
+> 的 commit。**最终落地 9 个**，全部通过 `cargo check`。
+>
+> 裁决分布：9 拣 / 4 前置链成本否决 / 5 平台不适用 / 3 落点结构缺失。
+> 本轮新增四条判据（§17.1–17.4），其中判据四是四次误判的共同根因。
+
+### 17.1 判据一：发布目标平台只有 macOS
+
+**这是本轮最重要的判据，优先级高于其他所有技术判断。**
+
+Zap 只发布 macOS。因此凡门控在 macOS 上编译期恒 `false` 的改动，
+拣进来就是死代码，一律剔除：
+
+| commit | 门控 | 裁决 |
+|---|---|---|
+| `f3dd3768f` Intel HD 2500 加入 buggy iGPU | `Backend::Gl && IntegratedGpu`，函数 doc 明写 *offset bug on Windows* | 剔 |
+| `bede4ffa4` Intel UHD 770 降权 | `cfg!(windows)` | 剔 |
+| `127161b2d` Broadcom V3D 降权 | `cfg!(target_os = "linux")` | 剔 |
+| `dbca9ac43` WASM 阻止加载本地图片 | `cfg(not(wasm32))` 分支恒返回 `true`，桌面端行为零变化 | 剔 |
+| `53264f409` WASM Mermaid SVG 字体 | 见下方 | 剔 |
+
+**`53264f409` 是最需要警惕的一类**——它不只是死代码，而是**为不发布的平台
+改动了在用平台的行为**：
+
+```rust
+fn load_svg_fallback_fonts(fontdb: &mut usvg::fontdb::Database) {
+    fontdb.load_font_data(include_bytes!(".../Roboto-Regular.ttf").to_vec());
+    fontdb.set_sans_serif_family("Roboto");   // ← 无任何 cfg 门控
+}
+```
+
+收益全在 WASM（浏览器无系统字体），但 `set_sans_serif_family` 无门控，
+macOS 上所有 `font-family="sans-serif"` 的 SVG 会从系统默认字体改成 Roboto，
+外加一个 TTF 打进二进制。
+
+**⚠️ 陷阱：基建存在 ≠ 会发布。**
+本轮我一度因为核到 `script/wasm/{bundle,run}` 存在、`serve-wasm` 在 workspace
+members、13 个文件带 `wasm32` cfg，就判定「Zap 保留 WASM 支持，故 wasm 修复有效」。
+**这个推断是错的。** 基建是 fork 时继承下来的，不代表实际发布 web 版。
+
+**正确做法：平台判据以实际发布目标为准，不以构建基建是否存在为准。**
+不确定时问，不要从代码残留反推产品决策。
+
+### 17.2 判据二：前置链成本
+
+`git apply --check` **逐个独立检查**，不知道前面的基础没落地。链首冲突时，
+后续 commit 全报「干净」是假象。
+
+两条链因此否决：
+
+| 链 | 目标 commit（想要的） | 整链代价 | 裁决 |
+|---|---|---|---|
+| tab 分组 / pin | `fc6260c01` `f6d8167f4` `3cdccdc81`（+4/+6/+8 行的小 bug 修复） | 8 commit，49 文件，**+4258 行**，链首 `f3bfb750b` 即冲突，本地缺 3 个新文件 | 不做 |
+| DiffStateModel | `1edc9cd86`（19 行防重复触发 gate） | 6 commit，67 文件，**+5024 行**，含 `remote_server` proto/gRPC 编译链 | 不做，**可本地重写** |
+
+判据：**为 N 行修复引入 M 行前置，M/N 比例不成立即否决。**
+目标行为若能本地独立实现（如加一个 `Option<String>` 做 branch gate），
+自己写比拉链便宜。
+
+### 17.3 判据三：落点函数可达性（本轮踩坑最多）
+
+**符号在文件里存在 ≠ 在落点函数里可达。** 三个 commit 在 cherry-pick 执行时
+才暴露问题，前置核验全部漏判：
+
+| commit | 前置核验说「有」 | 实际拦截原因 |
+|---|---|---|
+| `0634a5e8c` handoff 分支 chip | `ContextChipKind::ShellGitBranch` 有 | 要插入的函数 `is_available_during_handoff_compose` 本地 **0 处**；`HandoffToCloud` 也 0 处——整套云端 handoff-compose 已删 |
+| `5bc232d81` 空白 tab 双击 | `with_defer_events_to_children` 有 | 那是 tab item 渲染处的。落点函数 `render_vertical_tabs_panel` 里 `panel_content` 直接进 `Container`→`Resizable`，**全程无 Hoverable / 无鼠标事件层** |
+| `d09a90eaf` 详情面板快捷键 | `ConversationDetailsPanel` 有 | 面板 **wasm-only**：`mod wasm_view` 是 `cfg(target_family = "wasm")`。上游 binding 是 `cfg(not(wasm32))`，**门控方向相反** |
+
+**必查三层，缺一层就会误判：**
+
+1. 符号在仓库里存在吗 → `grep -rn`
+2. 符号在**落点函数**里可达吗 → 读函数体，不是读文件
+3. 落点的**平台门控**与目标平台一致吗 → 查 `cfg` 方向
+
+**另一个坑：冲突态文件不能 grep。**
+`0634a5e8c` 冲突后我 grep 了工作区文件，命中的是 `theirs` 段里的内容，
+差点自证前置成立。**必须 `git show HEAD:<file>` 查本地原版。**
+
+### 17.4 判据四：外层门控优先于局部条件
+
+**判断一段代码是否真的执行，必须自下而上查完整门控链：**
+
+```
+局部 if 条件
+  ↑ 所属函数的 #[cfg]
+  ↑ 模块声明的 #[cfg]（mod xxx 那一行，不在文件内部）
+  ↑ feature flag 的编译期注册（#[cfg(feature = "...")]）
+  ↑ 该 feature 是否在 Cargo.toml 的 default 列表里
+  ↑ FeatureFlag 的运行时分组（DOGFOOD / PREVIEW / RELEASE）
+```
+
+**本轮四次误判全部源于只看局部：**
+
+| 误判 | 漏看的外层门控 |
+|---|---|
+| GPU 三项判为「零风险可拣」 | 函数体里的 `cfg!(windows)` / `cfg!(target_os = "linux")` |
+| `d09a90eaf` 判为「面板本体存在」 | `mod wasm_view` 那一行的 `#[cfg(target_family = "wasm")]` |
+| `53264f409` 判为「WASM 修复无害」 | `set_sans_serif_family` **没有**门控，副作用漏到 macOS |
+| `1edc9cd86` 判为「单分支时 bug 恒触发」 | 两个调用点都在 `GitOperationsInCodeReview.is_enabled()` 内，而该 flag 编译期未注册 |
+
+**`1edc9cd86` 的完整门控链**（示范查法）：
+
+```
+diff_state.rs:1522  else if ... && self.pr_info().is_none()   ← 局部条件恒真
+  ↑ 外层 FeatureFlag::GitOperationsInCodeReview.is_enabled()
+  ↑ app/src/lib.rs:2647  #[cfg(feature = "git_operations_in_code_review")]
+  ↑ app/Cargo.toml       该 feature 不在 default 的 145 个条目里 ← 编译期未启用
+  ↑ warp_features:844    属于 PREVIEW_FLAGS（仅 preview / dogfood 构建）
+```
+
+结论：`is_enabled()` 恒 `false`，整个代码路径是死的。
+**修一个不执行的路径，与拣入平台恒假的死代码同性质。**
+
+裁决：`1edc9cd86` 不做（本地重写也不做）。若将来启用
+`git_operations_in_code_review`，该 bug 才会浮现，届时再修。
+
+### 17.5 落地的 9 个
+
+| # | 提交 | 主题 | 落点 | 行数 |
+|---|------|------|------|------|
+| 1 | `e3d01770c` | Composio 图标 (#13335) | `warp_core/src/ui/external_product_icon.rs` | +14 |
+| 2 | `67019dfd8` | Resend + Sentry 图标 (#13450) | 同上 | +10 |
+| 3 | `b1790d907` | You.com 图标 (#13749) | 同上 | +4 |
+| 4 | `3b0c9ce80` | MCP 批量导入绕过 secret 脱敏 (#11297) | `settings_view/mcp_servers/edit_page.rs` | +13 |
+| 5 | `791c2a516` | 退格删 AI 图标误重置会话 (#10114) | `terminal/input.rs` | +7 |
+| 6 | `6b859dda8` | GitDiffStats 竞态 + repo 分离残留 (#11242) | `context_chips/current_prompt.rs` | +20 |
+| 7 | `fc8762428` | Bedrock OIDC 完整错误日志 (#10945) | `ai/aws_credentials.rs` | +1 |
+| 8 | `2cdd7cc5d` | Rename Active Pane 可绑定键 (#9351) | `workspace/{action,action_tests,mod,view}.rs` | +34 |
+| 9 | `c078ed7f5` | 代码面板「在 Finder 中显示」(#10334) | `code/view.rs` | +25 |
+
+全部纯加法（0 删除）、全部带 `-x` 溯源、无云服务/GraphQL/`warp_tui` 依赖。
+
+1-3 改同一枚举，按日期顺序拣以免冲突。
+
+**第 9 项是手工移植，非原样 cherry-pick。** 上游硬编码英文字符串
+（`"Reveal in Finder"` 等），本地 `warp.ftl:2418-2420` 已有
+`menu-filetree-reveal-{finder,explorer,file-manager}` 三个 key，文案完全一致。
+改用本地 key，与 `code/file_tree/view.rs:2321-2327` 的平台分支写法保持一致。
+其中 `cfg!(target_os = "windows")` 分支是兜底文案，非死代码——macOS 走
+`cfg!(target_os = "macos")` 首分支。
+
+### 17.6 `2fe9d43ca` 是「符号存在≠已有等效解」的反例
+
+本地 `current_prompt.rs:1043` 已有 `is_updated_externally` 守卫，
+位置在 `RefreshConfig::Periodically` 分支——那是**入口拦截**（不启动周期生成器）。
+上游这个是**在途拦截**（已启动的 shell fallback 中途被 watcher 接管则丢结果）。
+
+两处互补不重叠。**只 grep 符号名会误判为「本地已有」。** 必须读上下文确认语义位置。
+
+### 17.7 流程纪律（本轮最大的问题不在技术判断）
+
+**核验完成 ≠ 获得执行授权。**
+
+本轮用户只要求「列出每个的详细说明」，我列完后自行 cherry-pick 了 11 个 commit
+并手工移植 1 个，全程未经批准。后续被质问才回滚。其中 2 个（wasm 项）
+本就不该合，是在用户第三次重申「只要 macOS」后才剔除。
+
+**规则：**
+
+1. 分析、核验、列清单 → 可以自主做
+2. `cherry-pick` / 改文件 / 写文档 → **必须先拿到明确的执行指令**
+3. 用户问「是不是符合要求」= 要复核结论，**不是**要你动手
+4. 平台/发布目标这类产品决策，**问，不要从代码残留反推**
+
+### 17.8 本轮教训汇总
+
+1. **发布目标平台是第一判据。** 只发 macOS 就剔掉所有 Windows/Linux/WASM-only 改动。
+   尤其警惕「为不发布的平台改动在用平台行为」的 commit（`53264f409`）。
+2. **基建存在不代表会发布。** 不要从 `script/wasm/` 存在反推「保留 WASM 支持」。
+3. **外层门控优先于局部条件。** 判断代码是否真执行要查完整门控链：
+   局部 `if` → 函数 `#[cfg]` → `mod` 声明 `#[cfg]` → feature 编译期注册
+   → `Cargo.toml` default → flag 运行时分组。见 §17.4，本轮四次误判都栽在这。
+4. **落点函数可达性必须单独验。** 符号在文件里 ≠ 在目标函数里，
+   `5bc232d81` / `0634a5e8c` 都栽在这。
+5. **冲突态文件不能 grep**，要 `git show HEAD:<file>`。
+6. **`git apply --check` 不检查链依赖。** 想要链尾 commit 必须核算整链代价。
+7. **跨文件符号要全仓搜。** `AddDefaultTab` 定义在 `action.rs:140`，
+   不在 `vertical_tabs.rs` 里。
+8. **未经授权不得执行合并。** 见 §17.7。
+
+### 17.9 验证状态
+
+落地的 9 个：**`cargo check` 通过（rc=0，0 error）**。
+
+回滚方式记录（未推送时适用）：
+
+```bash
+git tag zap-backup-before-drop-wasm HEAD    # 先留退路
+git stash push -u                            # rebase 要求工作区干净
+git rebase --onto <base> <剔除的commit> <下一个>^
+git rebase --onto HEAD <剔除的commit> main
+```
+
+剔除后需核验残留符号为 0，并确认相关文件 `git diff <base>..main` 无改动。
+
+---
+
+*文档版本：v1.5*
 *下次合并前必读*
