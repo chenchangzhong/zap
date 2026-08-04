@@ -953,7 +953,7 @@ git merge-base --is-ancestor <commit> upstream/master && echo MERGED || echo NOT
 
 | 分支 | tip | 有返工? | 裁决 |
 |---|---|---|---|
-| `oz-agent/fix-ctrl-c-block-selection-focus` | `fb9a283cc` → 后续 `028ee8230` | 有，上游明确否决初版 | **改**：取返工版 |
+| `factory/ctrl-c-block-selection-focus` | `fb9a283cc` → 后续 `028ee8230` | 有，上游明确否决初版 | **改**：取返工版 |
 | `oz-agent/fix-find-highlight-links` | `5478b9306`（就是 tip） | 无 | **不动**：上游没有更正确的版本 |
 
 **判据：未合并分支本身不是问题，「本地取的不是该分支的最终形态」才是问题。**
@@ -964,7 +964,7 @@ git merge-base --is-ancestor <commit> upstream/master && echo MERGED || echo NOT
 | # | 文件 | 偏差 | 修法 |
 |---|------|------|------|
 | 1 | `terminal/view.rs:7015` | 移植了被否决的初版（§18.1） | 补回 `if !self.ai_input_model.as_ref(ctx).is_ai_input_enabled()` guard，注释同步为返工版措辞 |
-| 2 | `ai/blocklist/action_model.rs:1240` | 上游 `6903db03f` 是把 `debug_assert!(false, ...)` **降级为 `log::warn!`**，本地只删 assert 留了中文注释，日志丢失 | 补 `log::warn!("Ignoring acceptance for non-pending requested command: {action_id:?}")` |
+| 2 | `ai/blocklist/action_model.rs:1240` | 上游 `6903db03f` 是把 `debug_assert!(false, ...)` **降级为 `log::warn!`**，本地只删 assert 留了中文注释，未补对应日志 | 补 `log::warn!("Ignoring acceptance for non-pending requested command: {action_id:?}")`，与上游逐字一致 |
 | 3 | `warpui_core/src/elements/text.rs:1213` | 注释描述的行为已被同 commit 的 `semantic_expansion_target` 推翻（双击 "m" 左缘不再选中 "first middle"） | 注释改为反映实际语义：backward 半边已修，forward 半边仍溢出 |
 
 偏差 2/3 是**同类**：移植时把上游的实质改动降格成注释。
@@ -1048,7 +1048,22 @@ clear 分支入口：has_block_list_selection || has_copiable_block_selection
 | `cargo nextest run -p warpui_core text` | 51 passed |
 | fail-before | 注掉 guard → 仅新测试 FAIL，既有 10 个全绿 → 实证既有测试不覆盖该 guard |
 
-改动量：4 文件 +118/-19（生产代码 3 处，各单 hunk）。
+改动量：代码 + 测试 4 文件 +118/-19（生产代码 3 处，各单 hunk）；
+含本文档共 5 文件 +268/-22。
+
+### 18.9 补记：上游修复落到本地自研诊断日志旁边时
+
+`action_model.rs` 那处 `let ... else` 分支里，本地早已有一条自研的
+`log::error!("[byop-diag] ... NOT FOUND in pending_actions ... chain 断了")`——
+上游同分支**没有**这条。补上上游的 `log::warn!` 后，同一事件出两条日志，
+且**级别定性相反**：本地 `error!` 说「chain 断了」（异常），上游 `warn!`
+说「不是编程错误」（正常）。
+
+两条都只是日志、无控制流，故不阻塞。但记下这个形态：
+**上游修复落点旁若有本地自研诊断，要先判断二者对同一事件的定性是否冲突**，
+而不是无脑并列。此处保留双条的理由是 `[byop-diag]` 前缀标明了它是 Zap 侧
+BYOP 诊断线索、带 `pending_conversations` 明细，与上游那条信息量不同；
+若将来 byop 诊断退役，应连带把 `error!` 一起删掉而非只删 `warn!`。
 
 ---
 

@@ -1240,9 +1240,9 @@ impl BlocklistAIActionModel {
             // 上游 6903db03f(#12747):卡片被拒后 action 已移出 pending_actions,
             // 此时迟到的确认会正常命中该分支,不是编程错误,不能 `debug_assert!(false)`
             // 崩掉 debug 构建;按上游做法降级为 warn 并忽略。
-            log::warn!(
-                "Ignoring acceptance for non-pending requested command: {action_id:?}"
-            );
+            // 上面那条 `error!` 是本地 byop 诊断(带 pending_conversations 明细),
+            // 与这条上游行为对齐的 warn 信息量不同,故并存。
+            log::warn!("Ignoring acceptance for non-pending requested command: {action_id:?}");
             return;
         };
 
