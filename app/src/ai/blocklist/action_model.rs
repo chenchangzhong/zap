@@ -1237,7 +1237,8 @@ impl BlocklistAIActionModel {
                     .collect::<Vec<_>>()
                     .join(",")
             );
-            debug_assert!(false, "Expected action to be requested command.");
+            // 上游 6903db03f(#12747):先拒后确认时该分支会被正常命中,不是编程错误,
+            // 不能 `debug_assert!(false)` 崩掉 debug 构建。上面的 `log::error!` 已记录足够诊断信息。
             return;
         };
 

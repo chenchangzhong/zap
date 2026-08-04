@@ -31,7 +31,7 @@ mod todos;
 use common::get_highlight_ranges_for_find_matches;
 use pathfinder_color::ColorU;
 use settings::Setting as _;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use warp_core::features::FeatureFlag;
 use warp_core::semantic_selection::SemanticSelection;
 use warpui::elements::{
@@ -67,7 +67,7 @@ use super::{
 
 use super::TextLocation;
 use crate::ai::blocklist::block::view_impl::comments::address_comment_chips;
-use crate::ai::blocklist::block::{DetectedLinksState, RICH_CONTENT_LINK_FIRST_CHAR_POSITION_ID};
+use crate::ai::blocklist::block::DetectedLinksState;
 use crate::ai::blocklist::history_model::BlocklistAIHistoryModel;
 use crate::cloud_object::model::persistence::ObjectStoreModel;
 
@@ -151,6 +151,77 @@ fn add_slash_command_highlight(
             .with_foreground_color(slash_command_foreground_color)
             .with_properties(default_properties)
     }
+}
+
+fn merge_text_styles(base: TextStyle, overlay: TextStyle) -> TextStyle {
+    let mut merged = base;
+    if overlay.foreground_color.is_some() {
+        merged.foreground_color = overlay.foreground_color;
+    }
+    if overlay.syntax_color.is_some() {
+        merged.syntax_color = overlay.syntax_color;
+    }
+    if overlay.background_color.is_some() {
+        merged.background_color = overlay.background_color;
+    }
+    if overlay.border.is_some() {
+        merged.border = overlay.border;
+    }
+    if overlay.error_underline_color.is_some() {
+        merged.error_underline_color = overlay.error_underline_color;
+    }
+    if overlay.underline_color.is_some() {
+        merged.underline_color = overlay.underline_color;
+    }
+    if overlay.hyperlink_id.is_some() {
+        merged.hyperlink_id = overlay.hyperlink_id;
+    }
+    merged.show_strikethrough |= overlay.show_strikethrough;
+    merged
+}
+
+fn merge_highlights(base: Highlight, overlay: Highlight) -> Highlight {
+    let properties = if overlay.properties() == Properties::default() {
+        base.properties()
+    } else {
+        overlay.properties()
+    };
+    Highlight::new()
+        .with_text_style(merge_text_styles(*base.text_style(), *overlay.text_style()))
+        .with_properties(properties)
+}
+
+fn normalize_highlighted_ranges(ranges: Vec<HighlightedRange>) -> Vec<HighlightedRange> {
+    let mut highlights_by_index = BTreeMap::new();
+    for range in ranges {
+        for index in range.highlight_indices {
+            highlights_by_index
+                .entry(index)
+                .and_modify(|highlight| {
+                    *highlight = merge_highlights(*highlight, range.highlight);
+                })
+                .or_insert(range.highlight);
+        }
+    }
+
+    let mut normalized: Vec<HighlightedRange> = vec![];
+    for (index, highlight) in highlights_by_index {
+        if let Some(last_range) = normalized.last_mut() {
+            let is_contiguous = last_range
+                .highlight_indices
+                .last()
+                .is_some_and(|last_index| *last_index + 1 == index);
+            if is_contiguous && last_range.highlight == highlight {
+                last_range.highlight_indices.push(index);
+                continue;
+            }
+        }
+        normalized.push(HighlightedRange {
+            highlight,
+            highlight_indices: vec![index],
+        });
+    }
+    normalized
 }
 
 /// Adds the appropriate highlighting for secrets and links to the given text element.
@@ -262,7 +333,7 @@ fn add_highlights_to_text(
                 }
                 text_element = text_element.with_saved_char_position(
                     open_link_tooltip.link_range.start,
-                    RICH_CONTENT_LINK_FIRST_CHAR_POSITION_ID.to_owned(),
+                    detected_links_state.resolved_tooltip_position_id(),
                 );
             }
         }
@@ -515,7 +586,7 @@ pub(crate) fn add_highlights_to_rich_text(
                     formatted_text_element = formatted_text_element.with_saved_glyph_position(
                         open_link_tooltip.link_range.start,
                         i,
-                        RICH_CONTENT_LINK_FIRST_CHAR_POSITION_ID.to_owned(),
+                        detected_links_state.resolved_tooltip_position_id(),
                     );
                 }
             }
@@ -596,12 +667,7 @@ pub(crate) fn add_highlights_to_rich_text(
             ));
         }
 
-        let merged_range = HighlightedRange::merge_overlapping_ranges(style_ranges);
-        let sorted_range = merged_range
-            .into_iter()
-            .sorted_by_key(|range| range.highlight_indices[0]);
-
-        formatted_text_element.add_styles(i, sorted_range);
+        formatted_text_element.add_styles(i, normalize_highlighted_ranges(style_ranges));
     }
     formatted_text_element
 }
@@ -1174,13 +1240,14 @@ impl View for AIBlock {
         let mut selectable = SelectableArea::new(
             self.state_handles.selection_handle.clone(),
             move |selection_args, ctx, _| {
-                let selection = selection_args.selection;
-                if let Some(selection) =
-                    selection.as_ref().filter(|selection| !selection.is_empty())
-                {
+                let selection = selection_args
+                    .selection
+                    .filter(|selection| !selection.is_empty());
+                if let Some(selection) = selection.as_ref() {
                     ctx.dispatch_typed_action(AIBlockAction::CopyOnSelect(selection.clone()));
                 }
                 *selected_text.write() = selection;
+                ctx.dispatch_typed_action(AIBlockAction::SelectText);
             },
             SavePosition::new(content.finish(), self.saved_position_id().as_str()).finish(),
         )
@@ -1328,3 +1395,7 @@ impl AIAgentInput {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "view_impl_tests.rs"]
+mod tests;

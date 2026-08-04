@@ -29,7 +29,7 @@ use crate::{
 };
 
 use crate::context_chips::prompt::Prompt;
-use crate::editor::{AutosuggestionLocation, AutosuggestionType};
+use crate::editor::{AutosuggestionLocation, AutosuggestionType, EditorAction};
 
 use crate::settings::{AISettings, AppEditorSettings, WarpPromptSeparator};
 
@@ -4348,6 +4348,115 @@ fn terminal_action_ctrl_c_exit_agent_view_requires_confirmation() {
     })
 }
 
+/// Regression test for GH-13480: pressing Ctrl+C on a whole-block selection with
+/// no foreground process running (idle path) must clear the selection and return
+/// focus to the prompt, even when `FeatureFlag::AgentView` is enabled.
+///
+/// Before the fix, `clear_selections_when_shell_mode_without_focusing_input` skipped
+/// clearing `selected_blocks` when AgentView was enabled (blocks are preserved as
+/// AI context attachments). This left the block highlighted after Ctrl+C and kept
+/// focus on the terminal grid instead of the input box.
+#[test]
+#[cfg(not(windows))]
+fn ctrl_c_with_selected_block_clears_selection_on_idle_path() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        FeatureFlag::AgentView.set_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        // Set up a completed (non-long-running) block and select it.
+        terminal.update(&mut app, |view, _| {
+            view.model.lock().simulate_block("ls", "output");
+        });
+        terminal.update(&mut app, |view, ctx| {
+            // Select the first (completed) block — this is the "whole-block highlight"
+            // the bug report describes.
+            view.selected_blocks.reset_to_single(BlockIndex::zero());
+            assert!(
+                !view.selected_blocks.is_empty(),
+                "block must be selected before Ctrl+C"
+            );
+
+            view.handle_action(&TerminalAction::CtrlC, ctx);
+
+            // Selection must be cleared after Ctrl+C on the idle path.
+            assert!(
+                view.selected_blocks.is_empty(),
+                "Ctrl+C on idle path must clear block selection"
+            );
+        });
+
+        // On the idle path (no foreground process) Ctrl+C must NOT send SIGINT.
+        assert!(
+            pty_writes.borrow().is_empty(),
+            "Ctrl+C on idle path with a block selection must not send ETX to PTY"
+        );
+    })
+}
+
+/// Regression test for GH-13480 (running-process path): pressing Ctrl+C when a
+/// foreground process is running AND a block is selected must clear the selection
+/// AND send SIGINT to the PTY. This path must remain correct after the fix.
+#[test]
+#[cfg(not(windows))]
+fn ctrl_c_with_selected_block_and_running_process_clears_selection_and_sends_sigint() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        FeatureFlag::AgentView.set_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        // Simulate a long-running command (foreground process) so Ctrl+C acts as SIGINT.
+        terminal.update(&mut app, |view, _| {
+            view.model
+                .lock()
+                .simulate_long_running_block("sleep 60", "running");
+        });
+        terminal.update(&mut app, |view, ctx| {
+            // Select a block while the long-running command is active.
+            view.selected_blocks.reset_to_single(BlockIndex::zero());
+            assert!(
+                !view.selected_blocks.is_empty(),
+                "block must be selected before Ctrl+C"
+            );
+
+            view.handle_action(&TerminalAction::CtrlC, ctx);
+
+            // Selection must still be cleared even on the running-process path.
+            assert!(
+                view.selected_blocks.is_empty(),
+                "Ctrl+C with a running process must still clear block selection"
+            );
+        });
+
+        // On the running-process path Ctrl+C must send SIGINT (ETX) to the PTY.
+        assert_eq!(
+            *pty_writes.borrow(),
+            vec![vec![warp_terminal::model::escape_sequences::C0::ETX]],
+            "Ctrl+C with a running process must send ETX to PTY regardless of block selection"
+        );
+    })
+}
+
 /// Sets up a CLI agent session, opens rich input, submits `text`, and returns
 /// the terminal handle and the collected PTY writes.
 #[allow(clippy::type_complexity)]
@@ -5603,4 +5712,73 @@ fn onekey_empty_candidates_with_empty_query_returns_empty_ordered() {
     let candidates: Vec<(&str, &str)> = vec![];
     let result = filter_and_sort_onekey_candidates(candidates.iter().copied(), "");
     assert_eq!(rows_indices(result), Vec::<usize>::new());
+}
+
+
+/// APP-4330 回归测试:Agent Mode 下输入字符不会清掉 block 选区,所以 input 选区与
+/// block 选区可以同时存在。此时 `copy()` 必须复制 input 选区,而不是 block 内容。
+#[test]
+fn copy_prioritizes_input_selection_over_selected_blocks() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, _ctx| {
+            let mut model = view.model.lock();
+            model.simulate_block("ls", "foo");
+            model.simulate_block("pwd", "bar");
+        });
+
+        // 基线:只选 block 时仍复制 block 内容。
+        terminal.update(&mut app, |view, ctx| {
+            view.selected_blocks.toggle(2.into(), None, Some(1.into()));
+            view.copy(ctx);
+            assert_eq!(
+                read_from_clipboard(ctx),
+                "pwd\nbar",
+                "no input selection: copy must still copy the selected block"
+            );
+        });
+
+        // 切 Agent Mode,该模式下输入字符不会清 block 选区。
+        terminal.update(&mut app, |view, ctx| {
+            view.set_ai_input_mode_with_query(None, ctx);
+        });
+
+        // 在 input 中打字并全选,焦点留在 terminal grid 上。
+        terminal.update(&mut app, |view, ctx| {
+            view.focus_terminal(ctx);
+            view.typed_characters_on_terminal("INPUTTEXT", ctx);
+            view.input.update(ctx, |input, ctx| {
+                input.editor().update(ctx, |editor, ctx| {
+                    editor.handle_action(&EditorAction::SelectAll, ctx)
+                })
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.selected_blocks.reset_to_single(2.into());
+
+            let input_selection = view.input.read(ctx, |input, ctx| {
+                input
+                    .editor()
+                    .read(ctx, |editor, ctx| editor.selected_text(ctx))
+            });
+            assert_eq!(
+                input_selection, "INPUTTEXT",
+                "test setup: input selection must be present"
+            );
+            assert!(
+                !view.selected_blocks.is_empty(),
+                "test setup: block selection must survive typing in Agent Mode"
+            );
+
+            view.copy(ctx);
+            assert_eq!(
+                read_from_clipboard(ctx),
+                "INPUTTEXT",
+                "input selection must win over the selected block"
+            );
+        });
+    })
 }

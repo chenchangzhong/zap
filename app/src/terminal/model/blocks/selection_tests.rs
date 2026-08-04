@@ -1584,3 +1584,165 @@ pub fn test_rect_selection_inverted_multi_block() {
         })
     })
 }
+
+
+/// 无点选区时，模型必须把富内容（AI）块的选区记录下来，并让
+/// `rich_content_blocks_in_selection` 从回落分支把它返回。这条回落分支正是
+/// copy / insert into input / attach as agent context 找到 AI 块选中文字的唯一
+/// 途径（#12079 的 `mouse_down` `if !handled` 守卫打断的就是这里）。
+#[test]
+pub fn test_rich_content_selection_recorded_without_point_selection() {
+    let mut blocks = new_bootstrapped_block_list(None, None, ChannelEventListener::new_for_test());
+    let semantic_selection = SemanticSelection::mock(false, "");
+    let view_id = EntityId::new();
+
+    // 初始状态：既没有点选区，也没有富内容选区。
+    assert!(blocks.rich_content_blocks_in_selection().is_empty());
+    assert!(!blocks.has_renderable_selection(&semantic_selection, false));
+
+    blocks.set_rich_content_selection(view_id);
+
+    assert_eq!(blocks.rich_content_blocks_in_selection(), vec![view_id]);
+    assert!(
+        blocks.has_renderable_selection(&semantic_selection, false),
+        "模型必须记录 AI 块的选区，copy/insert 才能找到选中文字"
+    );
+}
+
+/// `clear_rich_content_selection` 必须按 view id 精确匹配：清别的 view 不能影响
+/// 已记录的 id；清自己之后回落必须为空，否则后续 copy 会返回陈旧文字。
+#[test]
+pub fn test_clear_rich_content_selection_matches_view_id_exactly() {
+    let mut blocks = new_bootstrapped_block_list(None, None, ChannelEventListener::new_for_test());
+    let semantic_selection = SemanticSelection::mock(false, "");
+    let view_id = EntityId::new();
+    let other_view_id = EntityId::new();
+
+    blocks.set_rich_content_selection(view_id);
+
+    // 清另一个 view 的选区不能动到已记录的 id。
+    blocks.clear_rich_content_selection(other_view_id);
+    assert_eq!(blocks.rich_content_blocks_in_selection(), vec![view_id]);
+    assert!(blocks.has_renderable_selection(&semantic_selection, false));
+
+    // 清自己：回落必须为空。
+    blocks.clear_rich_content_selection(view_id);
+    assert!(blocks.rich_content_blocks_in_selection().is_empty());
+    assert!(!blocks.has_renderable_selection(&semantic_selection, false));
+
+    // 重复清空是幂等的，不应 panic 也不应复活选区。
+    blocks.clear_rich_content_selection(view_id);
+    assert!(blocks.rich_content_blocks_in_selection().is_empty());
+}
+
+/// `clear_selection` 必须同时清掉富内容选区。否则「点一下终端空白处取消选区」
+/// 之后，copy 仍会通过回落分支拿到 AI 块里的陈旧选中文字。
+#[test]
+pub fn test_clear_selection_clears_rich_content_selection() {
+    let mut blocks = new_bootstrapped_block_list(None, None, ChannelEventListener::new_for_test());
+    let semantic_selection = SemanticSelection::mock(false, "");
+    let view_id = EntityId::new();
+
+    blocks.set_rich_content_selection(view_id);
+    assert_eq!(blocks.rich_content_blocks_in_selection(), vec![view_id]);
+
+    blocks.clear_selection();
+
+    assert!(
+        blocks.rich_content_blocks_in_selection().is_empty(),
+        "clear_selection 必须连富内容选区一起清掉，否则会残留陈旧选中文字"
+    );
+    assert!(!blocks.has_renderable_selection(&semantic_selection, false));
+}
+
+/// 新的点选区抢占富内容选区（单选语义）。这里断言私有字段而不是
+/// `rich_content_blocks_in_selection()`：一旦点选区存在，该函数走的是点选区
+/// 分支、根本不看回落记录，所以残留只能在字段上观察到。残留的后果是等这个点
+/// 选区之后被丢弃（如 `ClearMode::ResetAndClear` 里的 `selection.take()`）时，
+/// 回落分支会复活一个早已失效的 AI 块选区。
+#[test]
+pub fn test_start_selection_supersedes_rich_content_selection() {
+    let mut blocks = new_bootstrapped_block_list(None, None, ChannelEventListener::new_for_test());
+    let block_index = insert_block(&mut blocks, "foo\n", "bar\n");
+    let view_id = EntityId::new();
+
+    blocks.set_rich_content_selection(view_id);
+    assert_eq!(blocks.rich_content_blocks_in_selection(), vec![view_id]);
+
+    let command_grid_offset = blocks
+        .block_at(block_index)
+        .expect("block should exist")
+        .command_grid_offset();
+    blocks.start_selection(
+        BlockListPoint::new(command_grid_offset, 0),
+        SelectionType::Simple,
+        Side::Right,
+    );
+
+    assert!(
+        blocks.rich_content_selections.is_empty(),
+        "新点选区必须抢占富内容选区（单选语义）"
+    );
+}
+
+/// 点选区与富内容选区的互斥规则：
+/// - 点选区**没有**跨过该富内容块时，新的富内容选区取代点选区；
+/// - 点选区**已经**跨过该富内容块时（command 块拖到 AI 块的跨块选区），
+///   点选区是唯一真相来源，`set_rich_content_selection` 必须原样放过它，
+///   否则会把 command 块那一段选区丢掉。
+#[test]
+pub fn test_set_rich_content_selection_versus_point_selection() {
+    let mut blocks = new_bootstrapped_block_list(None, None, ChannelEventListener::new_for_test());
+    let semantic_selection = SemanticSelection::mock(false, "");
+
+    // 第一个 block，后面紧跟一个富内容块，再跟一个 block。
+    let first_block_index = insert_block(&mut blocks, "foo\n", "bar\n");
+    let view_id = EntityId::new();
+    blocks.append_rich_content(RichContentItem::new_for_test(None, view_id, None), false);
+    insert_block(&mut blocks, "baz\n", "qux\n");
+
+    // 情形一：点选区只落在第一个 block 内，没有跨到富内容块。
+    let command_grid_offset = blocks
+        .block_at(first_block_index)
+        .expect("block should exist")
+        .command_grid_offset();
+    blocks.start_selection(
+        BlockListPoint::new(command_grid_offset, 0),
+        SelectionType::Simple,
+        Side::Right,
+    );
+    blocks.update_selection(BlockListPoint::new(command_grid_offset, 3), Side::Right);
+    assert!(!blocks
+        .rich_content_blocks_in_selection()
+        .contains(&view_id));
+
+    blocks.set_rich_content_selection(view_id);
+
+    // 点选区被取代，回落分支返回富内容块。
+    assert!(blocks.selection.is_none());
+    assert_eq!(blocks.rich_content_blocks_in_selection(), vec![view_id]);
+
+    // 情形二：构造一个从第一个 block 一直拖到最后的点选区，它跨过了富内容块。
+    let block_list_height = blocks.block_heights().summary().height;
+    blocks.start_selection(
+        BlockListPoint::new(command_grid_offset, 0),
+        SelectionType::Simple,
+        Side::Right,
+    );
+    blocks.update_selection(
+        BlockListPoint::new(block_list_height - 1.into_lines(), 0),
+        Side::Right,
+    );
+    assert!(
+        blocks.rich_content_blocks_in_selection().contains(&view_id),
+        "跨块点选区应当覆盖富内容块"
+    );
+    assert!(blocks.has_renderable_selection(&semantic_selection, false));
+
+    blocks.set_rich_content_selection(view_id);
+
+    assert!(
+        blocks.selection.is_some(),
+        "跨块点选区必须保留，否则 copy 会丢掉 command 块那一段"
+    );
+}
