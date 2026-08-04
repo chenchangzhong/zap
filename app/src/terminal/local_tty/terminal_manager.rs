@@ -826,6 +826,7 @@ impl TerminalManager {
         );
     }
 
+
     /// Contains necessary logic for stopping the current shared session.
     fn cleanup_shared_session(
         terminal_view: &ViewHandle<TerminalView>,
@@ -851,6 +852,7 @@ impl TerminalManager {
             view.on_session_share_ended(ctx);
         });
     }
+
 
     #[cfg(feature = "integration_tests")]
     pub fn pid(&self) -> Option<u32> {
