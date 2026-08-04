@@ -5782,3 +5782,37 @@ fn copy_prioritizes_input_selection_over_selected_blocks() {
         });
     })
 }
+
+// 行为测试：rich input 打开时，光标可见性必须跟随焦点归属。
+// cmd-down（FocusCLIAgentRichInput）焦点在 rich input → 隐藏；
+// cmd-up（FocusCLIAgentTerminal）焦点回 TUI grid → 显示。
+#[test]
+fn cli_agent_cursor_visible_when_terminal_focused() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        let terminal = open_cli_agent_rich_input_for_agent(&mut app, CLIAgent::Claude);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_action(&TerminalAction::FocusCLIAgentRichInput, ctx);
+        });
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                view.should_hide_cli_agent_cursor_cell(ctx),
+                "cursor should stay hidden while rich input holds focus"
+            );
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_action(&TerminalAction::FocusCLIAgentTerminal, ctx);
+        });
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                !view.should_hide_cli_agent_cursor_cell(ctx),
+                "cursor must be visible once the TUI grid holds focus"
+            );
+        });
+    })
+}

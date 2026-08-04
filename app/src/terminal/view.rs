@@ -21651,11 +21651,18 @@ impl TerminalView {
     }
 
     /// Returns true when cursor rendering should be suppressed because the
-    /// CLI agent rich input is open.
+    /// CLI agent rich input is open **and** the TUI grid does not hold focus.
+    ///
+    /// `cmd-up`(`TerminalAction::FocusCLIAgentTerminal`)把焦点交回 TerminalView
+    /// 自身,此时用户直接向 TUI 打字,必须能看到 agent 的光标。焦点在 rich input
+    /// 或任何其它子 view(footer 菜单、find bar、block filter)时保持隐藏。
     fn should_hide_cli_agent_cursor_cell(&self, app: &AppContext) -> bool {
-        CLIAgentSessionsModel::as_ref(app)
-            .session(self.view_id)
-            .is_some_and(|s| matches!(s.input_state, CLIAgentInputState::Open { .. }))
+        self.is_cli_agent_rich_input_open(app)
+            && !self
+                .view_handle
+                .upgrade(app)
+                .expect("terminal should upgrade")
+                .is_focused(app)
     }
 
     fn render_block_list_element(
