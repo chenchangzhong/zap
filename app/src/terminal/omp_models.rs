@@ -1,6 +1,5 @@
 use std::process::Output;
 use std::sync::LazyLock;
-use std::time::Instant;
 
 /// Represents a model available through the `omp` binary.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -24,7 +23,6 @@ struct ModelsResponse {
 /// All subprocess calls use a 30-second timeout.
 pub struct OmpModelRegistry {
     models: Vec<OmpModel>,
-    last_refresh: Option<Instant>,
     omp_binary: String,
 }
 
@@ -41,7 +39,7 @@ async fn run_with_timeout(
         warpui::r#async::Timer::after(std::time::Duration::from_secs(timeout_secs));
 
     let result = race(
-        async { output_fut.await },
+        output_fut,
         async {
             timeout_fut.await;
             Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "command timed out"))
@@ -63,7 +61,6 @@ impl OmpModelRegistry {
     pub fn new(omp_binary: &str) -> Self {
         Self {
             models: Vec::new(),
-            last_refresh: None,
             omp_binary: omp_binary.to_owned(),
         }
     }
@@ -94,7 +91,6 @@ impl OmpModelRegistry {
         }
 
         self.models = models;
-        self.last_refresh = Some(Instant::now());
         self.omp_binary = binary;
         Ok(())
     }
@@ -133,7 +129,6 @@ impl OmpModelRegistry {
     }
 
     /// Returns the cached model slice.
-    /// Returns the cached model slice.
     pub fn models(&self) -> &[OmpModel] {
         &self.models
     }
@@ -169,7 +164,7 @@ pub fn get_user_env() -> Vec<(String, String)> {
 /// 实际执行慢速登录 shell 抓取环境变量。仅在进程内首次调用时运行一次。
 fn compute_user_env() -> Vec<(String, String)> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let output = std::process::Command::new(&shell)
+    let output = command::blocking::Command::new(&shell)
         .arg("-l")
         .arg("-i")
         .arg("-c")
