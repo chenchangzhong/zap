@@ -2,7 +2,7 @@
 
 > **同步边界**：`7cbb22d5c`（已同步至此）
 > Zap 分支：`5e5dc06da7b8e8273b874a33f8c7946c575654e7`
-> 最后核验：2026-08-03，`cargo check -p warp` 通过（22 warnings，0 error）
+> 最后核验：2026-08-04，`cargo check -p warp -p warpui_core --all-targets` 通过（0 error）
 >
 > 历轮边界：
 >
@@ -15,6 +15,8 @@
 > | 五 | CLI agent 事件链路 5 项 | — | 2026-08-03 | §14 |
 > | — | DeepSeek 集成移除 | — | 2026-08-03 | §15 |
 > | 六 | `7cbb22d5c` → `02c042063` | 5 | 2026-08-03 | §16（全不合并） |
+> | 七 | fork 点全量对账 21 个缺失 | — | 2026-08-03 | §17（落地 9 个） |
+> | 八 | `f7e298027` 移植偏差回查 | — | 2026-08-04 | §18（修 3 处偏差） |
 >
 > **⚠️ 算待评估区间只能用上面的边界 hash**：本 fork 与上游无 merge-base
 > （浅克隆，历史断开）。`git rev-list HEAD..upstream/master` 会把全部历史
@@ -41,8 +43,9 @@
 | `settings_view/` 定制区 | 逐项判 | §0（冲突密集，低价值） |
 | `FeatureFlag` promote 类（加 variant + 列表） | 可拣 | §0 教训（需手动补 Cargo feature 定义） |
 | 纯加法的事件/枚举变体 | 可拣 | §14 第 1 项（`StopFailure` 先例） |
+| 来自**未合并分支**的 commit | 查分支 tip | §18.1（初版可能已被 review 否决） |
 
-### 移植前三问（§14 教训提炼）
+### 移植前四问（§14 / §18 教训提炼）
 
 1. **前置假设成立吗**——上游修复常依赖上游自己的实现前提。Zap 改过那个前提，
    同步修复反而引入退化（§14 第 2 项是典型）。
@@ -50,6 +53,9 @@
    cherry-pick，实际是删除已验证的本地功能换假想便利（§14 第 4 项）。
 3. **字段有消费点吗**——零消费点字段改动无风险；在回落链上的字段改动高风险。
    同一提交里不同字段的风险可以完全不同，`grep` 消费点是必要步骤。
+4. **这是上游的最终版本吗**——主题 grep 命中的常是初版。必查
+   `git branch -a --contains <commit>` 与该分支后续 commit；未合并 master 的
+   分支尤其要查有无返工（§18.1）。
 
 ## 0. 第二轮同步记录（2026-08-01）
 
@@ -905,5 +911,146 @@ git rebase --onto HEAD <剔除的commit> main
 
 ---
 
-*文档版本：v1.5*
+## 18. 第八轮核验（2026-08-04）：`f7e298027` 移植偏差回查
+
+> 本轮不是区间同步，而是对**已落地的一个本地 commit** `f7e298027`
+> （「修复 Oz agent 标签页无法复制文字，并移植 3 条上游修复」，27 文件 +1527/-135）
+> 做逐符号归属比对，检查移植是否忠实于上游。
+>
+> 结果：**3 处偏差，全部已修**。其余全部逐字 IDENTICAL。
+
+### 18.1 新判据：移植源必须是上游的**最终**版本
+
+**这是本轮唯一的实质性错误类型，也是最容易重犯的一类。**
+
+上游一个 PR 可能有多个 commit：初版 + review 返工。若只按主题 grep 到初版就移植，
+就会把上游**已经否决的方案**搬进来。
+
+本轮实例——Ctrl+C 清选区：
+
+| 上游 commit | 内容 | 状态 |
+|---|---|---|
+| `fb9a283cc` | 初版：Ctrl+C 总是清 block 选区 | 被 review 否决 |
+| `028ee8230` | 返工：restore `is_ai_input_enabled()` guard | **正确版本** |
+
+本地 `f7e298027` 移植的是 `fb9a283cc`。review 指出的 scope leak：初版把
+**AgentView guard 和 AI-input-mode guard 两个都删了**，后者必须保留——
+AI input 模式下用户 staged 为 AI context 的 blocks 会被静默丢弃。
+
+**查法：拿到候选 commit 后，必查它所在分支的 tip 和后续 commit。**
+
+```bash
+git branch -a --contains <commit>              # 它在哪条分支
+git log --oneline <branch> -5                  # 该分支有没有返工
+git merge-base --is-ancestor <commit> upstream/master && echo MERGED || echo NOT
+```
+
+`NOT MERGED` 的分支尤其要查——未合并意味着上游自己还在改。
+
+### 18.2 两条未合并分支的裁决差异
+
+本 commit 的来源里有两条**未合并 master** 的上游分支，裁决相反：
+
+| 分支 | tip | 有返工? | 裁决 |
+|---|---|---|---|
+| `oz-agent/fix-ctrl-c-block-selection-focus` | `fb9a283cc` → 后续 `028ee8230` | 有，上游明确否决初版 | **改**：取返工版 |
+| `oz-agent/fix-find-highlight-links` | `5478b9306`（就是 tip） | 无 | **不动**：上游没有更正确的版本 |
+
+**判据：未合并分支本身不是问题，「本地取的不是该分支的最终形态」才是问题。**
+分支 tip 即本地版本 → 等上游合并即可，不要自行"改进"。
+
+### 18.3 三处已修偏差
+
+| # | 文件 | 偏差 | 修法 |
+|---|------|------|------|
+| 1 | `terminal/view.rs:7015` | 移植了被否决的初版（§18.1） | 补回 `if !self.ai_input_model.as_ref(ctx).is_ai_input_enabled()` guard，注释同步为返工版措辞 |
+| 2 | `ai/blocklist/action_model.rs:1240` | 上游 `6903db03f` 是把 `debug_assert!(false, ...)` **降级为 `log::warn!`**，本地只删 assert 留了中文注释，日志丢失 | 补 `log::warn!("Ignoring acceptance for non-pending requested command: {action_id:?}")` |
+| 3 | `warpui_core/src/elements/text.rs:1213` | 注释描述的行为已被同 commit 的 `semantic_expansion_target` 推翻（双击 "m" 左缘不再选中 "first middle"） | 注释改为反映实际语义：backward 半边已修，forward 半边仍溢出 |
+
+偏差 2/3 是**同类**：移植时把上游的实质改动降格成注释。
+**上游删掉一行代码时，要确认它是"删除"还是"替换"。**
+
+### 18.4 测试覆盖缺口：guard 是裸的
+
+`028ee8230` 的返工带了 3 项测试改动（真实选区入口 ×2 + 焦点断言），已全部移植。
+但**上游返工没有为 guard 本身写测试**——注掉 guard，既有 10 个 `ctrl_c` 测试仍全绿。
+
+本轮补 `ctrl_c_in_ai_input_mode_preserves_staged_block_selection`
+（`terminal/view_test.rs`，`cfg(not(windows))`）。
+
+**写这个测试的关键发现——只造 block 选区的测试是无牙的：**
+
+```
+clear 分支入口：has_block_list_selection || has_copiable_block_selection
+                                            ↑ AI 模式下恒 false
+```
+
+`has_copiable_block_selection` 自身就带 `!is_ai_input_enabled()`
+（`view.rs:6940-6941`），所以 AI 模式下光有 block 选区**进不了 clear 分支**，
+测试会假绿。必须额外造 blocklist 文本选区让 `has_block_list_selection` 为 true。
+
+这是 §17.4「外层门控优先于局部条件」在**测试构造**上的同构表现：
+**构造测试前置条件时，也要查完整门控链，否则测的是一条不可达路径。**
+
+### 18.5 归属比对的路径坑
+
+上游有目录重命名，直接按本地路径 `git show upstream/master:<本地路径>` 会取到空串，
+**表现为「上游没有这个符号」的假阴性**（本轮一度误判 4 个测试是本地自研）：
+
+| 本地路径 | 上游实际路径 |
+|---|---|
+| `crates/warpui_core/src/elements/formatted_text_element_tests.rs` | `elements/gui/formatted_text_element_tests.rs` |
+| `app/src/util/link_detection_test.rs` | `app/src/util/link_detection_tests.rs`（`test` → `tests`） |
+| `app/src/ai/blocklist/block/view_impl_tests.rs` | master 无此文件，只在分支 `5478b9306` 里 |
+
+**做法：先 `git ls-tree -r --name-only upstream/master | grep <文件名关键词>`
+确认上游真实路径，再比对。取到空串时先怀疑路径，不要下「上游没有」的结论。**
+
+整文件 diff 也不足为据——本地与上游本就有大量无关分歧，
+**必须逐符号（函数体）比对**，本轮 13 个符号中 10 个整文件 DIFFER 但函数体 IDENTICAL。
+
+### 18.6 已核验同源、明确不动的项
+
+逐符号与 `upstream/master` 或对应分支比对一致，等上游演进：
+
+| 项 | 上游同源 |
+|---|---|
+| `remove_rich_content` 不清 `rich_content_selections` | `b2804a091` |
+| 单击链接吞掉 `selection_state.clear()` | `831327c6e` |
+| `add_highlights_to_text` 仍用 `merge_overlapping_ranges` 旧算法 | 分支 `5478b9306` 自己也只改 rich text 一侧，逐字一致 |
+| `AIBlockOutputStatus::Failed` 分支不调 `handle_updated_output` | `upstream/master` 同样不调 |
+| `elements/table/mod.rs` 的 `set_active_layer_click_through()` | `upstream/master` IDENTICAL |
+| `set_block_level_selected_text_for_test` / `simulate_text_selection_for_test` | `upstream/master` IDENTICAL |
+
+**注意第 3 项：reviewer 报的「旧算法未同步」不是移植偏差，是上游作者的取舍范围。**
+判定移植偏差前，必须核对**上游那条分支自己**的实现，而不是拿理想实现当基准。
+
+### 18.7 本轮教训汇总
+
+1. **移植源必须是上游的最终版本。** 主题 grep 到的常是初版；
+   必查 `git branch -a --contains` + 分支后续 commit（§18.1）。
+2. **未合并分支要分两类。** 有返工 → 取返工版；tip 即本地版本 → 不动（§18.2）。
+3. **上游删一行代码时，确认是"删除"还是"替换"。** 把实质改动降格成注释
+   是本轮 2/3 处偏差的共同形态（§18.3）。
+4. **构造测试前置条件也要查门控链。** 否则测的是不可达路径，测试假绿（§18.4）。
+5. **路径重命名导致假阴性。** `git show` 取到空串先怀疑路径（§18.5）。
+6. **整文件 diff 不足为据，逐符号比对。** 13 个符号中 10 个整文件 DIFFER
+   但函数体 IDENTICAL（§18.5）。
+7. **判定移植偏差的基准是上游那条分支的实现，不是理想实现**（§18.6）。
+
+### 18.8 验证状态
+
+| 项 | 结果 |
+|---|---|
+| `cargo check -p warp -p warpui_core --all-targets` | **rc=0，0 error** |
+| `cargo nextest run -p warp ctrl_c` | 11 passed（既有 10 + 新增 1） |
+| `cargo nextest run -p warp requested_command` | 15 passed |
+| `cargo nextest run -p warpui_core text` | 51 passed |
+| fail-before | 注掉 guard → 仅新测试 FAIL，既有 10 个全绿 → 实证既有测试不覆盖该 guard |
+
+改动量：4 文件 +118/-19（生产代码 3 处，各单 hunk）。
+
+---
+
+*文档版本：v1.6*
 *下次合并前必读*

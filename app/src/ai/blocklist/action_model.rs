@@ -1237,8 +1237,12 @@ impl BlocklistAIActionModel {
                     .collect::<Vec<_>>()
                     .join(",")
             );
-            // 上游 6903db03f(#12747):先拒后确认时该分支会被正常命中,不是编程错误,
-            // 不能 `debug_assert!(false)` 崩掉 debug 构建。上面的 `log::error!` 已记录足够诊断信息。
+            // 上游 6903db03f(#12747):卡片被拒后 action 已移出 pending_actions,
+            // 此时迟到的确认会正常命中该分支,不是编程错误,不能 `debug_assert!(false)`
+            // 崩掉 debug 构建;按上游做法降级为 warn 并忽略。
+            log::warn!(
+                "Ignoring acceptance for non-pending requested command: {action_id:?}"
+            );
             return;
         };
 

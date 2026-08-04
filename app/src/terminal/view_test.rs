@@ -4374,14 +4374,16 @@ fn ctrl_c_with_selected_block_clears_selection_on_idle_path() {
             });
         });
 
-        // Set up a completed (non-long-running) block and select it.
+        // Set up a completed (non-long-running) block and select it via the
+        // normal selection path (not direct field mutation) so the AI-context
+        // side effects run and the precondition faithfully mirrors production.
         terminal.update(&mut app, |view, _| {
             view.model.lock().simulate_block("ls", "output");
         });
         terminal.update(&mut app, |view, ctx| {
-            // Select the first (completed) block — this is the "whole-block highlight"
-            // the bug report describes.
-            view.selected_blocks.reset_to_single(BlockIndex::zero());
+            // Select the first (completed) block via the real selection entry
+            // point — this is the "whole-block highlight" the bug report describes.
+            view.reset_selection_to_single_block(BlockIndex::zero(), ctx);
             assert!(
                 !view.selected_blocks.is_empty(),
                 "block must be selected before Ctrl+C"
@@ -4393,6 +4395,15 @@ fn ctrl_c_with_selected_block_clears_selection_on_idle_path() {
             assert!(
                 view.selected_blocks.is_empty(),
                 "Ctrl+C on idle path must clear block selection"
+            );
+        });
+
+        // Focus must return to the input editor — this is the literal bug
+        // reported in GH-13480 ("ctrl+c does not set focus on prompt").
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                view.input.as_ref(ctx).editor().is_focused(ctx),
+                "input editor must be focused after Ctrl+C on idle path"
             );
         });
 
@@ -4432,8 +4443,9 @@ fn ctrl_c_with_selected_block_and_running_process_clears_selection_and_sends_sig
                 .simulate_long_running_block("sleep 60", "running");
         });
         terminal.update(&mut app, |view, ctx| {
-            // Select a block while the long-running command is active.
-            view.selected_blocks.reset_to_single(BlockIndex::zero());
+            // Select a block while the long-running command is active via the
+            // real selection entry point so AI-context side effects run.
+            view.reset_selection_to_single_block(BlockIndex::zero(), ctx);
             assert!(
                 !view.selected_blocks.is_empty(),
                 "block must be selected before Ctrl+C"
@@ -4454,6 +4466,87 @@ fn ctrl_c_with_selected_block_and_running_process_clears_selection_and_sends_sig
             vec![vec![warp_terminal::model::escape_sequences::C0::ETX]],
             "Ctrl+C with a running process must send ETX to PTY regardless of block selection"
         );
+    })
+}
+
+/// 回归测试:AI input 模式下按 Ctrl+C 不得清掉用户 staged 为 AI context 的 block 选区。
+///
+/// `ctrl_c_internal` 的 clear 分支由 `has_block_list_selection || has_copiable_block_selection`
+/// 进入。AI input 模式下 `has_copiable_block_selection` 恒为 false(context block 不可复制),
+/// 但 `has_block_list_selection`(blocklist 文本选区)仍可为 true,于是分支照样进入 ——
+/// 若 clear 前少了 `is_ai_input_enabled()` 这道 guard,`selected_blocks` 会被静默清空,
+/// 用户 staged 的 AI context block 就此丢失(上游 review 指出的 scope leak)。
+#[test]
+#[cfg(not(windows))]
+fn ctrl_c_in_ai_input_mode_preserves_staged_block_selection() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, _| {
+            view.model.lock().simulate_block("ls", "output");
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            // 切到 AI input 模式:此时选中的 block 即用户 staged 的 AI context。
+            view.input.update(ctx, |input, ctx| {
+                input.ai_input_model().update(ctx, |ai_input, ctx| {
+                    ai_input.set_input_config(
+                        InputConfig {
+                            input_type: InputType::AI,
+                            is_locked: false,
+                        },
+                        true,
+                        ctx,
+                    );
+                });
+            });
+            assert!(
+                view.ai_input_model().as_ref(ctx).is_ai_input_enabled(),
+                "前置条件:必须处于 AI input 模式"
+            );
+
+            // 走真实选区入口,让 AI-context 副作用同步发生。
+            view.reset_selection_to_single_block(BlockIndex::zero(), ctx);
+            assert!(
+                !view.selected_blocks.is_empty(),
+                "前置条件:Ctrl+C 之前 block 必须已被选中"
+            );
+
+            // 额外制造一个 blocklist 文本选区,使 `has_block_list_selection` 为 true。
+            // 这是 guard 唯一真正被考验的状态:AI 模式下 clear 分支照样会进入。
+            {
+                let mut terminal_model = view.model.lock();
+                let blocks = terminal_model.block_list_mut();
+                let block = blocks
+                    .block_at(BlockIndex::zero())
+                    .expect("simulate_block 应已插入 block");
+                let command_grid_offset = block.command_grid_offset();
+                let command_columns = block.prompt_and_command_grid().grid_handler().columns();
+                blocks.start_selection(
+                    BlockListPoint::new(command_grid_offset, 0),
+                    SelectionType::Simple,
+                    Side::Left,
+                );
+                blocks.update_selection(
+                    BlockListPoint::new(command_grid_offset, command_columns),
+                    Side::Right,
+                );
+                assert!(
+                    blocks.selection().is_some(),
+                    "前置条件:blocklist 必须存在文本选区,才能进入 clear 分支"
+                );
+            }
+
+            view.handle_action(&TerminalAction::CtrlC, ctx);
+
+            assert!(
+                !view.selected_blocks.is_empty(),
+                "scope leak 防御:AI input 模式下 Ctrl+C 必须保留 staged 为 AI context 的 block 选区"
+            );
+        });
     })
 }
 

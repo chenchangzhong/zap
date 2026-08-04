@@ -1210,8 +1210,9 @@ impl SelectableElement for Text {
                 // we always want it to the right of the character, and if we're expanding to the end we want it on the left.
                 // For instance, given some text "first |m|iddl|e| second",
                 // if we double click anywhere on "m" or "e", we should expand to select "middle".
-                // Currently if we double click on the left side of "m", all of "first middle" would be selected,
-                // and if we double click on the right side of "e" all of "middle second" would be selected.
+                // `semantic_expansion_target` fixed the backward half: double-clicking on the left
+                // side of "m" now selects just "middle". The forward half still overshoots —
+                // double-clicking on the right side of "e" selects "middle second".
                 let text_selection_bound = self.position_for_point(absolute_point)?;
                 let inner_point = text
                     .semantic_expansion_target(
