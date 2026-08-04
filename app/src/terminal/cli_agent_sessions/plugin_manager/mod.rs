@@ -1,7 +1,6 @@
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod gemini;
-pub(crate) mod oh_my_pi;
 pub(crate) mod opencode;
 
 use std::cmp::Ordering;
@@ -19,7 +18,6 @@ use crate::terminal::CLIAgent;
 use claude::ClaudeCodePluginManager;
 use codex::CodexPluginManager;
 use gemini::GeminiPluginManager;
-use oh_my_pi::OhMyPiPluginManager;
 use opencode::OpenCodePluginManager;
 
 /// Distinguishes whether the plugin instructions modal should show install or update steps.
@@ -248,10 +246,8 @@ pub(crate) fn plugin_manager_for_with_shell(
                 path_env_var,
             )))
         }
-        CLIAgent::OhMyPi => {
-            Some(Box::new(OhMyPiPluginManager))
-        }
-        CLIAgent::OpenCode
+        CLIAgent::OhMyPi
+        | CLIAgent::OpenCode
         | CLIAgent::Codex
         | CLIAgent::Gemini
         | CLIAgent::Amp

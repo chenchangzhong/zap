@@ -2924,13 +2924,6 @@ cli-agent-plugin-opencode-update-subtitle = opencode.json でプラグインを�
 cli-agent-plugin-opencode-replace-plugin-step = "plugin" 配列の既存の "@warp-dot-dev/opencode-warp" エントリを明示的なバージョン指定に置き換えます:
 cli-agent-plugin-opencode-restart-update-note = 更新されたプラグインを読み込むため OpenCode を再起動します。
 
-# oh-my-pi
-cli-agent-plugin-oh-my-pi-install-title = oh-my-pi CLI をインストール
-cli-agent-plugin-oh-my-pi-install-subtitle = oh-my-pi CLI はモデル切り替えに必要です。以下のいずれかを選択:
-cli-agent-plugin-oh-my-pi-install-step-brew = Homebrew
-cli-agent-plugin-oh-my-pi-install-step-cargo = Cargo
-cli-agent-plugin-oh-my-pi-restart-note = インストール後にターミナルセッションを再起動してください。
-
 # Remaining visible UI strings
 ai-ask-user-questions-unavailable = 質問を利用できません
 ai-ask-user-questions-skipped-auto-approve = 自動承認のため質問をスキップしました

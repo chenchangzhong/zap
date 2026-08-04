@@ -3004,13 +3004,6 @@ cli-agent-plugin-opencode-update-subtitle = 在 opencode.json 中将插件固定
 cli-agent-plugin-opencode-replace-plugin-step = 将 "plugin" 数组中现有的 "@warp-dot-dev/opencode-warp" 条目替换为显式版本：
 cli-agent-plugin-opencode-restart-update-note = 重启 OpenCode 以加载更新后的插件。
 
-# oh-my-pi
-cli-agent-plugin-oh-my-pi-install-title = 安装 oh-my-pi CLI
-cli-agent-plugin-oh-my-pi-install-subtitle = oh-my-pi CLI 是模型切换所必需的。选择一种安装方式：
-cli-agent-plugin-oh-my-pi-install-step-brew = Homebrew
-cli-agent-plugin-oh-my-pi-install-step-cargo = Cargo
-cli-agent-plugin-oh-my-pi-restart-note = 安装后重启终端会话。
-
 # Remaining visible UI strings
 ai-ask-user-questions-unavailable = 问题不可用
 ai-ask-user-questions-skipped-auto-approve = 已因自动批准跳过问题

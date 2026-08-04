@@ -3114,13 +3114,6 @@ cli-agent-plugin-opencode-update-subtitle = Pin the plugin to the latest version
 cli-agent-plugin-opencode-replace-plugin-step = Replace the existing "@warp-dot-dev/opencode-warp" entry in the "plugin" array with the explicit version:
 cli-agent-plugin-opencode-restart-update-note = Restart OpenCode to load the updated plugin.
 
-# oh-my-pi
-cli-agent-plugin-oh-my-pi-install-title = Install oh-my-pi CLI
-cli-agent-plugin-oh-my-pi-install-subtitle = oh-my-pi CLI is required for model switching. Choose one:
-cli-agent-plugin-oh-my-pi-install-step-brew = Homebrew
-cli-agent-plugin-oh-my-pi-install-step-cargo = Cargo
-cli-agent-plugin-oh-my-pi-restart-note = Restart the terminal session after installation.
-
 # Remaining visible UI strings
 ai-ask-user-questions-unavailable = Questions unavailable
 ai-ask-user-questions-skipped-auto-approve = Questions skipped due to auto-approve
