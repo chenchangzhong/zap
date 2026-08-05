@@ -1204,9 +1204,9 @@ impl<'a> TabComponent<'a> {
             };
 
             let border = if is_active || is_hovered {
-                internal_colors::fg_overlay_2(theme)
+                internal_colors::fg_overlay_4(theme)
             } else {
-                internal_colors::fg_overlay_1(theme)
+                internal_colors::fg_overlay_3(theme)
             };
 
             (bg, border)
