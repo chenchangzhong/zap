@@ -19,6 +19,29 @@ use warpui::r#async::executor;
 
 use crate::client::{ClientEvent, RemoteServerClient};
 use crate::setup::{PreinstallCheckResult, RemotePlatform};
+use serde::Serialize;
+
+/// How the remote server binary was installed. Used for telemetry to
+/// distinguish direct remote downloads from client-side SCP uploads.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallSource {
+    /// The remote host downloaded the binary directly from the CDN.
+    Server,
+    /// The client downloaded the binary locally and uploaded it via SCP.
+    Client,
+}
+
+/// Result of [`RemoteTransport::install_binary`], bundling the install
+/// result with the source that was attempted. The source is always set
+/// once the install path is determined, regardless of whether the
+/// install succeeded or failed.
+pub struct InstallOutcome {
+    /// Which install path was attempted.
+    pub source: Option<InstallSource>,
+    /// Whether the install succeeded.
+    pub result: Result<(), String>,
+}
 
 /// A successful return from [`RemoteTransport::connect`].
 ///
@@ -135,11 +158,11 @@ pub trait RemoteTransport: Send + Sync + std::fmt::Debug {
     /// ([`RemoteServerManager::install_binary`]) is responsible for emitting
     /// [`SetupStateChanged`] and [`BinaryInstallComplete`].
     ///
-    /// Returns `Ok(())` if the install succeeded, and
-    /// `Err(_)` if the install failed (e.g. SSH timeout, script error).
+    /// Returns an [`InstallOutcome`] containing the install result and
+    /// the [`InstallSource`] that was attempted (if known).
     fn install_binary(
         &self,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+    ) -> Pin<Box<dyn std::future::Future<Output = InstallOutcome> + Send>>;
 
     /// Establish a new connection to the remote server.
     ///

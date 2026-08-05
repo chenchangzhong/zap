@@ -15,7 +15,7 @@ use crate::setup::RemotePlatform;
 use crate::setup::RemoteServerSetupState;
 use crate::setup::UnsupportedReason;
 #[cfg(not(target_family = "wasm"))]
-use crate::transport::{Connection, ControlPath, RemoteTransport};
+use crate::transport::{Connection, ControlPath, InstallSource, RemoteTransport};
 use crate::HostId;
 use repo_metadata::RepoMetadataUpdate;
 use serde::Serialize;
@@ -352,12 +352,15 @@ pub enum RemoteServerManagerEvent {
         /// detection itself failed.
         has_old_binary: bool,
     },
-    /// Result of [`RemoteServerManager::install_binary`]. Returns a result where:
-    /// - `Ok(())` means the install succeeded, and
-    /// - `Err(_)` means the install failed and carries the failure reason (SSH error, timeout, script error, etc.).
+    /// Result of [`RemoteServerManager::install_binary`].
     BinaryInstallComplete {
         session_id: SessionId,
+        /// Whether the install succeeded or failed.
         result: Result<(), String>,
+        /// Which install path was attempted (`Server` for remote download,
+        /// `Client` for SCP upload). `None` if the path could not be
+        /// determined before the failure.
+        install_source: Option<InstallSource>,
     },
 
     // --- Telemetry events ---
@@ -609,9 +612,9 @@ impl RemoteServerManager {
     }
 
     /// Installs the remote server binary.
-    /// Emits `BinaryInstallComplete { result }`.
+    /// Emits `BinaryInstallComplete { result, install_source }`.
     ///
-    /// Returns Ok(()) if the install succeeded, and
+    /// Returns Ok(method) with the install method on success, and
     /// Err(_) if the install failed (e.g. SSH timeout/unreachable).
     #[cfg_attr(target_family = "wasm", allow(unused_variables))]
     pub fn install_binary<T>(
@@ -644,10 +647,10 @@ impl RemoteServerManager {
             let spawner = self.spawner.clone();
             ctx.background_executor()
                 .spawn(async move {
-                    let result = transport.install_binary().await;
+                    let outcome = transport.install_binary().await;
                     let _ = spawner
                         .spawn(move |_me, ctx| {
-                            if let Err(error) = &result {
+                            if let Err(error) = &outcome.result {
                                 ctx.emit(RemoteServerManagerEvent::SetupStateChanged {
                                     session_id,
                                     state: RemoteServerSetupState::Failed {
@@ -657,7 +660,8 @@ impl RemoteServerManager {
                             }
                             ctx.emit(RemoteServerManagerEvent::BinaryInstallComplete {
                                 session_id,
-                                result,
+                                result: outcome.result,
+                                install_source: outcome.source,
                             });
                         })
                         .await;

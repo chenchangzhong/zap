@@ -18,7 +18,9 @@ use remote_server::setup::{
     parse_uname_output, remote_server_daemon_dir, PreinstallCheckResult, RemotePlatform,
 };
 use remote_server::ssh::ssh_args;
-use remote_server::transport::{Connection, ControlPath, RemoteTransport};
+use remote_server::transport::{
+    Connection, ControlPath, InstallOutcome, InstallSource, RemoteTransport,
+};
 
 /// SSH transport: connects via a ControlMaster socket.
 ///
@@ -658,7 +660,7 @@ impl RemoteTransport for SshTransport {
         })
     }
 
-    fn install_binary(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+    fn install_binary(&self) -> Pin<Box<dyn Future<Output = InstallOutcome> + Send>> {
         let socket_path = self.socket_path.clone();
         Box::pin(async move {
             log::info!(
@@ -673,7 +675,12 @@ impl RemoteTransport for SshTransport {
             if remote_server::setup::is_dev_source_build() {
                 log::info!("dev remote-server: 检测到 DEBUG 源码构建,改用本地交叉编译安装");
                 match dev_install_local_binary(&socket_path).await {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        return InstallOutcome {
+                            source: Some(InstallSource::Client),
+                            result: Ok(()),
+                        }
+                    }
                     Err(error) => {
                         log::warn!(
                             "dev remote-server: 本地交叉编译安装不可用,回退到下载安装: {error:#}"
@@ -686,17 +693,31 @@ impl RemoteTransport for SshTransport {
             match run_install_script(&socket_path, None, remote_server::setup::INSTALL_TIMEOUT)
                 .await
             {
-                Ok(()) => verify_installed_binary(&socket_path)
-                    .await
-                    .map_err(|error| format!("{error:#}")),
-                Err(error) if should_skip_scp_fallback(&error) => Err(error.to_string()),
+                Ok(()) => match verify_installed_binary(&socket_path).await {
+                    Ok(()) => InstallOutcome {
+                        source: Some(InstallSource::Server),
+                        result: Ok(()),
+                    },
+                    Err(error) => InstallOutcome {
+                        source: Some(InstallSource::Server),
+                        result: Err(format!("{error:#}")),
+                    },
+                },
+                Err(error) if should_skip_scp_fallback(&error) => InstallOutcome {
+                    source: Some(InstallSource::Server),
+                    result: Err(error.to_string()),
+                },
                 Err(error) => {
                     log::warn!("remote-server install failed, trying SCP fallback: {error}");
                     match scp_install_fallback(&socket_path).await {
-                        Ok(()) => Ok(()),
-                        Err(fallback_error) => {
-                            Err(format!("{error}; SCP fallback failed: {fallback_error:#}"))
-                        }
+                        Ok(()) => InstallOutcome {
+                            source: Some(InstallSource::Client),
+                            result: Ok(()),
+                        },
+                        Err(fallback_error) => InstallOutcome {
+                            source: Some(InstallSource::Client),
+                            result: Err(format!("{error}; SCP fallback failed: {fallback_error:#}")),
+                        },
                     }
                 }
             }

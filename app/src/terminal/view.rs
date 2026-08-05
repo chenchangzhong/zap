@@ -4170,7 +4170,11 @@ impl TerminalView {
                         me.remove_ssh_remote_server_choice_block(*session_id, ctx);
                         me.remove_ssh_remote_server_failed_banner(*session_id, ctx);
                     }
-                    RemoteServerManagerEvent::BinaryInstallComplete { session_id, result } => {
+                    RemoteServerManagerEvent::BinaryInstallComplete {
+                        session_id,
+                        result,
+                        install_source,
+                    } => {
                         let (remote_os, remote_arch) = RemoteServerManager::handle(ctx)
                             .as_ref(ctx)
                             .platform_for_session(*session_id)
@@ -4184,6 +4188,7 @@ impl TerminalView {
                         send_telemetry_from_ctx!(
                             TelemetryEvent::RemoteServerInstallation {
                                 error: result.as_ref().err().cloned(),
+                                install_source: *install_source,
                                 remote_os,
                                 remote_arch,
                             },
@@ -8496,10 +8501,10 @@ impl TerminalView {
                 self.warpify_state.abort_ssh_warpify_timeout();
                 self.user_write_ctrl_c_to_pty(ctx);
             }
-            SshInstallTmuxBlockEvent::InstallTmuxAndWarpify(install_method) => {
+            SshInstallTmuxBlockEvent::InstallTmuxAndWarpify(install_source) => {
                 send_telemetry_from_ctx!(TelemetryEvent::SshInstallTmuxBlockAccepted, ctx);
                 self.clear_ssh_blocks(ctx);
-                self.install_tmux_and_warpify(ctx, install_method);
+                self.install_tmux_and_warpify(ctx, install_source);
                 self.update_scroll_position_locking(
                     ScrollPositionUpdate::AfterRichBlockUpdated,
                     ctx,
