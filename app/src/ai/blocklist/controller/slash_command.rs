@@ -39,9 +39,6 @@ pub enum SlashCommandRequest {
         /// /compact /compact-and 手动触发时为 false;auto-trigger 路径为 true。
         overflow: bool,
     },
-    FetchReviewComments {
-        repo_path: String,
-    },
     /// Invoke a skill.
     InvokeSkill {
         skill: ai::skills::ParsedSkill,
@@ -185,9 +182,7 @@ impl SlashCommandRequest {
         app: &AppContext,
     ) -> Option<AIConversationId> {
         match self {
-            Self::Summarize { .. }
-            | Self::InvokeSkill { .. }
-            | Self::FetchReviewComments { .. } => controller
+            Self::Summarize { .. } | Self::InvokeSkill { .. } => controller
                 .context_model
                 .as_ref(app)
                 .selected_conversation_id(app),
@@ -225,9 +220,6 @@ impl SlashCommandRequest {
             SlashCommandRequest::Summarize { prompt, overflow } => {
                 vec![AIAgentInput::SummarizeConversation { prompt, overflow }]
             }
-            SlashCommandRequest::FetchReviewComments { repo_path } => {
-                vec![AIAgentInput::FetchReviewComments { repo_path, context }]
-            }
             SlashCommandRequest::InvokeSkill { skill, user_query } => {
                 let user_query = if FeatureFlag::SkillArguments.is_enabled() {
                     user_query
@@ -259,7 +251,6 @@ impl SlashCommandRequest {
             SlashCommandRequest::InitProjectRules { .. } => EntrypointType::InitProjectRules,
             SlashCommandRequest::CreateNewProject { .. }
             | SlashCommandRequest::Summarize { .. }
-            | SlashCommandRequest::FetchReviewComments { .. }
             | SlashCommandRequest::InvokeSkill { .. } => EntrypointType::UserInitiated,
         }
     }

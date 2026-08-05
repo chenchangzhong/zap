@@ -39,7 +39,7 @@ pub use shell_command::{ShellCommandExecutor, ShellCommandExecutorEvent};
 pub use suggest_new_conversation::NewConversationDecision;
 use suggest_new_conversation::SuggestNewConversationExecutor;
 pub use suggest_prompt::{PromptSuggestionExecutor, PromptSuggestionExecutorEvent};
-use warp_core::{execution_mode::AppExecutionMode, features::FeatureFlag};
+use warp_core::execution_mode::AppExecutionMode;
 
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::is_binary_file;
@@ -531,14 +531,12 @@ impl BlocklistAIActionExecutor {
                 comments,
                 base_branch,
             } => {
-                if FeatureFlag::PRCommentsSlashCommand.is_enabled() {
-                    ctx.emit(BlocklistAIActionExecutorEvent::InsertCodeReviewComments {
-                        action_id: action.id,
-                        repo_path: repo_path.clone(),
-                        comments: comments.clone(),
-                        base_branch: base_branch.clone(),
-                    });
-                }
+                ctx.emit(BlocklistAIActionExecutorEvent::InsertCodeReviewComments {
+                    action_id: action.id,
+                    repo_path: repo_path.clone(),
+                    comments: comments.clone(),
+                    base_branch: base_branch.clone(),
+                });
                 ActionExecution::<()>::Sync(AIAgentActionResultType::InsertReviewComments(
                     InsertReviewCommentsResult::Success {
                         repo_path: repo_path.to_string_lossy().to_string(),

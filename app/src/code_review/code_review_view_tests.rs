@@ -27,7 +27,6 @@ use chrono::Local;
 use repo_metadata::repositories::DetectedRepositories;
 use std::path::PathBuf;
 use std::sync::Arc;
-use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
 use warp_editor::content::buffer::InitialBufferState;
 use warp_editor::render::element::VerticalExpansionBehavior;
@@ -416,9 +415,7 @@ fn test_relocate_comments_file_comment_passes_through() {
 #[test]
 fn test_relocate_comments_line_comment_no_matching_editor_marked_outdated() {
     App::test((), |mut app| async move {
-        let _flag_override = FeatureFlag::PRCommentsSlashCommand.override_enabled(true);
-
-        // Editor is for "test.txt" but comment is for "other.txt"
+                // Editor is for "test.txt" but comment is for "other.txt"
         let ctx = TestContext::new(
             &mut app,
             PathBuf::from("test.txt"),
@@ -673,9 +670,7 @@ fn test_attach_pending_imported_thread_flattens_depth_first_sorted_by_timestamp(
 #[test]
 fn test_relocate_comments_file_comment_no_matching_editor_marked_outdated() {
     App::test((), |mut app| async move {
-        let _flag_override = FeatureFlag::PRCommentsSlashCommand.override_enabled(true);
-
-        // Editor is for "test.txt" but comment is for "other.txt"
+                // Editor is for "test.txt" but comment is for "other.txt"
         let ctx = TestContext::new(
             &mut app,
             PathBuf::from("test.txt"),
@@ -717,9 +712,7 @@ fn test_relocate_comments_file_comment_no_matching_editor_marked_outdated() {
 #[test]
 fn test_relocate_comments_line_removed_marked_outdated() {
     App::test((), |mut app| async move {
-        let _flag_override = FeatureFlag::PRCommentsSlashCommand.override_enabled(true);
-
-        // Editor has "line 1\nline 3" (line 2 was removed)
+                // Editor has "line 1\nline 3" (line 2 was removed)
         // Comment was attached to "line 2" which no longer exists
         let file_path = PathBuf::from("test.txt");
         let ctx = TestContext::new(&mut app, file_path.clone(), "line 1\nline 3");
@@ -923,9 +916,7 @@ fn test_handle_edit_comment_scrolls_with_buffer() {
 #[test]
 fn test_active_comments_not_marked_outdated() {
     App::test((), |mut app| async move {
-        let _flag_override = FeatureFlag::PRCommentsSlashCommand.override_enabled(true);
-
-        let file_path = PathBuf::from("test.txt");
+                let file_path = PathBuf::from("test.txt");
         let ctx = TestContext::new(&mut app, file_path.clone(), "line 1\nline 2\nline 3");
 
         // Comment attached to "line 2" which exists in the editor

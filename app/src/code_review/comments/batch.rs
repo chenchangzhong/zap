@@ -3,7 +3,6 @@ use super::{
 };
 use crate::{code::editor::EditorReviewComment, code_review::diff_state::DiffMode};
 use std::{collections::HashMap, path::Path};
-use warp_core::features::FeatureFlag;
 use warp_editor::render::model::LineCount;
 use warpui::{Entity, ModelContext};
 
@@ -96,13 +95,7 @@ impl ReviewCommentBatch {
 
     pub(crate) fn editor_comments_for_file(&self, file: &Path) -> Vec<EditorReviewComment> {
         self.file_comments(file)
-            .filter(|comment| {
-                if FeatureFlag::PRCommentsSlashCommand.is_enabled() {
-                    !comment.outdated
-                } else {
-                    true
-                }
-            })
+            .filter(|comment| !comment.outdated)
             .filter_map(|comment| EditorReviewComment::try_from(comment.clone()).ok())
             .collect()
     }

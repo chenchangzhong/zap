@@ -27,15 +27,6 @@ pub static ADD_MCP: LazyLock<StaticCommand> = LazyLock::new(|| StaticCommand {
     argument: None,
 });
 
-pub static PR_COMMENTS: LazyLock<StaticCommand> = LazyLock::new(|| StaticCommand {
-    name: "/pr-comments",
-    description: t_static!("slash-cmd-pr-comments-desc"),
-    icon_path: "bundled/svg/github.svg",
-    availability: Availability::REPOSITORY.union(Availability::AI_ENABLED),
-    auto_enter_ai_mode: true,
-    argument: None,
-});
-
 pub static CREATE_DOCKER_SANDBOX: LazyLock<StaticCommand> = LazyLock::new(|| StaticCommand {
     name: "/docker-sandbox",
     description: t_static!("slash-cmd-docker-sandbox-desc"),
@@ -482,12 +473,6 @@ fn all_commands() -> Vec<StaticCommand> {
     if FeatureFlag::ListSkills.is_enabled() && !cfg!(target_family = "wasm") {
         commands.push(EDIT_SKILL.clone());
         commands.push(INVOKE_SKILL.clone());
-    }
-
-    if FeatureFlag::PRCommentsSlashCommand.is_enabled()
-        && !FeatureFlag::PRCommentsSkill.is_enabled()
-    {
-        commands.push(PR_COMMENTS.clone());
     }
 
     if FeatureFlag::InlineProfileSelector.is_enabled() {
