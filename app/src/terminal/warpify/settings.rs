@@ -261,11 +261,11 @@ impl WarpifySettings {
 
     /// This is different from the typical register method, as it also ensures that
     /// our parsed regexes stay in sync with the underlying data by having the
-    /// model subscribe to itself after it's registered.
+    /// settings model update itself when its own settings change.
     pub fn register(ctx: &mut AppContext) {
         let handle = ctx.add_singleton_model(Self::new_from_storage);
-        handle.clone().update(ctx, |_, ctx| {
-            ctx.subscribe_to_model(&handle, |me, _, event, _| match event {
+        ctx.subscribe_to_model(&handle, |settings, event, ctx| {
+            settings.update(ctx, |me, _| match event {
                 WarpifySettingsChangedEvent::AddedSubshellCommands { .. } => {
                     me.parsed_added_subshell_commands =
                         Self::parse_added_subshell_commands(&me.added_subshell_commands)

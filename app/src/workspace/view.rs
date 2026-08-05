@@ -18296,6 +18296,12 @@ impl Workspace {
             context.set.insert(flags::LEGACY_SSH_WRAPPER_CONTEXT_FLAG);
         }
 
+        if *ssh_settings.reuse_existing_control_master.value() {
+            context
+                .set
+                .insert(flags::SSH_REUSE_CONTROL_MASTER_CONTEXT_FLAG);
+        }
+
         if *ssh_settings.enable_ssh_auto_discovery.value() {
             context.set.insert(flags::SSH_AUTO_DISCOVERY_CONTEXT_FLAG);
         }

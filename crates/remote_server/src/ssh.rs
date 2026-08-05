@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::process::Output;
 use std::time::Duration;
-
 use anyhow::{anyhow, Result};
 use command::r#async::Command;
 use warpui::r#async::FutureExt as _;
+
+use crate::transport::ControlPath;
 
 /// Timeout for `ssh -O exit`. The command only talks to the local
 /// ControlMaster over a Unix socket, so it should return almost
@@ -28,7 +29,7 @@ pub fn ssh_args(socket_path: &Path) -> Vec<String> {
 }
 
 /// Runs `ssh -O exit -o ControlPath=<socket_path>` to force the local
-/// SSH `ControlMaster` managing `socket_path` to exit immediately,
+/// SSH `ControlMaster` behind `control_path` to exit immediately,
 /// without waiting for multiplexed channels to finish draining.
 ///
 /// The user's interactive ssh is spawned with `-o ControlMaster=yes` by
@@ -38,13 +39,30 @@ pub fn ssh_args(socket_path: &Path) -> Vec<String> {
 /// `ssh ... remote-server-proxy`) to finish cleanup on the remote
 /// side. Sending `-O exit` bypasses that wait.
 ///
+/// Only [`ControlPath::WarpManaged`] masters are acted on: a
+/// [`ControlPath::UserOwned`] master (the SSH wrapper attached to a
+/// master the user already had running) is left untouched, and
+/// [`ControlPath::None`] is a no-op.
+///
 /// **Only safe to call once the user's shell has already exited** --
-/// this tears down the interactive ssh outright. In practice it is
-/// invoked from the `ExitShell` teardown path on the client.
+/// for Warp-managed masters this tears down the interactive ssh
+/// outright. In practice it is invoked from the `ExitShell` teardown
+/// path on the client.
 ///
 /// Fire-and-forget. Errors are logged but not propagated: at teardown
 /// time there is nothing useful to do with them.
-pub async fn stop_control_master(socket_path: &Path) {
+pub async fn stop_control_master(control_path: &ControlPath) {
+    let socket_path = match control_path {
+        ControlPath::WarpManaged(socket_path) => socket_path,
+        ControlPath::UserOwned(socket_path) => {
+            log::info!(
+                "stop_control_master: leaving user-owned ControlMaster at {} running",
+                socket_path.display()
+            );
+            return;
+        }
+        ControlPath::None => return,
+    };
     let args = ssh_args(socket_path);
     let result = async {
         Command::new("ssh")

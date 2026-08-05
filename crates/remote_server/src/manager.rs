@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_family = "wasm"))]
-use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
@@ -16,8 +15,7 @@ use crate::setup::RemotePlatform;
 use crate::setup::RemoteServerSetupState;
 use crate::setup::UnsupportedReason;
 #[cfg(not(target_family = "wasm"))]
-use crate::transport::Connection;
-use crate::transport::RemoteTransport;
+use crate::transport::{Connection, ControlPath, RemoteTransport};
 use crate::HostId;
 use repo_metadata::RepoMetadataUpdate;
 use serde::Serialize;
@@ -34,7 +32,6 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 2;
 /// Delay between reconnection attempts.
 #[cfg(not(target_family = "wasm"))]
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
-
 /// Parameters that travel together through the reconnection flow.
 #[cfg(not(target_family = "wasm"))]
 struct ReconnectParams {
@@ -43,7 +40,7 @@ struct ReconnectParams {
     exit_status: Option<RemoteServerExitStatus>,
     transport: Arc<dyn RemoteTransport>,
     auth_context: Arc<RemoteServerAuthContext>,
-    control_path: Option<PathBuf>,
+    control_path: ControlPath,
     identity_key: String,
 }
 
@@ -189,7 +186,7 @@ pub enum RemoteSessionState {
         _child: async_process::Child,
         /// See type-level doc.
         #[cfg(not(target_family = "wasm"))]
-        control_path: Option<PathBuf>,
+        control_path: ControlPath,
     },
     /// Initialize handshake succeeded. Client is ready for requests.
     Connected {
@@ -206,7 +203,7 @@ pub enum RemoteSessionState {
         _child: async_process::Child,
         /// See type-level doc.
         #[cfg(not(target_family = "wasm"))]
-        control_path: Option<PathBuf>,
+        control_path: ControlPath,
         /// Transport stored for reconnection after spontaneous disconnect.
         #[cfg(not(target_family = "wasm"))]
         transport: Arc<dyn RemoteTransport>,
@@ -216,7 +213,7 @@ pub enum RemoteSessionState {
     Reconnecting {
         attempt: u32,
         host_id: HostId,
-        control_path: Option<PathBuf>,
+        control_path: ControlPath,
     },
     /// Connection dropped (EOF/error from the reader task).
     Disconnected,
@@ -939,7 +936,7 @@ impl RemoteServerManager {
             Some(RemoteSessionState::Connected { control_path, .. })
             | Some(RemoteSessionState::Initializing { control_path, .. }) => control_path.clone(),
             Some(RemoteSessionState::Reconnecting { control_path, .. }) => control_path.clone(),
-            _ => None,
+            _ => ControlPath::None,
         };
 
         // Extract `host_id` from states that track a host connection.
@@ -966,13 +963,11 @@ impl RemoteServerManager {
         // Spawned detached because the ssh subcommand may take a moment
         // to complete and we don't want to block the main thread on it.
         #[cfg(not(target_family = "wasm"))]
-        if let Some(control_path) = control_path {
-            ctx.background_executor()
-                .spawn(async move {
-                    crate::ssh::stop_control_master(&control_path).await;
-                })
-                .detach();
-        }
+        ctx.background_executor()
+            .spawn(async move {
+                crate::ssh::stop_control_master(&control_path).await;
+            })
+            .detach();
     }
 
     /// Returns the client for this session, if connected.
