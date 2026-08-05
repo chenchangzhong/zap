@@ -41,6 +41,8 @@ pub(crate) use controller::{
     response_stream::ResponseStreamId, BlocklistAIController, BlocklistAIControllerEvent,
     ClientIdentifiers, SessionContext, SlashCommandRequest,
 };
+#[cfg(test)]
+pub(crate) use controller::response_stream::ResponseStream;
 pub(crate) use history_model::{
     AIQueryHistory, AIQueryHistoryOutputStatus, BlocklistAIHistoryEvent, BlocklistAIHistoryModel,
     FORK_PREFIX, PRE_REWIND_PREFIX,
