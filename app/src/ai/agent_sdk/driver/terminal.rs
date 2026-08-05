@@ -26,7 +26,6 @@ use crate::{
         shell::ShellType,
         TerminalView,
     },
-    util::sync::Condition,
 };
 
 use crate::ai::attachment_utils::attachments_download_dir;
@@ -49,6 +48,48 @@ pub(crate) enum TerminalDriverEvent {
     SlowBootstrap,
 }
 
+/// Describes why a terminal session bootstrap failed.
+#[derive(Debug)]
+pub(crate) enum BootstrapError {
+    /// The PTY or shell process failed before the bootstrap script completed.
+    /// When `reason` is `Some`, the message is
+    /// "Shell spawn failed: {reason}. Check the Warp logs for details."
+    /// When `reason` is `None`, it is
+    /// "Shell spawn failed. Check the Warp logs for details."
+    PtySpawnFailed { reason: Option<String> },
+    /// The bootstrap script did not complete within the expected time.
+    TimedOut,
+    /// An unexpected internal error in the bootstrap channel
+    /// (e.g. the sender was dropped without sending).
+    InternalError,
+}
+
+impl std::fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BootstrapError::PtySpawnFailed { reason: Some(r) } => {
+                write!(
+                    f,
+                    "Shell spawn failed: {r}. Check the Warp logs for details."
+                )
+            }
+            BootstrapError::PtySpawnFailed { reason: None } => {
+                write!(f, "Shell spawn failed. Check the Warp logs for details.")
+            }
+            BootstrapError::TimedOut => write!(
+                f,
+                "Terminal session did not start within the expected time. \
+                 Check the Warp logs for details."
+            ),
+            BootstrapError::InternalError => {
+                write!(f, "An unexpected internal error occurred during bootstrap.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BootstrapError {}
+
 /// Manages the terminal session lifecycle for the agent driver.
 ///
 /// Responsibilities:
@@ -57,7 +98,12 @@ pub(crate) enum TerminalDriverEvent {
 /// - Detecting block completion
 pub(crate) struct TerminalDriver {
     terminal_view: ViewHandle<TerminalView>,
-    session_bootstrapped: Condition,
+    /// Sender half of the bootstrap result channel. Exactly one of
+    /// `SessionBootstrapped`, `PtySpawnFailed`, or `Exited` (pre-bootstrap)
+    /// will send the outcome; all others no-op after the first send.
+    bootstrap_tx: Option<oneshot::Sender<Result<(), BootstrapError>>>,
+    /// Receiver half consumed by `wait_for_session_bootstrapped`.
+    bootstrap_rx: Option<oneshot::Receiver<Result<(), BootstrapError>>>,
     waiting_command: Option<oneshot::Sender<ExitCode>>,
 
     /// State for the pending command we're expecting to start executing.
@@ -69,6 +115,7 @@ pub(crate) struct TerminalDriver {
 impl Entity for TerminalDriver {
     type Event = TerminalDriverEvent;
 }
+
 
 /// Create the terminal window and extract the [`ViewHandle<TerminalView>`].
 ///
@@ -118,9 +165,6 @@ impl TerminalDriver {
 
     /// Wrap an already-created terminal view in a new `TerminalDriver` model.
     ///
-    /// Unlike [`Self::create`], this does not open a new window — it reuses an
-    /// existing view (e.g. a docker sandbox pane). Session sharing is disabled
-    /// and no task ID is associated.
     pub(crate) fn create_from_existing_view(
         terminal_view: ViewHandle<TerminalView>,
         ctx: &mut AppContext,
@@ -128,15 +172,12 @@ impl TerminalDriver {
         ctx.add_model(|ctx| Self::new(terminal_view, None, PathBuf::default(), ctx))
     }
 
-    /// Set up event subscriptions for an already-created terminal view.
     fn new(
         terminal_view: ViewHandle<TerminalView>,
         task_id: Option<AmbientAgentTaskId>,
         working_dir: PathBuf,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        let session_bootstrapped = Condition::new();
-
         // 立即把 task_id 和附件下载目录写入 AI controller,供本地任务元数据和附件使用。
         if let Some(tid) = task_id {
             let attachments_dir = attachments_download_dir(&working_dir);
@@ -152,9 +193,10 @@ impl TerminalDriver {
             me.handle_terminal_view_event(event, ctx);
         });
 
-        // If the session already bootstrapped before we subscribed, set the
-        // condition immediately so callers of `wait_for_session_bootstrapped`
-        // don't block forever.
+        let (bootstrap_tx_inner, bootstrap_rx) = oneshot::channel::<Result<(), BootstrapError>>();
+
+        // If bootstrap already completed before we subscribed, resolve the
+        // channel immediately so `wait_for_session_bootstrapped` doesn't block.
         let already_bootstrapped = terminal_view.read(ctx, |terminal, _| {
             terminal
                 .model
@@ -162,13 +204,17 @@ impl TerminalDriver {
                 .block_list()
                 .is_bootstrapping_precmd_done()
         });
-        if already_bootstrapped {
-            session_bootstrapped.set();
-        }
+        let bootstrap_tx = if already_bootstrapped {
+            let _ = bootstrap_tx_inner.send(Ok(()));
+            None
+        } else {
+            Some(bootstrap_tx_inner)
+        };
 
         Self {
             terminal_view,
-            session_bootstrapped,
+            bootstrap_tx,
+            bootstrap_rx: Some(bootstrap_rx),
             waiting_command: None,
             pending_command_start: None,
         }
@@ -333,21 +379,32 @@ impl TerminalDriver {
 
     /// Returns a future that resolves when the session has bootstrapped.
     ///
-    /// This only waits for the `SessionBootstrapped` terminal view event.
+    /// The bootstrap result channel carries `Ok(())` on success or
+    /// `Err(BootstrapError)` on failure. If the channel times out, the error
+    /// is `BootstrapError::TimedOut`.
     pub fn wait_for_session_bootstrapped(
-        &self,
-    ) -> impl Future<Output = Result<(), AgentDriverError>> {
-        let session_bootstrapped = self.session_bootstrapped.clone();
+        &mut self,
+    ) -> impl Future<Output = Result<(), BootstrapError>> {
+        let bootstrap_rx = self.bootstrap_rx.take();
 
         async move {
-            session_bootstrapped
-                .wait()
-                .with_timeout(TERMINAL_SESSION_BOOTSTRAP_TIMEOUT)
-                .await
-                .map_err(|_| {
-                    log::error!("Timed out waiting for session bootstrap");
-                    AgentDriverError::BootstrapFailed
-                })
+            let result = if let Some(rx) = bootstrap_rx {
+                // Map channel cancellation (sender dropped without sending)
+                // to InternalError — this shouldn't happen in practice.
+                let inner = async move { rx.await.unwrap_or(Err(BootstrapError::InternalError)) };
+                match inner.with_timeout(TERMINAL_SESSION_BOOTSTRAP_TIMEOUT).await {
+                    Ok(result) => result,
+                    Err(_timeout) => Err(BootstrapError::TimedOut),
+                }
+            } else {
+                // bootstrap_rx already consumed — shouldn't happen in normal flow.
+                Err(BootstrapError::InternalError)
+            };
+
+            if let Err(e) = &result {
+                log::error!("Terminal bootstrap failed: {e}");
+            }
+            result
         }
     }
 }
@@ -388,7 +445,28 @@ impl TerminalDriver {
     ) {
         match event {
             crate::terminal::view::Event::SessionBootstrapped => {
-                self.session_bootstrapped.set();
+                if let Some(tx) = self.bootstrap_tx.take() {
+                    let _ = tx.send(Ok(()));
+                }
+            }
+            crate::terminal::view::Event::PtySpawnFailed { reason } => {
+                // Signal the bootstrap waiter immediately so it doesn't wait
+                // for the full 60 s timeout when a spawn failure has already
+                // been confirmed.
+                if let Some(tx) = self.bootstrap_tx.take() {
+                    let _ = tx.send(Err(BootstrapError::PtySpawnFailed {
+                        reason: Some(reason.clone()),
+                    }));
+                }
+            }
+            crate::terminal::view::Event::Exited => {
+                // The shell process exited before bootstrap completed —
+                // cancel the wait immediately rather than sitting out the
+                // full 60 s timeout. No specific reason is known at this
+                // point; the logs will have details.
+                if let Some(tx) = self.bootstrap_tx.take() {
+                    let _ = tx.send(Err(BootstrapError::PtySpawnFailed { reason: None }));
+                }
             }
             crate::terminal::view::Event::SlowBootstrap => {
                 ctx.emit(TerminalDriverEvent::SlowBootstrap);

@@ -271,7 +271,10 @@ pub enum AgentDriverError {
     #[error("Saved prompt not found for id {0}")]
     AIWorkflowNotFound(String),
     #[error("Terminal bootstrap failed")]
-    BootstrapFailed,
+    BootstrapFailed {
+        #[source]
+        error: terminal::BootstrapError,
+    },
     #[error("Error syncing Zap Drive")]
     WarpDriveSyncFailed,
     #[error("Requested environment not found: {0}")]
@@ -904,11 +907,11 @@ impl AgentDriver {
         foreground
             .spawn(|me, ctx| {
                 me.terminal_driver
-                    .as_ref(ctx)
-                    .wait_for_session_bootstrapped()
+                    .update(ctx, |driver, _| driver.wait_for_session_bootstrapped())
             })
             .await?
-            .await?;
+            .await
+            .map_err(|error| AgentDriverError::BootstrapFailed { error })?;
 
         // Set up MCP servers, model overrides, and profile information.
         {
