@@ -51,6 +51,8 @@ const CARD_BUTTON_PADDING: f32 = 6.0;
 const FIELD_LABEL_MARGIN_TOP: f32 = 6.0;
 const FIELD_LABEL_MARGIN_BOTTOM: f32 = 2.0;
 const MODEL_ROW_GAP: f32 = 6.0;
+/// 模型列表折叠时默认显示的条数(参考同页 models_dev 快速添加区的折叠)。
+const COLLAPSED_MODEL_LIMIT: usize = 3;
 
 // ---------------------------------------------------------------------------
 // 模型行展开状态(process-local,thread_local 单线程 UI 安全;不持久化)
@@ -60,6 +62,9 @@ std::thread_local! {
     /// {provider_id => Set<model_index>} 当前展开的模型条目。
     /// 关 settings 页就丢,行为类似 `models_dev::chips_expanded()` 的 AtomicBool。
     static EXPANDED_MODELS: RefCell<HashMap<String, HashSet<usize>>> = RefCell::new(HashMap::new());
+    /// {provider_id} 模型列表处于"全部展开"状态的 provider。
+    /// 默认折叠只显示前 `COLLAPSED_MODEL_LIMIT` 条,行为同 `models_dev::chips_expanded()`。
+    static EXPANDED_MODEL_LISTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 pub(super) fn is_model_expanded(provider_id: &str, model_index: usize) -> bool {
@@ -80,8 +85,33 @@ pub(super) fn toggle_model_expanded(provider_id: &str, model_index: usize) {
     });
 }
 
+/// 模型列表是否处于"全部展开"状态(否则折叠,只显示前 `COLLAPSED_MODEL_LIMIT` 条)。
+pub(super) fn is_model_list_expanded(provider_id: &str) -> bool {
+    EXPANDED_MODEL_LISTS.with(|m| m.borrow().contains(provider_id))
+}
+
+pub(super) fn toggle_model_list_expanded(provider_id: &str) {
+    EXPANDED_MODEL_LISTS.with(|m| {
+        let mut set = m.borrow_mut();
+        if !set.insert(provider_id.to_string()) {
+            set.remove(provider_id);
+        }
+    });
+}
+
 /// 删除 provider 时连带清掉它的展开记录,避免索引漂移。
 pub(super) fn clear_expanded_models_for_provider(provider_id: &str) {
+    EXPANDED_MODELS.with(|m| {
+        m.borrow_mut().remove(provider_id);
+    });
+    EXPANDED_MODEL_LISTS.with(|m| {
+        m.borrow_mut().remove(provider_id);
+    });
+}
+
+/// 删除单条模型后清掉该 provider 的单行展开记录(模型 index 漂移,避免误展开)。
+/// 列表级折叠状态以 provider_id 为键、无索引可漂移,保留不清,避免逐条删除时列表反复折叠。
+pub(super) fn clear_expanded_model_rows_for_provider(provider_id: &str) {
     EXPANDED_MODELS.with(|m| {
         m.borrow_mut().remove(provider_id);
     });
@@ -124,6 +154,8 @@ struct ProviderRow {
     save_button_state: MouseStateHandle,
     remove_button_state: MouseStateHandle,
     add_model_button_state: MouseStateHandle,
+    /// 模型列表展开/折叠按钮(列表条数超过折叠上限时才显示)。
+    expand_models_button_state: MouseStateHandle,
     header_rows: Vec<HeaderRow>,
     add_header_button_state: MouseStateHandle,
     /// 5 个 ApiType chip 各自的鼠标状态。HashMap 由 chip 显示名映射。
@@ -562,6 +594,7 @@ impl AgentProvidersWidget {
             save_button_state: MouseStateHandle::default(),
             remove_button_state: MouseStateHandle::default(),
             add_model_button_state: MouseStateHandle::default(),
+            expand_models_button_state: MouseStateHandle::default(),
             header_rows,
             add_header_button_state,
             api_type_chip_states: RefCell::new(HashMap::new()),
@@ -1183,7 +1216,15 @@ impl AgentProvidersWidget {
             .finish();
             models_column.add_child(header);
 
-            for (idx, m_row) in row.model_rows.iter().enumerate() {
+            // 折叠时默认只显示前 COLLAPSED_MODEL_LIMIT 条,展开则全显(参考同页 models_dev)。
+            let total_models = row.model_rows.len();
+            let list_expanded = is_model_list_expanded(&provider.id);
+            let visible_count = if list_expanded {
+                total_models
+            } else {
+                COLLAPSED_MODEL_LIMIT.min(total_models)
+            };
+            for (idx, m_row) in row.model_rows.iter().take(visible_count).enumerate() {
                 let model = match provider.models.get(idx) {
                     Some(m) => m,
                     // 极端情况:rebuild 间隙 settings 又被改了,model_rows 与 provider.models
@@ -1198,6 +1239,34 @@ impl AgentProvidersWidget {
                     draft_editors.clone(),
                     appearance,
                 ));
+            }
+
+            // 展开/收起按钮(模型数超过折叠上限才展示;参考同页 models_dev 快速添加区)。
+            if total_models > COLLAPSED_MODEL_LIMIT {
+                let toggle_label = if list_expanded {
+                    crate::t!("settings-agent-providers-collapse")
+                } else {
+                    let count: i64 = (total_models - COLLAPSED_MODEL_LIMIT) as i64;
+                    crate::t!("settings-agent-providers-expand-remaining", count = count)
+                };
+                let toggle_button = Self::render_card_button(
+                    toggle_label,
+                    row.expand_models_button_state.clone(),
+                    AISettingsPageAction::ToggleAgentProviderModelListExpanded {
+                        provider_id: provider.id.clone(),
+                    },
+                    appearance,
+                );
+                models_column.add_child(
+                    Container::new(
+                        Flex::row()
+                            .with_main_axis_alignment(MainAxisAlignment::Start)
+                            .with_child(toggle_button)
+                            .finish(),
+                    )
+                    .with_margin_top(MODEL_ROW_GAP)
+                    .finish(),
+                );
             }
         }
 

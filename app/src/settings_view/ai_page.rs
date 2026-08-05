@@ -2378,6 +2378,10 @@ pub enum AISettingsPageAction {
     SetModelsDevSearchQuery(String),
 
     // ----- 单条模型条目 detail panel -----
+    /// 折叠/展开 provider 卡片的模型列表(默认只显示前 3 条,参考 models_dev 折叠)。
+    ToggleAgentProviderModelListExpanded {
+        provider_id: String,
+    },
     /// 切换单条模型的 detail panel 展开/折叠状态。
     ToggleAgentProviderModelExpanded {
         provider_id: String,
@@ -3236,8 +3240,9 @@ impl TypedActionView for AISettingsPageView {
                     }
                     let _ = settings.agent_providers.set_value(providers, ctx);
                 });
-                // 删一条会让后续 index 漂移,清掉这个 provider 的全部展开记录避免误展开。
-                super::agent_providers_widget::clear_expanded_models_for_provider(provider_id);
+                // 删一条会让后续 index 漂移,清掉该 provider 的单行展开记录避免误展开;
+                // 列表级折叠状态保留,避免逐条删除时列表反复折叠。
+                super::agent_providers_widget::clear_expanded_model_rows_for_provider(provider_id);
                 self.rebuild_current_page(ctx);
             }
             AISettingsPageAction::UpdateAgentProviderModelName {
@@ -3573,6 +3578,10 @@ impl TypedActionView for AISettingsPageView {
             AISettingsPageAction::SetModelsDevSearchQuery(q) => {
                 use crate::ai::agent_providers::models_dev;
                 models_dev::set_search_query(q.clone());
+                ctx.notify();
+            }
+            AISettingsPageAction::ToggleAgentProviderModelListExpanded { provider_id } => {
+                super::agent_providers_widget::toggle_model_list_expanded(provider_id);
                 ctx.notify();
             }
             AISettingsPageAction::ToggleAgentProviderModelExpanded {

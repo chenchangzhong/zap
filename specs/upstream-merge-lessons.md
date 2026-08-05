@@ -1440,5 +1440,42 @@ lifecycle 栈（§21）按 §21.4 方案 A 执行。全部执行记录见 §23�
 
 ---
 
-*文档版本：v2.2*
+## 24. 本地功能改动记录（2026-08-05）：Agent 提供商模型列表折叠
+
+> 这不是上游拣入，而是 Zap 本地的 UI 优化。记录原因：改动落在
+> `app/src/settings_view/`（决策速查表 §0 已标注「冲突密集，低价值」的本地
+> 定制区），且新增了本地专有的折叠状态。未来同步该区域时不得用上游版本
+> 覆盖（§1「Zap 本地功能禁止覆盖」）。
+
+### 24.1 改动内容
+
+| 文件 | 内容 |
+|------|------|
+| `app/src/settings_view/agent_providers_widget.rs` | 模型列表折叠：新增 `COLLAPSED_MODEL_LIMIT = 3`、thread_local `EXPANDED_MODEL_LISTS`（`HashSet<provider_id>`，关页即丢）与 `is_model_list_expanded` / `toggle_model_list_expanded`；渲染循环 `.take(visible_count)` 只显示前 3 条；模型数 >3 时列表末尾显示「展开剩余 N 个 ▼ / 收起 ▲」按钮（左对齐，防 Stretch 拉伸）；`clear_expanded_models_for_provider`（删 provider）两者都清，新增 `clear_expanded_model_rows_for_provider`（删单条模型只清单行展开记录，保留列表展开态，避免逐条删除时列表反复折叠） |
+| `app/src/settings_view/ai_page.rs` | 新增 action `ToggleAgentProviderModelListExpanded { provider_id }`，处理只 `toggle_model_list_expanded + ctx.notify()`（纯渲染层切换，不 rebuild；模型行 editor handle 全量保留） |
+
+与同页 models_dev「快速添加」区折叠（`COLLAPSED_LIMIT=8` + AtomicBool）同模式：
+折叠只影响渲染，未保存草稿不丢，保存仍全量提交。
+
+### 24.2 合并注意事项
+
+1. **i18n key 复用**：折叠按钮复用 models_dev 的 `settings-agent-providers-collapse` /
+   `settings-agent-providers-expand-remaining`（en/ja/zh-CN 三语言已存在），未新增翻译。
+2. **两套折叠状态并存**：`EXPANDED_MODELS`（单模型行 detail panel，`HashMap<provider_id, Set<index>>`）
+   与 `EXPANDED_MODEL_LISTS`（列表级，`HashSet<provider_id>`）语义不同、互不干扰；
+   清状态时删 provider 两者都清，删单条模型只清前者（index 漂移只影响前者）。
+3. **上游若给 provider 模型列表加展开/折叠**：先判语义（单行 detail vs 列表级），
+   不要直接覆盖本地实现。
+
+### 24.3 验证状态
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp` | ✅ 通过（0 error，22 个既有 warning，改动文件零新增） |
+| code review（1 reviewer） | ✅ approve（2 处 P3 nit 已修：折叠按钮防 Stretch 拉伸、删模型保留列表展开态） |
+| dev app 手动验证 | ✅ 通过（`./script/run`，OSS channel `zap-oss`，窗口与 shell 正常启动） |
+
+---
+
+*文档版本：v2.3*
 *下次合并前必读*
