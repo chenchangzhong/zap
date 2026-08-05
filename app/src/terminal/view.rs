@@ -24155,7 +24155,7 @@ impl TypedActionView for TerminalView {
             | ToggleHideCliResponses
             | OpenConversationsPalette
             | ExitAgentView
-            | StartNewAgentConversation
+            | StartNewAgentConversation { .. }
             | CancelAmbientAgentTask
             | OpenInlineHistoryMenu
             | OpenModelSelector
@@ -25074,9 +25074,14 @@ impl TypedActionView for TerminalView {
                     ctx.notify();
                 }
             }
-            StartNewAgentConversation => {
+            StartNewAgentConversation { origin } => {
                 self.input.update(ctx, |input, ctx| {
-                    input.handle_action(&InputAction::StartNewAgentConversation, ctx);
+                    input.handle_action(
+                        &InputAction::StartNewAgentConversation {
+                            origin: *origin,
+                        },
+                        ctx,
+                    );
                 });
             }
             OpenInlineHistoryMenu => {

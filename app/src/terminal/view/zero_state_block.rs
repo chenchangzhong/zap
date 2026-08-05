@@ -18,7 +18,8 @@ use warpui::{
 
 use crate::{
     ai::blocklist::agent_view::{
-        AgentViewController, AgentViewControllerEvent, ENTER_AGENT_VIEW_NEW_CONVERSATION_KEYSTROKE,
+        AgentViewController, AgentViewControllerEvent, AgentViewEntryOrigin,
+        ENTER_AGENT_VIEW_NEW_CONVERSATION_KEYSTROKE,
     },
     appearance::Appearance,
     settings::{AISettings, AISettingsChangedEvent, InputModeSettings},
@@ -191,7 +192,11 @@ impl View for TerminalViewZeroStateBlock {
                         MessageItem::text(crate::t!("terminal-zero-state-start-agent")),
                     ],
                     |ctx| {
-                        ctx.dispatch_typed_action(TerminalAction::StartNewAgentConversation);
+                        ctx.dispatch_typed_action(TerminalAction::StartNewAgentConversation {
+                            origin: AgentViewEntryOrigin::Input {
+                                was_prompt_autodetected: false,
+                            },
+                        });
                     },
                     self.state_handles.start_new_conversation.clone(),
                 )]),
