@@ -121,9 +121,6 @@ pub enum FeatureFlag {
     /// Enables AI rules for use with Agent Mode.
     AIRules,
 
-    /// Routes SSH sessions through the tmux-backed SSH wrapper.
-    SSHTmuxWrapper,
-
     /// Reduces the amount of horizontal padding in the blocklist
     /// from 20px to 16px.
     LessHorizontalTerminalPadding,
@@ -786,8 +783,6 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::RemoveAutosuggestionDuringTabCompletions,
     FeatureFlag::ResizeFix,
     FeatureFlag::AgentModeWorkflows,
-    #[cfg(not(windows))]
-    FeatureFlag::SSHTmuxWrapper,
     FeatureFlag::AgentModeAnalytics,
     FeatureFlag::LazySceneBuilding,
     FeatureFlag::SshDragAndDrop,

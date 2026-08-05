@@ -11,12 +11,12 @@ use crate::{
         model::{
             blocks::RichContentItem, rich_content::RichContentType, terminal_model::BlockIndex,
         },
-        ssh::{error::SshErrorBlock, install_tmux::SshInstallTmuxBlock, warpify::SshWarpifyBlock},
         view::{
             ambient_agent::AmbientAgentEntryBlock,
             block_onboarding::onboarding_agentic_suggestions_block::OnboardingAgenticSuggestionsBlock,
             ssh_remote_server_choice_view::SshRemoteServerChoiceView,
             ssh_remote_server_failed_banner::SshRemoteServerFailedBanner,
+            ssh_tmux_deprecation_banner::SshTmuxDeprecationBanner,
         },
         warpify::success_block::WarpifySuccessBlock,
         TerminalView,
@@ -207,20 +207,14 @@ pub enum RichContentMetadata {
     EnvVarCollectionBlock {
         env_var_collection_block_handle: ViewHandle<EnvVarCollectionBlock>,
     },
-    SshWarpifyBlock {
-        ssh_warpify_block_handle: ViewHandle<SshWarpifyBlock>,
-    },
-    SshInstallTmuxBlock {
-        ssh_install_tmux_block_handle: ViewHandle<SshInstallTmuxBlock>,
-    },
-    SshErrorBlock {
-        ssh_error_block_handle: ViewHandle<SshErrorBlock>,
-    },
     SshRemoteServerChoiceBlock {
         handle: ViewHandle<SshRemoteServerChoiceView>,
     },
     SshRemoteServerFailedBanner {
         handle: ViewHandle<SshRemoteServerFailedBanner>,
+    },
+    SshTmuxDeprecationBanner {
+        handle: ViewHandle<SshTmuxDeprecationBanner>,
     },
     WarpifySuccessBlock {
         bootstrap_success_block_handle: ViewHandle<WarpifySuccessBlock>,

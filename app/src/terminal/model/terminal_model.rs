@@ -3,7 +3,7 @@ use crate::ai::blocklist::SerializedBlockListItem;
 use crate::terminal::available_shells::AvailableShell;
 use crate::terminal::block_list_element::GridType;
 use crate::terminal::event::{
-    BootstrappedEvent, Event, ExecutedExecutorCommandEvent, InitSshEvent, InitSubshellEvent,
+    BootstrappedEvent, Event, ExecutedExecutorCommandEvent, InitSubshellEvent,
     SourcedRcFileInSubshellEvent, SshLoginStatus, TerminalMode,
 };
 use crate::terminal::event_listener::ChannelEventListener;
@@ -20,14 +20,10 @@ use crate::terminal::ssh::util::{InteractiveSshCommand, SshLoginState};
 use crate::terminal::{block_filter::BlockFilterQuery, model::ansi::Handler};
 use crate::terminal::{color, ssh, BlockPadding, ShellHost, SizeUpdate, SizeUpdateReason};
 use crate::terminal::{ShellLaunchData, ShellLaunchState};
-use crate::util::AsciiDebug;
 
 pub use crate::terminal::history::HistoryEntry;
 
-use super::ansi::{
-    FinishUpdateValue, InputBufferValue, Mode, PendingHook, TmuxInstallFailedInfo,
-    WarpificationUnavailableReason,
-};
+use super::ansi::{FinishUpdateValue, InputBufferValue, Mode, PendingHook};
 use super::block::{
     AgentInteractionMetadata, Block, BlockId, BlockMetadata, BlockSize, BlocklistEnvVarMetadata,
     SerializedBlock,
@@ -46,16 +42,14 @@ use super::kitty::{
 use super::secrets::{RespectObfuscatedSecrets, SecretAndHandle};
 use super::selection::ScrollDelta;
 use super::session::{BootstrapSessionType, InBandCommandOutputReceiver, SessionId};
-use super::tmux::commands::TmuxCommand;
 use super::{
     super::{AltScreen, BlockList},
     ansi::BootstrappedValue,
 };
-use super::{tmux, Secret, SecretHandle};
+use super::{Secret, SecretHandle};
 use crate::terminal::model::ansi::{
-    ClearValue, CommandFinishedValue, ExitShellValue, InitShellValue, InitSshValue,
-    InitSubshellValue, PreInteractiveSSHSessionValue, PrecmdValue, PreexecValue, SSHValue,
-    SourcedRcFileForWarpValue,
+    ClearValue, CommandFinishedValue, ExitShellValue, InitShellValue, InitSubshellValue,
+    PreInteractiveSSHSessionValue, PrecmdValue, PreexecValue, SSHValue, SourcedRcFileForWarpValue,
 };
 use crate::terminal::model::grid::IndexRegion;
 use crate::terminal::model::session::SessionInfo;
@@ -71,7 +65,6 @@ use crate::terminal::shared_session::protocol::{
 use async_channel::Sender;
 use base64::Engine;
 use hex::FromHexError;
-use instant::Instant;
 use itertools::{Either, Itertools};
 use serde::Serialize;
 use std::cmp::{max, min};
@@ -79,7 +72,6 @@ use std::collections::{HashMap, HashSet};
 use std::num::ParseIntError;
 use std::ops::{Range, RangeInclusive};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use warp_core::features::FeatureFlag;
 use warp_core::semantic_selection::SemanticSelection;
@@ -378,77 +370,6 @@ pub struct SubshellSuccessBlockInfo {
     pub session_type: BootstrapSessionType,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TmuxInstallationState {
-    /// This means tmux was installed by Zap in this session, successfully or unsuccessfully.
-    /// It also means we had root access and used a package manager to install tmux and all
-    /// dependencies.
-    InstalledByWarpRootInThisSession,
-    /// This means tmux was installed by Zap in this session, successfully or unsuccessfully.
-    InstalledByWarpInThisSession,
-    InstalledByWarpInPriorSession,
-    /// This means that warp did not install it locally. It was either installed by the user
-    /// or it was installed by warp in a prior session using the package manager.
-    InstalledByUser,
-    /// This means we never tried to install tmux in this session.
-    #[default]
-    NotInstalled,
-}
-
-impl FromStr for TmuxInstallationState {
-    type Err = anyhow::Error;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        match input {
-            "installed_by_warp_root_in_this_session" => {
-                Ok(TmuxInstallationState::InstalledByWarpRootInThisSession)
-            }
-            "installed_by_warp_in_this_session" => {
-                Ok(TmuxInstallationState::InstalledByWarpInThisSession)
-            }
-            "warp" | "installed_by_warp_in_prior_session" => {
-                Ok(TmuxInstallationState::InstalledByWarpInPriorSession)
-            }
-            "user" | "installed_by_user" => Ok(TmuxInstallationState::InstalledByUser),
-            "not_installed" => Ok(TmuxInstallationState::NotInstalled),
-            _ => Err(anyhow::anyhow!("Invalid TmuxInstallationState")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WarpInitiatedTmuxControlMode {
-    pub start_time: Instant,
-    pub tmux_installation: Option<TmuxInstallationState>,
-}
-
-impl WarpInitiatedTmuxControlMode {
-    pub fn new(tmux_installation: Option<TmuxInstallationState>) -> Self {
-        Self {
-            start_time: Instant::now(),
-            tmux_installation,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TmuxControlModeContext {
-    UserInitiated,
-    WarpInitiatedForSsh(WarpInitiatedTmuxControlMode),
-}
-
-impl TmuxControlModeContext {
-    pub fn tmux_installation(&self) -> Option<TmuxInstallationState> {
-        match self {
-            TmuxControlModeContext::UserInitiated => None,
-            TmuxControlModeContext::WarpInitiatedForSsh(warp_initiated) => {
-                warp_initiated.tmux_installation
-            }
-        }
-    }
-}
-
 pub struct TerminalModel {
     /// For fullscreen programs like vim.
     alt_screen: AltScreen,
@@ -485,15 +406,7 @@ pub struct TerminalModel {
     /// The pending `SSHValue`, if any, of the active session. This is a temporary value that's
     /// stored between when an SSH connection is initiated (the `SSH` hook executed on the local
     /// machine) and when the remote shell sends the `InitShell` DCS.
-    pending_legacy_ssh_session: Option<SSHValue>,
-
-    /// This variable allows us to differentiate between warp-initiated and user-initiated invocations of
-    /// control mode. Whenever we attempt to warpify an ssh session, we track the context of when warp initiated
-    /// control mode, indicating that we expect the shell to enter control mode. We reset to None whenever
-    /// the active block finishes. If we enter control mode and option is None, then we know it's user-initiated.
-    pending_warp_initiated_control_mode: Option<WarpInitiatedTmuxControlMode>,
-
-    tmux_control_mode_context: Option<TmuxControlModeContext>,
+    pending_ssh_wrapper_session: Option<SSHValue>,
 
     /// The path of the shell binary used for the pending shell session, if any. This is
     /// temporarily stored between the spawning of the child shell process and bootstrap completion.
@@ -595,9 +508,6 @@ pub struct TerminalModel {
     /// Used to suppress live-conversation-specific actions (e.g. tombstone insertion)
     /// until the replay is complete.
     is_receiving_agent_conversation_replay: bool,
-
-    tmux_background_outputs: HashMap<u32, Vec<u8>>,
-
     /// When some, the TerminalModel emits the event [Event::DetectedEndOfSshLogin]. This
     /// event is emitted either as the initial check or the confirmation check.
     notify_on_end_of_ssh_login: Option<SshLogin>,
@@ -1151,7 +1061,7 @@ impl TerminalModel {
             colors,
             override_colors: color::OverrideList::empty(),
             event_proxy,
-            pending_legacy_ssh_session: None,
+            pending_ssh_wrapper_session: None,
             pending_shell_launch_data: None,
             active_shell_launch_data: None,
             pending_session_info: None,
@@ -1175,9 +1085,6 @@ impl TerminalModel {
             ordered_terminal_events_for_shared_session_tx: None,
             write_to_pty_events_for_shared_session_tx: None,
             is_receiving_agent_conversation_replay: false,
-            tmux_background_outputs: HashMap::new(),
-            tmux_control_mode_context: None,
-            pending_warp_initiated_control_mode: None,
             notify_on_end_of_ssh_login: None,
             is_receiving_hook: IsReceivingHook::No,
             image_id_to_metadata: HashMap::new(),
@@ -1638,7 +1545,7 @@ impl TerminalModel {
     }
 
     pub fn has_pending_ssh_session(&self) -> bool {
-        self.pending_legacy_ssh_session.is_some()
+        self.pending_ssh_wrapper_session.is_some()
     }
 
     pub fn pending_shell_type(&self) -> Option<ShellType> {
@@ -2175,12 +2082,6 @@ impl TerminalModel {
                     log::warn!("Failed to send OrderedTerminalEventType::Resize: {e}");
                 }
             }
-
-            if self.tmux_control_mode_context.is_some() {
-                self.emit_handler_event(HandlerEvent::RunTmuxCommand(
-                    TmuxCommand::UpdateClientSize { num_rows, num_cols },
-                ));
-            }
         }
     }
 
@@ -2390,27 +2291,6 @@ impl TerminalModel {
         self.env_var_collection_name = value;
     }
 
-    pub fn set_pending_warp_initiated_control_mode(&mut self) {
-        let tmux_installation = self
-            .tmux_control_mode_context
-            .and_then(|context| context.tmux_installation());
-        self.pending_warp_initiated_control_mode =
-            Some(WarpInitiatedTmuxControlMode::new(tmux_installation));
-    }
-
-    pub fn set_pending_warp_initiated_control_mode_with_install_tmux(&mut self, with_root: bool) {
-        self.pending_warp_initiated_control_mode =
-            Some(WarpInitiatedTmuxControlMode::new(Some(if with_root {
-                TmuxInstallationState::InstalledByWarpRootInThisSession
-            } else {
-                TmuxInstallationState::InstalledByWarpInThisSession
-            })));
-    }
-
-    pub fn clear_pending_warp_initiated_control_mode(&mut self) {
-        self.pending_warp_initiated_control_mode = None;
-    }
-
     /// Informs the terminal model to start watching for ssh output that indicates the session
     /// has progressed past authentication/login. When login is complete, emit Event::DetectedEndOfSshLogin.
     pub fn start_notify_on_end_of_ssh_login(&mut self) {
@@ -2504,21 +2384,6 @@ impl TerminalModel {
     pub fn is_ssh_block(&self) -> bool {
         self.notify_on_end_of_ssh_login.is_some()
     }
-
-    pub fn tmux_control_mode_active(&self) -> bool {
-        self.tmux_control_mode_context.is_some()
-    }
-
-    pub fn is_pending_warp_initiated_control_mode(&self) -> bool {
-        self.pending_warp_initiated_control_mode.is_some()
-    }
-
-    pub fn is_warpified_ssh(&self) -> bool {
-        matches!(
-            self.tmux_control_mode_context,
-            Some(TmuxControlModeContext::WarpInitiatedForSsh { .. })
-        )
-    }
 }
 
 /// Used in the ansi::Handler implementation for TerminalModel below. Performs
@@ -2591,13 +2456,6 @@ pub enum HandlerEvent {
     UnsetMode {
         mode: Mode,
     },
-    StartTmuxControlMode,
-    TmuxControlModeReady {
-        primary_pane: u32,
-        context: Option<TmuxControlModeContext>,
-    },
-    EndTmuxControlMode,
-    RunTmuxCommand(TmuxCommand),
 }
 
 impl ansi::Handler for TerminalModel {
@@ -3043,8 +2901,8 @@ impl ansi::Handler for TerminalModel {
             _ => None,
         };
 
-        let fully_populated_session_info = pending_session_info
-            .merge_from_bootstrapped_value(value, self.tmux_control_mode_context.is_some());
+        let fully_populated_session_info =
+            pending_session_info.merge_from_bootstrapped_value(value);
 
         self.block_list
             .early_output_mut()
@@ -3090,7 +2948,7 @@ impl ansi::Handler for TerminalModel {
                     value.socket_path.display()
                 );
             }
-            self.pending_legacy_ssh_session = Some(value);
+            self.pending_ssh_wrapper_session = Some(value);
             self.event_proxy
                 .send_terminal_event(Event::SSH(remote_shell));
         }
@@ -3135,11 +2993,7 @@ impl ansi::Handler for TerminalModel {
                 data,
                 subshell_info,
                 self.pending_shell_launch_data.take(),
-                self.pending_legacy_ssh_session.take(),
-                matches!(
-                    self.tmux_control_mode_context,
-                    Some(TmuxControlModeContext::WarpInitiatedForSsh { .. })
-                ),
+                self.pending_ssh_wrapper_session.take(),
                 self.block_list().active_block().session_id(),
             );
             self.pending_session_info = Some(pending_session_info.clone());
@@ -3163,28 +3017,18 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn init_subshell(&mut self, data: InitSubshellValue) {
-        let is_tmux_ssh = self.pending_warp_initiated_control_mode.is_some();
-        let shell_type = ShellType::from_name(data.shell.as_str());
-        if let Some(shell_type) = shell_type {
-            self.event_proxy
-                .send_terminal_event(Event::InitSubshell(InitSubshellEvent {
-                    shell_type,
-                    uname: data.uname,
-                }));
-        } else {
-            log::error!(
-                "Received invalid shell name in init_subshell: {} | is_tmux_ssh: {}",
-                data.shell,
-                is_tmux_ssh
-            );
-            if is_tmux_ssh {
+        match ShellType::from_name(data.shell.as_str()) {
+            Some(shell_type) => {
                 self.event_proxy
-                    .send_terminal_event(Event::RemoteWarpificationIsUnavailable(
-                        WarpificationUnavailableReason::UnsupportedShell {
-                            shell_name: data.shell,
-                        },
-                    ))
+                    .send_terminal_event(Event::InitSubshell(InitSubshellEvent {
+                        shell_type,
+                        uname: data.uname,
+                    }))
             }
+            None => log::error!(
+                "Received invalid shell name in init_subshell: {}",
+                data.shell
+            ),
         }
     }
 
@@ -3201,7 +3045,6 @@ impl ansi::Handler for TerminalModel {
                             SourcedRcFileInSubshellEvent {
                                 shell_type,
                                 uname: data.uname,
-                                tmux: data.tmux,
                             },
                         ))
                 }
@@ -3215,49 +3058,9 @@ impl ansi::Handler for TerminalModel {
         }
     }
 
-    fn init_ssh(&mut self, data: InitSshValue) {
-        let shell_type = ShellType::from_name(data.shell.as_str());
-        match shell_type {
-            Some(shell_type @ (ShellType::Bash | ShellType::Zsh | ShellType::Fish)) => self
-                .event_proxy
-                .send_terminal_event(Event::InitSsh(InitSshEvent {
-                    shell_type,
-                    uname: data.uname,
-                })),
-            _ => self
-                .event_proxy
-                .send_terminal_event(Event::RemoteWarpificationIsUnavailable(
-                    WarpificationUnavailableReason::UnsupportedShell {
-                        shell_name: data.shell,
-                    },
-                )),
-        }
-    }
-
     fn finish_update(&mut self, data: FinishUpdateValue) {
         self.event_proxy
             .send_terminal_event(Event::FinishUpdate(data));
-    }
-
-    fn remote_warpification_is_unavailable(&mut self, data: WarpificationUnavailableReason) {
-        self.event_proxy
-            .send_terminal_event(Event::RemoteWarpificationIsUnavailable(data));
-    }
-
-    fn notify_ssh_tmux_is_installed(&mut self, tmux_installation: TmuxInstallationState) {
-        if let Some(ref mut warp_initiated_for_ssh) = self.pending_warp_initiated_control_mode {
-            warp_initiated_for_ssh.tmux_installation = Some(tmux_installation);
-        }
-        self.event_proxy
-            .send_terminal_event(Event::SshTmuxInstaller(tmux_installation));
-    }
-
-    fn tmux_install_failed(&mut self, data: TmuxInstallFailedInfo) {
-        self.event_proxy
-            .send_terminal_event(Event::TmuxInstallFailed {
-                line: data.line,
-                command: data.command,
-            });
     }
 
     fn start_in_band_command_output(&mut self) {
@@ -3355,76 +3158,6 @@ impl ansi::Handler for TerminalModel {
             return;
         }
         delegate!(self.on_reset_grid());
-    }
-
-    fn tmux_control_mode_event(&mut self, event: tmux::ControlModeEvent) {
-        match event {
-            tmux::ControlModeEvent::BackgroundPaneOutput { pane, byte } => {
-                let output = self.tmux_background_outputs.entry(pane).or_default();
-                output.push(byte);
-                if byte == b'\n' && output.ends_with(b"$$$\r\n") {
-                    match tmux::parse_generator_output(output) {
-                        Some(command_event) => {
-                            self.event_proxy
-                                .send_terminal_event(Event::ExecutedInBandCommand(command_event));
-                        }
-                        None => {
-                            log::warn!(
-                                "Could not parse tmux generator output: {:?}",
-                                AsciiDebug(output)
-                            );
-                        }
-                    }
-                    self.tmux_background_outputs.remove(&pane);
-                }
-            }
-            tmux::ControlModeEvent::Starting => {
-                if let Some(warp_initiated_for_ssh) = self.pending_warp_initiated_control_mode {
-                    self.tmux_control_mode_context = Some(
-                        TmuxControlModeContext::WarpInitiatedForSsh(warp_initiated_for_ssh),
-                    );
-                } else {
-                    self.tmux_control_mode_context = Some(TmuxControlModeContext::UserInitiated);
-                }
-                self.emit_handler_event(HandlerEvent::StartTmuxControlMode);
-
-                self.emit_handler_event(HandlerEvent::RunTmuxCommand(
-                    TmuxCommand::GetPrimaryWindowPane,
-                ));
-
-                let size = self.block_list.size();
-                let num_rows = size.rows();
-                let num_cols = size.columns();
-
-                if self.tmux_control_mode_context != Some(TmuxControlModeContext::UserInitiated) {
-                    // We don't want to intentionally disable persistence when the user runs tmux control
-                    // mode on their own.
-                    self.emit_handler_event(HandlerEvent::RunTmuxCommand(
-                        TmuxCommand::SetDestroyUnattached,
-                    ));
-
-                    self.emit_handler_event(HandlerEvent::RunTmuxCommand(
-                        TmuxCommand::SetWindowSizeToSmallest,
-                    ));
-                }
-
-                self.emit_handler_event(HandlerEvent::RunTmuxCommand(
-                    TmuxCommand::UpdateClientSize { num_cols, num_rows },
-                ));
-            }
-            tmux::ControlModeEvent::Exited => {
-                self.tmux_control_mode_context = None;
-                self.emit_handler_event(HandlerEvent::EndTmuxControlMode);
-            }
-            tmux::ControlModeEvent::ControlModeReady { primary_pane, .. } => {
-                self.emit_handler_event(HandlerEvent::TmuxControlModeReady {
-                    primary_pane,
-                    context: self.tmux_control_mode_context,
-                });
-                self.event_proxy
-                    .send_terminal_event(Event::TmuxControlModeReady { primary_pane });
-            }
-        }
     }
 
     fn start_completions_output(&mut self, data: CompletionsShellData) {

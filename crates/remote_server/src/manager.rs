@@ -581,7 +581,7 @@ impl RemoteServerManager {
     /// Marks a session as unsupported by the prebuilt remote-server
     /// binary, based on a positive classification from the preinstall
     /// check. The setup state transitions to `Unsupported`, which the
-    /// downstream UI treats as a clean fall-back to the legacy SSH flow.
+    /// downstream UI treats as a clean fall-back to the wrapper-only SSH flow.
     ///
     /// No-op on WASM (remote server connections use a different transport).
     #[cfg(target_family = "wasm")]
@@ -597,7 +597,7 @@ impl RemoteServerManager {
     /// Marks a session as unsupported by the prebuilt remote-server
     /// binary, based on a positive classification from the preinstall
     /// check. The setup state transitions to `Unsupported`, which the
-    /// downstream UI treats as a clean fall-back to the legacy SSH flow.
+    /// downstream UI treats as a clean fall-back to the wrapper-only SSH flow.
     #[cfg(not(target_family = "wasm"))]
     pub fn mark_setup_unsupported(
         &mut self,

@@ -200,7 +200,7 @@ impl PathCompletionContext for SessionContext {
         // caching so we retry after the remote server handshake finishes.
         if let SessionType::WarpifiedRemote { host_id: None } = self.session.session_type() {
             if FeatureFlag::SshRemoteServer.is_enabled()
-                && !self.session.is_legacy_ssh_session()
+                && !self.session.is_ssh_wrapper_session()
             {
                 return Arc::new(vec![]);
             }
@@ -486,9 +486,8 @@ printf '%b' '\0' &&
 find . -maxdepth 1 -not -type d -print0
             "#
     )
-    // Ensure all newlines are escaped, and that the command is a single line.
-    // ls_script_for_dir should not contain newlines, as we need to run it as a
-    // single line for TMUX control mode at this time.
+    // Ensure all newlines are escaped, and that the command is a single line, since some
+    // in-band executors run commands a single line at a time.
     .replace("\n", " ");
 
     Some(command)

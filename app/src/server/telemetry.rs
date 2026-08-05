@@ -59,14 +59,11 @@ use crate::terminal::block_list_viewport::InputMode;
 use crate::terminal::cli_agent_sessions::CLIAgentInputEntrypoint;
 use crate::terminal::cli_agent_sessions::CLIAgentRichInputCloseReason;
 use crate::terminal::input::TelemetryInputSuggestionsMode;
-use crate::terminal::model::ansi::WarpificationUnavailableReason;
 use crate::terminal::model::block::BlockId;
 use crate::terminal::model::session::SessionId;
 use crate::terminal::model::terminal_model::BlockSelectionCardinality;
-use crate::terminal::model::terminal_model::TmuxInstallationState;
 use crate::terminal::settings::AltScreenPaddingMode;
 use crate::terminal::shell::ShellType;
-use crate::terminal::ssh::ssh_detection::SshInteractiveSessionDetected;
 use crate::terminal::view::block_onboarding::onboarding_agentic_suggestions_block::OnboardingChipType;
 use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionTriggeredFrom;
 use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionType;
@@ -1546,12 +1543,6 @@ pub enum TelemetryEvent {
     AddAddedSubshellCommand,
     RemoveAddedSubshellCommand,
     ReceivedSubshellRcFileDcs,
-    AddDenylistedSshTmuxWrapperHost,
-    RemoveDenylistedSshTmuxWrapperHost,
-    /// User Setting for enabling SSH Tmux Wrapper changed.
-    ToggleSshTmuxWrapper {
-        enabled: bool,
-    },
     ToggleSshWarpification {
         enabled: bool,
     },
@@ -1564,13 +1555,6 @@ pub enum TelemetryEvent {
     SshRemoteServerChoiceDoNotAskAgainToggled {
         checked: bool,
     },
-    /// An ssh interactive session was detected.
-    SshInteractiveSessionDetected(SshInteractiveSessionDetected),
-    SshTmuxWarpifyBannerDisplayed,
-    /// A SSH Warpify Block was accepted
-    SshTmuxWarpifyBlockAccepted,
-    /// A SSH Warpify Block was dismissed
-    SshTmuxWarpifyBlockDismissed,
     WarpifyFooterShown {
         is_ssh: bool,
     },
@@ -1578,22 +1562,6 @@ pub enum TelemetryEvent {
     WarpifyFooterAcceptedWarpify {
         is_ssh: bool,
     },
-    /// How long until the warpify process succeeded
-    SshTmuxWarpificationSuccess {
-        tmux_installation: Option<TmuxInstallationState>,
-        duration_ms: u64,
-    },
-    /// An SSH Error block was displayed to the user.
-    SshTmuxWarpificationErrorBlock {
-        error: WarpificationUnavailableReason,
-        tmux_installation: Option<TmuxInstallationState>,
-    },
-    /// A SSH Install Tmux Block was displayed.
-    SshInstallTmuxBlockDisplayed,
-    /// A SSH Install Tmux Block was accepted.
-    SshInstallTmuxBlockAccepted,
-    /// A SSH Install Tmux Block was dismissed.
-    SshInstallTmuxBlockDismissed,
     ShowAliasExpansionBanner,
     EnableAliasExpansionFromBanner,
     DismissAliasExpansionBanner,
@@ -2566,7 +2534,7 @@ pub enum TelemetryEvent {
     },
     /// Emitted when the preinstall check classifies the remote host as
     /// unsupported by the prebuilt remote-server binary, so the controller
-    /// silently falls back to the legacy SSH/`RemoteCommandExecutor`
+    /// silently falls back to the wrapper-only SSH/`RemoteCommandExecutor`
     /// flow without surfacing an install prompt.
     RemoteServerHostUnsupported {
         remote_os: Option<String>,
@@ -3062,29 +3030,11 @@ impl TelemetryEvent {
             TelemetryEvent::ToggleNewWindowsAtCustomSize { enabled } => {
                 Some(json!({"enabled": enabled}))
             }
-            TelemetryEvent::ToggleSshTmuxWrapper { enabled } => Some(json!({"enabled": enabled})),
             TelemetryEvent::ToggleSshWarpification { enabled } => Some(json!({"enabled": enabled})),
             TelemetryEvent::SetSshExtensionInstallMode { mode } => Some(json!({"mode": mode})),
             TelemetryEvent::SshRemoteServerChoiceDoNotAskAgainToggled { checked } => {
                 Some(json!({"checked": checked}))
             }
-            TelemetryEvent::SshInteractiveSessionDetected(ssh_interactive_session_detected) => {
-                Some(json!({"ssh_interactive_session": ssh_interactive_session_detected}))
-            }
-            TelemetryEvent::SshTmuxWarpificationSuccess {
-                duration_ms,
-                tmux_installation,
-            } => Some(json!({
-                "duration_ms": duration_ms,
-                "tmux_installation": *tmux_installation,
-            })),
-            TelemetryEvent::SshTmuxWarpificationErrorBlock {
-                error,
-                tmux_installation,
-            } => Some(json!({
-                "error": error,
-                "tmux_installation": *tmux_installation,
-            })),
             TelemetryEvent::WebObjectOpenedOnDesktop { object_metadata } => Some(json!({
                 "object": object_metadata,
             })),
@@ -3657,19 +3607,11 @@ impl TelemetryEvent {
             | TelemetryEvent::SetNewWindowsAtCustomSize
             | TelemetryEvent::DisableInputSync
             | TelemetryEvent::ShowSubshellBanner
-            | TelemetryEvent::SshTmuxWarpifyBannerDisplayed
             | TelemetryEvent::AddDenylistedSubshellCommand
             | TelemetryEvent::RemoveDenylistedSubshellCommand
             | TelemetryEvent::AddAddedSubshellCommand
             | TelemetryEvent::RemoveAddedSubshellCommand
             | TelemetryEvent::ReceivedSubshellRcFileDcs
-            | TelemetryEvent::AddDenylistedSshTmuxWrapperHost
-            | TelemetryEvent::RemoveDenylistedSshTmuxWrapperHost
-            | TelemetryEvent::SshTmuxWarpifyBlockAccepted
-            | TelemetryEvent::SshTmuxWarpifyBlockDismissed
-            | TelemetryEvent::SshInstallTmuxBlockDisplayed
-            | TelemetryEvent::SshInstallTmuxBlockAccepted
-            | TelemetryEvent::SshInstallTmuxBlockDismissed
             | TelemetryEvent::ShowAliasExpansionBanner
             | TelemetryEvent::EnableAliasExpansionFromBanner
             | TelemetryEvent::DismissAliasExpansionBanner
@@ -4290,21 +4232,9 @@ impl TelemetryEvent {
             | TelemetryEvent::AddAddedSubshellCommand
             | TelemetryEvent::RemoveAddedSubshellCommand
             | TelemetryEvent::ReceivedSubshellRcFileDcs
-            | TelemetryEvent::AddDenylistedSshTmuxWrapperHost
-            | TelemetryEvent::RemoveDenylistedSshTmuxWrapperHost
-            | TelemetryEvent::ToggleSshTmuxWrapper { .. }
-            | TelemetryEvent::SshInteractiveSessionDetected(_)
-            | TelemetryEvent::SshTmuxWarpifyBannerDisplayed
-            | TelemetryEvent::SshTmuxWarpifyBlockAccepted
-            | TelemetryEvent::SshTmuxWarpifyBlockDismissed
             | TelemetryEvent::WarpifyFooterShown { .. }
             | TelemetryEvent::AgentToolbarDismissed
             | TelemetryEvent::WarpifyFooterAcceptedWarpify { .. }
-            | TelemetryEvent::SshTmuxWarpificationSuccess { .. }
-            | TelemetryEvent::SshTmuxWarpificationErrorBlock { .. }
-            | TelemetryEvent::SshInstallTmuxBlockDisplayed
-            | TelemetryEvent::SshInstallTmuxBlockAccepted
-            | TelemetryEvent::SshInstallTmuxBlockDismissed
             | TelemetryEvent::ShowAliasExpansionBanner
             | TelemetryEvent::EnableAliasExpansionFromBanner
             | TelemetryEvent::DismissAliasExpansionBanner

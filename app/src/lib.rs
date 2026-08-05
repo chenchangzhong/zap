@@ -181,7 +181,6 @@ pub use warp_core::errors::{report_error, report_if_error};
 
 #[cfg(feature = "plugin_host")]
 pub use plugin::{run_plugin_host, PLUGIN_HOST_FLAG};
-use warp_core::user_preferences::GetUserPreferences as _;
 use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback};
 use warpui::platform::app::ApproveTerminateResult;
 use window_settings::WindowSettings;
@@ -1480,9 +1479,6 @@ fn initialize_app(
     // Zap Wave 7-2:`settings_view::update_environment_form::init` 随 cloud ambient agent
     // 主体子系统物理删。
     env_vars::env_var_collection_block::init(ctx);
-    terminal::ssh::install_tmux::init(ctx);
-    terminal::ssh::warpify::init(ctx);
-    terminal::ssh::error::init(ctx);
     context_chips::display_menu::init(ctx);
     context_chips::node_version_popup::init(ctx);
     env_vars::view::env_var_collection::init(ctx);
@@ -1699,17 +1695,6 @@ fn initialize_app(
     timer.mark_interval_end("SINGLETON_MODELS_REGISTERED");
 
     ctx.add_singleton_model(move |_| timer);
-
-    let is_ssh_tmux_wrapper_enabled = ctx
-        .private_user_preferences()
-        .read_value("SshTmuxWrapperOverride")
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse().ok());
-
-    if let Some(is_ssh_tmux_wrapper_enabled) = is_ssh_tmux_wrapper_enabled {
-        FeatureFlag::SSHTmuxWrapper.set_user_preference(is_ssh_tmux_wrapper_enabled);
-    }
 
     ctx.add_singleton_model(|ctx| AIExecutionProfilesModel::new(launch_mode, ctx));
 
@@ -2327,8 +2312,6 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::AgentModeWorkflows,
         #[cfg(feature = "ai_rules")]
         FeatureFlag::AIRules,
-        #[cfg(feature = "ssh_tmux_wrapper")]
-        FeatureFlag::SSHTmuxWrapper,
         #[cfg(feature = "onekey_prompt")]
         FeatureFlag::OneKeyPrompt,
         #[cfg(feature = "less_horizontal_terminal_padding")]

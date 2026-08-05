@@ -135,7 +135,7 @@ impl AtContextMenuDisabledReason {
             .and_then(|metadata| metadata.session_id())
             .and_then(|session_id| sessions.get(session_id))
             .map(|session| {
-                let is_ssh_session = session.is_legacy_ssh_session()
+                let is_ssh_session = session.is_ssh_wrapper_session()
                     || matches!(session.session_type(), SessionType::WarpifiedRemote { .. });
                 let is_subshell = session.subshell_info().is_some();
                 (is_ssh_session, is_subshell)

@@ -6,7 +6,7 @@ use super::*;
 use crate::terminal::model::index::VisibleRow;
 use crate::terminal::model::session::SessionId;
 use crate::terminal::model::{ansi::InputBufferValue, selection::ScrollDelta};
-use std::{collections::HashSet, io, io::Write, path::PathBuf};
+use std::{collections::HashSet, io, path::PathBuf};
 
 const HEX_ENCODED_JSON_DCS_START: &[u8] = &[0x1b, 0x50, 0x24, 0x64];
 const UNENCODED_JSON_DCS_START: &[u8] = &[0x1b, 0x50, 0x24, 0x66];
@@ -214,10 +214,6 @@ impl Handler for MockHandler {
     fn init_subshell(&mut self, data: InitSubshellValue) {
         self.d_proto_hooks
             .push(DProtoHook::InitSubshell { value: data })
-    }
-
-    fn init_ssh(&mut self, data: InitSshValue) {
-        self.d_proto_hooks.push(DProtoHook::InitSsh { value: data })
     }
 
     fn sourced_rc_file(&mut self, data: SourcedRcFileForWarpValue) {
@@ -781,7 +777,6 @@ fn parse_sourced_rc_file_hook() {
             SourcedRcFileForWarpValue {
                 shell: "zsh".to_owned(),
                 uname: None,
-                tmux: None,
             }
         ),
         _ => panic!("incorrect dcs value"),
@@ -808,7 +803,6 @@ fn parse_sourced_rc_file_hook_with_uname() {
             SourcedRcFileForWarpValue {
                 shell: "zsh".to_owned(),
                 uname: Some("Darwin".to_owned()),
-                tmux: None,
             }
         ),
         _ => panic!("incorrect dcs value"),
@@ -920,45 +914,4 @@ fn parse_osc777_missing_parts_ignored() {
     let (_, handler) = parse_bytes(bytes);
 
     assert_eq!(handler.pluggable_notifications.len(), 0);
-}
-
-#[test]
-fn tmux_pane_writer_formats_bytes_as_send_keys() {
-    // Test that TmuxPaneWriter correctly converts writes to tmux send-keys format
-    let mut output = Vec::new();
-    {
-        let mut writer = super::TmuxPaneWriter::new(&mut output, 123);
-        // Write a cursor position response (ESC[1;1R)
-        writer.write_all(b"\x1b[1;1R").unwrap();
-    }
-
-    let output_str = String::from_utf8(output).unwrap();
-    // The output should be a send-keys command with hex bytes
-    // Format: send-keys -Ht %{pane_id} {hex} {hex}...\n
-    assert!(output_str.starts_with("send-keys -Ht %123"));
-    assert!(output_str.contains("1B")); // ESC = 0x1B
-    assert!(output_str.ends_with('\n'));
-}
-
-#[test]
-fn tmux_pane_writer_empty_write_returns_zero() {
-    let mut output = Vec::new();
-    let mut writer = super::TmuxPaneWriter::new(&mut output, 42);
-    let result = writer.write(&[]).unwrap();
-
-    assert_eq!(result, 0);
-    assert!(output.is_empty());
-}
-
-#[test]
-fn tmux_pane_writer_returns_original_byte_count() {
-    let mut output = Vec::new();
-    let mut writer = super::TmuxPaneWriter::new(&mut output, 42);
-    let input = b"test";
-    let result = writer.write(input).unwrap();
-
-    assert_eq!(result, 4);
-    let output_str = String::from_utf8(output).unwrap();
-    assert!(output_str.starts_with("send-keys -Ht %42"));
-    assert!(output_str.ends_with('\n'));
 }

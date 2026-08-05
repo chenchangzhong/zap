@@ -163,7 +163,6 @@ use crate::terminal::available_shells::AvailableShell;
 use crate::terminal::available_shells::AvailableShells;
 use crate::terminal::block_list_viewport::InputMode;
 use crate::terminal::ligature_settings::should_use_ligature_rendering;
-use crate::terminal::warpify::settings::WarpifySettings;
 use crate::ui_components::avatar::{Avatar, AvatarContent, StatusElementTypes};
 
 #[cfg(target_family = "wasm")]
@@ -18225,7 +18224,6 @@ impl Workspace {
         let general_settings = GeneralSettings::as_ref(app);
         let theme_settings = ThemeSettings::as_ref(app);
         let ssh_settings = SshSettings::as_ref(app);
-        let warpify_settings = WarpifySettings::as_ref(app);
         let terminal_settings = TerminalSettings::as_ref(app);
         let pane_settings = PaneSettings::as_ref(app);
         let keys_settings = KeysSettings::as_ref(app);
@@ -18269,11 +18267,6 @@ impl Workspace {
             context.set.insert(flags::WARP_SAME_LINE_PROMPT_FLAG);
         }
 
-        if *ssh_settings.enable_legacy_ssh_wrapper.value() {
-            #[allow(deprecated)]
-            context.set.insert(flags::LEGACY_SSH_WRAPPER_CONTEXT_FLAG);
-        }
-
         if *ssh_settings.reuse_existing_control_master.value() {
             context
                 .set
@@ -18282,10 +18275,6 @@ impl Workspace {
 
         if *ssh_settings.enable_ssh_auto_discovery.value() {
             context.set.insert(flags::SSH_AUTO_DISCOVERY_CONTEXT_FLAG);
-        }
-
-        if *warpify_settings.use_ssh_tmux_wrapper.value() {
-            context.set.insert(flags::SSH_TMUX_WRAPPER_CONTEXT_FLAG);
         }
 
         if keys_settings.extra_meta_keys.left_alt {

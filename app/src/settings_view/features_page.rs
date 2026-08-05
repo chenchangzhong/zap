@@ -45,7 +45,7 @@ use crate::settings::{
     AliasExpansionEnabled, AliasExpansionSettings, AppEditorSettings, AtContextMenuInTerminalMode,
     AutocompleteSymbols, AutosuggestionKeybindingHint, CodeSettings, CommandCorrections,
     CompletionsOpenWhileTyping, CopyOnSelect, CtrlTabBehavior, DefaultSessionMode,
-    EnableSshAutoDiscovery, EnableSlashCommandsInTerminal, EnableSshWrapper,
+    EnableSshAutoDiscovery, EnableSlashCommandsInTerminal,
     ErrorUnderliningEnabled, ExtraMetaKeys,
     GPUSettings, GlobalHotkeyMode, InputSettings, InputSettingsChangedEvent,
     LinuxSelectionClipboard, MiddleClickPasteEnabled, MouseScrollMultiplier, PreferLowPowerGPU,
@@ -358,22 +358,6 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
         ),
     ];
 
-    if !FeatureFlag::SSHTmuxWrapper.is_enabled() {
-        toggle_binding_pairs.push(ToggleSettingActionPair::new(
-            &crate::t!("toggle-suffix-ssh-wrapper"),
-            builder(SettingsAction::FeaturesPageToggle(
-                #[allow(deprecated)]
-                FeaturesPageAction::ToggleSshWrapper,
-            )),
-            context,
-            #[allow(deprecated)]
-            flags::LEGACY_SSH_WRAPPER_CONTEXT_FLAG,
-        ));
-    }
-
-    // Registered regardless of the SSHTmuxWrapper feature flag: even when the
-    // flag is on, the legacy ControlMaster wrapper is still what runs unless
-    // the user opts into the tmux wrapper, so this setting stays meaningful.
     toggle_binding_pairs.push(ToggleSettingActionPair::new(
         "reuse existing SSH ControlMaster in the Warp SSH wrapper",
         builder(SettingsAction::FeaturesPageToggle(
@@ -662,8 +646,6 @@ pub enum FeaturesPageAction {
     ToggleAutocompleteSymbols,
     ToggleLinuxClipboardSelection,
     ToggleOpenLinksInDesktopApp,
-    #[deprecated]
-    ToggleSshWrapper,
     ToggleSshReuseControlMaster,
     ToggleSshAutoDiscovery,
     ToggleSnackbar,
@@ -854,11 +836,6 @@ impl FeaturesPageAction {
             Self::ToggleAutocompleteSymbols => TelemetryEvent::FeaturesPageAction {
                 action: "ToggleAutocompleteSymbols".to_string(),
                 value: to_string(*AppEditorSettings::as_ref(ctx).autocomplete_symbols),
-            },
-            #[allow(deprecated)]
-            Self::ToggleSshWrapper => TelemetryEvent::FeaturesPageAction {
-                action: "ToggleSshWrapper".to_string(),
-                value: to_string(*ssh_settings.enable_legacy_ssh_wrapper.value()),
             },
             Self::ToggleSshReuseControlMaster => TelemetryEvent::FeaturesPageAction {
                 action: "ToggleSshReuseControlMaster".to_string(),
@@ -1312,10 +1289,6 @@ pub struct FeaturesPageView {
     mouse_scroll_input_editor: ViewHandle<EditorView>,
     valid_mouse_scroll_multiplier: bool,
 
-    // Whether or not the SSH wrapper value was changed while the page has been
-    // open.
-    ssh_wrapper_toggled: bool,
-
     #[cfg(feature = "local_fs")]
     external_editor_view: ViewHandle<features::ExternalEditorView>,
     word_boundary_editor: ViewHandle<EditorView>,
@@ -1425,15 +1398,6 @@ impl TypedActionView for FeaturesPageView {
                         .autocomplete_symbols
                         .toggle_and_save_value(ctx));
                 })
-            }
-            #[allow(deprecated)]
-            ToggleSshWrapper => {
-                self.ssh_wrapper_toggled = true;
-                SshSettings::handle(ctx).update(ctx, |ssh_settings, ctx| {
-                    report_if_error!(ssh_settings
-                        .enable_legacy_ssh_wrapper
-                        .toggle_and_save_value(ctx));
-                });
             }
             ToggleSshAutoDiscovery => {
                 SshSettings::handle(ctx).update(ctx, |ssh_settings, ctx| {
@@ -2034,9 +1998,6 @@ impl FeaturesPageView {
         ctx.subscribe_to_model(&AppEditorSettings::handle(ctx), |_, _, _, ctx| ctx.notify());
 
         ctx.subscribe_to_model(&SelectionSettings::handle(ctx), |_, _, _, ctx| ctx.notify());
-
-        // TODO(CORE-3029): Remove when we launch the new SSH Warpification.
-        ctx.subscribe_to_model(&SshSettings::handle(ctx), |_, _, _, ctx| ctx.notify());
         ctx.subscribe_to_model(&AltScreenReporting::handle(ctx), |_, _, _, ctx| {
             ctx.notify()
         });
@@ -2492,8 +2453,6 @@ impl FeaturesPageView {
             max_block_size_input_editor: block_size_editor,
             valid_max_block_size: true,
 
-            ssh_wrapper_toggled: false,
-
             #[cfg(feature = "local_fs")]
             external_editor_view,
             word_boundary_editor,
@@ -2607,14 +2566,6 @@ impl FeaturesPageView {
         let mut session_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![];
 
         session_widgets.push(Box::new(BlockLimitWidget::default()));
-
-        if !FeatureFlag::SSHTmuxWrapper.is_enabled()
-            && SshSettings::as_ref(ctx)
-                .enable_legacy_ssh_wrapper
-                .is_supported_on_current_platform()
-        {
-            session_widgets.push(Box::new(SSHWrapperWidget::default()));
-        }
 
         if SshSettings::as_ref(ctx)
             .enable_ssh_auto_discovery
@@ -4156,10 +4107,6 @@ impl SettingsPageMeta for FeaturesPageView {
             ctx.notify();
         });
 
-        // Make sure we're not already showing the hint text for the SSH wrapper
-        // toggle when the user switches to the page.
-        self.ssh_wrapper_toggled = false;
-
         // Fetch the latest tab behavior state in case the user changed their keybindings
         // since we last loaded this page.
         self.refresh_tab_behavior_state(ctx);
@@ -4932,65 +4879,6 @@ impl SettingsWidget for BlockLimitWidget {
             appearance,
             input_field,
             Some(block_maximum_rows_description()),
-        )
-    }
-}
-
-#[derive(Default)]
-struct SSHWrapperWidget {
-    additional_info_link: MouseStateHandle,
-    switch_state: SwitchStateHandle,
-}
-
-impl SettingsWidget for SSHWrapperWidget {
-    type View = FeaturesPageView;
-
-    fn search_terms(&self) -> &str {
-        "ssh wrapper"
-    }
-
-    fn render(
-        &self,
-        view: &Self::View,
-        appearance: &Appearance,
-        app: &AppContext,
-    ) -> Box<dyn Element> {
-        let ui_builder = appearance.ui_builder();
-        render_body_item::<FeaturesPageAction>(
-            crate::t!("settings-features-ssh-wrapper"),
-            Some(AdditionalInfo {
-                mouse_state: self.additional_info_link.clone(),
-                on_click_action: Some(FeaturesPageAction::OpenUrl(
-                    "".into(),
-                )),
-                secondary_text: if view.ssh_wrapper_toggled {
-                    Some(crate::t!("settings-features-takes-effect-new-sessions"))
-                } else {
-                    None
-                },
-                tooltip_override_text: None,
-            }),
-            LocalOnlyIconState::for_setting(
-                EnableSshWrapper::storage_key(),
-                EnableSshWrapper::sync_to_cloud(),
-                &mut view
-                    .button_mouse_states
-                    .local_only_icon_tooltip_states
-                    .borrow_mut(),
-                app,
-            ),
-            ToggleState::Enabled,
-            appearance,
-            ui_builder
-                .switch(self.switch_state.clone())
-                .check(*SshSettings::as_ref(app).enable_legacy_ssh_wrapper.value())
-                .build()
-                .on_click(move |ctx, _, _| {
-                    #[allow(deprecated)]
-                    ctx.dispatch_typed_action(FeaturesPageAction::ToggleSshWrapper);
-                })
-                .finish(),
-            None,
         )
     }
 }

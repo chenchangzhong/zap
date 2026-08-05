@@ -1,10 +1,7 @@
 use async_channel::Sender;
 
 use crate::terminal::{
-    model::{
-        session::command_executor::{InBandCommand, InBandCommandCancelledEvent},
-        tmux::commands::TmuxCommand,
-    },
+    model::session::command_executor::{InBandCommand, InBandCommandCancelledEvent},
     shell::ShellType,
 };
 
@@ -17,11 +14,8 @@ pub enum ExecutorCommandEvent {
         /// Lets us unblock the command in the executor.
         cancel_tx: Sender<InBandCommandCancelledEvent>,
     },
-    ExecuteTmuxCommand(TmuxCommand),
     /// The command identified by `id` should be cancelled.
-    CancelCommand {
-        id: String,
-    },
+    CancelCommand { id: String },
 }
 
 pub fn shell_escape_single_quotes(command: &str, shell_type: ShellType) -> String {

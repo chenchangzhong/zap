@@ -1,4 +1,4 @@
-﻿use crate::auth::AuthStateProvider;
+use crate::auth::AuthStateProvider;
 use crate::remote_server::auth_context::server_api_auth_context;
 use instant::Instant;
 use remote_server::auth::RemoteServerAuthContext;
@@ -14,7 +14,7 @@ use crate::remote_server::manager::{RemoteServerManager, RemoteServerManagerEven
 use crate::remote_server::ssh_transport::SshTransport;
 // Zap Wave 3-1:`ServerApiProvider` 不再被本文件使用 — `auth_client`
 // 调用点随 AuthClient 一同物理删。
-use crate::terminal::model::session::{IsLegacySSHSession, SessionInfo};
+use crate::terminal::model::session::{IsSSHWrapperSession, SessionInfo};
 use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
 use crate::terminal::warpify::settings::WarpifySettings;
 use crate::{send_telemetry_from_ctx, TelemetryEvent};
@@ -178,10 +178,10 @@ impl<T: EventLoopSender> RemoteServerController<T> {
 
     /// Idle -> AwaitingCheck
     fn on_ssh_init_shell_requested(&mut self, info: SessionInfo, ctx: &mut ModelContext<Self>) {
-        let IsLegacySSHSession::Yes {
+        let IsSSHWrapperSession::Yes {
             socket_path,
             external_control_master,
-        } = &info.is_legacy_ssh_session
+        } = &info.is_ssh_wrapper_session
         else {
             return;
         };
@@ -258,7 +258,7 @@ impl<T: EventLoopSender> RemoteServerController<T> {
         // Preinstall gate. Runs **before** any user-visible install
         // affordance: if the script positively classified the host as
         // unsupported, skip the install/prompt entirely and fall back to
-        // the legacy ControlMaster-backed SSH flow.
+        // the ControlMaster-backed SSH wrapper flow.
         let unsupported = preinstall_check
             .as_ref()
             .and_then(|check| match &check.status {
@@ -268,7 +268,7 @@ impl<T: EventLoopSender> RemoteServerController<T> {
         if let Some((check, reason)) = unsupported {
             log::info!(
                 "Preinstall check classified {session_id:?} as unsupported \
-                 ({:?}); falling back to legacy SSH",
+                 ({:?}); falling back to the wrapper-only SSH flow",
                 check.status
             );
             send_unsupported_telemetry(self.remote_platform.as_ref(), check, ctx);
