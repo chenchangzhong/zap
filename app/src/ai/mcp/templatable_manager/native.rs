@@ -182,7 +182,7 @@ impl TemplatableMCPServerManager {
     ) -> Self {
         // Subscribe to FileBasedMCPManager events.
         let file_based_mcp_manager = FileBasedMCPManager::handle(ctx);
-        ctx.subscribe_to_model(&file_based_mcp_manager, |me, event, ctx| match event {
+        ctx.subscribe_to_model(&file_based_mcp_manager, |me, _, event, ctx| match event {
             FileBasedMCPManagerEvent::SpawnServers { installations } => {
                 me.spawn_file_based_servers(installations, ctx);
             }
@@ -198,7 +198,7 @@ impl TemplatableMCPServerManager {
 
         // TemplatableMCPServerManager is the source of truth for templatable MCP servers stored on the cloud
         let object_store_model = ObjectStoreModel::handle(ctx);
-        ctx.subscribe_to_model(&object_store_model, |me, event, ctx| match event {
+        ctx.subscribe_to_model(&object_store_model, |me, _, event, ctx| match event {
             ObjectStoreEvent::ObjectUpdated {
                 type_and_id:
                     ObjectTypeAndId::GenericStringObject {

@@ -707,7 +707,7 @@ impl AgentConversationsModel {
         // Issue #93 修复:必须订阅 BlocklistAIHistoryModel 的事件,否则用户在历史对话
         // 列表中删除对话后,本模型缓存的 conversations 不会刷新,UI 将持续展示已删除的项。
         let history_model = BlocklistAIHistoryModel::handle(ctx);
-        ctx.subscribe_to_model(&history_model, |me, event, ctx| {
+        ctx.subscribe_to_model(&history_model, |me, _, event, ctx| {
             me.handle_history_event(event, ctx);
         });
 

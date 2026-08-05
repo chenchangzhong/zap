@@ -557,7 +557,6 @@ impl AgentInputFooter {
                 .with_tooltip_alignment(TooltipAlignment::Left)
         });
 
-
         let omp_model_selector = if FeatureFlag::OmpModelSelector.is_enabled() {
             let view = ctx.add_typed_action_view(|ctx| {
                 crate::terminal::omp_model_selector::OmpModelSelector::new(
@@ -566,15 +565,15 @@ impl AgentInputFooter {
                     ctx,
                 )
             });
-            ctx.subscribe_to_view(&view, |_me, _, event, ctx| {
-                match event {
-                    crate::terminal::omp_model_selector::OmpModelSelectorEvent::ModelSelected { .. }
-                    | crate::terminal::omp_model_selector::OmpModelSelectorEvent::MenuClosed => {
-                        ctx.emit(AgentInputFooterEvent::ModelSelectorClosed);
-                    }
-                    crate::terminal::omp_model_selector::OmpModelSelectorEvent::MenuOpened => {
-                        ctx.emit(AgentInputFooterEvent::ModelSelectorOpened);
-                    }
+            ctx.subscribe_to_view(&view, |_me, _, event, ctx| match event {
+                crate::terminal::omp_model_selector::OmpModelSelectorEvent::ModelSelected {
+                    ..
+                }
+                | crate::terminal::omp_model_selector::OmpModelSelectorEvent::MenuClosed => {
+                    ctx.emit(AgentInputFooterEvent::ModelSelectorClosed);
+                }
+                crate::terminal::omp_model_selector::OmpModelSelectorEvent::MenuOpened => {
+                    ctx.emit(AgentInputFooterEvent::ModelSelectorOpened);
                 }
             });
             Some(view)

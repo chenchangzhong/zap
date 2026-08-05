@@ -19,7 +19,7 @@ use crate::server::ids::{ObjectUid, SyncId};
 use crate::settings::AISettings;
 use crate::workflows::WorkflowObject;
 use std::collections::HashMap;
-use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
+use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
 
 /// Datasource that searches against all Zap Drive objects
 pub struct DataSource {
@@ -70,6 +70,7 @@ impl DataSource {
 
     fn handle_cloud_object_updated(
         &mut self,
+        _: ModelHandle<ObjectStoreModel>,
         event: &ObjectStoreEvent,
         ctx: &mut ModelContext<Self>,
     ) {

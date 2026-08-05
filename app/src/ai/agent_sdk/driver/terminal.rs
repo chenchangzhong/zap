@@ -116,7 +116,6 @@ impl Entity for TerminalDriver {
     type Event = TerminalDriverEvent;
 }
 
-
 /// Create the terminal window and extract the [`ViewHandle<TerminalView>`].
 ///
 /// This is separate from [`TerminalDriver::new`] because [`AppContext::add_model`]
@@ -189,7 +188,7 @@ impl TerminalDriver {
             });
         }
 
-        ctx.subscribe_to_view(&terminal_view, move |me, event, ctx| {
+        ctx.subscribe_to_view(&terminal_view, move |me, _, event, ctx| {
             me.handle_terminal_view_event(event, ctx);
         });
 

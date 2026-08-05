@@ -454,7 +454,7 @@ impl BlocklistAIController {
         terminal_view_id: EntityId,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        ctx.subscribe_to_model(&action_model, move |me, event, ctx| {
+        ctx.subscribe_to_model(&action_model, move |me, _, event, ctx| {
             let BlocklistAIActionEvent::FinishedAction {
                 conversation_id,
                 cancellation_reason,
@@ -471,8 +471,9 @@ impl BlocklistAIController {
             // `FinalizedExternally` (e.g. shell exit) means the conversation status and message
             // is set elsewhere through a dedicated path, so we must not trigger a follow-up or
             // update conversation status here.
-            let cancellation_outcome =
-                cancellation_reason.as_ref().map(|reason| reason.conversation_outcome());
+            let cancellation_outcome = cancellation_reason
+                .as_ref()
+                .map(|reason| reason.conversation_outcome());
             if matches!(
                 cancellation_outcome,
                 Some(CancellationOutcome::FinalizedExternally)
@@ -592,7 +593,7 @@ impl BlocklistAIController {
             me.send_follow_up_for_conversation(*conversation_id, trigger, ctx);
         });
 
-        ctx.subscribe_to_model(&agent_view_controller, |me, event, ctx| {
+        ctx.subscribe_to_model(&agent_view_controller, |me, _, event, ctx| {
             let AgentViewControllerEvent::ExitedAgentView {
                 conversation_id,
                 final_exchange_count,
@@ -3038,7 +3039,7 @@ impl BlocklistAIController {
         let input_contains_user_query = request_input
             .all_inputs()
             .any(|input| input.is_user_query());
-        ctx.subscribe_to_model(&response_stream, move |me, event, ctx| {
+        ctx.subscribe_to_model(&response_stream, move |me, _, event, ctx| {
             me.handle_response_stream_event(
                 input_contains_user_query,
                 event,
@@ -3376,7 +3377,7 @@ impl BlocklistAIController {
         ctx: &mut ModelContext<Self>,
     ) {
         let stream_clone = stream.clone();
-        ctx.subscribe_to_model(&stream, move |me, event, ctx| {
+        ctx.subscribe_to_model(&stream, move |me, _, event, ctx| {
             me.handle_response_stream_event(false, event, &stream_clone, ctx);
         });
         self.in_flight_response_streams.register_new_stream(
@@ -3584,7 +3585,6 @@ impl BlocklistAIController {
                 }
 
                 if let Some(stream_cancellation) = &cancellation {
-
                     history_model.update(ctx, |history_model, ctx| {
                         history_model.mark_response_stream_cancelled(
                             &stream_id,

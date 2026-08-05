@@ -200,14 +200,14 @@ impl AIExecutionProfilesModel {
         // (2) Let views subscribed to us know whenever a backing profile changes.
         // (3) Keep profile_id_to_sync_id map up to date when profiles are created/deleted remotely
         if !cfg!(feature = "agent_mode_evals") {
-            ctx.subscribe_to_model(&ObjectStoreModel::handle(ctx), |me, event, ctx| {
+            ctx.subscribe_to_model(&ObjectStoreModel::handle(ctx), |me, _, event, ctx| {
                 me.handle_object_store_event(event, ctx);
             });
         }
 
         ctx.subscribe_to_model(
             &TemplatableMCPServerManager::handle(ctx),
-            |me, event, ctx| {
+            |me, _, event, ctx| {
                 me.handle_templatable_mcp_server_manager_event(event, ctx);
             },
         );
@@ -221,7 +221,7 @@ impl AIExecutionProfilesModel {
                 let sync_id_of_default_profile = *profile_id_to_sync_id
                     .get(id)
                     .expect("default profile is synced but no sync id found");
-                ctx.subscribe_to_model(&ObjectStoreModel::handle(ctx), move |me, event, _| {
+                ctx.subscribe_to_model(&ObjectStoreModel::handle(ctx), move |me, _, event, _| {
                 if let ObjectStoreEvent::ObjectDeleted {
                     type_and_id: ObjectTypeAndId::GenericStringObject {
                         id: deleted_sync_id,

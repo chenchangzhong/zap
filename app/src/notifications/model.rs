@@ -56,12 +56,12 @@ impl SingletonEntity for NotificationsModel {}
 impl NotificationsModel {
     pub(crate) fn new(ctx: &mut ModelContext<Self>) -> Self {
         let history_model = BlocklistAIHistoryModel::handle(ctx);
-        ctx.subscribe_to_model(&history_model, move |me, event, ctx| {
+        ctx.subscribe_to_model(&history_model, move |me, _, event, ctx| {
             me.handle_history_event(event, ctx);
         });
 
         let cli_sessions_model = CLIAgentSessionsModel::handle(ctx);
-        ctx.subscribe_to_model(&cli_sessions_model, |me, event, ctx| {
+        ctx.subscribe_to_model(&cli_sessions_model, |me, _, event, ctx| {
             me.handle_cli_agent_session_event(event, ctx);
         });
 
@@ -182,9 +182,7 @@ impl NotificationsModel {
                         .unwrap_or_else(|| format!("{} failed", agent.display_name()));
                     self.add_notification(
                         title,
-                        message
-                            .clone()
-                            .unwrap_or_else(|| "Task failed.".to_owned()),
+                        message.clone().unwrap_or_else(|| "Task failed.".to_owned()),
                         NotificationCategory::Error,
                         NotificationSourceAgent::CLI(*agent),
                         NotificationOrigin::CLISession(*terminal_view_id),

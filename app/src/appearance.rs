@@ -49,7 +49,7 @@ pub struct AppearanceManager {
 
 impl AppearanceManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        ctx.subscribe_to_model(&ThemeSettings::handle(ctx), move |me, _event, ctx| {
+        ctx.subscribe_to_model(&ThemeSettings::handle(ctx), move |me, _, _event, ctx| {
             me.refresh_theme_state(ctx);
         });
 
@@ -57,7 +57,7 @@ impl AppearanceManager {
         {
             ctx.subscribe_to_model(
                 &AppIconSettings::handle(ctx),
-                move |me, event, ctx| match event {
+                move |me, _, event, ctx| match event {
                     AppIconSettingsChangedEvent::AppIconState { .. } => {
                         me.set_app_icon(ctx);
                     }
@@ -67,7 +67,7 @@ impl AppearanceManager {
 
         ctx.subscribe_to_model(
             &FontSettings::handle(ctx),
-            move |_, event, ctx| match event {
+            move |_, _, event, ctx| match event {
                 FontSettingsChangedEvent::MonospaceFontName { .. } => {
                     let (font_name, match_fonts) = {
                         let settings = FontSettings::as_ref(ctx);

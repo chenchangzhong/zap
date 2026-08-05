@@ -223,7 +223,7 @@ impl GlobalBufferModel {
     pub fn subscribe_to_remote_server_manager(ctx: &mut ModelContext<Self>) {
         use remote_server::manager::{RemoteServerManager, RemoteServerManagerEvent};
         let mgr = RemoteServerManager::handle(ctx);
-        ctx.subscribe_to_model(&mgr, |me, event, ctx| {
+        ctx.subscribe_to_model(&mgr, |me, _, event, ctx| {
             if let RemoteServerManagerEvent::BufferUpdated {
                 host_id,
                 path,
@@ -558,7 +558,12 @@ impl GlobalBufferModel {
     }
 
     #[cfg(feature = "local_fs")]
-    fn handle_file_model_events(&mut self, event: &FileModelEvent, ctx: &mut ModelContext<Self>) {
+    fn handle_file_model_events(
+        &mut self,
+        _: ModelHandle<FileModel>,
+        event: &FileModelEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
         match event {
             FileModelEvent::FileLoaded {
                 content,
@@ -1069,7 +1074,7 @@ impl GlobalBufferModel {
             };
             if let Some(client) = client_for_sub {
                 let path_for_edit = path_str.clone();
-                ctx.subscribe_to_model(&buffer, move |me, event, ctx| {
+                ctx.subscribe_to_model(&buffer, move |me, _, event, ctx| {
                     if let BufferEvent::ContentChanged { delta, origin, .. } = event {
                         // Skip server-originated changes to prevent echo loop.
                         // Server pushes applied via insert_at_char_offset_ranges

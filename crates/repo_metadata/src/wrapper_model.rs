@@ -88,6 +88,7 @@ impl RepoMetadataModel {
 
     fn forward_local_event(
         &mut self,
+        _: ModelHandle<LocalRepoMetadataModel>,
         event: &RepositoryMetadataEvent,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -131,6 +132,7 @@ impl RepoMetadataModel {
 
     fn forward_remote_event(
         &mut self,
+        _: ModelHandle<RemoteRepoMetadataModel>,
         event: &RemoteRepositoryMetadataEvent,
         ctx: &mut ModelContext<Self>,
     ) {

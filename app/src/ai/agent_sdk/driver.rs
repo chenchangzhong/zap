@@ -444,7 +444,7 @@ impl AgentDriver {
         )?;
 
         // Subscribe to TerminalDriver events for task-specific handling.
-        ctx.subscribe_to_model(&terminal_driver, |me, event, _| {
+        ctx.subscribe_to_model(&terminal_driver, |me, _, event, _| {
             me.handle_terminal_driver_event(event);
         });
 
@@ -638,7 +638,7 @@ impl AgentDriver {
         let mut tx = Some(tx);
         ctx.subscribe_to_model(
             &templatable_mcp_manager,
-            move |_me, event, ctx| match event {
+            move |_me, _, event, ctx| match event {
                 TemplatableMCPServerManagerEvent::StateChanged { uuid, state } => {
                     let mut pending_ids = mcp_to_start.borrow_mut();
                     if !pending_ids.contains(uuid) {
@@ -751,7 +751,7 @@ impl AgentDriver {
         let templatable_mcp_manager = TemplatableMCPServerManager::handle(ctx);
         let manager_clone = templatable_mcp_manager.clone();
 
-        ctx.subscribe_to_model(&templatable_mcp_manager, move |_me, event, ctx| {
+        ctx.subscribe_to_model(&templatable_mcp_manager, move |_me, _, event, ctx| {
             if let TemplatableMCPServerManagerEvent::StateChanged { uuid, state } = event {
                 if !uuids_to_start.contains(uuid) {
                     return;
@@ -838,7 +838,7 @@ impl AgentDriver {
         let templatable_manager_handle = TemplatableMCPServerManager::handle(ctx);
         let manager_clone = templatable_manager_handle.clone();
 
-        ctx.subscribe_to_model(&templatable_manager_handle, move |_me, event, ctx| {
+        ctx.subscribe_to_model(&templatable_manager_handle, move |_me, _, event, ctx| {
             if let TemplatableMCPServerManagerEvent::StateChanged { uuid, state } = event {
                 if !pending_uuids.contains(uuid) {
                     return;
@@ -1040,7 +1040,7 @@ impl AgentDriver {
         let conversation_id_cell = Arc::new(Mutex::new(Option::<String>::None));
         let conversation_id_cell_for_handler = Arc::clone(&conversation_id_cell);
 
-        ctx.subscribe_to_model(&history_model_handle, move |me, event, ctx| {
+        ctx.subscribe_to_model(&history_model_handle, move |me, _, event, ctx| {
             if event.terminal_view_id().is_some_and(|id| id != terminal_id) {
                 return;
             }

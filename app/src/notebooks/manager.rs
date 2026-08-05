@@ -4,8 +4,8 @@ use std::sync::Arc;
 use futures_util::stream::AbortHandle;
 use markdown_parser::markdown_parser::parse_markdown_to_raw_text;
 use warpui::{
-    r#async::SpawnedFutureHandle, Entity, EntityId, ModelContext, SingletonEntity, WeakViewHandle,
-    WindowId,
+    r#async::SpawnedFutureHandle, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity,
+    WeakViewHandle, WindowId,
 };
 
 use crate::{
@@ -141,6 +141,7 @@ impl NotebookManager {
 
     fn handle_object_store_event(
         &mut self,
+        _: ModelHandle<ObjectStoreModel>,
         event: &ObjectStoreEvent,
         ctx: &mut ModelContext<Self>,
     ) {

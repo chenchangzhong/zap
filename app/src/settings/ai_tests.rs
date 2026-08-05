@@ -63,7 +63,7 @@ fn test_update_both_values_changed() {
             let sender = sender.clone();
             ctx.subscribe_to_model(
                 &model_handle_clone,
-                move |_, event: &FocusedTerminalInfoEvent, _| match event {
+                move |_, _, event: &FocusedTerminalInfoEvent, _| match event {
                     FocusedTerminalInfoEvent::TerminalInfoUpdated => {
                         let _ = sender.try_send(());
                     }
@@ -104,7 +104,7 @@ fn test_update_additional_value_changed() {
             let sender = sender.clone();
             ctx.subscribe_to_model(
                 &model_handle_clone,
-                move |_, event: &FocusedTerminalInfoEvent, _| match event {
+                move |_, _, event: &FocusedTerminalInfoEvent, _| match event {
                     FocusedTerminalInfoEvent::TerminalInfoUpdated => {
                         let _ = sender.try_send(());
                     }
@@ -153,7 +153,7 @@ fn test_update_no_change() {
             let sender = sender.clone();
             ctx.subscribe_to_model(
                 &model_handle_clone,
-                move |_, event: &FocusedTerminalInfoEvent, _| match event {
+                move |_, _, event: &FocusedTerminalInfoEvent, _| match event {
                     FocusedTerminalInfoEvent::TerminalInfoUpdated => {
                         let _ = sender.try_send(());
                     }
@@ -202,7 +202,7 @@ fn test_update_only_remote_toggles() {
             let sender = sender.clone();
             ctx.subscribe_to_model(
                 &model_handle_clone,
-                move |_, event: &FocusedTerminalInfoEvent, _| match event {
+                move |_, _, event: &FocusedTerminalInfoEvent, _| match event {
                     FocusedTerminalInfoEvent::TerminalInfoUpdated => {
                         let _ = sender.try_send(());
                     }
@@ -251,7 +251,7 @@ fn test_update_only_restored_toggles() {
             let sender = sender.clone();
             ctx.subscribe_to_model(
                 &model_handle_clone,
-                move |_, event: &FocusedTerminalInfoEvent, _| match event {
+                move |_, _, event: &FocusedTerminalInfoEvent, _| match event {
                     FocusedTerminalInfoEvent::TerminalInfoUpdated => {
                         let _ = sender.try_send(());
                     }

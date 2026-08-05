@@ -261,7 +261,7 @@ impl PrivacySettings {
         );
 
         // Listen for changes to the object store and update ourselves when they happen.
-        ctx.subscribe_to_model(&WarpDrivePrivacySettings::handle(ctx), |me, event, ctx| {
+        ctx.subscribe_to_model(&WarpDrivePrivacySettings::handle(ctx), |me, _, event, ctx| {
             let privacy_settings = WarpDrivePrivacySettings::as_ref(ctx);
             match event {
                 WarpDrivePrivacySettingsChangedEvent::IsTelemetryEnabled { .. } => {

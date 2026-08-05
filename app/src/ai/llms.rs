@@ -529,19 +529,19 @@ impl LLMPreferences {
         // 监听 settings.agent_providers 变更 → 重建 byop 模型列表。
         ctx.subscribe_to_model(
             &crate::settings::AISettings::handle(ctx),
-            |me, _event, ctx| {
+            |me, _, _event, ctx| {
                 me.refresh_byop_models(ctx);
             },
         );
         // 监听 secrets 变更(API key 增删) → 重建,因为合法性依赖 api_key 是否存在。
         ctx.subscribe_to_model(
             &crate::ai::agent_providers::AgentProviderSecrets::handle(ctx),
-            |me, _event, ctx| {
+            |me, _, _event, ctx| {
                 me.refresh_byop_models(ctx);
             },
         );
 
-        ctx.subscribe_to_model(&NetworkStatus::handle(ctx), |me, event, ctx| {
+        ctx.subscribe_to_model(&NetworkStatus::handle(ctx), |me, _, event, ctx| {
             if let NetworkStatusEvent::NetworkStatusChanged {
                 new_status: NetworkStatusKind::Online,
             } = event
@@ -554,13 +554,13 @@ impl LLMPreferences {
         // available LLMs query to the general workspace metadata query which is polled
         // and hooked up to workspace changes. For that to work, each user would need to
         // have a personal workspace. This is a stop-gap.
-        ctx.subscribe_to_model(&AuthManager::handle(ctx), |me, event, ctx| {
+        ctx.subscribe_to_model(&AuthManager::handle(ctx), |me, _, event, ctx| {
             if let AuthManagerEvent::AuthComplete = event {
                 me.refresh_authed_models(ctx);
             }
         });
 
-        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |me, event, ctx| {
+        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |me, _, event, ctx| {
             if let UserWorkspacesEvent::TeamsChanged = event {
                 me.refresh_authed_models(ctx);
             }

@@ -192,8 +192,7 @@ impl TerminalManager {
         // Initialize the sessions model.
         let sessions = ctx.add_model(|ctx| Sessions::new(executor_command_tx.clone(), ctx));
 
-        let model_events =
-            ctx.add_model(|ctx| {
+        let model_events = ctx.add_model(|ctx| {
             ModelEventDispatcher::new_with_ssh_remote_server_support(
                 events_rx,
                 sessions.clone(),
@@ -714,7 +713,7 @@ impl TerminalManager {
 
         // Whenever we get a BlockStarted, we want to start the terminal attribute poller.
         // Whenever the block is completed, we can stop the terminal attribute poller.
-        ctx.subscribe_to_view(terminal_view, move |_view, event, ctx| {
+        ctx.subscribe_to_view(terminal_view, move |_view, _, event, ctx| {
             let Some(poller) = poller_weak_handle.upgrade(ctx) else {
                 return;
             };
@@ -767,7 +766,7 @@ impl TerminalManager {
         // this logic can't live in TerminalView (because termios is a *nix thing).
         ctx.subscribe_to_model(
             terminal_attributes_poller,
-            move |terminal_manager, event, ctx| {
+            move |terminal_manager, _, event, ctx| {
                 let Some(view) = view_weak_handle.upgrade(ctx) else {
                     return;
                 };
@@ -826,7 +825,6 @@ impl TerminalManager {
         );
     }
 
-
     /// Contains necessary logic for stopping the current shared session.
     fn cleanup_shared_session(
         terminal_view: &ViewHandle<TerminalView>,
@@ -852,7 +850,6 @@ impl TerminalManager {
             view.on_session_share_ended(ctx);
         });
     }
-
 
     #[cfg(feature = "integration_tests")]
     pub fn pid(&self) -> Option<u32> {

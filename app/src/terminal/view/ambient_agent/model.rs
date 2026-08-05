@@ -96,7 +96,6 @@ pub struct AmbientAgentViewModel {
     harness: Harness,
     /// Whether the optimistic InitialUserQuery block has been inserted for the current run.
     has_inserted_ambient_agent_user_query_block: bool,
-
 }
 
 impl AmbientAgentViewModel {
@@ -148,8 +147,6 @@ impl AmbientAgentViewModel {
         self.harness = harness;
         ctx.emit(AmbientAgentViewModelEvent::HarnessSelected);
     }
-
-
 
     /// Whether or not this terminal session is for an ambient agent.
     pub fn is_ambient_agent(&self) -> bool {
@@ -706,7 +703,6 @@ pub enum AmbientAgentViewModelEvent {
     Cancelled,
     /// The selected execution harness (Oz / Claude Code) changed.
     HarnessSelected,
-
 }
 
 impl Entity for AmbientAgentViewModel {

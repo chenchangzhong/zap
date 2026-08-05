@@ -179,12 +179,15 @@ pub(crate) fn init(ctx: &mut AppContext) -> bool {
     });
 
     let antivirus_info = AntivirusInfo::handle(ctx);
-    ctx.subscribe_to_model(&antivirus_info, |antivirus_info, event, ctx| match event {
-        AntivirusInfoEvent::ScannedComplete => {
-            let antivirus_info = antivirus_info.as_ref(ctx);
-            set_antivirus_info(antivirus_info);
-        }
-    });
+    ctx.subscribe_to_model(
+        &antivirus_info,
+        |antivirus_info, _, event, ctx| match event {
+            AntivirusInfoEvent::ScannedComplete => {
+                let antivirus_info = antivirus_info.as_ref(ctx);
+                set_antivirus_info(antivirus_info);
+            }
+        },
+    );
 
     let is_crash_reporting_enabled = is_crash_reporting_enabled(ctx);
 

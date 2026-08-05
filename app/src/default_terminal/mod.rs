@@ -1,6 +1,6 @@
 use warpui::{
     windowing::{StateEvent, WindowManager},
-    Entity, ModelContext, SingletonEntity,
+    Entity, ModelContext, ModelHandle, SingletonEntity,
 };
 
 #[cfg(target_os = "macos")]
@@ -56,7 +56,12 @@ impl DefaultTerminal {
     /// This is an OS-level setting. Unlike most other settings, where Zap is the source-of-truth
     /// for the value of the setting, it can be changed outside of Zap. We monitor if it gets
     /// changed externally by checking when Zap is focused.
-    fn handle_window_manager_event(&mut self, event: &StateEvent, ctx: &mut ModelContext<Self>) {
+    fn handle_window_manager_event(
+        &mut self,
+        _: ModelHandle<WindowManager>,
+        event: &StateEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
         match event {
             StateEvent::ValueChanged { current, previous } => {
                 if current.active_window.is_some() && previous.active_window.is_none() {

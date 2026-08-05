@@ -26,7 +26,7 @@ pub struct OneTimeModalModel {
 
 impl OneTimeModalModel {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        ctx.subscribe_to_model(&AuthManager::handle(ctx), |me, event, ctx| {
+        ctx.subscribe_to_model(&AuthManager::handle(ctx), |me, _, event, ctx| {
             let AuthManagerEvent::AuthComplete = event else {
                 return;
             };
@@ -98,11 +98,7 @@ impl OneTimeModalModel {
         }
     }
 
-    fn set_zap_launch_modal_open(
-        &mut self,
-        is_open: bool,
-        ctx: &mut ModelContext<Self>,
-    ) -> bool {
+    fn set_zap_launch_modal_open(&mut self, is_open: bool, ctx: &mut ModelContext<Self>) -> bool {
         if self.is_zap_launch_modal_open != is_open {
             self.is_zap_launch_modal_open = is_open;
             ctx.emit(OneTimeModalEvent::VisibilityChanged { is_open });

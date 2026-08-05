@@ -9,9 +9,7 @@ use crate::{
     ai::llms::LLMModelHost,
     auth::{UserUid, TEST_USER_UID},
     channel::ChannelState,
-    cloud_object::{
-        ObjectType, Owner, Space, StoredObjectEventEntrypoint,
-    },
+    cloud_object::{ObjectType, Owner, Space, StoredObjectEventEntrypoint},
     server::ids::ServerId,
     settings::{AISettings, PrivacySettings},
     workspaces::workspace::{AiAutonomySettings, SandboxedAgentSettings},

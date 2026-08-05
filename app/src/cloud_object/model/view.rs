@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use chrono::{Duration, Utc};
-use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
+use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
 
 use crate::{
     auth::{AuthStateProvider, UserUid},
@@ -316,6 +316,7 @@ impl ObjectStoreViewModel {
 
     fn handle_object_store_event(
         &mut self,
+        _: ModelHandle<ObjectStoreModel>,
         event: &ObjectStoreEvent,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -381,6 +382,7 @@ impl ObjectStoreViewModel {
 
     fn handle_update_manager_event(
         &mut self,
+        _: ModelHandle<UpdateManager>,
         event: &UpdateManagerEvent,
         ctx: &mut ModelContext<Self>,
     ) {

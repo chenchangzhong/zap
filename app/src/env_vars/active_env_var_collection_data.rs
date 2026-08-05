@@ -49,7 +49,7 @@ impl ActiveEnvVarCollectionData {
         // `ObjectStoreModel` 订阅保留(本地对象变更仍需 breadcrumbs 刷新)。
         let object_store_model = ObjectStoreModel::handle(ctx);
 
-        ctx.subscribe_to_model(&object_store_model, |me, event, ctx| {
+        ctx.subscribe_to_model(&object_store_model, |me, _, event, ctx| {
             me.handle_object_store_event(event, ctx);
         });
 

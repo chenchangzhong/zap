@@ -208,7 +208,7 @@ impl AutoupdateState {
                 // 启动轮询循环;是否真的发起后台检查由用户设置控制。
                 me.poll_for_update(ctx);
                 // 应用被激活时入队一次可能的每日检查,执行前同样会读取用户设置。
-                ctx.subscribe_to_model(&state_handle, |me, event, ctx| {
+                ctx.subscribe_to_model(&state_handle, |me, _, event, ctx| {
                     let windowing::StateEvent::ValueChanged { current, previous } = event;
                     if previous.stage == ApplicationStage::Inactive
                         && current.stage == ApplicationStage::Active

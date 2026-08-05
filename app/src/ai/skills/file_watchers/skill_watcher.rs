@@ -116,17 +116,19 @@ impl SkillWatcher {
         );
 
         if home_dir.is_some() {
-            ctx.subscribe_to_model(
-                &HomeDirectoryWatcher::handle(ctx),
-                |me, event, ctx| match event {
+            ctx.subscribe_to_model(&HomeDirectoryWatcher::handle(ctx), |me, _, event, ctx| {
+                match event {
                     HomeDirectoryWatcherEvent::HomeFilesChanged(event) => {
                         me.handle_home_files_changed(event, ctx);
                     }
+                }
+            });
+            ctx.subscribe_to_model(
+                &WarpManagedPathsWatcher::handle(ctx),
+                |me, _, event, ctx| {
+                    me.handle_warp_managed_paths_event(event, ctx);
                 },
             );
-            ctx.subscribe_to_model(&WarpManagedPathsWatcher::handle(ctx), |me, event, ctx| {
-                me.handle_warp_managed_paths_event(event, ctx);
-            });
         }
 
         // Subscribe to home directory skills via DirectoryWatcher.
@@ -168,7 +170,7 @@ impl SkillWatcher {
         //    updates (add/delete/move). This handles changes after initial load.
         //
         // The order of these events doesn't matter - both are idempotent and serve different purposes.
-        ctx.subscribe_to_model(&RepoMetadataModel::handle(ctx), |me, event, ctx| {
+        ctx.subscribe_to_model(&RepoMetadataModel::handle(ctx), |me, _, event, ctx| {
             use repo_metadata::wrapper_model::RepoMetadataEvent;
             use repo_metadata::RepositoryIdentifier;
             match event {

@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 use itertools::Itertools;
 use repo_metadata::RepositoryUpdate;
-use warpui::{ModelContext, SingletonEntity};
+use warpui::{ModelContext, ModelHandle, SingletonEntity};
 
 use crate::features::FeatureFlag;
 use crate::launch_configs::launch_config::LaunchConfig;
@@ -75,6 +75,7 @@ impl super::WarpConfig {
 
     fn handle_warp_managed_paths_event(
         &mut self,
+        _: ModelHandle<WarpManagedPathsWatcher>,
         event: &WarpManagedPathsWatcherEvent,
         ctx: &mut ModelContext<Self>,
     ) {

@@ -2942,7 +2942,12 @@ impl EditorModel {
 
 /// The private interface.
 impl EditorModel {
-    fn handle_buffer_event(&mut self, event: &buffer::Event, ctx: &mut ModelContext<Self>) {
+    fn handle_buffer_event(
+        &mut self,
+        _: ModelHandle<Buffer>,
+        event: &buffer::Event,
+        ctx: &mut ModelContext<Self>,
+    ) {
         match event {
             buffer::Event::Edited { edit_origin, .. } => ctx.emit(EditorModelEvent::Edited {
                 edit_origin: *edit_origin,
@@ -2957,17 +2962,19 @@ impl EditorModel {
 
     fn handle_buffer_event_for_non_collaborative_editor(
         &mut self,
+        buffer: ModelHandle<Buffer>,
         event: &buffer::Event,
         ctx: &mut ModelContext<Self>,
     ) {
         // For non-collaborative editors, we don't care about fanning out updates to peers.
         if !matches!(event, buffer::Event::UpdatePeers { .. }) {
-            self.handle_buffer_event(event, ctx);
+            self.handle_buffer_event(buffer, event, ctx);
         }
     }
 
     fn handle_display_map_event(
         &mut self,
+        _: ModelHandle<DisplayMap>,
         event: &display_map::Event,
         ctx: &mut ModelContext<Self>,
     ) {
