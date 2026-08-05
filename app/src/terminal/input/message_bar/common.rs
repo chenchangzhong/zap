@@ -1,4 +1,3 @@
-use crate::ai::blocklist::agent_view::agent_view_bg_color;
 use pathfinder_color::ColorU;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::Fill;
@@ -460,7 +459,7 @@ pub fn disableable_message_item_color_overrides(
         Some(
             appearance
                 .theme()
-                .disabled_text_color(agent_view_bg_color(app).into())
+                .disabled_text_color(appearance.theme().background())
                 .into_solid(),
         ),
         Some(blended_colors::neutral_2(appearance.theme())),

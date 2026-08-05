@@ -3,7 +3,6 @@
 use super::shared_session::adapter::Kind as SharedSessionKind;
 use super::{Event, PaneConfiguration, TerminalAction, TerminalViewState, Viewer};
 use crate::ai::agent::conversation::{AIConversation, ConversationStatus};
-use crate::ai::blocklist::agent_view::agent_view_bg_fill;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::ai::conversation_status_ui::{render_status_element, STATUS_ELEMENT_PADDING};
 use crate::appearance::Appearance;
@@ -379,13 +378,7 @@ impl TerminalView {
             header_ctx.draggable_state.is_dragging(),
         );
 
-        if is_fullscreen_agent_view {
-            Container::new(header)
-                .with_background(agent_view_bg_fill(app))
-                .finish()
-        } else {
-            header
-        }
+        header
     }
 }
 

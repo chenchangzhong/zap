@@ -56,7 +56,7 @@ use warpui::{
 };
 
 use crate::{
-    ai::blocklist::{agent_view::agent_view_bg_fill, block::cli_controller::CLISubagentEvent},
+    ai::blocklist::block::cli_controller::CLISubagentEvent,
     cmd_or_ctrl_shift,
     server::telemetry::{CLIAgentType, CLISubagentControlState, TelemetryEvent},
     settings::{
@@ -1404,8 +1404,7 @@ impl View for UseAgentToolbar {
             if let Some(bg_color) = terminal_model.alt_screen().inferred_bg_color() {
                 container = container.with_background(bg_color);
             }
-        } else if terminal_model.block_list().agent_view_state().is_inline() {
-            container = container.with_background(agent_view_bg_fill(app));
+
         }
 
         container.finish()
