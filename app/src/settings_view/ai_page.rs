@@ -35,8 +35,9 @@ use crate::terminal::cli_agent::{CLIAgentInstallEvent, CLIAgentInstallModel};
 use crate::terminal::CLIAgent;
 use crate::view_components::{
     action_button::{ActionButton, ButtonSize, SecondaryTheme},
-    FilterableDropdown, SubmittableTextInput, SubmittableTextInputEvent,
+    DismissibleToast, FilterableDropdown, SubmittableTextInput, SubmittableTextInputEvent,
 };
+use crate::workspace::ToastStack;
 use crate::workspaces::user_workspaces::UserWorkspacesEvent;
 use ::ai::api_keys::ApiKeyManager;
 use enum_iterator::all;
@@ -85,6 +86,19 @@ use super::{
     SettingActionPairContexts, SettingActionPairDescriptions, SettingsAction, SettingsSection,
     ToggleSettingActionPair,
 };
+
+/// 在设置页窗口弹一条 ephemeral toast(成功/失败)。
+fn show_provider_toast(ctx: &mut ViewContext<AISettingsPageView>, success: bool, message: String) {
+    let window_id = ctx.window_id();
+    ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+        let toast = if success {
+            DismissibleToast::success(message)
+        } else {
+            DismissibleToast::error(message)
+        };
+        toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+    });
+}
 
 /// Identifies which subpage of the AI settings the user is viewing.
 /// When `None`, the page shows all widgets (legacy/full view).
@@ -3109,6 +3123,11 @@ impl TypedActionView for AISettingsPageView {
                 );
                 super::agent_providers_widget::clear_expanded_models_for_provider(provider_id);
                 self.rebuild_current_page(ctx);
+                show_provider_toast(
+                    ctx,
+                    true,
+                    crate::t!("settings-agent-providers-remove-success"),
+                );
             }
             AISettingsPageAction::UpdateAgentProviderName { provider_id, name } => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
@@ -3181,6 +3200,11 @@ impl TypedActionView for AISettingsPageView {
                     ctx,
                 );
                 ctx.notify();
+                show_provider_toast(
+                    ctx,
+                    true,
+                    crate::t!("settings-agent-providers-saved-toast"),
+                );
             }
             AISettingsPageAction::SaveAgentProviderEditsThen {
                 provider_id,
@@ -3311,8 +3335,12 @@ impl TypedActionView for AISettingsPageView {
             }
             AISettingsPageAction::FetchAgentProviderModels { provider_id } => {
                 let provider_id = provider_id.clone();
+                super::agent_providers_widget::set_fetching(&provider_id, true);
+                ctx.notify();
                 let providers = AISettings::as_ref(ctx).agent_providers.value().clone();
                 let Some(provider) = providers.into_iter().find(|p| p.id == provider_id) else {
+                    super::agent_providers_widget::set_fetching(&provider_id, false);
+                    ctx.notify();
                     return;
                 };
                 let api_key = crate::ai::agent_providers::AgentProviderSecrets::as_ref(ctx)
@@ -3329,36 +3357,58 @@ impl TypedActionView for AISettingsPageView {
                         )
                         .await
                     },
-                    move |view, result, ctx| match result {
-                        Ok(fetched) => {
-                            AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                                let mut providers = settings.agent_providers.value().clone();
-                                if let Some(p) = providers
-                                    .iter_mut()
-                                    .find(|p| p.id == provider_id_for_handler)
-                                {
-                                    // 合并保留: 已存在的 id 保留用户改过的 name,新 id 追加,
-                                    // 本地多余的 id 不删(用户手动 ×)。
-                                    let existing: std::collections::HashSet<String> =
-                                        p.models.iter().map(|m| m.id.clone()).collect();
-                                    for m in fetched {
-                                        if !existing.contains(&m.id) {
-                                            p.models.push(
-                                                crate::settings::AgentProviderModel::from_id(m.id),
-                                            );
+                    move |view, result, ctx| {
+                        super::agent_providers_widget::set_fetching(&provider_id_for_handler, false);
+                        match result {
+                            Ok(fetched) => {
+                                let mut added = 0usize;
+                                let mut found = false;
+                                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                                    let mut providers = settings.agent_providers.value().clone();
+                                    if let Some(p) = providers
+                                        .iter_mut()
+                                        .find(|p| p.id == provider_id_for_handler)
+                                    {
+                                        found = true;
+                                        // 合并保留: 已存在的 id 保留用户改过的 name,新 id 追加,
+                                        // 本地多余的 id 不删(用户手动 ×)。
+                                        let existing: std::collections::HashSet<String> =
+                                            p.models.iter().map(|m| m.id.clone()).collect();
+                                        for m in fetched {
+                                            if !existing.contains(&m.id) {
+                                                p.models.push(
+                                                    crate::settings::AgentProviderModel::from_id(
+                                                        m.id,
+                                                    ),
+                                                );
+                                                added += 1;
+                                            }
                                         }
                                     }
+                                    let _ = settings.agent_providers.set_value(providers, ctx);
+                                });
+                                // 模型行数可能变了,需要 rebuild widget rows。
+                                view.rebuild_current_page(ctx);
+                                // provider 已在抓取期间被删:不弹成功 toast(否则误导为「新增 0 个」)。
+                                if found {
+                                    let added_count: i64 = added as i64;
+                                    show_provider_toast(
+                                        ctx,
+                                        true,
+                                        crate::t!(
+                                            "settings-agent-providers-fetch-success",
+                                            count = added_count
+                                        ),
+                                    );
                                 }
-                                let _ = settings.agent_providers.set_value(providers, ctx);
-                            });
-                            // 模型行数可能变了,需要 rebuild widget rows。
-                            view.rebuild_current_page(ctx);
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "Failed to fetch models for provider {provider_id_for_handler}: {e}"
-                            );
-                            ctx.notify();
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Failed to fetch models for provider {provider_id_for_handler}: {e}"
+                                );
+                                show_provider_toast(ctx, false, format!("{e}"));
+                                ctx.notify();
+                            }
                         }
                     },
                 );
@@ -3485,6 +3535,11 @@ impl TypedActionView for AISettingsPageView {
                 use crate::ai::agent_providers::models_dev;
                 let Some(catalog) = models_dev::cached() else {
                     log::warn!("[models.dev] 目录未加载,无法同步 {provider_id}");
+                    show_provider_toast(
+                        ctx,
+                        false,
+                        crate::t!("settings-agent-providers-sync-catalog-unavailable"),
+                    );
                     return;
                 };
                 let providers_snapshot = AISettings::as_ref(ctx).agent_providers.value().clone();
@@ -3515,9 +3570,17 @@ impl TypedActionView for AISettingsPageView {
                         local.base_url,
                         local.name
                     );
+                    show_provider_toast(
+                        ctx,
+                        false,
+                        crate::t!("settings-agent-providers-sync-no-match"),
+                    );
                     return;
                 };
                 let cat_models = cat_provider.models.clone();
+                // 计数「处理」的模型数(元数据被 catalog 覆盖 + 新追加),toast 显示总量;
+                // 仅算新增会在首次同步(AddProviderFromModelsDev 已预填)时误报 0。
+                let mut processed = 0usize;
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     let mut providers = settings.agent_providers.value().clone();
                     if let Some(p) = providers.iter_mut().find(|p| p.id == *provider_id) {
@@ -3555,6 +3618,7 @@ impl TypedActionView for AISettingsPageView {
                                 if local_model.audio.is_none() {
                                     local_model.audio = merged.audio;
                                 }
+                                processed += 1;
                             }
                         }
                         let existing: std::collections::HashSet<String> =
@@ -3563,12 +3627,22 @@ impl TypedActionView for AISettingsPageView {
                             let clean_id = crate::ai::agent_providers::models_dev::strip_uuid_prefix(&cat_m.id);
                             if !existing.contains(clean_id) {
                                 p.models.push(models_dev::into_agent_provider_model(cat_m));
+                                processed += 1;
                             }
                         }
                     }
                     let _ = settings.agent_providers.set_value(providers, ctx);
                 });
                 self.rebuild_current_page(ctx);
+                let processed_count: i64 = processed as i64;
+                show_provider_toast(
+                    ctx,
+                    true,
+                    crate::t!(
+                        "settings-agent-providers-sync-success",
+                        count = processed_count
+                    ),
+                );
             }
             AISettingsPageAction::ToggleModelsDevChipsExpanded => {
                 use crate::ai::agent_providers::models_dev;

@@ -1481,8 +1481,16 @@ settings-agent-providers-model-context-placeholder = コンテキスト (トー�
 settings-agent-providers-model-output-placeholder = 出力 (トークン)
 settings-agent-providers-add-model = + モデル追加
 settings-agent-providers-fetch-from-api = API から取得
+settings-agent-providers-fetching = API からモデルを取得中…
+settings-agent-providers-fetch-success = API から { $count } 件のモデルを追加しました
 settings-agent-providers-sync-models-dev = models.dev から同期
+settings-agent-providers-sync-success = models.dev から { $count } 件のモデルを同期しました
+settings-agent-providers-sync-no-match = models.dev に一致するプロバイダーが見つかりません
+settings-agent-providers-sync-catalog-unavailable = models.dev カタログがまだ準備できていません。後でもう一度お試しください。
 settings-agent-providers-remove = 削除
+settings-agent-providers-remove-success = プロバイダーを削除しました
+settings-agent-providers-save = 保存
+settings-agent-providers-saved-toast = 保存しました
 
 # ---- AI page (settings_view/ai_page.rs) ----
 settings-ai-title = AI

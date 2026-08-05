@@ -1520,8 +1520,14 @@ settings-agent-providers-model-context-placeholder = 上下文（tokens）
 settings-agent-providers-model-output-placeholder = 输出（tokens）
 settings-agent-providers-add-model = + 添加模型
 settings-agent-providers-fetch-from-api = 从 API 抓取
+settings-agent-providers-fetching = 正在从 API 抓取…
+settings-agent-providers-fetch-success = 从 API 新增 { $count } 个模型
 settings-agent-providers-sync-models-dev = 从 models.dev 同步
+settings-agent-providers-sync-success = 从 models.dev 同步了 { $count } 个模型
+settings-agent-providers-sync-no-match = 未在 models.dev 中找到匹配的提供商
+settings-agent-providers-sync-catalog-unavailable = models.dev 目录尚未就绪，请稍后重试。
 settings-agent-providers-remove = 移除
+settings-agent-providers-remove-success = 提供商已移除
 settings-agent-providers-save = 保存
 settings-agent-providers-saved-toast = 已保存
 

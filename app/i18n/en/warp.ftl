@@ -1546,8 +1546,14 @@ settings-agent-providers-model-context-placeholder = Context (tokens)
 settings-agent-providers-model-output-placeholder = Output (tokens)
 settings-agent-providers-add-model = + Add model
 settings-agent-providers-fetch-from-api = Fetch from API
+settings-agent-providers-fetching = Fetching models from API…
+settings-agent-providers-fetch-success = Added { $count } models from API
 settings-agent-providers-sync-models-dev = Sync from models.dev
+settings-agent-providers-sync-success = Synced { $count } models from models.dev
+settings-agent-providers-sync-no-match = No matching provider found in models.dev
+settings-agent-providers-sync-catalog-unavailable = models.dev catalog is not ready yet. Try again later.
 settings-agent-providers-remove = Remove
+settings-agent-providers-remove-success = Provider removed
 settings-agent-providers-save = Save
 settings-agent-providers-saved-toast = Saved
 

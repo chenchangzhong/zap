@@ -1477,5 +1477,53 @@ lifecycle 栈（§21）按 §21.4 方案 A 执行。全部执行记录见 §23�
 
 ---
 
-*文档版本：v2.3*
+## 25. 本地功能改动记录（2026-08-05）：Agent 提供商操作反馈（Fetch loading + toast）
+
+> 这不是上游拣入，而是 Zap 本地的 UX 优化（承接 §24 同一功能区的后续改动）。
+> 记录原因：改动落在 `app/src/settings_view/`（决策速查表 §0 已标注本地定制区），
+> 且「从 API 抓取」此前失败静默（只 log::error，UI 无反馈）。未来同步该区域
+> 时不得用上游版本覆盖（§1「Zap 本地功能禁止覆盖」）。
+
+### 25.1 改动内容
+
+| 文件 | 内容 |
+|------|------|
+| `app/src/settings_view/agent_providers_widget.rs` | Fetch 按钮 loading：thread_local `FETCHING_PROVIDERS`（`HashSet<provider_id>`）+ `is_fetching`/`set_fetching`；`render_card_button_preserving_draft` 加 `disabled: bool` 参数（11 个调用点补 `false`，仅 fetch 传 `is_fetching`）；抓取中按钮禁用 + 文案变「正在从 API 抓取…」（唯一异步操作，防重复点击） |
+| `app/src/settings_view/ai_page.rs` | 新增 `show_provider_toast`（`ToastStack` + `DismissibleToast`，仓库既有模式）；Fetch 成功 toast「从 API 新增 N 个模型」/失败 error toast（`OpenAiCompatibleError` 中文文案直接透出）；Sync 成功「同步了 N 个模型」（计数=元数据覆盖+新追加）、未匹配/目录未就绪 error toast；Save「已保存」（复用既有死 key `settings-agent-providers-saved-toast`，ja 顺带补上该 key）；Remove「提供商已移除」 |
+| `app/i18n/{en,ja,zh-CN}/warp.ftl` | 新增 6 key × 3 语言（fetching / fetch-success / sync-success / sync-no-match / sync-catalog-unavailable / remove-success） |
+
+### 25.2 关键决策：toast 时长**不做本地定制**
+
+曾尝试给 `DismissibleToast` 加 per-toast `duration` 字段（`with_duration` builder，
+模型配置页 toast 用 2 秒），经评估后**撤销**：
+
+- `dismissible_toast.rs` 是上游文件（虽低频：上游近期 4 commits），加字段 = 扩大冲突面；
+  上游未来若自己也做 per-toast 时长，会双实现并存（§14 第 4 项先例）
+- 结论：**模型配置页 toast 用全局默认 4 秒**，`dismissible_toast.rs` / `workspace/view.rs`
+  零本地改动。若未来确实需要短时 toast，优先考虑页内自实现，别动上游 struct。
+
+### 25.3 合并注意事项
+
+1. **失败不再静默**：Fetch 失败路径此前只 `log::error!`，现 error toast 透出
+   `OpenAiCompatibleError`（已是中文文案）。上游若改 fetch 错误处理，先判本地 toast
+   是否保留。
+2. **`FETCHING_PROVIDERS` 生命周期**：thread_local 进程级；删除 provider 时经
+   `clear_expanded_models_for_provider` 清理。已知残余场景（fetch 中关设置页，
+   spawn 回调不派发）为未验证推测、影响轻（重启即恢复），未修。
+3. **Save toast 只挂 `SaveAgentProviderEdits`**：`SaveAgentProviderEditsThen`
+   （fetch/sync 前置保存）不弹「已保存」，避免噪音。
+4. **Sync 计数语义**：toast 计数为「处理」数（元数据被 catalog 覆盖 + 新追加），
+   非仅新增——首次同步（catalog 已预填）时避免误报 0。
+
+### 25.4 验证状态
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp` | ✅ 通过（0 error，22 个既有 warning，改动文件零新增） |
+| code review（2 reviewer 并行） | ✅ 1 approve + 1 request-changes（P2 已修：Sync 目录未加载补 toast；P3 已修：Sync 计数含覆盖、Fetch 期间 provider 被删不弹成功 toast） |
+| dev app 手动验证 | ✅ 通过（`./script/run`，OSS channel `zap-oss`） |
+
+---
+
+*文档版本：v2.4*
 *下次合并前必读*

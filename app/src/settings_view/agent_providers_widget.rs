@@ -65,6 +65,8 @@ std::thread_local! {
     /// {provider_id} 模型列表处于"全部展开"状态的 provider。
     /// 默认折叠只显示前 `COLLAPSED_MODEL_LIMIT` 条,行为同 `models_dev::chips_expanded()`。
     static EXPANDED_MODEL_LISTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// {provider_id} 正在从 API 抓取模型列表的 provider(Fetch from API 异步进行中)。
+    static FETCHING_PROVIDERS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 pub(super) fn is_model_expanded(provider_id: &str, model_index: usize) -> bool {
@@ -99,12 +101,31 @@ pub(super) fn toggle_model_list_expanded(provider_id: &str) {
     });
 }
 
-/// 删除 provider 时连带清掉它的展开记录,避免索引漂移。
+/// 该 provider 是否正在从 API 抓取模型列表(异步进行中,按钮禁用防重复点击)。
+pub(super) fn is_fetching(provider_id: &str) -> bool {
+    FETCHING_PROVIDERS.with(|m| m.borrow().contains(provider_id))
+}
+
+pub(super) fn set_fetching(provider_id: &str, fetching: bool) {
+    FETCHING_PROVIDERS.with(|m| {
+        let mut set = m.borrow_mut();
+        if fetching {
+            set.insert(provider_id.to_string());
+        } else {
+            set.remove(provider_id);
+        }
+    });
+}
+
+/// 删除 provider 时连带清掉它的展开记录(单行 + 列表级)与抓取中状态,避免索引漂移/残留。
 pub(super) fn clear_expanded_models_for_provider(provider_id: &str) {
     EXPANDED_MODELS.with(|m| {
         m.borrow_mut().remove(provider_id);
     });
     EXPANDED_MODEL_LISTS.with(|m| {
+        m.borrow_mut().remove(provider_id);
+    });
+    FETCHING_PROVIDERS.with(|m| {
         m.borrow_mut().remove(provider_id);
     });
 }
@@ -645,6 +666,7 @@ impl AgentProvidersWidget {
                         api_type: variant,
                     },
                     appearance,
+                    false,
                 );
                 chip_row = chip_row.with_child(Container::new(chip).with_margin_right(6.).finish());
             }
@@ -702,8 +724,9 @@ impl AgentProvidersWidget {
         draft_editors: ProviderDraftEditors,
         action: AISettingsPageAction,
         appearance: &Appearance,
+        disabled: bool,
     ) -> Box<dyn Element> {
-        appearance
+        let mut button = appearance
             .ui_builder()
             .button(ButtonVariant::Secondary, mouse_state)
             .with_style(UiComponentStyles {
@@ -711,7 +734,11 @@ impl AgentProvidersWidget {
                 padding: Some(Coords::uniform(CARD_BUTTON_PADDING)),
                 ..Default::default()
             })
-            .with_centered_text_label(label.into())
+            .with_centered_text_label(label.into());
+        if disabled {
+            button = button.disabled();
+        }
+        button
             .build()
             .on_click(move |ctx, app, _| {
                 ctx.dispatch_typed_action(draft_editors.to_save_then_action(app, action.clone()));
@@ -741,6 +768,7 @@ impl AgentProvidersWidget {
                 model_index: index,
             },
             appearance,
+            false,
         );
         let quick_remove_button = Self::render_card_button_preserving_draft(
             "×",
@@ -751,6 +779,7 @@ impl AgentProvidersWidget {
                 model_index: index,
             },
             appearance,
+            false,
         );
         let row_controls = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -853,6 +882,7 @@ impl AgentProvidersWidget {
                     kind,
                 },
                 appearance,
+                false,
             )
         };
 
@@ -910,6 +940,7 @@ impl AgentProvidersWidget {
                 draft_editors.clone(),
                 action,
                 appearance,
+                false,
             )
         };
 
@@ -947,6 +978,7 @@ impl AgentProvidersWidget {
                 model_index: index,
             },
             appearance,
+            false,
         );
 
         let remove_row = Container::new(
@@ -1067,6 +1099,7 @@ impl AgentProvidersWidget {
                     header_index: idx,
                 },
                 appearance,
+                false,
             );
             let header_row = Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -1105,6 +1138,7 @@ impl AgentProvidersWidget {
                 provider_id: provider.id.clone(),
             },
             appearance,
+            false,
         );
         headers_column.add_child(add_header_button);
 
@@ -1279,15 +1313,22 @@ impl AgentProvidersWidget {
                 provider_id: provider.id.clone(),
             },
             appearance,
+            false,
         );
+        let fetching = is_fetching(&provider.id);
         let fetch_button = Self::render_card_button_preserving_draft(
-            crate::t!("settings-agent-providers-fetch-from-api"),
+            if fetching {
+                crate::t!("settings-agent-providers-fetching")
+            } else {
+                crate::t!("settings-agent-providers-fetch-from-api")
+            },
             row.fetch_button_state.clone(),
             draft_editors.clone(),
             AISettingsPageAction::FetchAgentProviderModels {
                 provider_id: provider.id.clone(),
             },
             appearance,
+            fetching,
         );
         let sync_models_dev_button = Self::render_card_button_preserving_draft(
             crate::t!("settings-agent-providers-sync-models-dev"),
@@ -1297,6 +1338,7 @@ impl AgentProvidersWidget {
                 provider_id: provider.id.clone(),
             },
             appearance,
+            false,
         );
         let remove_button = Self::render_card_button(
             crate::t!("settings-agent-providers-remove"),
