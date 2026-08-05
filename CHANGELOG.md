@@ -17,6 +17,15 @@
   - Phase 4: 高风险模块 — Terminal 基础设施、SSH RemoteServerSupport、AI MCP/MOD、CLIAgent Hermes+Vibe 支持
   - 保留本地 OMP 实现，仅 cherry-pick 上游非冲突增量
   - 预存测试编译错误（cloud/teams 代码）待后续清理
+- **上游同步 (第八/九轮拣选)**:34 commit 合并（边界 `7cbb22d5c` 之后逐条拣入）
+  - 安全:禁用 iTerm 文件下载、仅支持 inline 文件（#25261）;cd 转义 + 非本地会话不 cd（#25383）
+  - 终端/协议:DCS hook session ID 完整性校验（#25395）;normal-screen focus events（#11946）;PTY spawn 快速失败（#12663）;CRLF 粘贴规范化（#12446）;PS1 复制（#13076）;启动期 inline 图片（#10478）;PowerShell bootstrap 延迟加载（#12764）
+  - CLI agent:rich input 方向键修复（#10556）;拖拽图片（#9553）;CLI subagent 交互缩范围（#12384）;cmd-enter 新会话（#12540）;cmd-k 取消在途（#12555）;Oz run failure 上报（#13210）;多 pane 会话 AI 块（#11494）
+  - 焦点/导航:block 上下导航（#10095）;命令完成焦点返回（#12583）;code diff 导航不抢焦点（#12107）;focus_ai_block 清理（#12286）
+  - 设置/基建:复用已有 control master（#12465）;amd64 arch 映射与遥测（#10534）;ModelContext 订阅 emitter 参数（#12767）
+  - 死代码清理:删 TMUX SSH warpification 流程（#12478）;删 /pr-comments 斜杠命令（#13621）;删 WelcomePalette（#12614）;删 Agent Mode 背景叠加（#13495）
+  - 其他 UI:tab 分割线对比度（#13200）;分屏 footer 溢出（#11099）;vertical tab Summary PR chip（#12945）;completions banner 永久 dismiss（#12969）等
+  - 品牌:PTY spawn 错误消息 "Warp logs" → "Zap logs"
 
 ## [v2026.05.06.preview] — 2026-05-06
 

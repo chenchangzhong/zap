@@ -1,8 +1,8 @@
 # 上游合并经验文档
 
-> **同步边界**：`7cbb22d5c`（已同步至此）
+> **同步边界**：`7cbb22d5c` 之后拣入 34 commit（散点，非连续区间；详见 §19）
 > Zap 分支：`5e5dc06da7b8e8273b874a33f8c7946c575654e7`
-> 最后核验：2026-08-04，`cargo check -p warp -p warpui_core --all-targets` 通过（0 error）
+> 最后核验：2026-08-05，`cargo check` 通过（0 error）；`cargo nextest run -p warp -E 'test(code_review_view) or test(comment_list) or test(slash_command)'` 92/92 通过
 >
 > 历轮边界：
 >
@@ -17,6 +17,7 @@
 > | 六 | `7cbb22d5c` → `02c042063` | 5 | 2026-08-03 | §16（全不合并） |
 > | 七 | fork 点全量对账 21 个缺失 | — | 2026-08-03 | §17（落地 9 个） |
 > | 八 | `f7e298027` 移植偏差回查 | — | 2026-08-04 | §18（修 3 处偏差） |
+> | 九 | `7cbb22d5c` 后 34 个拣入 | 34 | 2026-08-05 | §19 |
 >
 > **⚠️ 算待评估区间只能用上面的边界 hash**：本 fork 与上游无 merge-base
 > （浅克隆，历史断开）。`git rev-list HEAD..upstream/master` 会把全部历史
@@ -1067,5 +1068,72 @@ BYOP 诊断线索、带 `pending_conversations` 明细，与上游那条信息�
 
 ---
 
-*文档版本：v1.6*
+## 19. 第九轮拣选（2026-08-05）：`7cbb22d5c` 之后 34 commit 拣入
+
+按用户批准的待办清单（33 条 + 安全 2 条）逐条移植，**散点拣入非连续区间**。
+
+### 19.1 拣入清单（按主题）
+
+| 主题 | 提交（本地） | 上游 | 说明 |
+|------|-------------|------|------|
+| 安全 | `7813d6678` | #25261 | iTerm 文件下载禁用，仅 inline 文件；与上游逐字节一致 |
+| 安全 | `7123d71e7` | #25383 | cd 转义 + 非本地会话不 cd；3 调用点全接线 |
+| 终端协议 | `421494b45` | #25395 | DCS hook session ID 完整性校验（生成/注册/校验/拒绝） |
+| 终端协议 | `5d88e1243` | #11946 | normal-screen focus events |
+| 终端 | `95c8757eb` | #12663 | PTY spawn 快速失败（BootstrapError） |
+| 终端 | `1b9740ee4` | #12446 | CRLF 粘贴规范化 |
+| 终端 | `734c0733a` | #13076 | PS1 复制 |
+| 终端 | `9d3670053` | #10478 | 启动期 inline 图片 |
+| 终端 | `96bd5c675` | #12764 | PowerShell bootstrap 延迟 |
+| CLI agent | `dad290572` | #10556 | rich input 方向键 |
+| CLI agent | `2db5191ca` | #9553 | 拖拽图片 |
+| CLI agent | `242d6ef68` | #12384 | CLI subagent 交互缩范围 |
+| CLI agent | `3753865c4` | #12540 | cmd-enter 新会话 |
+| CLI agent | `de678c35c` | #12555 | cmd-k 取消在途 |
+| CLI agent | `7f458083b` | #13210 | Oz run failure 上报 |
+| CLI agent | `a4927f2f4` | #11494 | 多 pane 会话 AI 块 |
+| 焦点/导航 | `54eaa44c3` | #10095 | block 上下导航 |
+| 焦点/导航 | `35ad5d8a6` | #12583 | 命令完成焦点返回 |
+| 焦点/导航 | `900eb2a1b` | #12107 | code diff 导航不抢焦点 |
+| 焦点/导航 | `e77ff2ce5` | #12286 | focus_ai_block 清理 |
+| 设置/基建 | `f1c380c60` | #12465 | 复用已有 control master |
+| 设置/基建 | `f29621edd` | #10534 | amd64 arch 映射遥测 |
+| 设置/基建 | `065100372` | #12767 | ModelContext 订阅 emitter 参数（全仓签名大改） |
+| 死代码 | `dc0a4d4b7` | #12478 | 删 TMUX SSH warpification（84 文件） |
+| 死代码 | `97cc0ba0e` | #13621 | 删 /pr-comments（24 文件） |
+| 死代码 | `f634adea8` | #12614 | 删 WelcomePalette |
+| 死代码 | `a80d0c358` | #13495 | 删 Agent Mode 背景叠加 |
+| 其他 UI | `f16e94caa` / `d48c97bea` | #13200 | tab 分割线对比度（**重复移植，见 19.3**） |
+| 其他 UI | `13be2a4ef` | #11099 | 分屏 footer 溢出 |
+| 其他 UI | `96c93a248` | #12945 | vertical tab Summary PR chip |
+| 其他 UI | `31777d158` | #12969 | completions banner 永久 dismiss |
+| 其他 UI | `e7d0b84ec` | #10542 | worktree 配置裁剪 |
+| 其他 UI | `ca977ca19` | #12811 | 最大化/最小化 pane 菜单 |
+
+### 19.2 本轮回查发现（review 结论：APPROVED_WITH_NITS）
+
+1. **品牌违规修复**：`95c8757eb` 的 BootstrapError 用户可见消息 "Check the Warp logs"
+   → "Zap logs"（3 条消息 + 2 处 doc，新 commit `7369c2ead` 修复）。
+   **教训**：移植上游错误消息时品牌替换是必做项，不能只查 UI 文案。
+2. **重复移植**：`d48c97bea` 与 `f16e94caa`（现 `6dbd6b92c`）都是上游 `6c85d81de`
+   （#13200）的移植——上游仅 1 处 hunk（NewTabStyling 分支），本地拆成两个 commit
+   各改一处（NewTabStyling + legacy 分支）。功能完整（本地默认渲染路径需要 legacy 分支
+   改动），历史冗余。**教训**：同主题 grep 命中多个本地 commit 时先核对是否同一上游
+   commit 重复移植；后续可 squash 整理。
+3. **空行污染**：移植适配产生 4 处连续空行（init.rs/terminal_manager.rs/pane_group/mod.rs），
+   新 commit `2848f5a14` 清理。**教训**：移植后跑 `grep -P '\n{3,}'` 检查目标文件空行。
+
+### 19.3 与 §7.1 验收清单对照
+
+| 检查项 | 结果 |
+|--------|------|
+| `cargo check` 通过 | ✅（clean 全量 1m43s + 增量多次） |
+| 相关测试 | ✅ 92/92（code_review_view/comment_list/slash_command） |
+| CHANGELOG.md 记录同步边界 | ✅ 本轮已补 |
+| 本文档头部同步边界更新 | ✅ 本轮已补 |
+| 残留引用核验 | ✅ tmux/pr-comments 全家 0 残留（仅 back-compat 注释保留） |
+
+---
+
+*文档版本：v1.7*
 *下次合并前必读*
