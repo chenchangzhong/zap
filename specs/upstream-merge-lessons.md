@@ -1135,5 +1135,59 @@ BYOP 诊断线索、带 `pending_conversations` 明细，与上游那条信息�
 
 ---
 
-*文档版本：v1.7*
+## 20. 本地功能改动记录（2026-08-05）：file tree「附加为上下文」焦点路由
+
+> 这不是上游拣入，而是 Zap 本地的行为优化。记录原因：改动落在
+> `app/src/terminal/view.rs`（上游高频改动区），且行为与上游
+> `try_send_text_to_cli_agent_or_rich_input` 的「rich input 优先」策略不同——
+> 本地是**焦点优先**。未来同步该区域时不得用上游版本覆盖（§1「Zap 本地
+> 功能禁止覆盖」）。
+
+### 20.1 改动内容
+
+| 文件 | 内容 |
+|------|------|
+| `app/src/terminal/view.rs` `attach_path_as_context` | CLI agent 场景按焦点路由：rich input 打开且焦点不在 TUI grid → 插入 rich input（`append_to_rich_input`，自动聚焦）；否则写 TUI（PTY）+ `focus_terminal`（原行为） |
+| `app/src/terminal/view_test.rs` | 3 个路由测试：焦点在 rich input / 焦点在 TUI / 无 rich input |
+
+路由判定（核心三行）：
+
+```rust
+let terminal_is_focused = ctx.focused_view_id(ctx.window_id()) == Some(self.view_id);
+if self.is_cli_agent_rich_input_open(ctx) && !terminal_is_focused {
+    self.append_to_rich_input(&content, ctx);   // rich input
+} else {
+    self.write_to_pty(content.into_bytes(), ctx); // TUI 输入框
+    self.focus_terminal(ctx);
+}
+```
+
+### 20.2 与上游行为差异
+
+上游 `try_send_text_to_cli_agent_or_rich_input`（view.rs）是「rich input 开着就
+插 rich input」。本地 `attach_path_as_context` 是「焦点在哪插哪」：rich input
+开着但焦点已切回 TUI grid（cmd-up）时写 TUI。两者并存、互不调用。
+
+### 20.3 合并注意事项（两个坑，均已实测）
+
+1. **update 回调内 `WeakViewHandle::upgrade` 必失败**：`AppContext::update_view`
+   回调期间 view 已从 `window.views` 移除（回调后插回），`upgrade` 返回 None。
+   判定焦点不能用 `view_handle.upgrade(app).is_focused(app)`（read/渲染路径才
+   安全），必须用 `ctx.focused_view_id(ctx.window_id()) == Some(view_id)`。
+2. **`ctx.focus()` / `focus_self()` 异步生效**：入队 `pending_effects`，update
+   回调结束 flush 后才更新焦点。测试里先切焦点再断言路由，必须分两个
+   `terminal.update`。
+
+### 20.4 验证状态
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp` | ✅ 通过（0 error，22 个既有 warning） |
+| 新测试 3 个 | ✅ 全过 |
+| CLI agent / rich input 回归 165 个 | ✅ 164 过；1 个 pre-existing bidi 失败（`cli_agent_rich_input_hint_text_mentions_active_cli_agent`，与本次改动无关，stash baseline 复现） |
+| dev app 手动验证 | ✅ 通过 |
+
+---
+
+*文档版本：v1.8*
 *下次合并前必读*

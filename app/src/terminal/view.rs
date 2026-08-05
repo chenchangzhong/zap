@@ -4663,11 +4663,23 @@ impl TerminalView {
     }
 
     pub fn attach_path_as_context(&mut self, path: &Path, ctx: &mut ViewContext<Self>) {
-        // If a CLI agent is running, write the path directly to the PTY.
+        // If a CLI agent is running, route the path to whichever input the user
+        // is currently editing: rich input 打开且焦点不在 TUI grid(即焦点在
+        // rich input)时插入 rich input,否则写入 TUI 输入框(PTY)。
+        //
+        // 焦点判定不能用 `view_handle.upgrade(...)`:在 update 回调期间 view
+        // 已从 `window.views` 移除,upgrade 会失败。`focused_view_id` 只查
+        // 焦点状态,update 回调内安全。
         if self.active_cli_agent(ctx).is_some() {
             let content = path.to_string_lossy().to_string();
-            self.write_to_pty(content.into_bytes(), ctx);
-            self.focus_terminal(ctx);
+            let terminal_is_focused =
+                ctx.focused_view_id(ctx.window_id()) == Some(self.view_id);
+            if self.is_cli_agent_rich_input_open(ctx) && !terminal_is_focused {
+                self.append_to_rich_input(&content, ctx);
+            } else {
+                self.write_to_pty(content.into_bytes(), ctx);
+                self.focus_terminal(ctx);
+            }
             return;
         }
 

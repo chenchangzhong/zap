@@ -6988,3 +6988,134 @@ fn cmd_k_in_agent_view_cancels_in_progress_conversation_and_starts_new_one() {
         });
     })
 }
+
+// 行为测试：file tree 右键“附加为上下文”(attach_path_as_context)在 CLI agent
+// 场景下按焦点路由。rich input 打开且焦点在 rich input 上 → 插入 rich input；
+// 焦点在 TUI grid 或 rich input 未打开 → 写入 PTY。
+#[test]
+fn attach_path_as_context_routes_to_rich_input_when_focused() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let _hoa = FeatureFlag::HoaCodeReview.override_enabled(true);
+
+        let terminal = open_cli_agent_rich_input_for_agent(&mut app, CLIAgent::Claude);
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_action(&TerminalAction::FocusCLIAgentRichInput, ctx);
+            assert!(view.is_cli_agent_rich_input_open(ctx));
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.attach_path_as_context(std::path::Path::new("/tmp/foo.txt"), ctx);
+        });
+
+        // 路径应进入 rich input buffer,且不产生任何 PTY 写入。
+        terminal.read(&app, |view, ctx| {
+            let buffer = view.input.as_ref(ctx).buffer_text(ctx);
+            assert!(
+                buffer.contains("/tmp/foo.txt"),
+                "path should be inserted into rich input, got: {buffer}"
+            );
+        });
+        assert!(
+            pty_writes.borrow().is_empty(),
+            "path must not be written to the PTY when rich input holds focus"
+        );
+    })
+}
+
+#[test]
+fn attach_path_as_context_routes_to_pty_when_terminal_focused() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let _hoa = FeatureFlag::HoaCodeReview.override_enabled(true);
+
+        let terminal = open_cli_agent_rich_input_for_agent(&mut app, CLIAgent::Claude);
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            // 焦点切回 TUI grid:即使 rich input 打开,路径也应写入 PTY。
+            view.handle_action(&TerminalAction::FocusCLIAgentTerminal, ctx);
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.attach_path_as_context(std::path::Path::new("/tmp/foo.txt"), ctx);
+        });
+
+        let writes = pty_writes.borrow();
+        assert!(
+            writes.iter().any(|w| w == b"/tmp/foo.txt"),
+            "path should be written to the PTY when the terminal holds focus"
+        );
+    })
+}
+
+#[test]
+fn attach_path_as_context_routes_to_pty_without_rich_input() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let _hoa = FeatureFlag::HoaCodeReview.override_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    CLIAgentSession { agent: CLIAgent::Claude,
+                    status: CLIAgentSessionStatus::InProgress,
+                    session_context: CLIAgentSessionContext::default(),
+                    input_state: CLIAgentInputState::Closed,
+                    should_auto_toggle_input: false,
+                    listener: None,
+                    remote_host: None,
+                    plugin_version: None,
+                    draft_text: None,
+                    custom_command_prefix: None, current_model: None },
+                    ctx,
+                );
+            });
+        });
+
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            assert!(!view.is_cli_agent_rich_input_open(ctx));
+            view.attach_path_as_context(std::path::Path::new("/tmp/foo.txt"), ctx);
+        });
+
+        let writes = pty_writes.borrow();
+        assert!(
+            writes.iter().any(|w| w == b"/tmp/foo.txt"),
+            "path should be written to the PTY when rich input is closed"
+        );
+    })
+}
