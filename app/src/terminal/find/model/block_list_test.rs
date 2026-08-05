@@ -27,6 +27,7 @@ impl BlockListFindRun {
 
 #[test]
 fn test_run_find_on_block_list() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         let mut mock_terminal_model = TerminalModel::mock(None, None);
         mock_terminal_model.simulate_block("foobar", "foo\r\nbar\r\n");
@@ -85,6 +86,7 @@ fn test_run_find_on_block_list() {
 
 #[test]
 fn test_run_find_on_block_list_pin_to_top() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         let mut mock_terminal_model = TerminalModel::mock(None, None);
         mock_terminal_model.simulate_block("foobar", "foo\r\nbar\r\n");
@@ -141,6 +143,7 @@ fn test_run_find_on_block_list_pin_to_top() {
 
 #[test]
 fn test_run_find_on_block_list_case_sensitive() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         let mut mock_terminal_model = TerminalModel::mock(None, None);
         mock_terminal_model.simulate_block("foobar", "foo\r\nbar\r\n");
@@ -186,6 +189,7 @@ fn test_run_find_on_block_list_case_sensitive() {
 
 #[test]
 fn test_run_find_on_block_list_regex_enabled() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         let mut mock_terminal_model = TerminalModel::mock(None, None);
         mock_terminal_model.simulate_block("foobar", "foo\r\nbar\r\n");
@@ -255,6 +259,7 @@ fn test_run_find_on_block_list_regex_enabled() {
 
 #[test]
 fn test_run_find_on_block_list_with_filtered_block() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         let mut mock_terminal_model = TerminalModel::mock(None, None);
         mock_terminal_model.simulate_block("foobar", "foo\r\nbar\r\n");
@@ -365,6 +370,7 @@ fn test_run_find_on_block_list_with_filtered_block() {
 /// inserted before it in the match vector.
 #[test]
 fn test_rerun_on_block_preserves_focused_match_in_active_block() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         let mut mock_terminal_model = TerminalModel::mock(None, None);
         // Block 1: a finished block.
@@ -429,6 +435,7 @@ fn test_rerun_on_block_preserves_focused_match_in_active_block() {
 /// receives new streaming output, the focus must not drift to a different match.
 #[test]
 fn test_rerun_on_block_preserves_focused_match_in_older_block() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         let mut mock_terminal_model = TerminalModel::mock(None, None);
         mock_terminal_model.simulate_block("echo bar", "bar\r\n");

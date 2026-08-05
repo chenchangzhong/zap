@@ -12,6 +12,7 @@ use crate::server::telemetry::ImageProtocol;
 use crate::terminal::model::block::BlockMetadata;
 use crate::terminal::model::block::SerializedBlock;
 use crate::terminal::model::completions::ShellCompletion;
+use crate::terminal::model::lifecycle::LifecycleRecoveryRecord;
 use crate::terminal::model::terminal_model::HandlerEvent;
 use crate::terminal::shell::ShellType;
 use crate::terminal::ClipboardType;
@@ -103,6 +104,8 @@ pub enum Event {
         is_tagged_in: bool,
     },
     Handler(HandlerEvent),
+    /// Carries non-UGC lifecycle diagnostics to the model dispatcher for telemetry.
+    LifecycleRecovery(LifecycleRecoveryRecord),
     /// Emitted when the remote server binary has been successfully checked or
     /// installed and is ready. The session is initialized independently on
     /// `Bootstrapped`; when the remote server later connects, the client is
@@ -443,6 +446,7 @@ impl Debug for Event {
                 )
             }
             Event::Handler(handler_event) => write!(f, "Handler({handler_event:?}))"),
+            Event::LifecycleRecovery(record) => write!(f, "LifecycleRecovery({record:?})"),
             Event::RemoteServerReady { session_id } => {
                 write!(f, "RemoteServerReady(session: {session_id:?})")
             }

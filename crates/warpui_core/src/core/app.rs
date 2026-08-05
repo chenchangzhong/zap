@@ -4387,6 +4387,14 @@ impl AppContext {
             .and_then(|window| window.focused_view)
     }
 
+    /// Returns the ancestor chain of `view_id` in `window_id`, from the window
+    /// root down to (and including) `view_id` itself.
+    pub fn view_ancestors(&self, window_id: WindowId, view_id: EntityId) -> Vec<EntityId> {
+        self.presenter(window_id)
+            .map(|presenter| presenter.borrow().ancestors(view_id))
+            .unwrap_or_default()
+    }
+
     pub fn view_name(&self, window_id: WindowId, view_id: EntityId) -> Option<&str> {
         self.windows
             .get(&window_id)

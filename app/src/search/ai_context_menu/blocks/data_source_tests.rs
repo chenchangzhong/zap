@@ -39,6 +39,7 @@ fn make_block_search_item(
 
 #[test]
 fn zero_state_scores_reflect_recency() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let term = add_window_with_terminal(&mut app, None);
@@ -168,6 +169,7 @@ fn zero_state_active_bonus_boosts_nearby_blocks() {
 
 #[test]
 fn zero_state_very_recent_inactive_outranks_old_active() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
 
@@ -215,6 +217,7 @@ fn zero_state_very_recent_inactive_outranks_old_active() {
 fn fuzzy_query_active_session_blocks_rank_above_other_sessions() {
     // Blocks from the active session receive a score bonus, so given equal
     // fuzzy match quality the active-session block should rank above others.
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
 

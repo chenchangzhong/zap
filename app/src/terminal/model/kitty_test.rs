@@ -131,6 +131,7 @@ fn terminal_with_two_placements() -> TerminalModel {
 #[test]
 fn zero_size_transmit_and_display_does_not_panic() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let reply = reply_for("a=T,i=1,f=24,s=0,v=0", &[]);
 
@@ -141,6 +142,7 @@ fn zero_size_transmit_and_display_does_not_panic() {
 #[test]
 fn zero_size_display_of_stored_image_does_not_panic() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     terminal.process_bytes(kitty_apc("a=t,i=1,f=24,s=0,v=0", &[]).as_str());
@@ -153,6 +155,7 @@ fn zero_size_display_of_stored_image_does_not_panic() {
 #[test]
 fn query_reply_is_sent_despite_quiet_mode() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let reply = reply_for("a=q,i=1,q=1,f=24,s=1,v=1", one_pixel_rgb());
 
@@ -162,6 +165,7 @@ fn query_reply_is_sent_despite_quiet_mode() {
 #[test]
 fn unknown_image_id_error_reply_uses_enoent() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let reply = reply_for("a=p,i=999", &[]);
 
@@ -174,6 +178,7 @@ fn unknown_image_id_error_reply_uses_enoent() {
 #[test]
 fn ok_reply_echoes_image_and_placement_ids() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let reply = reply_for("a=T,i=7,p=3,f=24,s=1,v=1", one_pixel_rgb());
 
@@ -183,6 +188,7 @@ fn ok_reply_echoes_image_and_placement_ids() {
 #[test]
 fn quiet_mode_one_suppresses_ok_but_not_errors() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let ok_reply = reply_for("a=T,i=1,q=1,f=24,s=1,v=1", one_pixel_rgb());
     assert!(ok_reply.is_empty(), "unexpected reply: {ok_reply:?}");
@@ -197,6 +203,7 @@ fn quiet_mode_one_suppresses_ok_but_not_errors() {
 #[test]
 fn quiet_mode_two_suppresses_errors() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let error_reply = reply_for("a=p,i=999,q=2", &[]);
     assert!(error_reply.is_empty(), "unexpected reply: {error_reply:?}");
@@ -208,6 +215,7 @@ fn quiet_mode_two_suppresses_errors() {
 #[test]
 fn delete_all_removes_every_placement() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_two_placements();
     delete(&mut terminal, "d=a");
@@ -219,6 +227,7 @@ fn delete_all_removes_every_placement() {
 #[test]
 fn delete_by_id_removes_only_that_image() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_two_placements();
     // A second placement of image 1, so we can tell "every placement of an
@@ -235,6 +244,7 @@ fn delete_by_id_removes_only_that_image() {
 #[test]
 fn delete_by_id_with_placement_id_removes_only_that_placement() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_two_placements();
     place_image(&mut terminal, "i=1,p=9");
@@ -249,6 +259,7 @@ fn delete_by_id_with_placement_id_removes_only_that_placement() {
 #[test]
 fn delete_by_number_removes_the_numbered_image() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     // `i=` still identifies the image; `I=` is the client's own number, which is
@@ -265,6 +276,7 @@ fn delete_by_number_removes_the_numbered_image() {
 #[test]
 fn delete_at_cursor_removes_the_placement_under_the_cursor() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     // The helper leaves the cursor on image 2's cell.
     let mut terminal = terminal_with_two_placements();
@@ -277,6 +289,7 @@ fn delete_at_cursor_removes_the_placement_under_the_cursor() {
 #[test]
 fn delete_at_point_removes_the_placement_in_that_cell() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_two_placements();
     delete(&mut terminal, "d=p,x=1,y=1");
@@ -288,6 +301,7 @@ fn delete_at_point_removes_the_placement_in_that_cell() {
 #[test]
 fn delete_at_point_with_z_index_only_removes_matching_depths() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     // Two placements stacked on the same cell at different depths.
     let mut terminal = kitty_terminal();
@@ -303,6 +317,7 @@ fn delete_at_point_with_z_index_only_removes_matching_depths() {
 #[test]
 fn delete_in_column_removes_placements_in_that_column() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_two_placements();
     delete(&mut terminal, "d=x,x=3");
@@ -314,6 +329,7 @@ fn delete_in_column_removes_placements_in_that_column() {
 #[test]
 fn delete_in_row_removes_placements_in_that_row() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_two_placements();
     delete(&mut terminal, "d=y,y=2");
@@ -325,6 +341,7 @@ fn delete_in_row_removes_placements_in_that_row() {
 #[test]
 fn delete_by_z_index_removes_placements_at_that_depth() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     place_image(&mut terminal, "i=1,p=1,z=5");
@@ -339,6 +356,7 @@ fn delete_by_z_index_removes_placements_at_that_depth() {
 #[test]
 fn delete_by_id_range_removes_ids_within_the_range() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     for image_id in 1..=4 {
@@ -356,6 +374,7 @@ fn delete_by_id_range_removes_ids_within_the_range() {
 #[test]
 fn unknown_delete_specifier_is_rejected_and_deletes_nothing() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     // Regression test: an unrecognized `d=` used to fall through to "delete all".
     for specifier in ["d=w", "d=!"] {
@@ -380,6 +399,7 @@ fn unknown_delete_specifier_is_rejected_and_deletes_nothing() {
 #[test]
 fn uppercase_delete_also_frees_the_image_data() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     place_image(&mut terminal, "i=1,p=1");
@@ -407,6 +427,7 @@ fn uppercase_delete_also_frees_the_image_data() {
 #[test]
 fn uppercase_positional_delete_also_frees_the_image_data() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     place_image(&mut terminal, "i=1,p=1");
@@ -422,6 +443,7 @@ fn uppercase_positional_delete_also_frees_the_image_data() {
 #[test]
 fn delete_frames_is_reported_as_unsupported() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     place_image(&mut terminal, "i=1,p=1");
@@ -439,6 +461,7 @@ fn delete_frames_is_reported_as_unsupported() {
 #[test]
 fn unicode_placeholder_transmit_and_display_is_accepted() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let reply = reply_for("a=T,U=1,i=1,p=2,f=24,s=1,v=1", one_pixel_rgb());
 
@@ -449,6 +472,7 @@ fn unicode_placeholder_transmit_and_display_is_accepted() {
 #[test]
 fn unicode_placeholder_display_of_stored_image_is_accepted() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     terminal.process_bytes(kitty_apc("a=t,i=1,f=24,s=1,v=1", one_pixel_rgb()).as_str());
@@ -462,6 +486,7 @@ fn unicode_placeholder_display_of_stored_image_is_accepted() {
 #[test]
 fn unicode_placeholder_placement_does_not_move_the_cursor() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     let before = cursor_point(&terminal);
@@ -480,6 +505,7 @@ fn unicode_placeholder_placement_does_not_move_the_cursor() {
 #[test]
 fn unicode_placeholder_records_rows_and_columns_unresolved() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     terminal
@@ -501,6 +527,7 @@ fn unicode_placeholder_records_rows_and_columns_unresolved() {
 #[test]
 fn anchored_placement_records_no_virtual_placement() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     terminal.process_bytes(kitty_apc("a=T,i=1,p=2,f=24,s=1,v=1", one_pixel_rgb()).as_str());
@@ -511,6 +538,7 @@ fn anchored_placement_records_no_virtual_placement() {
 #[test]
 fn extreme_aspect_ratio_display_does_not_underflow() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     // A 4000x1 image squeezed into one column: the desired height truncates to
@@ -527,6 +555,7 @@ fn extreme_aspect_ratio_display_does_not_underflow() {
 #[test]
 fn query_is_answered_before_a_command_starts_executing() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     // No `simulate_cmd`: the block is still before `preexec`, so grid-bound
     // actions route to the header grid. A support probe must be answered anyway.
@@ -541,6 +570,7 @@ fn query_is_answered_before_a_command_starts_executing() {
 #[test]
 fn transmitted_frames_accumulate_with_their_gaps() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_stored_image();
 
@@ -561,6 +591,7 @@ fn transmitted_frames_accumulate_with_their_gaps() {
 #[test]
 fn animation_control_starts_and_stops_playback() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_stored_image();
     animate(&mut terminal, "a=f,i=1,f=24,s=1,v=1,z=100", one_pixel_rgb());
@@ -579,6 +610,7 @@ fn animation_control_starts_and_stops_playback() {
 #[test]
 fn animation_control_edits_a_frame_gap() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_stored_image();
     animate(&mut terminal, "a=f,i=1,f=24,s=1,v=1,z=100", one_pixel_rgb());
@@ -594,6 +626,7 @@ fn animation_control_edits_a_frame_gap() {
 #[test]
 fn frames_needing_compositing_are_unsupported() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_stored_image();
 
@@ -627,6 +660,7 @@ fn frames_needing_compositing_are_unsupported() {
 #[test]
 fn compose_action_is_unsupported() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let reply = reply_for("a=c,i=1", &[]);
 
@@ -639,6 +673,7 @@ fn compose_action_is_unsupported() {
 #[test]
 fn zero_image_number_gets_no_reply() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     // `I=0` is the unset default of client libraries that always emit the key;
     // replying would hand them an id they never asked about.
@@ -650,6 +685,7 @@ fn zero_image_number_gets_no_reply() {
 #[test]
 fn animation_messages_resolve_the_client_image_number() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     terminal.process_bytes(kitty_apc("a=t,i=1,I=5,f=24,s=1,v=1", one_pixel_rgb()).as_str());
@@ -663,6 +699,7 @@ fn animation_messages_resolve_the_client_image_number() {
 #[test]
 fn frame_edit_of_a_missing_frame_is_an_error_not_an_append() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_stored_image();
 
@@ -675,6 +712,7 @@ fn frame_edit_of_a_missing_frame_is_an_error_not_an_append() {
 #[test]
 fn explicit_zero_base_frame_is_accepted() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_stored_image();
 
@@ -688,6 +726,7 @@ fn explicit_zero_base_frame_is_accepted() {
 #[test]
 fn animation_frames_are_capped() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = terminal_with_stored_image();
     for _ in 0..MAX_ANIMATION_FRAMES {
@@ -707,6 +746,7 @@ fn animation_frames_are_capped() {
 #[test]
 fn reply_echoes_the_client_image_number() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     // No `i=`: the reply is how the client learns the id the terminal assigned
     // to its number.
@@ -719,6 +759,7 @@ fn reply_echoes_the_client_image_number() {
 #[test]
 fn delete_all_clears_virtual_placements_without_freeing_the_image() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     terminal.process_bytes(kitty_apc("a=T,U=1,i=1,p=5,f=24,s=1,v=1", one_pixel_rgb()).as_str());
@@ -733,6 +774,7 @@ fn delete_all_clears_virtual_placements_without_freeing_the_image() {
 #[test]
 fn delete_by_id_clears_virtual_placements() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     terminal.process_bytes(kitty_apc("a=T,U=1,i=1,p=5,f=24,s=1,v=1", one_pixel_rgb()).as_str());
@@ -748,6 +790,7 @@ fn delete_by_id_clears_virtual_placements() {
 #[test]
 fn delete_by_z_index_clears_matching_virtual_placements() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     terminal.process_bytes(kitty_apc("a=T,U=1,i=1,p=5,z=3,f=24,s=1,v=1", one_pixel_rgb()).as_str());
@@ -761,6 +804,7 @@ fn delete_by_z_index_clears_matching_virtual_placements() {
 #[test]
 fn uppercase_z_delete_evicts_every_placement_of_a_freed_image() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     place_image(&mut terminal, "i=1,p=1,z=5");
@@ -778,6 +822,7 @@ fn uppercase_z_delete_evicts_every_placement_of_a_freed_image() {
 #[test]
 fn uppercase_delete_by_id_with_placement_frees_the_whole_image() {
     let _kitty_images = FeatureFlag::KittyImages.override_enabled(true);
+    let _recovery = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
 
     let mut terminal = kitty_terminal();
     place_image(&mut terminal, "i=1,p=1");

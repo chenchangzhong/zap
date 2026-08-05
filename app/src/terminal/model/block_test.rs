@@ -12,9 +12,9 @@ use crate::{
     },
     test_util::mock_blockgrid,
 };
-use warp_core::features::FeatureFlag;
 use float_cmp::assert_approx_eq;
 use futures_lite::stream::StreamExt;
+use warp_core::features::FeatureFlag;
 
 impl float_cmp::ApproxEq for BlockSection {
     type Margin = float_cmp::F64Margin;
@@ -44,7 +44,7 @@ impl float_cmp::ApproxEq for BlockSection {
 pub fn test_find() {
     let mut block = TestBlockBuilder::new().build();
 
-    block.precmd(PrecmdValue::default());
+    block.prompt_only_precmd(PromptMetadata::default());
     block.start();
     assert_lines_approx_eq!(block.height(&AgentViewState::Inactive), 3.);
 
@@ -234,7 +234,7 @@ pub fn test_find() {
 
     let mut block = TestBlockBuilder::new().build();
 
-    block.precmd(PrecmdValue::default());
+    block.prompt_only_precmd(PromptMetadata::default());
     block.start();
 
     block.header_grid.command_grid_linefeed();
@@ -264,7 +264,7 @@ pub fn test_long_running_block_bottom_padding() {
     warpui::r#async::block_on(async {
         let mut block = TestBlockBuilder::new().build();
 
-        block.precmd(Default::default());
+        block.prompt_only_precmd(Default::default());
         block.start();
         for c in "command".chars() {
             block.input(c);
@@ -292,7 +292,7 @@ pub fn test_long_running_block_bottom_padding() {
 pub fn test_precmd_no_preexec() {
     let mut block = TestBlockBuilder::new().build();
     block.start();
-    block.precmd(PrecmdValue::default());
+    block.prompt_only_precmd(PromptMetadata::default());
 
     for c in "command".chars() {
         block.input(c);
@@ -367,7 +367,7 @@ pub fn test_image_completion_drops_in_warp_input_stage() {
 pub fn test_command_grid_bold() {
     let mut block = TestBlockBuilder::new().build();
     block.start();
-    block.precmd(PrecmdValue::default());
+    block.prompt_only_precmd(PromptMetadata::default());
 
     // We should have the BOLD flag enabled for commands, once we've started the command grid.
     assert!(block
@@ -389,7 +389,7 @@ pub fn test_command_grid_bold() {
 pub fn test_command_grid_bold_after_reset() {
     let mut block = TestBlockBuilder::new().build();
     block.start();
-    block.precmd(PrecmdValue::default());
+    block.prompt_only_precmd(PromptMetadata::default());
 
     // We should have the BOLD flag enabled for commands, once we've started the command grid.
     assert!(block
@@ -418,7 +418,7 @@ pub fn test_command_grid_bold_after_reset() {
 pub fn test_empty_command() {
     let mut block = TestBlockBuilder::new().build();
     block.start();
-    block.precmd(PrecmdValue::default());
+    block.prompt_only_precmd(PromptMetadata::default());
 
     block.finish(0);
 
@@ -429,14 +429,14 @@ pub fn test_empty_command() {
 pub fn test_failed_block() {
     let mut block = TestBlockBuilder::new().build();
 
-    block.precmd(PrecmdValue::default());
+    block.prompt_only_precmd(PromptMetadata::default());
     block.preexec(Default::default());
 
     block.finish(1 /* exit_code */);
     assert!(block.has_failed());
 
     let mut block = TestBlockBuilder::new().build();
-    block.precmd(PrecmdValue::default());
+    block.prompt_only_precmd(PromptMetadata::default());
     block.finish(1 /* exit_code */);
 
     // The block should not be marked as failed since execution never started.
@@ -447,7 +447,7 @@ pub fn test_failed_block() {
 fn test_non_error_exit_codes() {
     let mut block = TestBlockBuilder::new().build();
 
-    block.precmd(Default::default());
+    block.prompt_only_precmd(Default::default());
     block.preexec(Default::default());
 
     block.finish(130 /* exit_code */);
@@ -456,7 +456,7 @@ fn test_non_error_exit_codes() {
 
     let mut block = TestBlockBuilder::new().build();
 
-    block.precmd(Default::default());
+    block.prompt_only_precmd(Default::default());
     block.preexec(Default::default());
 
     block.finish(141 /* exit_code */);
@@ -555,7 +555,7 @@ pub fn test_block_emits_block_completed_event_for_in_band_command() {
         .build();
 
     block.start_for_in_band_command();
-    block.precmd(Default::default());
+    block.prompt_only_precmd(Default::default());
     block.preexec(PreexecValue {
         command: "warp_run_generator_command 1234 foo".to_owned(),
         session_id: None,
@@ -1337,7 +1337,7 @@ fn test_top_level_command() {
         .with_size_info(SizeInfo::new_without_font_metrics(1, 20))
         .build();
     block.start();
-    block.precmd(PrecmdValue {
+    block.prompt_only_precmd(PromptMetadata {
         session_id: Some(0),
         ..Default::default()
     });
@@ -1351,7 +1351,7 @@ fn test_top_level_command() {
         .with_size_info(SizeInfo::new_without_font_metrics(1, 20))
         .build();
     block.start();
-    block.precmd(PrecmdValue {
+    block.prompt_only_precmd(PromptMetadata {
         session_id: Some(0),
         ..Default::default()
     });
@@ -1377,7 +1377,7 @@ fn test_top_level_command_with_aliases() {
         .with_size_info(SizeInfo::new_without_font_metrics(1, 20))
         .build();
     block.start();
-    block.precmd(PrecmdValue {
+    block.prompt_only_precmd(PromptMetadata {
         session_id: Some(0),
         ..Default::default()
     });
@@ -1390,7 +1390,7 @@ fn test_top_level_command_with_aliases() {
         .with_size_info(SizeInfo::new_without_font_metrics(1, 20))
         .build();
     block.start();
-    block.precmd(PrecmdValue {
+    block.prompt_only_precmd(PromptMetadata {
         session_id: Some(0),
         ..Default::default()
     });
@@ -1403,7 +1403,7 @@ fn test_top_level_command_with_aliases() {
         .with_size_info(SizeInfo::new_without_font_metrics(1, 20))
         .build();
     block.start();
-    block.precmd(PrecmdValue {
+    block.prompt_only_precmd(PromptMetadata {
         session_id: Some(0),
         ..Default::default()
     });
@@ -1424,7 +1424,7 @@ fn test_mark_end_of_prompt_with_some_rows_in_flat_storage() {
         .with_honor_ps1(true)
         .build();
 
-    block.precmd(PrecmdValue {
+    block.prompt_only_precmd(PromptMetadata {
         ps1: Some(hex::encode("prompt1\r\n")),
         honor_ps1: Some(true),
         ..Default::default()

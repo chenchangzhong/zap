@@ -30,7 +30,7 @@ use crate::ai::agent::{AIAgentAttachment, AIAgentExchangeId, CancellationReason}
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::blocklist::agent_view::shortcuts::AgentShortcutViewModel;
 use crate::ai::blocklist::agent_view::{
-    AgentViewEntryOrigin, ENTER_AGENT_VIEW_NEW_CONVERSATION_KEYSTROKE, EphemeralMessageModel,
+    AgentViewEntryOrigin, EphemeralMessageModel, ENTER_AGENT_VIEW_NEW_CONVERSATION_KEYSTROKE,
 };
 use crate::ai::blocklist::block::cli_controller::CLISubagentController;
 use crate::ai::blocklist::block::status_bar::BlocklistAIStatusBar;
@@ -2194,9 +2194,10 @@ impl Input {
                 AgentInputFooterEvent::OpenRichInput | AgentInputFooterEvent::HideRichInput => {
                     ctx.emit(Event::Escape);
                 }
-                // WriteToPty, InsertIntoCLIRichInput, ToggleCodeReviewPane, and ToggleFileExplorer
-                // are handled by UseAgentToolbar's subscription, not here.
+                // WriteToPty, InsertIntoCLIPty, InsertIntoCLIRichInput, ToggleCodeReviewPane, and
+                // ToggleFileExplorer are handled by UseAgentToolbar's subscription, not here.
                 AgentInputFooterEvent::WriteToPty(_)
+                | AgentInputFooterEvent::InsertIntoCLIPty(_)
                 | AgentInputFooterEvent::InsertIntoCLIRichInput(_)
                 | AgentInputFooterEvent::ToggleCodeReviewPane(_)
                 | AgentInputFooterEvent::ToggleFileExplorer(_) => {}
@@ -7635,7 +7636,6 @@ impl Input {
             ctx.emit(Event::Escape);
         }
     }
-
 
     /// Emits an `AgentModeAutodetectionFalsePositive` telemetry event if the current input text has
     /// been autodetected as AI input and the user manually toggled to shell.

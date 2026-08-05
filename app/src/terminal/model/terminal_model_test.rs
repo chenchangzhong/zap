@@ -20,6 +20,8 @@ use warp_terminal::model::ansi::ClearMode;
 use warpui::text::str_to_byte_vec;
 use warpui::text::SelectionType;
 
+use crate::features::FeatureFlag;
+
 /// Helper function to create a SerializedBlock with default values,
 /// including the new is_local field.
 fn create_default_serialized_block() -> SerializedBlock {
@@ -105,7 +107,7 @@ fn ignores_non_inline_iterm_file_payload_without_overwriting_cwd_file() {
     fs::write(&target_path, original_bytes).unwrap();
 
     let mut terminal = TerminalModel::mock(None, None);
-    terminal.precmd(PrecmdValue {
+    terminal.prompt_only_precmd(PromptMetadata {
         pwd: Some(temp_dir.path().to_string_lossy().to_string()),
         ..Default::default()
     });
@@ -126,7 +128,7 @@ fn ignores_multipart_non_inline_iterm_file_payload_without_overwriting_cwd_file(
     fs::write(&target_path, original_bytes).unwrap();
 
     let mut terminal = TerminalModel::mock(None, None);
-    terminal.precmd(PrecmdValue {
+    terminal.prompt_only_precmd(PromptMetadata {
         pwd: Some(temp_dir.path().to_string_lossy().to_string()),
         ..Default::default()
     });
@@ -163,11 +165,12 @@ fn handles_inline_iterm_image_payload() {
 // Ensures that an ssh session successfully bootstraps even if the block list is empty.
 #[test]
 fn ssh_bootstraps_if_blocklist_empty() {
+    let _recovery_enabled = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     let mut terminal = TerminalModel::mock(None, None);
     terminal.command_finished(Default::default());
-    terminal.precmd(Default::default());
+    terminal.prompt_only_precmd(Default::default());
     terminal.command_finished(Default::default());
-    terminal.precmd(Default::default());
+    terminal.prompt_only_precmd(Default::default());
 
     let bootstrapped_value = BootstrappedValue {
         session_id: None,
@@ -195,7 +198,9 @@ fn ssh_bootstraps_if_blocklist_empty() {
     };
     terminal.bootstrapped(bootstrapped_value.clone());
     terminal.command_finished(Default::default());
-    terminal.block_list_mut().precmd(Default::default());
+    terminal
+        .block_list_mut()
+        .prompt_only_precmd(Default::default());
 
     assert!(terminal.is_active_block_bootstrapped());
 
@@ -215,12 +220,12 @@ fn ssh_bootstraps_if_blocklist_empty() {
     assert!(!terminal.is_active_block_bootstrapped());
 
     terminal.command_finished(Default::default());
-    terminal.precmd(PrecmdValue::default());
+    terminal.prompt_only_precmd(PromptMetadata::default());
     terminal.command_finished(Default::default());
-    terminal.precmd(Default::default());
+    terminal.prompt_only_precmd(Default::default());
     terminal.bootstrapped(bootstrapped_value);
     terminal.command_finished(Default::default());
-    terminal.precmd(Default::default());
+    terminal.prompt_only_precmd(Default::default());
 
     assert!(terminal.is_active_block_bootstrapped());
 }
@@ -228,6 +233,7 @@ fn ssh_bootstraps_if_blocklist_empty() {
 #[test]
 // An empty block that is restored should have a nonzero height and it should not get deleted.
 pub fn test_restored_empty_command_block() {
+    let _recovery_enabled = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     let restored_blocks = [create_default_serialized_block().into()];
     let model = TerminalModel::mock(Some(&restored_blocks), None);
     let restored_block = &model.block_list().blocks()[0];
@@ -248,6 +254,7 @@ pub fn test_restored_empty_command_block() {
 /// restored.
 #[test]
 fn test_restored_blocks_on_different_host() {
+    let _recovery_enabled = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     let restored_blocks = [
         SerializedBlock {
             id: BlockId::new(),
@@ -785,13 +792,16 @@ fn test_reset_state() {
 
 #[test]
 fn test_exit_alt_screen_on_command_finished() {
+    let _recovery_enabled = FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     let mut terminal: TerminalModel = TerminalModel::mock(None, None);
 
     terminal.enter_alt_screen(true);
 
     terminal.command_finished(CommandFinishedValue {
-        exit_code: ExitCode::from(0),
-        next_block_id: BlockId::new(),
+        completion_metadata: CompletionMetadata {
+            exit_code: ExitCode::from(0),
+            next_block_id: BlockId::new(),
+        },
         session_id: None,
     });
 
@@ -805,8 +815,10 @@ fn test_unset_bracketed_paste_mode_on_command_finished() {
     terminal.set_mode(Mode::BracketedPaste);
 
     terminal.command_finished(CommandFinishedValue {
-        exit_code: ExitCode::from(0),
-        next_block_id: BlockId::new(),
+        completion_metadata: CompletionMetadata {
+            exit_code: ExitCode::from(0),
+            next_block_id: BlockId::new(),
+        },
         session_id: None,
     });
 

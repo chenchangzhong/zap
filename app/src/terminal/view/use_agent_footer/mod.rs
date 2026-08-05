@@ -144,13 +144,9 @@ fn rich_input_submit_strategy(agent: CLIAgent) -> RichInputSubmitStrategy {
         | CLIAgent::Auggie
         | CLIAgent::CursorCli
         | CLIAgent::Vibe
-        | CLIAgent::Hermes
         | CLIAgent::Antigravity => RichInputSubmitStrategy::DelayedEnter,
-        CLIAgent::Amp
-        | CLIAgent::Droid
-        | CLIAgent::Pi
-        | CLIAgent::Goose
-        | CLIAgent::Unknown => {
+        CLIAgent::Hermes => RichInputSubmitStrategy::BracketedPaste,
+        CLIAgent::Amp | CLIAgent::Droid | CLIAgent::Pi | CLIAgent::Goose | CLIAgent::Unknown => {
             RichInputSubmitStrategy::Inline
         }
     }
@@ -236,6 +232,9 @@ impl TerminalView {
                 // forward the write request to the sharer instead of only
                 // emitting a local PTY write event.
                 self.write_user_bytes_to_pty(text.as_bytes().to_vec(), ctx);
+            }
+            UseAgentToolbarEvent::InsertIntoCLIPty(text) => {
+                self.insert_text_into_cli_agent_pty(text, ctx);
             }
             UseAgentToolbarEvent::InsertIntoRichInput(text) => {
                 self.input.update(ctx, |input, ctx| {
@@ -965,13 +964,7 @@ impl TerminalView {
                 self.maybe_close_rich_input_after_submit(ctx);
             }
             RichInputSubmitStrategy::BracketedPaste => {
-                let mut bytes = Vec::with_capacity(
-                    BRACKETED_PASTE_START.len() + text_bytes.len() + BRACKETED_PASTE_END.len(),
-                );
-                bytes.extend_from_slice(BRACKETED_PASTE_START);
-                bytes.extend_from_slice(&text_bytes);
-                bytes.extend_from_slice(BRACKETED_PASTE_END);
-                self.write_user_bytes_to_pty(bytes, ctx);
+                self.write_cli_agent_text(&text_bytes, strategy, ctx);
                 self.write_user_bytes_to_pty(b"\r".to_vec(), ctx);
                 self.maybe_close_rich_input_after_submit(ctx);
             }
@@ -986,13 +979,7 @@ impl TerminalView {
                 );
             }
             RichInputSubmitStrategy::BracketedPasteDelayedEnter => {
-                let mut bytes = Vec::with_capacity(
-                    BRACKETED_PASTE_START.len() + text_bytes.len() + BRACKETED_PASTE_END.len(),
-                );
-                bytes.extend_from_slice(BRACKETED_PASTE_START);
-                bytes.extend_from_slice(&text_bytes);
-                bytes.extend_from_slice(BRACKETED_PASTE_END);
-                self.write_user_bytes_to_pty(bytes, ctx);
+                self.write_cli_agent_text(&text_bytes, strategy, ctx);
                 ctx.spawn(
                     Timer::after(CLI_AGENT_BRACKETED_PASTE_ENTER_DELAY),
                     move |me, _, ctx| {
@@ -1002,6 +989,50 @@ impl TerminalView {
                 );
             }
         }
+    }
+
+    /// Inserts `text` into the active CLI agent's input without submitting it.
+    ///
+    /// Voice transcription uses this when rich input is closed. Agents that
+    /// require bracketed paste receive one complete paste payload so embedded
+    /// newlines are inserted rather than interpreted as separate submissions.
+    fn insert_text_into_cli_agent_pty(&mut self, text: &str, ctx: &mut ViewContext<Self>) {
+        let Some(agent) = CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.view_id)
+            .map(|s| s.agent)
+        else {
+            return;
+        };
+
+        if text.is_empty() {
+            return;
+        }
+
+        self.write_cli_agent_text(text.as_bytes(), rich_input_submit_strategy(agent), ctx);
+    }
+
+    fn write_cli_agent_text(
+        &mut self,
+        text_bytes: &[u8],
+        strategy: RichInputSubmitStrategy,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let bytes = match strategy {
+            RichInputSubmitStrategy::BracketedPaste
+            | RichInputSubmitStrategy::BracketedPasteDelayedEnter => {
+                let mut bytes = Vec::with_capacity(
+                    BRACKETED_PASTE_START.len() + text_bytes.len() + BRACKETED_PASTE_END.len(),
+                );
+                bytes.extend_from_slice(BRACKETED_PASTE_START);
+                bytes.extend_from_slice(text_bytes);
+                bytes.extend_from_slice(BRACKETED_PASTE_END);
+                bytes
+            }
+            RichInputSubmitStrategy::Inline | RichInputSubmitStrategy::DelayedEnter => {
+                text_bytes.to_vec()
+            }
+        };
+        self.write_user_bytes_to_pty(bytes, ctx);
     }
 
     pub(in crate::terminal) fn open_cli_agent_rich_input(
@@ -1194,6 +1225,9 @@ impl UseAgentToolbar {
             AgentInputFooterEvent::WriteToPty(text) => {
                 ctx.emit(UseAgentToolbarEvent::WriteToPty(text.clone()));
             }
+            AgentInputFooterEvent::InsertIntoCLIPty(text) => {
+                ctx.emit(UseAgentToolbarEvent::InsertIntoCLIPty(text.clone()));
+            }
             AgentInputFooterEvent::InsertIntoCLIRichInput(text) => {
                 ctx.emit(UseAgentToolbarEvent::InsertIntoRichInput(text.clone()));
             }
@@ -1290,6 +1324,8 @@ pub enum UseAgentToolbarEvent {
     Dismiss,
     /// Write text to the PTY (from CLI agent view).
     WriteToPty(String),
+    /// Insert text into the CLI agent's PTY input using its paste strategy.
+    InsertIntoCLIPty(String),
     /// Insert text into CLI agent rich input.
     InsertIntoRichInput(String),
     /// Toggle the code review pane (from CLI agent view).
@@ -1385,7 +1421,6 @@ impl View for UseAgentToolbar {
             if let Some(bg_color) = terminal_model.alt_screen().inferred_bg_color() {
                 container = container.with_background(bg_color);
             }
-
         }
 
         container.finish()

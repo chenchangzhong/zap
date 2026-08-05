@@ -1855,6 +1855,7 @@ fn test_insert_into_input() {
 
 #[test]
 fn test_copy_on_select() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
 
@@ -2117,6 +2118,7 @@ fn test_alt_screen_select_with_sgr_mouse() {
 // Regression test for WAR-3433 on find bar selection crash.
 #[test]
 fn test_find_bar_select() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
 
@@ -2252,6 +2254,7 @@ fn test_viewport_iter_most_recent_at_bottom() {
 
 #[test]
 fn test_viewport_iter_most_recent_at_top() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
 
@@ -2301,6 +2304,7 @@ fn test_viewport_iter_most_recent_at_top() {
 
 #[test]
 fn test_viewport_most_recent_at_top() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
 
@@ -2767,6 +2771,7 @@ fn run_navigation_test(input_mode: InputMode) {
 
 #[test]
 fn test_navigate_blocks() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     run_navigation_test(InputMode::PinnedToBottom);
 }
 
@@ -2881,6 +2886,7 @@ fn test_block_select() {
 
 #[test]
 fn test_select_all_blocks() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
 
@@ -2967,6 +2973,7 @@ fn test_expand_selection_above_and_below() {
 
 #[test]
 fn test_copy_blocks() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
 
@@ -3210,16 +3217,19 @@ fn run_find_test(input_mode: InputMode) {
 
 #[test]
 fn test_find_in_blocks() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     run_find_test(InputMode::PinnedToBottom);
 }
 
 #[test]
 fn test_find_in_blocks_inverted_blocklist() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     run_find_test(InputMode::PinnedToTop);
 }
 
 #[test]
 fn test_case_sensitive_find() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
 
@@ -3312,6 +3322,7 @@ fn test_case_sensitive_find() {
 
 #[test]
 fn test_find_bar_prefix_search() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
 
@@ -4169,6 +4180,7 @@ fn agent_footer_updates_chip_groups_when_side_assignment_changes() {
 
 #[test]
 fn test_link_at_range_trims_zero_width_spaces() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let terminal = add_window_with_terminal(&mut app, None);
@@ -6422,6 +6434,7 @@ fn onekey_empty_candidates_with_empty_query_returns_empty_ordered() {
 /// block 选区可以同时存在。此时 `copy()` 必须复制 input 选区,而不是 block 内容。
 #[test]
 fn copy_prioritizes_input_selection_over_selected_blocks() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let terminal = add_window_with_terminal(&mut app, None);
@@ -6580,6 +6593,7 @@ fn cmd_enter_from_terminal_without_selected_block_enters_agent_view() {
 
 #[test]
 fn cmd_enter_from_terminal_with_selected_block_enters_agent_view_with_context() {
+    let _recovery = crate::features::FeatureFlag::TerminalLifecycleRecovery.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         app.add_singleton_model(ImportedConfigModel::new);

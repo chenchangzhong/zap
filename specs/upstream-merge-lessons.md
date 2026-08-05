@@ -1,6 +1,7 @@
 # 上游合并经验文档
 
 > **同步边界**：`7cbb22d5c` 之后拣入 34 commit（散点，非连续区间；详见 §19）
+> **✅ 遗漏修复（2026-08-05）**：terminal lifecycle recovery 栈 6 commit（#12853/#12854/#12855/#12856/#12858/#12859）已按方案 A 完整移植（详见 §21.4/§23）；§22 重扫发现的 5 件遗漏已全部拣入（zsh glitch 剥离 #14166/#12438、尾点链接 #12965、Hermes BracketedPaste #14367、系统终止 #12480、O(1) 焦点 #13113，详见 §23）
 > Zap 分支：`5e5dc06da7b8e8273b874a33f8c7946c575654e7`
 > 最后核验：2026-08-05，`cargo check` 通过（0 error）；`cargo nextest run -p warp -E 'test(code_review_view) or test(comment_list) or test(slash_command)'` 92/92 通过
 >
@@ -491,7 +492,7 @@ grep -rl 'AgentProviderApiType::DeepSeek' app crates | wc -l   # 应 > 0
 
 ### 教训
 
-- **同步盲区**：第一轮起点 `89f742fa6`（7-24）之前的上游 master commit（7-20~7-24）从未被评估。下次同步应确认盲区范围（建议核对 `5e5dc06d`（分支点）之后所有 master commit），或至少对 agent 相关主题做 `git log --all --not HEAD` 全量扫描。
+- **同步盲区（2026-08-05 修正）**：第一轮起点 `89f742fa6`（7-24）之前的上游 master commit 从未被评估。原记录把盲区估为 7-20~7-24，**实际至少到 6-23** —— 2026-08-05 发现 terminal lifecycle recovery 栈（`43c21508f` #12858 及其前置 #12853~#12856、开关 `d81d7b067` #12859，日期 6-23~7-02）整条落在此盲区内，从未上过任何一轮评估清单。**盲区修正为：fork 点（`0dbd3d567`，4-28）之后、第一轮起点（`89f742fa6`，7-24）之前的所有 master commit 均视为未评估**，下次同步必须覆盖。建议核对 `5e5dc06d`（分支点）之后所有 master commit，或至少对 agent + terminal 主题做 `git log --all --not HEAD` 全量扫描。
 - **本地精简版文件**：`agent_conversations_model.rs` 等文件本地为精简版，上游修复可能落在已删区域，需先对比行数与结构再决定。
 
 ---
@@ -1189,5 +1190,254 @@ if self.is_cli_agent_rich_input_open(ctx) && !terminal_is_focused {
 
 ---
 
-*文档版本：v1.8*
+## 21. 遗漏项记录（2026-08-05）：terminal lifecycle recovery 栈
+
+> 发现路径：用户报告「两个 omp 同时启动后左侧标签页 spinner 消失」。排查确认
+> 根因是 `in_flight_in_band_command_count` 计数器泄漏（一次 `CommandFinished`
+> 丢失 → 计数器永久 > 0 → `set_title` 永久 no-op → OSC 0 标题停止更新 → spinner
+> 冻结）。上游有完整修复栈，本 fork 未合并。
+
+### 21.1 遗漏的 7 个 commit（全部在盲区内）
+
+| commit | PR | 日期 | 内容 |
+|--------|-----|------|------|
+| `8ef527eb7` / `14b0489fa` | #12853 | 06-23 / 06-30 | Precmd 携带命令完成元数据（stack 1/7） |
+| `077749693` | #12854 | 07-01 | 区分带完成元数据的 Precmd 与仅 prompt 的 Precmd（2/7） |
+| `171f681a6` | #12855 | 07-01 | 集中化 terminal lifecycle 变更（3/7） |
+| `cb40a808e` | #12856 | 07-02 | 用 coordinator 门控 lifecycle 迁移（4/7） |
+| `43c21508f` | #12858 | 07-02 | 从 Precmd 完成元数据恢复丢失的 CommandFinished（6/7） |
+| `d81d7b067` | #12859 | 07-02 | dogfood 开启 lifecycle recovery（开关） |
+| `19ebec9da` | #13788 | 07-15 | **prod 开启 lifecycle recovery（2026-08-05 补记）** |
+
+> #12857 不在本地对象库（stack 5/7 未 fetch 到或未合并）。栈依赖关系：
+> #12853 → #12854 → #12855 → #12856 → #12858；#12859 是 dogfood 开关、
+> #13788 提升到 prod。§21.1 初版漏记 #13788（单独日期 07-15，超出
+> 6-23~7-02 栈窗口），2026-08-05 全量重扫时补齐。
+
+### 21.2 根因分析：为什么漏了
+
+1. **时间盲区**：栈日期 6-23~7-02，早于第一轮同步起点 `89f742fa6`（7-24）整整一个月。§13 原记录把盲区低估为 7-20~7-24。
+2. **主题盲区**：历轮对账聚焦 agent 主题（§12/§13 用户单子、§14 `cli_agent_sessions/` 目录）。该栈在 `terminal/model/lifecycle/`（block 完成检测层），不在任何一轮主题雷达内。
+3. **全量对账名不副实**：§17 声称「fork 点全量对账」，实际落地 9 个全是小修复（+4~+34 行），terminal model 层的 1000+ 行大栈未进视野。
+4. **决策表可能的误导**（推测，无记录佐证）：速查表「CLIAgent::OhMyPi / CLI agent session → 取本地」若被粗套用，可能把该栈误归「CLI agent 相关 = Zap 自研不动」。
+
+### 21.3 本 fork 现状（2026-08-05 核实）
+
+```
+in_flight_in_band_command_count:
+  += 1  blocks.rs:2926  (start_active_block_for_in_band_command)
+  -= 1  blocks.rs:3824  (仅 command_finished, saturating_sub)
+  读    blocks.rs:3230  (is_writing_or_executing_in_band_command)
+```
+
+无超时、无 Precmd 恢复、无 lifecycle 协调器。`FeatureFlag::TerminalLifecycleRecovery`
+仍有声明但无任何实现代码（空壳 flag）。对比上游：递减在
+`complete_active_block_and_advance`（upstream blocks.rs:3161-3174），
+`command_finished` 委托之，故 Precmd 恢复路径也能递减。
+
+### 21.4 裁决与执行（2026-08-05 已执行方案 A）
+
+| 方案 | 做法 | 代价 |
+|------|------|------|
+| A | 移植整个栈（#12853~#12859，缺 #12857） | 大：8 文件 +1000+ 行，跨基线无 merge-base，`blocks.rs` 有 fork 本地改动（`clear_visible_screen` 37ddfdc39/6e6f293f4）会冲突 |
+| B | 仅移植恢复核心 | 中：抄上游设计易漏状态机细节 |
+| C | 计数器加超时归零兜底 | 最小：偏离上游，治症状 |
+
+**已执行 A**（用户批准「与上游一致 + 保留本地功能」）。C 会留下与上游的长期分歧
+（§17.2「为 N 行修复引入 M 行前置」权衡）。执行详情与验证见 §23。
+
+### 21.5 观察到的副作用（未验证推测，勿据此排优先级）
+
+99770 进程残留两个与当前 session 不匹配的 `model-switch-*.sock`。与
+`socket not found (omp not running?)` 类切模型故障疑似相关，但与本次
+spinner bug 的关联未证实。
+
+---
+
+## 22. 遗漏项全量重扫（2026-08-05）：盲区修正后的重新对账
+
+> 触发：§21 发现 lifecycle 栈在盲区（6-23~7-02 早于第一轮起点 7-24）后，
+> 修正 §13 盲区记录，并对上游 master（tip `c8a166b6c`，本轮 fetch 推进
+> 自 `02c042063`）6-23 起全量重扫。方法：主题关键词过滤 784 个 commit →
+> 344 个命中 → 排除已记录/已处理 → 16 个候选逐符号对照（2 个 scout 并行）。
+> 推送基线核实：`origin/main` 已含历轮全部拣入（第九轮 34 个在
+> `30461e317`），`main` 仅领先 1 个本地 commit（`38cfa4481`，§20 改动）。
+
+### 22.1 新发现的遗漏（5 件，按优先级）
+
+| # | commit | PR | 主题 | 判定证据 |
+|---|--------|-----|------|----------|
+| 1 | `0b07f7c2e` + 前置 `ae832ff68` | #14166 + #12438 | zsh prompt 显式宽度构造（glitch）剥离机制整体缺失 | 本地 zsh_body.sh grep `warp_strip_glitch_width_constructs`/`_WARP_RAW_PROMPT`/`_warp_stripped_prompt` 全 0；本地 wrap 为 `%{$prompt_prefix$ORIGINAL_PROMPT$suffix%}`（与上游修复前逐字一致）；本地架构前提（隐藏 prompt 网格 + WARP_HONOR_PS1）与上游相同 → 静态+动态两层剥离均缺 |
+| 2 | `6d1ac1dd` | #12965 | terminal 文件链接尾句点（`.md.`）污染高亮与分类 | 本地 `terminal/view/link_detection.rs` `SUFFIXES_TO_REMOVE` 仅 `["@"]`，无 period trim 分支；`path_without_trailing_sentence_period` 0 命中；Windows 路径归一化剥尾点的 bug 场景在本地成立 |
+| 3 | `21b35edb` | #14367 | Hermes 语音转写未走 BracketedPaste | 本地 `agent_input_footer/mod.rs:1608-1617` else 分支仍 `WriteToPty(transcribed_text)`（与上游修复前逐字一致）；`InsertIntoCLIPty` 0 命中；本地 Hermes 走 DelayedEnter，不构成等效。BracketedPaste 机制本地已存在（OhMyPi/Codex 用），移植面小 |
+| 4 | `ebe8be84` | #12480 | 系统发起终止（logout/重启/OS 更新）不应被 quit-warning 拦截 | 本地 `on_should_terminate_app` 签名仍是 `|ctx|`（`app/src/lib.rs:1882`），`TerminationRequestSource` 0 命中；macOS 侧 quit-warning 模态无可见窗口挂靠的 #12441 场景在本地成立 |
+| 5 | `2f4d1d24` | #13113 | `is_any_ai_block_focused` O(1) 化（纯性能） | 本地 `view.rs:7159` 仍是 O(n) 逐 rich-content `is_self_or_child_focused`；需 warpui_core ancestor-set API 适配，无行为收益 → 低价值 |
+
+### 22.2 判为不适用/取本地（6 件）
+
+| commit | PR | 主题 | 判定 |
+|--------|-----|------|------|
+| `8a30a37ff` | #13766 | 上游新增 OhMyPi 原生支持 | **取本地**（§1）：上游加了枚举变体+OSC777 监听，但本地自研集成（OmpModelSelector、plugin manager）更完整，合并即覆盖本地 |
+| `974bd763` | #13191 | CliAgentUserQuery / LRC snapshot 竞态 | **不适用**：queued-query 子系统 + 云协议本地不存在；本地有自己的等效处理（controller.rs LRC→CLI subagent 路由 + `collect_linearized_task_messages` 去重） |
+| `28f25535f` | #13774 | LRC 渲染（blockgrid + warp_tui） | **不适用**：主体在已删 warp_tui；blockgrid 侧新增 `visible_cursor_display_position` 无本地消费方 |
+| `87f0753c` | #13333 | BlocklistAIInputModel surface-agnostic 重构 | **不适用**：为 TUI/GUI 双 surface 解耦，本地单 surface 无收益，且与本地 input_model 定制冲突 |
+| `b15bdd3a` | #13013 | TerminalManager view-agnostic 重构 | **不适用**：纯 3k 行架构重构，为上游未来 TUI，无功能修复；本地 local_tty 982 行 vs 上游重构前 2755 行 |
+| `d4997e6c` | #12887 | 提取 warp_multi_agent_client crate | **不适用**：依赖 `server_api.rs`/`api/impl.rs` 本地均不存在，链断（§0 先例） |
+
+### 22.3 判为已合入（2 件）
+
+| commit | PR | 主题 | 证据 |
+|--------|-----|------|------|
+| `37dc8830d` | #13317 | macOS rich-text glyph 字体身份修复 | 本地 `d6270ce32` 同源 |
+| `9444f94d` | #12841 | markdown 表格选区 click-through（1 行） | 本地 `elements/table/mod.rs:1215-1216` 逐字相同（§18.5 路径陷阱实例：上游 `gui/` 目录本地已去前缀） |
+
+### 22.4 上游已废弃（1 件）
+
+| commit | PR | 主题 | 判定 |
+|--------|-----|------|------|
+| `fa831815` | #12619 | multiline command grid preexec 对账 | **不拣**：上游 `0b07f7c2e`（#14166）已回滚其整段 Rust 逻辑，根因并入 zsh 动态剥离方案；本地现状与回滚后一致 |
+
+### 22.5 合并顺序（2026-08-05 已全部执行）
+
+1. **#14166 + #12438**（zsh glitch 剥离，含 #12619 清理语义）—— 根因级，适用本地架构
+2. **#14367**（Hermes BracketedPaste）—— 移植面小，机制现成
+3. **#12965**（尾点链接）—— 单函数插入
+4. **#12480**（系统终止不拦截）—— 签名变更 + 平台层，需评估 warpui 改动面
+5. **#13113**（O(1) 焦点判定）—— 低价值，可选
+
+lifecycle 栈（§21）按 §21.4 方案 A 执行。全部执行记录见 §23。
+
+### 22.6 本轮教训
+
+1. **盲区修正后必须全量重扫**：§13 的「7-20~7-24」低估导致 lifecycle 栈（6-23 起）
+   从未进评估清单；修正为 fork 点后，一次主题过滤就捞出 5 件新遗漏。
+2. **上游已回滚的 commit 不拣**：`fa831815` 单看是真遗漏，但上游自己用
+   `0b07f7c2e` 回滚了它——拣入 = 把上游否决的方案搬进来（§18.1 同构）。
+3. **「上游也做了 Zap 自研功能」优先取本地**：`8a30a37ff` 上游加 OhMyPi，
+   方向与本地一致但本地更完整——不是遗漏，是竞争实现，按 §1 不动。
+4. **性能重构与 bug 修复要分开裁决**：`b15bdd3a`/`87f0753c` 是纯架构重构
+   （无行为收益），`13113` 是纯性能（低价值），都不该与真修复同权。
+5. **已推送基线要核实**：`origin/main` 含全部历轮拣入，扫描以推送态为准，
+   未推送的 1 个本地 commit（§20）不构成扫描差异。
+
+---
+
+## 23. 第二批拣入执行记录（2026-08-05）：5 件遗漏 + lifecycle 栈
+
+> 按 §22.5 顺序 + §21.4 方案 A 执行。原则：**与上游一致 + 保留本地新增/优化功能**。
+> 全部未提交（工作区），`cargo check -p warp` 绿，相关测试全过。
+
+### 23.1 zsh glitch 剥离（#12438 + #14166）
+
+| 文件 | 改动 |
+|------|------|
+| `app/assets/bundled/bootstrap/zsh_body.sh` | 静态+动态两层：新增 `warp_strip_glitch_width_constructs()`（#12438）与 `_warp_stripped_prompt()`/`_WARP_RAW_PROMPT`（#14166 动态 wrapper，`${(e)...}` 展开 subshell）；`ORIGINAL_PROMPT` 赋值改为 `_WARP_RAW_PROMPT` 维护（幂等）；Warp-prompt wrap 按 `promptsubst` 开关分支；删除 `ORIGINAL_RPROMPT` 死赋值（上游 #14166 同删） |
+
+验证：zsh 语法检查 ✓；4 组功能测试（静态剥离/`%%` 转义不误伤/动态 subshell 展开/空值）✓。
+注意：`bash_body.sh`/`fish.sh`/`pwsh.ps1` 的 glitch 机制上游未移植（上游仅 zsh），不做。
+
+### 23.2 Hermes BracketedPaste（#14367）
+
+| 文件 | 改动 |
+|------|------|
+| `agent_input_footer/mod.rs` | 语音 else 分支 `WriteToPty` → `InsertIntoCLIPty`；事件枚举加变体 |
+| `use_agent_footer/mod.rs` | `rich_input_submit_strategy` Hermes 移入 `BracketedPaste`；新增 `insert_text_into_cli_agent_pty` + `write_cli_agent_text`；`BracketedPaste`/`BracketedPasteDelayedEnter` 分支复用新函数；`UseAgentToolbarEvent` 加变体 + handler + 转发 |
+| `input.rs` | match 分支补 `InsertIntoCLIPty` |
+| `mod_test.rs` | 2 个新测试（strategy 断言 + 多行语音 bracketed paste 不提交） |
+
+验证：cargo check ✓；新增测试 ✓。
+
+### 23.3 尾点链接（#12965）
+
+| 文件 | 改动 |
+|------|------|
+| `link_detection.rs` | 新增 `path_without_trailing_sentence_period()`（剥尾点但保留 `.`/`..`/`foo/.` 组件）；`compute_valid_paths` 的 exact lookup 前插入 trim 先行分支（本地签名多 `validation_ctx` 参数已适配） |
+| `link_detection_tests.rs`（新） | 2 个测试（纯函数边界 + `.md.` 回归） |
+
+### 23.4 系统终止不拦截（#12480）
+
+| 文件 | 改动 |
+|------|------|
+| `warpui_core/platform/app.rs` | 新增 `TerminationRequestSource` 枚举；`on_should_terminate_app` 签名加 source；`should_terminate_app` 透传 |
+| `warpui/platform/{headless,mac,winit}` | 各平台调用传 `TerminationRequestSource::User`（mac 侧按 `system_initiated` 区分） |
+| `mac/objc/app.{h,m}` | 签名加 `BOOL systemInitiated`；`isSystemInitiatedTermination()` 解析 `kAEQuitReason`；系统终止直接 `NSTerminateNow` |
+| `app/src/lib.rs` | 闭包签名 + `System` 分支（跳过 quit-warning 与 apply_pending_update，注释说明 #12441 场景） |
+
+### 23.5 O(1) 焦点判定（#13113）
+
+| 文件 | 改动 |
+|------|------|
+| `warpui_core/core/app.rs` | 内层 `AppContext` 加 `view_ancestors()` 公开方法（包装 `presenter.ancestors`） |
+| `terminal/view.rs` | `is_any_ai_block_focused` 从 O(n) `is_self_or_child_focused` 改为 ancestor-set 判定 |
+
+注意：外层 wrapper 加方法不可见（ViewContext Deref 目标是内层 AppContext），首轮加错层已修正。
+
+### 23.6 lifecycle 栈（#12853/#12854/#12855/#12856/#12858/#12859，方案 A）
+
+| commit | 移植方式 |
+|--------|----------|
+| #12853 | 4 个 bootstrap 脚本提取 `next_block_id` + Precmd 加 `exit_code`/`next_block_id`；dcs_hooks 忽略新字段 |
+| #12854 | `PrecmdHookValue` 枚举化（WithCompletionMetadata/PromptOnly）+ `CompletionMetadata`/`PromptMetadata` 拆分；11 生产文件 `format-patch` + `git apply --3way` + 手工解冲突 |
+| #12855 | `complete_active_block_and_advance`/`apply_precmd_to_active`/`apply_preexec_to_active` 抽取；本地 ctrl-l 延迟清理逻辑保留在 `apply_precmd_to_active` |
+| #12856 | `lifecycle/` 3 新文件（mod 124/telemetry 215/transition 298 行）+ coordinator 门控；**共享会话 viewer/event_loop.rs 本地不存在→跳过** |
+| #12858 | Precmd 恢复逻辑 + `completion_mismatch` 字段；import 合并两处（@both 后清理重复） |
+| #12859 | `TerminalLifecycleRecovery` 已在 DOGFOOD_FLAGS |
+
+**本地适配关键点**：
+1. **telemetry.rs**：上游依赖 `warp_core::telemetry` API（本地已精简为 no-op 宏集）→ 保留 `LifecycleRecoveryRecord`/`LifecycleTelemetryLimiter`/枚举，去掉 `TelemetryEvent` trait 实现与 `register_telemetry_event!`/`enum_events`。对应删掉 mod_tests 的 payload/contains_ugc 测试。
+2. **本地自研保留**：`create_restored_command_block`（适配 `PromptMetadata` 结构）、ctrl-l 延迟清理（§20 同源）、kitty 扩展（uppercase delete/virtual placements/z-index 等，与上游对比 100% 保留）。
+3. **事件补齐**：`BlockWorkingDirectoryUpdated` 变体+struct+Debug fmt 从上游补齐（本地早期分叉缺失，`set_current_working_directory` 依赖）。
+4. **trait 补齐**：`ansi::Handler` 加 `set_current_working_directory`（本地分叉缺失）。
+5. **测试适配**（上游语义：mock 的 bootstrap 序列在 `TerminalLifecycleRecovery` off 时被 coordinator 拦截）：
+   - `kitty_test.rs` 45 个测试统一加 `TerminalLifecycleRecovery.override_enabled(true)`（与上游 43c21508f 测试做法一致）
+   - `terminal_model_test.rs` 4 个（ssh_bootstraps/exit_alt_screen/restored_empty/restored_blocks）
+   - `zero_state_block_tests.rs` 移植上游 `advance_prebootstrap_to_script_execution` helper
+   - 旧 API 测试批量转换：`.precmd(PrecmdValue)` → `.prompt_only_precmd(PromptMetadata)`、`CommandFinishedValue { exit_code, next_block_id }` → `{ completion_metadata: CompletionMetadata { ... } }`
+
+### 23.7 验证
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp` | ✅ 绿（22 个既有 warning） |
+| 相关测试 93 个（bracketed_paste/link_detection/hermes/ctrl_c/lifecycle/zero_state/kitty） | ✅ 全过 |
+| `terminal::model` 全量 | 541 通过，**新增失败归零**（仅剩基线既有 7 个：regex/secrets/kitty delete 类，基线 worktree 复现确认） |
+| lifecycle 测试 6 个 | ✅ 全过 |
+
+### 23.8 本轮教训
+
+1. **跨基线 3way 移植用 `format-patch` + `git apply --3way` 按文件应用**：`git show <sha> -- <file>` 输出不被 apply 接受（corrupt patch），format-patch 输出可。index 与 base 不一致时先 `git add` 再 3way。
+2. **`@both` 合并 import 会重复**：3way 已在别处加过相同 import 时，@both 产生重复定义（E0252），需清理。
+3. **外层 wrapper 方法对 ViewContext 不可见**：ViewContext Deref 目标是内层 AppContext（`self.0.borrow()` 那个），公开方法必须加在内层（§23.5 首轮加错层）。
+4. **`RecoveryDisabled` 拦截 mock bootstrap 是上游语义**：`TerminalLifecycleRecovery` off 时，phase=Unknown 的 mock 序列（command_finished/precmd）被 coordinator 以 `Ignore(RecoveryDisabled)` 拦截 → bootstrap 不完成。真实 shell phase=Executing 不受影响。测试需 override flag（上游 43c21508f 的测试已这么做）。
+5. **本地专有测试暴露上游代码缺陷**：kitty_test 走 `process_bytes` 的 StoreAndDisplay 空 map 路径（上游无此测试）。本轮回合通过 override 修复（bootstrap 完整后正常），缺陷本身与上游一致（上游也无此场景测试）。
+6. **方法名转换用 ast_edit 对多行参数不匹配**：`.precmd($ARG)` 对 `precmd(PrecmdValue {\n...})` 多行结构不生效，需 sed 兜底。
+
+### 23.9 代码评审整改（2026-08-05，9 个 reviewer 并行）
+
+9 个 reviewer（8 组 + 1 平台组）审查 50 文件。结果：5 approve，4 changes-requested。
+整改后全量测试**新增失败归零**（工作区 28 失败 == 基线 28，全为既有）。
+
+| 严重级 | finding | 处置 |
+|--------|---------|------|
+| **high** | OSC 7 CWD 链是死代码（RevTermModel）：移植 #12854 时 3way 带入 `set_current_working_directory`（上游 #9279 的功能），但本地无 `b"7"` OSC 解析、BlockList 无 delegate、model_events 无分发 → trait 方法 + 2 覆写 + 事件全不可达 | **删除**死代码：trait 方法（handler.rs）、TerminalModel 覆写（terminal_model.rs）、Block 覆写 + `BlockWorkingDirectoryUpdatedEvent` 发射（block.rs）、事件变体 + struct + Debug fmt（event.rs）、import。理由：#9279 是独立功能（5-21），不在本次移植范围；死代码注释声称的行为本地不存在，误导。本地保持无 OSC 7 现状（pwd 靠 precmd 更新）。**下次同步若移植 #9279 需整套补** |
+| medium | 同上（RevAnsi/RevBlockLifecycle 各报一次） | 同上 |
+| low | #12854 分类测试只留 happy path，4 个分类/KV 测试缺失（RevAnsi） | **已移植 4 个**（parse_dcs_precmd_classifies_prompt_only_payload / rejects_partial_completion_metadata / pending_precmd_classifies / rejects_partial_or_invalid），全过 |
+| low | mock bootstrap 拦截影响 find ×7 + input ×1 + view ×14 + search ×3（多处） | **已加 override**（与上游测试做法一致）：block_list_test 7、input_test 1、view_test 14、data_source_tests 3 |
+| low | lifecycle 集成测试缺失（RevTermModel：上游 ~17 个 TerminalModel 层集成测试未移植） | **不做**（记录）：coordinator 单元测试已有，TerminalModel 层集成测试工作量大，低优先，后续补 |
+| nit | BTreeSet 孤儿 import（RevLifecycleTests） | **已删** |
+| nit | 硬编码 11（RevFooter） | **已改** `b"line1\nline2".len()` |
+| nit | input_test/view_test/zero_state rustfmt（RevView/RevFooter/RevTermModel/RevBlockLifecycle） | **已跑 cargo fmt** |
+| nit | 文件尾换行（RevBlockLifecycle） | 确认已有 |
+| low | RPROMPT 空值 guard 缺失（RevBootstrap：上游 #11868） | **不修**（记录）：既有分叉（HEAD 就有），非本次引入；同类 wrapped-redraw bug，后续对齐 |
+| low | complete_active_block_and_advance 缺 ScriptExecution eager start（RevBlockLifecycle） | **不修**（记录）：既有分叉（HEAD 同样没有），非本次引入 |
+| — | test_directory_search_support 失败 | **无关**：i18n 初始化问题（t! before init），与本次改动无交集 |
+
+**评审教训**：
+1. **3way 带入的上游上下文行可能是独立功能**：`set_current_working_directory` 是 #9279（OSC 7）的，不在 #12854 改动里，但 3way 因本地缺失把它带进来。移植时对"上下文行引入的新符号"要查上游来源 commit，判断是当前栈的一部分还是独立功能——独立功能要么整套移植要么删除，不留半截死链。
+2. **mock bootstrap 拦截影响面远超预期**：lifecycle 合入后所有依赖 mock 完整 bootstrap 的测试（find/view/input/search）都受影响，逐模块全量测试才能发现。上游合入时同步适配了测试库，本地需按上游模式（override）补齐。
+3. **reviewer 并行分组按文件局部性有效**：3 个 reviewer 独立发现同一 OSC 7 死链（high/medium），交叉验证了 severity。
+
+---
+
+*文档版本：v2.2*
 *下次合并前必读*
