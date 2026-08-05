@@ -21,7 +21,6 @@ mod search_bar;
 pub mod search_results_menu;
 pub mod searcher;
 pub mod slash_command_menu;
-pub mod welcome_palette;
 mod workflows;
 
 pub use item::SearchItem;

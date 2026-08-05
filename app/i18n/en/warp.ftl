@@ -2062,10 +2062,6 @@ keybinding-desc-code-save-as = Save file as
 keybinding-desc-code-close-all-tabs = Close all tabs
 keybinding-desc-code-close-saved-tabs = Close saved tabs
 
-# Welcome view binding desc
-keybinding-desc-welcome-terminal-session = Terminal session
-keybinding-desc-welcome-add-repository = Add repository
-
 # AI assistant panel binding desc
 keybinding-desc-ai-assistant-close = Close Zap AI
 keybinding-desc-ai-assistant-focus-terminal-input = Focus Terminal Input From Zap AI
@@ -2519,15 +2515,13 @@ rewind-dialog-cancel = Cancel
 rewind-dialog-confirm = Rewind
 
 # --- ANCHOR-SUB-SEARCH-PALETTES ---
-# Search palettes (app/src/search/command_palette/view.rs, app/src/search/welcome_palette/view.rs)
+# Search palettes (app/src/search/command_palette/view.rs)
 command-palette-search-placeholder = Search for a command
 command-palette-no-results = No results found
 command-palette-toast-cannot-switch-conversations = Cannot switch conversations while agent is monitoring a command.
 command-palette-toast-cannot-start-new-conversation = Cannot start a new conversation while agent is monitoring a command.
 command-palette-zero-state-recent = Recent
 command-palette-zero-state-suggested = Suggested
-welcome-palette-search-placeholder = Code, build, or search for anything...
-welcome-palette-no-results = No results found
 search-filter-placeholder-history = Search history
 search-filter-placeholder-workflows = Search workflows
 search-filter-placeholder-agent-mode-workflows = Search prompts

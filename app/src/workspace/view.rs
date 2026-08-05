@@ -3599,8 +3599,6 @@ impl Workspace {
         let open_warp_drive = if !show_warp_home {
             if self.should_trigger_get_started_onboarding(ctx) {
                 self.trigger_get_started_onboarding(ctx);
-            } else if FeatureFlag::WelcomeTab.is_enabled() {
-                self.add_welcome_tab(ctx);
             } else {
                 self.add_new_session_tab_with_default_mode(
                     NewSessionSource::Window,
@@ -10255,26 +10253,6 @@ impl Workspace {
             None,
             None,
             hide_homepage,
-            ctx,
-        );
-        ctx.notify();
-    }
-
-    fn add_welcome_tab(&mut self, ctx: &mut ViewContext<Self>) {
-        let startup_directory = self.get_new_tab_startup_directory(
-            NewSessionSource::Tab,
-            Some(ctx.window_id()),
-            None,
-            ctx,
-        );
-        self.add_tab_with_pane_layout(
-            PanesLayout::Snapshot(Box::new(PaneNodeSnapshot::Leaf(LeafSnapshot {
-                is_focused: true,
-                custom_vertical_tabs_title: None,
-                contents: LeafContents::Welcome { startup_directory },
-            }))),
-            Arc::new(HashMap::new()),
-            None,
             ctx,
         );
         ctx.notify();
@@ -18885,11 +18863,7 @@ impl TypedActionView for Workspace {
                     DefaultSessionMode::Terminal
                     | DefaultSessionMode::Agent
                     | DefaultSessionMode::AmbientAgent => {
-                        if FeatureFlag::WelcomeTab.is_enabled() {
-                            self.add_welcome_tab(ctx);
-                        } else {
-                            self.add_terminal_tab(false, ctx);
-                        }
+                        self.add_terminal_tab(false, ctx);
                     }
                 }
             }

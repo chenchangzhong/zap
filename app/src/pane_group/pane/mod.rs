@@ -28,8 +28,6 @@ pub(crate) mod sftp_pane;
 pub(crate) mod ssh_server_pane;
 pub(super) mod terminal_pane;
 pub mod view;
-pub(super) mod welcome_pane;
-pub(crate) mod welcome_view;
 pub mod workflow_pane;
 
 use std::{any::Any, fmt::Display};
@@ -69,13 +67,10 @@ pub use self::view::PaneHeaderCustomAction;
 pub use self::view::PaneView;
 pub use self::view::PaneViewEvent;
 
-use welcome_view::WelcomeView;
-
 use super::{ActivationReason, LeafContents, PaneGroup, PaneGroupAction};
 
 pub(super) fn init(app: &mut AppContext) {
     self::view::init(app);
-    welcome_view::init(app);
     get_started_view::init(app);
 }
 
@@ -154,7 +149,6 @@ pub(crate) enum IPaneType {
     GetStarted,
     SshServer,
     Sftp,
-    Welcome,
     DeferredPlaceholder,
     /// A pane type only for tests.
     #[cfg(test)]
@@ -180,7 +174,6 @@ impl Display for IPaneType {
             IPaneType::GetStarted => write!(f, "GetStarted"),
             IPaneType::SshServer => write!(f, "SSH Server"),
             IPaneType::Sftp => write!(f, "SFTP"),
-            IPaneType::Welcome => write!(f, "Welcome"),
             IPaneType::DeferredPlaceholder => write!(f, "Placeholder"),
             #[cfg(test)]
             IPaneType::Dummy => write!(f, "Dummy"),
@@ -268,10 +261,6 @@ impl PaneId {
         ctx: &ViewContext<PaneView<ExecutionProfileEditorView>>,
     ) -> Self {
         Self::new_from_ctx(IPaneType::ExecutionProfileEditor, ctx)
-    }
-
-    pub fn from_welcome_pane_ctx(ctx: &ViewContext<PaneView<WelcomeView>>) -> Self {
-        Self::new_from_ctx(IPaneType::Welcome, ctx)
     }
 
     pub fn from_get_started_pane_ctx(ctx: &ViewContext<PaneView<GetStartedView>>) -> Self {
@@ -386,10 +375,6 @@ impl PaneId {
         sftp_pane_view: &ViewHandle<PaneView<SftpBrowserView>>,
     ) -> Self {
         Self::new(IPaneType::Sftp, sftp_pane_view)
-    }
-
-    pub fn from_welcome_pane_view(welcome_pane_view: &ViewHandle<PaneView<WelcomeView>>) -> Self {
-        Self::new(IPaneType::Welcome, welcome_pane_view)
     }
 
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
@@ -512,9 +497,6 @@ impl PaneId {
             }
             IPaneType::Sftp => {
                 ChildView::<PaneView<SftpBrowserView>>::with_id(self.0.pane_view_id).finish()
-            }
-            IPaneType::Welcome => {
-                ChildView::<PaneView<WelcomeView>>::with_id(self.0.pane_view_id).finish()
             }
             IPaneType::DeferredPlaceholder => warpui::elements::Empty::new().finish(),
             #[cfg(test)]

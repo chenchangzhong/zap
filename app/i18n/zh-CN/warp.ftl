@@ -1984,10 +1984,6 @@ keybinding-desc-code-save-as = 文件另存为
 keybinding-desc-code-close-all-tabs = 关闭所有标签页
 keybinding-desc-code-close-saved-tabs = 关闭已保存的标签页
 
-# 欢迎视图 binding desc
-keybinding-desc-welcome-terminal-session = 终端会话
-keybinding-desc-welcome-add-repository = 添加仓库
-
 # AI 助手面板 binding desc
 keybinding-desc-ai-assistant-close = 关闭 Zap AI
 keybinding-desc-ai-assistant-focus-terminal-input = 从 Zap AI 切回终端输入
@@ -2442,15 +2438,13 @@ rewind-dialog-cancel = 取消
 rewind-dialog-confirm = 倒回
 
 # --- ANCHOR-SUB-SEARCH-PALETTES ---
-# 搜索面板（app/src/search/command_palette/view.rs, app/src/search/welcome_palette/view.rs）
+# 搜索面板（app/src/search/command_palette/view.rs）
 command-palette-search-placeholder = 搜索命令
 command-palette-no-results = 未找到结果
 command-palette-toast-cannot-switch-conversations = 智能体正在监控命令时，无法切换对话。
 command-palette-toast-cannot-start-new-conversation = 智能体正在监控命令时，无法开始新对话。
 command-palette-zero-state-recent = 最近使用
 command-palette-zero-state-suggested = 推荐
-welcome-palette-search-placeholder = 编码、构建，或搜索任意内容...
-welcome-palette-no-results = 未找到结果
 search-filter-placeholder-history = 搜索历史记录
 search-filter-placeholder-workflows = 搜索工作流
 search-filter-placeholder-agent-mode-workflows = 搜索提示词

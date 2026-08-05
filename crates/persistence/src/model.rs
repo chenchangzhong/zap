@@ -15,8 +15,8 @@ use super::schema::{
     mcp_server_installations, mcp_server_panes, notebook_panes, notebooks, object_actions,
     object_metadata, object_permissions, pane_branches, pane_leaves, pane_nodes, panels,
     project_rules, projects, server_experiments, settings_panes, ssh_nodes, ssh_onekey_credentials,
-    ssh_servers, sync_meta, tabs, team_members, team_settings, teams, terminal_panes,
-    user_profiles, welcome_panes, windows, workflow_panes, workflows, workspace_teams, workspaces,
+    ssh_servers, sync_meta, tabs, team_members, team_settings, teams, terminal_panes, user_profiles,
+    windows, workflow_panes, workflows, workspace_teams, workspaces,
 };
 
 #[derive(Insertable)]
@@ -437,15 +437,6 @@ pub struct SettingsPane {
     pub current_page: String,
 }
 
-#[derive(Identifiable, Queryable, Selectable)]
-#[diesel(table_name = welcome_panes)]
-#[diesel(primary_key(id))]
-pub struct WelcomePane {
-    pub id: i32,
-    pub kind: String,
-    pub startup_directory: Option<String>,
-}
-
 /// Maps to the `ai_memory_panes` table
 /// (where table name is historical and not worth a migration to change).
 #[derive(Identifiable, Queryable, Selectable)]
@@ -527,9 +518,6 @@ pub const CODE_REVIEW_PANE_KIND: &str = "code_review";
 
 /// The [`pane_leaves::kind`] value for execution profile editor panes.
 pub const EXECUTION_PROFILE_EDITOR_PANE_KIND: &str = "execution_profile_editor";
-
-/// The [`pane_leaves::kind`] value for the welcome pane.
-pub const WELCOME_PANE_KIND: &str = "welcome";
 
 /// The [`pane_leaves::kind`] value for the get-started pane.
 pub const GET_STARTED_PANE_KIND: &str = "get_started";
@@ -622,13 +610,6 @@ pub struct NewAIFactPane {
 #[diesel(table_name = mcp_server_panes)]
 pub struct NewMCPServerPane {
     pub id: i32,
-}
-
-#[derive(Insertable)]
-#[diesel(table_name = welcome_panes)]
-pub struct NewWelcomePane {
-    pub id: i32,
-    pub startup_directory: Option<String>,
 }
 
 #[derive(Identifiable, Queryable, Selectable)]

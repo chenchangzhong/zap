@@ -27,7 +27,6 @@ use crate::env_vars::EnvVarCollectionType;
 use crate::notebooks::file::FileNotebookView;
 use crate::pane_group::focus_state::PaneGroupFocusEvent;
 use crate::pane_group::pane::get_started_pane::GetStartedPane;
-use crate::pane_group::pane::welcome_pane::WelcomePane;
 use crate::pane_group::pane::ActionOrigin;
 use crate::quit_warning::UnsavedStateSummary;
 use crate::settings::{AISettings, DefaultSessionMode, PaneSettings};
@@ -1845,22 +1844,8 @@ impl PaneGroup {
                     Ok((PaneData::new(pane_id), focus))
                 }
             }
-            LeafContents::Welcome { startup_directory } => {
-                if !FeatureFlag::WelcomeTab.is_enabled() {
-                    Err(anyhow::anyhow!("Welcome pane not supported"))
-                } else {
-                    let pane: Box<dyn AnyPaneContent + 'static> =
-                        Box::new(WelcomePane::new(startup_directory, ctx));
-                    let pane_id = pane.as_pane().id();
-                    pane_contents.insert(pane_id, pane);
-                    let focus = InitialFocus {
-                        focused_pane: leaf.is_focused.then_some(pane_id),
-                        active_session: None,
-                    };
-                    Ok((PaneData::new(pane_id), focus))
-                }
-            } // Zap Wave 7-3:`EnvironmentManagement` LeafContents arm 随 ambient-agent UI
-              // 子系统物理删。
+            // Zap Wave 7-3:`EnvironmentManagement` LeafContents arm 随 ambient-agent UI
+            // 子系统物理删。
         };
 
         if let (Ok((pane_data, _)), Some(title)) = (&result, custom_vertical_tabs_title.as_deref())

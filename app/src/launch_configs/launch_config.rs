@@ -155,7 +155,6 @@ impl TryFrom<PaneNodeSnapshot> for PaneTemplateType {
                 | LeafContents::CodeReview(_)
                 | LeafContents::ExecutionProfileEditor
                 | LeafContents::GetStarted
-                | LeafContents::Welcome { .. }
                 | LeafContents::AIDocument(_)
                 // Zap Wave 7-3:`EnvironmentManagement` arm 随 ambient-agent UI
                 // 子系统物理删。

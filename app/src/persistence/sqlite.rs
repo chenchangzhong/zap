@@ -46,7 +46,7 @@ use super::model::{
     NewWorkspace, NewWorkspaceTeam, ObjectMetadata, ObjectPermissions, Project, Tab, Window,
     AI_DOCUMENT_PANE_KIND, AI_FACT_PANE_KIND, CODE_PANE_KIND, ENV_VAR_COLLECTION_PANE_KIND,
     EXECUTION_PROFILE_EDITOR_PANE_KIND, MCP_SERVER_PANE_KIND, NOTEBOOK_PANE_KIND,
-    SETTINGS_PANE_KIND, TERMINAL_PANE_KIND, WELCOME_PANE_KIND, WORKFLOW_PANE_KIND,
+    SETTINGS_PANE_KIND, TERMINAL_PANE_KIND, WORKFLOW_PANE_KIND,
 };
 use super::schema;
 use super::{
@@ -1034,7 +1034,6 @@ fn save_app_state(conn: &mut SqliteConnection, app_state: &AppState) -> Result<(
         diesel::delete(schema::mcp_server_panes::dsl::mcp_server_panes).execute(conn)?;
         diesel::delete(schema::code_review_panes::dsl::code_review_panes).execute(conn)?;
         diesel::delete(schema::ambient_agent_panes::dsl::ambient_agent_panes).execute(conn)?;
-        diesel::delete(schema::welcome_panes::dsl::welcome_panes).execute(conn)?;
         diesel::delete(schema::pane_leaves::dsl::pane_leaves).execute(conn)?;
         diesel::delete(schema::pane_branches::dsl::pane_branches).execute(conn)?;
         diesel::delete(schema::pane_nodes::dsl::pane_nodes).execute(conn)?;
@@ -1280,7 +1279,6 @@ fn save_pane_state(
         LeafContents::AmbientAgent(_) => AMBIENT_AGENT_PANE_KIND,
         LeafContents::ExecutionProfileEditor => EXECUTION_PROFILE_EDITOR_PANE_KIND,
         LeafContents::GetStarted => GET_STARTED_PANE_KIND,
-        LeafContents::Welcome { .. } => WELCOME_PANE_KIND,
         LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
         // Zap Wave 7-3:`EnvironmentManagement` arm 随 variant 一同物理删。
         LeafContents::SshServer { .. } => {
@@ -1493,17 +1491,6 @@ fn save_pane_state(
         }
         LeafContents::GetStarted => {
             // Stateless
-        }
-        LeafContents::Welcome { startup_directory } => {
-            let welcome_pane = model::NewWelcomePane {
-                id,
-                startup_directory: startup_directory
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
-            };
-            diesel::insert_into(schema::welcome_panes::dsl::welcome_panes)
-                .values(welcome_pane)
-                .execute(conn)?;
         }
         LeafContents::AIDocument(ai_document_snapshot) => match ai_document_snapshot {
             crate::app_state::AIDocumentPaneSnapshot::Local {
@@ -2629,15 +2616,6 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
                     }
                 }
                 GET_STARTED_PANE_KIND => LeafContents::GetStarted,
-                WELCOME_PANE_KIND => {
-                    let welcome_pane = schema::welcome_panes::dsl::welcome_panes
-                        .find(node.id)
-                        .select(model::WelcomePane::as_select())
-                        .first(conn)?;
-                    LeafContents::Welcome {
-                        startup_directory: welcome_pane.startup_directory.map(PathBuf::from),
-                    }
-                }
                 AI_DOCUMENT_PANE_KIND => {
                     let ai_document_pane = schema::ai_document_panes::dsl::ai_document_panes
                         .find(node.id)

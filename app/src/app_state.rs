@@ -140,11 +140,6 @@ pub enum LeafContents {
     ExecutionProfileEditor,
     CodeReview(CodeReviewPaneSnapshot),
     AmbientAgent(AmbientAgentPaneSnapshot),
-    /// An entrypoint pane type to launch other pane types from a search palette. The default view
-    /// when creating a tab.
-    Welcome {
-        startup_directory: Option<PathBuf>,
-    },
     /// A new first-time user experience which prioritizes choosing a coding repository.
     GetStarted,
     /// SSH 服务器编辑器 pane(openWarp 独有)。引用 `ssh_servers.node_id` 主键
@@ -198,7 +193,6 @@ impl LeafContents {
             | LeafContents::ExecutionProfileEditor
             | LeafContents::CodeReview(_)
             | LeafContents::AmbientAgent(_)
-            | LeafContents::Welcome { .. }
             | LeafContents::GetStarted => true,
         }
     }
