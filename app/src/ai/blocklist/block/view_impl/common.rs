@@ -3046,6 +3046,9 @@ pub fn render_failed_output(props: FailedOutputProps, app: &AppContext) -> Box<d
         RenderableAIError::CloudStartupFailed(message) => {
             format!("{ERROR_APOLOGY_TEXT}\n\n{message}")
         }
+        RenderableAIError::AgentExitedShell => {
+            format!("{ERROR_APOLOGY_TEXT}\n\n{}", props.error)
+        }
     };
 
     Flex::row()

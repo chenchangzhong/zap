@@ -757,7 +757,7 @@ impl BlocklistAIHistoryModel {
         status: ConversationStatus,
         ctx: &mut ModelContext<Self>,
     ) {
-        self.update_conversation_status_with_error_message(
+        self.update_conversation_status_with_error(
             terminal_view_id,
             conversation_id,
             status,
@@ -766,21 +766,16 @@ impl BlocklistAIHistoryModel {
         );
     }
 
-    pub fn update_conversation_status_with_error_message(
+    pub fn update_conversation_status_with_error(
         &mut self,
         terminal_view_id: EntityId,
         conversation_id: AIConversationId,
         status: ConversationStatus,
-        error_message: Option<String>,
+        error: Option<RenderableAIError>,
         ctx: &mut ModelContext<Self>,
     ) {
         if let Some(conversation) = self.conversations_by_id.get_mut(&conversation_id) {
-            conversation.update_status_with_error_message(
-                status,
-                error_message,
-                terminal_view_id,
-                ctx,
-            );
+            conversation.update_status_with_error(status, error, terminal_view_id, ctx);
         }
     }
 
