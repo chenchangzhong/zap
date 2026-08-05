@@ -2607,7 +2607,6 @@ impl PaneGroup {
         }
     }
 
-
     /// Helper that creates the initial [`PaneData`] and [`InitialFocus`] given a terminal view.
     /// This is a common case in creating a new pane group with a single terminal session.
     fn terminal_pane_data(
@@ -4295,8 +4294,6 @@ impl PaneGroup {
 
         success
     }
-
-
 
     /// Clear all panes that were hidden due to being closed (for undo functionality)
     /// This is typically called when starting pane rearrangement operations

@@ -1035,7 +1035,6 @@ fn register_input_mode_bindings(app: &mut AppContext) {
         & !id!("SubshellBanner")
         & !id!(CLI_AGENT_SESSION_ACTIVE_KEY);
 
-
     // A context predicate that is active when there is a long running command.
     let command_predicate = id!("LongRunningCommand") | id!("AltScreen");
     // A context predicate that is active when the user can switch input to agent mode.
@@ -1062,7 +1061,6 @@ fn register_input_mode_bindings(app: &mut AppContext) {
             | id!(flags::ACTIVE_AGENT_VIEW)
             | id!(flags::ACTIVE_INLINE_AGENT_VIEW)
             | !id!(flags::LOCKED_INPUT));
-
 
     // A context predicate that is active when a user can start a new agent conversation.
     let agent_conversation_predicate = base_context.clone()
@@ -1093,7 +1091,6 @@ fn register_input_mode_bindings(app: &mut AppContext) {
         )
         .with_enabled(|| FeatureFlag::AgentView.is_enabled()),
     ]);
-
 
     app.register_editable_bindings([
         EditableBinding::new(
