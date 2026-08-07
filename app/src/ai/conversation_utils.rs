@@ -10,14 +10,39 @@ pub fn delete_conversation(
     terminal_view_id: Option<EntityId>,
     ctx: &mut AppContext,
 ) {
+    delete_conversations([conversation_id], terminal_view_id, ctx);
+}
+
+/// Delete multiple conversations from the blocklist and local storage.
+pub fn delete_conversations(
+    conversation_ids: impl IntoIterator<Item = AIConversationId>,
+    terminal_view_id: Option<EntityId>,
+    ctx: &mut AppContext,
+) {
     BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, model_ctx| {
-        history.delete_conversation(conversation_id, terminal_view_id, model_ctx);
+        history.delete_conversations(conversation_ids, terminal_view_id, model_ctx);
     });
 
     // Make sure the agent conversations model is up to date.
     AgentConversationsModel::handle(ctx).update(ctx, |model, ctx| {
         model.sync_conversations(ctx);
     });
+}
+
+/// Delete all conversations from the blocklist and local storage.
+///
+/// 进行中/ambient 对话会被跳过,返回被跳过的数量。
+pub fn delete_all_conversations(ctx: &mut AppContext) -> usize {
+    let skipped = BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, model_ctx| {
+        history.delete_all_conversations(model_ctx)
+    });
+
+    // Make sure the agent conversations model is up to date.
+    AgentConversationsModel::handle(ctx).update(ctx, |model, ctx| {
+        model.sync_conversations(ctx);
+    });
+
+    skipped
 }
 
 /// Remove a conversation from the blocklist.

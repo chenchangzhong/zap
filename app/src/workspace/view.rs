@@ -5319,12 +5319,16 @@ impl Workspace {
                 conversation_id,
                 conversation_title,
                 terminal_view_id,
+                conversation_ids,
+                delete_all,
             } => {
                 self.show_delete_conversation_confirmation_dialog(
                     DeleteConversationDialogSource {
                         conversation_id: *conversation_id,
                         conversation_title: conversation_title.clone(),
                         terminal_view_id: *terminal_view_id,
+                        conversation_ids: conversation_ids.clone(),
+                        delete_all: *delete_all,
                     },
                     ctx,
                 );
@@ -9421,13 +9425,34 @@ impl Workspace {
             DeleteConversationConfirmationEvent::Confirm { source } => {
                 self.current_workspace_state
                     .is_delete_conversation_confirmation_dialog_open = false;
-                self.handle_action(
-                    &WorkspaceAction::ExecuteDeleteConversation {
-                        conversation_id: source.conversation_id,
-                        terminal_view_id: source.terminal_view_id,
-                    },
-                    ctx,
-                );
+                if source.delete_all {
+                    self.handle_action(
+                        &WorkspaceAction::ExecuteDeleteAllConversations,
+                        ctx,
+                    );
+                } else if !source.conversation_ids.is_empty() {
+                    self.handle_action(
+                        &WorkspaceAction::ExecuteDeleteConversations {
+                            conversation_ids: source.conversation_ids.clone(),
+                            terminal_view_id: source.terminal_view_id,
+                        },
+                        ctx,
+                    );
+                } else {
+                    let Some(conversation_id) = source.conversation_id else {
+                        log::error!("Delete confirm with no single conversation id");
+                        ctx.focus(&self.left_panel_view);
+                        ctx.notify();
+                        return;
+                    };
+                    self.handle_action(
+                        &WorkspaceAction::ExecuteDeleteConversation {
+                            conversation_id,
+                            terminal_view_id: source.terminal_view_id,
+                        },
+                        ctx,
+                    );
+                }
                 ctx.focus(&self.left_panel_view);
                 ctx.notify();
             }
@@ -20425,6 +20450,55 @@ impl TypedActionView for Workspace {
                         window_id,
                         ctx,
                     );
+                });
+            }
+            ExecuteDeleteConversations {
+                conversation_ids,
+                terminal_view_id,
+            } => {
+                let count = conversation_ids.len();
+                conversation_utils::delete_conversations(
+                    conversation_ids.iter().copied(),
+                    *terminal_view_id,
+                    ctx,
+                );
+
+                // 批量删除时逐条上报会让事件过于密集,这里只上报一次。
+                send_telemetry_from_ctx!(TelemetryEvent::ConversationListItemDeleted, ctx);
+                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    toast_stack.add_ephemeral_toast(
+                        DismissibleToast::success(crate::t!(
+                            "workspace-toast-conversations-deleted",
+                            count = count
+                        )),
+                        window_id,
+                        ctx,
+                    );
+                });
+            }
+            ExecuteDeleteAllConversations => {
+                let skipped = conversation_utils::delete_all_conversations(ctx);
+
+                send_telemetry_from_ctx!(TelemetryEvent::ConversationListItemDeleted, ctx);
+                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    if skipped > 0 {
+                        // 部分对话(进行中/ambient)未被删除,提示用户。
+                        toast_stack.add_ephemeral_toast(
+                            DismissibleToast::error(crate::t!(
+                                "workspace-conversation-list-delete-all-partial"
+                            )),
+                            window_id,
+                            ctx,
+                        );
+                    } else {
+                        toast_stack.add_ephemeral_toast(
+                            DismissibleToast::success(crate::t!(
+                                "workspace-toast-all-conversations-deleted"
+                            )),
+                            window_id,
+                            ctx,
+                        );
+                    }
                 });
             }
             #[cfg(target_family = "wasm")]

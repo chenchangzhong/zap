@@ -51,6 +51,12 @@ pub const STATIC_ITEM_MIN_HEIGHT: f32 = 42.;
 pub struct ItemState {
     pub mouse_state: MouseStateHandle,
     pub overflow_button_state: MouseStateHandle,
+    /// 多选模式下 checkbox 的独立鼠标状态。
+    ///
+    /// 不能与 `mouse_state` 共享:`Hoverable` 在 `LeftMouseUp` 时会
+    /// `click_count.take()` 消费共享状态,深层 checkbox 会抢先取走,
+    /// 导致行上的 click handler 永远拿不到 `Some(click_count)` 而不触发。
+    pub checkbox_mouse_state: MouseStateHandle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,6 +73,10 @@ pub struct ItemProps<'a> {
     pub highlight_indices: Option<&'a Vec<usize>>,
     pub is_selected: bool,
     pub is_focused_conversation: bool,
+    /// 多选模式下该条目是否已勾选。
+    pub is_checked: bool,
+    /// 是否处于多选删除模式(点击切换勾选而非打开)。
+    pub multi_select_mode: bool,
     pub index: usize,
     pub state: &'a ItemState,
     pub overflow_menu: &'a ViewHandle<Menu<ConversationListViewAction>>,
@@ -154,6 +164,8 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
         highlight_indices,
         is_selected,
         is_focused_conversation,
+        is_checked,
+        multi_select_mode,
         index,
         state,
         overflow_menu,
@@ -201,11 +213,30 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
         render_status_element(&conversation.status(app), font_size, appearance)
     };
 
+    let mut icon_and_title_row = Flex::row()
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(ICON_SPACING);
+
+    // 多选模式下最左侧显示 checkbox(未选中=空心框,选中=打勾)。
+    // 点击行为由行上的 on_click 统一处理,checkbox 仅作视觉,避免双重触发。
+    // ambient 对话不可删除,不渲染 checkbox(避免不可勾选的死控件)。
+    if multi_select_mode && !conversation.is_ambient_agent_conversation() {
+        let checkbox = appearance
+            .ui_builder()
+            .checkbox(state.checkbox_mouse_state.clone(), Some(12.))
+            .check(is_checked)
+            .build();
+        icon_and_title_row = icon_and_title_row.with_child(
+            ConstrainedBox::new(checkbox.finish())
+                .with_width(status_element_size)
+                .with_height(status_element_size)
+                .finish(),
+        );
+    }
+
     let icon_and_title_row = Shrinkable::new(
         1.0,
-        Flex::row()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_spacing(ICON_SPACING)
+        icon_and_title_row
             .with_child(icon_element)
             .with_child(Shrinkable::new(1.0, title_text.finish()).finish())
             .finish(),
@@ -219,6 +250,15 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
     )
     .with_color(theme.sub_text_color(theme.background()).into())
     .finish();
+
+    // 多选模式下标题行前插入了 checkbox 槽位,底部行缩进同步,保持对齐。
+    let bottom_padding_left = status_element_size
+        + ICON_SPACING
+        + if multi_select_mode && !conversation.is_ambient_agent_conversation() {
+            status_element_size + ICON_SPACING
+        } else {
+            0.
+        };
 
     let bottom_row = if let Some(subtext) = format_item_subtext(conversation) {
         let subtext_element = Shrinkable::new(
@@ -238,7 +278,7 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
                 .with_child(timestamp)
                 .finish(),
         )
-        .with_padding_left(status_element_size + ICON_SPACING)
+        .with_padding_left(bottom_padding_left)
         .finish()
     } else {
         // If no subtext, still show timestamp in the bottom row
@@ -249,7 +289,7 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
                 .with_child(timestamp)
                 .finish(),
         )
-        .with_padding_left(status_element_size + ICON_SPACING)
+        .with_padding_left(bottom_padding_left)
         .finish()
     };
 
@@ -270,6 +310,8 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
             .with_padding_top(8.);
 
         let container = if is_focused_conversation {
+            container.with_background(theme.surface_overlay_2())
+        } else if is_checked {
             container.with_background(theme.surface_overlay_2())
         } else if is_selected || !matches!(overflow_menu_display, OverflowMenuDisplay::Closed) {
             container.with_background(theme.surface_overlay_1())
@@ -353,7 +395,16 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
     })
     .with_defer_events_to_children();
 
-    let hoverable_element = if open_action.is_some() {
+    let hoverable_element = if multi_select_mode {
+        hoverable
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ConversationListViewAction::ToggleSelectItem {
+                    conversation_id,
+                });
+            })
+            .finish()
+    } else if open_action.is_some() {
         hoverable
             .with_cursor(Cursor::PointingHand)
             .on_click(move |ctx, _, _| {

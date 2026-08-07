@@ -11,7 +11,9 @@ use crate::editor::{
     PropagateHorizontalNavigationKeys, SingleLineEditorOptions, TextOptions,
 };
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
-use crate::view_components::action_button::{ActionButton, ButtonSize, SecondaryTheme};
+use crate::view_components::action_button::{
+    ActionButton, ButtonSize, DangerPrimaryTheme, NakedTheme, SecondaryTheme,
+};
 use crate::view_components::DismissibleToast;
 use crate::workspace::global_actions::ForkedConversationDestination;
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
@@ -128,14 +130,31 @@ pub enum ConversationListViewAction {
         conversation_id: ConversationOrTaskId,
         destination: ForkedConversationDestination,
     },
+    /// 进入/退出多选删除模式。
+    ToggleMultiSelectMode,
+    /// 多选模式下切换某个条目的勾选状态。
+    ToggleSelectItem {
+        conversation_id: ConversationOrTaskId,
+    },
+    /// 勾选当前列表中的全部对话。
+    SelectAllConversations,
+    /// 请求删除所有已勾选的对话(弹确认对话框)。
+    DeleteSelectedConversations,
+    /// 请求删除全部对话历史(弹确认对话框)。
+    DeleteAllConversations,
 }
 
 pub enum Event {
     NewConversationInNewTab,
     ShowDeleteConfirmationDialog {
-        conversation_id: AIConversationId,
+        /// 单条删除时的会话 ID;批量/清空场景为 `None`。
+        conversation_id: Option<AIConversationId>,
         conversation_title: String,
         terminal_view_id: Option<EntityId>,
+        /// 批量删除的会话 ID;为空表示单条删除(走 `conversation_id`)。
+        conversation_ids: Vec<AIConversationId>,
+        /// 是否删除全部历史。
+        delete_all: bool,
     },
 }
 
@@ -145,10 +164,24 @@ pub struct ConversationListView {
     view_model: ModelHandle<ConversationListViewModel>,
     query_editor: ViewHandle<EditorView>,
     toggle_view_all_button: ViewHandle<ActionButton>,
+    /// 进入多选删除模式的按钮。
+    select_button: ViewHandle<ActionButton>,
+    /// 删除全部历史按钮。
+    delete_all_button: ViewHandle<ActionButton>,
+    /// 退出多选模式的按钮。
+    cancel_select_button: ViewHandle<ActionButton>,
+    /// 多选模式下全选按钮。
+    select_all_button: ViewHandle<ActionButton>,
+    /// 删除已勾选对话按钮(标签带数量)。
+    delete_selected_button: ViewHandle<ActionButton>,
     item_overflow_menu: ViewHandle<Menu<ConversationListViewAction>>,
     /// Tracks the overflow menu state (which item it's open for and where to position it).
     overflow_menu_state: Option<OverflowMenuState>,
     selected_index: Option<usize>,
+    /// 多选删除模式:开启后点击条目切换勾选而非打开。
+    multi_select_mode: bool,
+    /// 多选模式下已勾选的会话(仅本地对话,不含 ambient task)。
+    selected_conversation_ids: HashSet<ConversationOrTaskId>,
     collapsed_sections: HashSet<ConversationSection>,
     /// Cached flat list of items (headers + conversations) for rendering and navigation.
     /// Rebuilt when model data changes or collapse state changes.
@@ -225,6 +258,60 @@ impl ConversationListView {
             })
         });
 
+        let select_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new(crate::t!("workspace-conversation-list-select"), SecondaryTheme)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(ConversationListViewAction::ToggleMultiSelectMode);
+                })
+        });
+
+        let delete_all_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new(
+                crate::t!("workspace-conversation-list-delete-all"),
+                DangerPrimaryTheme,
+            )
+            .with_size(ButtonSize::Small)
+            .on_click(|ctx| {
+                ctx.dispatch_typed_action(ConversationListViewAction::DeleteAllConversations);
+            })
+        });
+
+        let cancel_select_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new(crate::t!("workspace-conversation-list-cancel"), NakedTheme)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(ConversationListViewAction::ToggleMultiSelectMode);
+                })
+        });
+
+        let select_all_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new(
+                crate::t!("workspace-conversation-list-select-all"),
+                SecondaryTheme,
+            )
+            .with_size(ButtonSize::Small)
+            .on_click(|ctx| {
+                ctx.dispatch_typed_action(ConversationListViewAction::SelectAllConversations);
+            })
+        });
+
+        let delete_selected_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new(
+                crate::t!(
+                    "workspace-conversation-list-delete-selected",
+                    count = 0
+                ),
+                DangerPrimaryTheme,
+            )
+            .with_size(ButtonSize::Small)
+            // 窄面板下防止长计数标签把按钮挤出面板。
+            .with_max_label_width(110.)
+            .on_click(|ctx| {
+                ctx.dispatch_typed_action(ConversationListViewAction::DeleteSelectedConversations);
+            })
+        });
+
         let item_overflow_menu = ctx.add_typed_action_view(|_| {
             Menu::new()
                 .prevent_interaction_with_other_elements()
@@ -248,9 +335,16 @@ impl ConversationListView {
             view_model,
             query_editor,
             toggle_view_all_button,
+            select_button,
+            delete_all_button,
+            cancel_select_button,
+            select_all_button,
+            delete_selected_button,
             item_overflow_menu,
             overflow_menu_state: None,
             selected_index: None,
+            multi_select_mode: false,
+            selected_conversation_ids: HashSet::new(),
             collapsed_sections: HashSet::new(),
             list_items: Arc::new(Vec::new()),
             view_all: false,
@@ -470,6 +564,11 @@ impl ConversationListView {
     /// Activate the currently selected item by dispatching the appropriate WorkspaceAction
     /// (i.e. opening the selected conversation or starting a new conversation).
     fn activate_selected_item(&mut self, ctx: &mut ViewContext<Self>) {
+        // 多选模式下 Enter 不应打开对话,避免误触。
+        if self.multi_select_mode {
+            return;
+        }
+
         let Some(list_item) = self
             .selected_index
             .and_then(|index| self.get_list_item(index))
@@ -499,15 +598,18 @@ impl ConversationListView {
 
     fn sync_list_items(&mut self, ctx: &mut ViewContext<Self>) {
         let model = self.view_model.as_ref(ctx);
-        let current_ids: std::collections::HashSet<_> = model.current_ids().cloned().collect();
+        // 剪枝用未过滤的全量 id 集合:搜索过滤不应静默取消用户勾选,
+        // 只有真正消失(被删除)的对话才从勾选中移除。
+        let all_ids: std::collections::HashSet<_> = model.all_ids().cloned().collect();
+        let unfiltered_count = model.unfiltered_item_count();
 
         // Remove stale entries
         self.state_handles
             .item_states
-            .retain(|id, _| current_ids.contains(id));
+            .retain(|id, _| all_ids.contains(id));
 
         // Add new entries
-        for id in current_ids {
+        for id in all_ids.iter().cloned() {
             self.state_handles.item_states.entry(id).or_default();
         }
 
@@ -523,6 +625,19 @@ impl ConversationListView {
                 self.selected_index = (index..self.item_count()).find(|&i| self.is_selectable(i));
             }
         }
+
+        // Remove stale multi-selection entries.
+        if !self.selected_conversation_ids.is_empty() {
+            self.selected_conversation_ids.retain(|id| all_ids.contains(id));
+        }
+
+        // 列表清空(如清空全部后)时退出多选模式,避免没有退出入口。
+        if unfiltered_count == 0 && self.multi_select_mode {
+            self.multi_select_mode = false;
+            self.selected_conversation_ids.clear();
+        }
+
+        self.update_delete_selected_button(ctx);
         ctx.notify();
     }
 
@@ -543,6 +658,44 @@ impl ConversationListView {
 
     fn get_position_id(&self) -> String {
         format!("conversation_list_{}", self.view_id)
+    }
+
+    /// 多选模式下更新"删除选中"按钮的标签与禁用状态。
+    fn update_delete_selected_button(&mut self, ctx: &mut ViewContext<Self>) {
+        let count = self.selected_conversation_ids.len();
+        self.delete_selected_button.update(ctx, |button, ctx| {
+            button.set_label(
+                crate::t!(
+                    "workspace-conversation-list-delete-selected",
+                    count = count
+                ),
+                ctx,
+            );
+            button.set_disabled(count == 0, ctx);
+        });
+    }
+
+    /// 渲染列表工具栏:非多选模式为"选择 / 删除全部",多选模式为
+    /// "取消 / 全选 / 删除选中(N)"。
+    fn render_toolbar(&self) -> Box<dyn Element> {
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(4.);
+
+        if self.multi_select_mode {
+            row.add_child(ChildView::new(&self.cancel_select_button).finish());
+            row.add_child(ChildView::new(&self.select_all_button).finish());
+            row.add_child(ChildView::new(&self.delete_selected_button).finish());
+        } else {
+            row.add_child(ChildView::new(&self.select_button).finish());
+            row.add_child(ChildView::new(&self.delete_all_button).finish());
+        }
+
+        Container::new(row.finish())
+            .with_horizontal_padding(12.)
+            .with_vertical_padding(4.)
+            .finish()
     }
 }
 
@@ -795,9 +948,11 @@ impl TypedActionView for ConversationListView {
                     .map(|c| c.title(ctx).to_string())
                     .unwrap_or_else(|| crate::t!("workspace-conversation-list-fallback-title"));
                 ctx.emit(Event::ShowDeleteConfirmationDialog {
-                    conversation_id: *conversation_id,
+                    conversation_id: Some(*conversation_id),
                     conversation_title,
                     terminal_view_id: *terminal_view_id,
+                    conversation_ids: vec![],
+                    delete_all: false,
                 });
             }
             ConversationListViewAction::ToggleOverflowMenu {
@@ -921,9 +1076,11 @@ impl TypedActionView for ConversationListView {
                     .map(|c| c.title(ctx).to_string())
                     .unwrap_or_else(|| crate::t!("workspace-conversation-list-fallback-title"));
                 ctx.emit(Event::ShowDeleteConfirmationDialog {
-                    conversation_id: *ai_conversation_id,
+                    conversation_id: Some(*ai_conversation_id),
                     conversation_title,
                     terminal_view_id,
+                    conversation_ids: vec![],
+                    delete_all: false,
                 });
             }
             ConversationListViewAction::OpenItem { id } => {
@@ -1009,7 +1166,134 @@ impl TypedActionView for ConversationListView {
                     destination: *destination,
                 });
             }
+            ConversationListViewAction::ToggleMultiSelectMode => {
+                self.multi_select_mode = !self.multi_select_mode;
+                if !self.multi_select_mode {
+                    self.selected_conversation_ids.clear();
+                }
+                self.selected_index = None;
+                self.update_delete_selected_button(ctx);
+                ctx.notify();
+            }
+            ConversationListViewAction::ToggleSelectItem { conversation_id } => {
+                // 仅本地对话支持删除;ambient task/对话不可勾选。
+                let ConversationOrTaskId::ConversationId(conv_id) = conversation_id else {
+                    return;
+                };
+                let is_ambient = BlocklistAIHistoryModel::as_ref(ctx)
+                    .conversation(conv_id)
+                    .is_some_and(|c| c.task_id().is_some());
+                if is_ambient {
+                    return;
+                }
+                if !self.selected_conversation_ids.insert(*conversation_id) {
+                    self.selected_conversation_ids.remove(conversation_id);
+                }
+                self.update_delete_selected_button(ctx);
+                ctx.notify();
+            }
+            ConversationListViewAction::SelectAllConversations => {
+                // 遍历未过滤的全量对话(而非可见子集),保证"全选"语义完整;
+                // 排除进行中与 ambient 对话——它们本就不能删除。
+                let model = self.view_model.as_ref(ctx);
+                for id in model.all_ids() {
+                    if let ConversationOrTaskId::ConversationId(conv_id) = id {
+                        let conversation =
+                            BlocklistAIHistoryModel::as_ref(ctx).conversation(conv_id);
+                        let is_deletable = conversation.is_none_or(|c| {
+                            c.task_id().is_none() && (c.status().is_done() || c.is_empty())
+                        });
+                        if is_deletable {
+                            self.selected_conversation_ids.insert(*id);
+                        }
+                    }
+                }
+                self.update_delete_selected_button(ctx);
+                ctx.notify();
+            }
+            ConversationListViewAction::DeleteSelectedConversations => {
+                let conversation_ids: Vec<AIConversationId> = self
+                    .selected_conversation_ids
+                    .iter()
+                    .filter_map(|id| match id {
+                        ConversationOrTaskId::ConversationId(conv_id) => Some(*conv_id),
+                        ConversationOrTaskId::TaskId(_) => None,
+                    })
+                    .collect();
+                if conversation_ids.is_empty() {
+                    return;
+                }
+                self.request_batch_delete(conversation_ids, ctx);
+            }
+            ConversationListViewAction::DeleteAllConversations => {
+                self.request_delete_all(ctx);
+            }
         }
+    }
+}
+
+impl ConversationListView {
+    /// 批量删除前的校验:ambient 对话与进行中的非空对话拒绝删除
+    /// (与单条删除/溢出菜单的判定一致)。
+    fn request_batch_delete(
+        &mut self,
+        conversation_ids: Vec<AIConversationId>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let window_id = ctx.window_id();
+        for &conversation_id in &conversation_ids {
+            let Some(conversation) =
+                BlocklistAIHistoryModel::as_ref(ctx).conversation(&conversation_id)
+            else {
+                // 历史-only 对话(无 live conversation)可删。
+                continue;
+            };
+            // live ambient 对话(restore 路径下无 metadata,需查 task_id)。
+            if conversation.task_id().is_some() {
+                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    toast_stack.add_ephemeral_toast(
+                        DismissibleToast::error(crate::t!(
+                            "workspace-conversation-list-delete-ambient-tooltip"
+                        )),
+                        window_id,
+                        ctx,
+                    );
+                });
+                return;
+            }
+            // 与单条路径一致:进行中的空对话(从未运行)允许删除。
+            if !conversation.status().is_done() && !conversation.is_empty() {
+                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    toast_stack.add_ephemeral_toast(
+                        DismissibleToast::error(crate::t!(
+                            "workspace-conversation-list-delete-in-progress-error"
+                        )),
+                        window_id,
+                        ctx,
+                    );
+                });
+                return;
+            }
+        }
+
+        ctx.emit(Event::ShowDeleteConfirmationDialog {
+            conversation_id: None,
+            conversation_title: String::new(),
+            terminal_view_id: None,
+            conversation_ids,
+            delete_all: false,
+        });
+    }
+
+    /// 请求删除全部对话历史(弹确认对话框)。
+    fn request_delete_all(&mut self, ctx: &mut ViewContext<Self>) {
+        ctx.emit(Event::ShowDeleteConfirmationDialog {
+            conversation_id: None,
+            conversation_title: String::new(),
+            terminal_view_id: None,
+            conversation_ids: vec![],
+            delete_all: true,
+        });
     }
 }
 
@@ -1052,6 +1336,8 @@ impl View for ConversationListView {
             let start_new_conversation_state =
                 self.state_handles.start_new_conversation_item.clone();
             let selected_index = self.selected_index;
+            let multi_select_mode = self.multi_select_mode;
+            let selected_conversation_ids = self.selected_conversation_ids.clone();
             let collapsed_sections = self.collapsed_sections.clone();
             let active_header_mouse_state = self.state_handles.active_header.clone();
             let past_header_mouse_state = self.state_handles.past_header.clone();
@@ -1125,6 +1411,9 @@ impl View for ConversationListView {
                                             highlight_indices: highlight_ref,
                                             is_selected,
                                             is_focused_conversation,
+                                            is_checked: selected_conversation_ids
+                                                .contains(&entry.id),
+                                            multi_select_mode,
                                             index,
                                             state,
                                             overflow_menu: &overflow_menu,
@@ -1182,6 +1471,7 @@ impl View for ConversationListView {
 
         if has_conversations {
             column = column.with_child(render_search_box(&self.query_editor, app));
+            column = column.with_child(self.render_toolbar());
         }
 
         let column_element = column

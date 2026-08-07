@@ -162,6 +162,11 @@ workspace-toast-out-of-ai-credits = Looks like you're out of AI credits.
 workspace-toast-upgrade-more-credits = Upgrade for more credits.
 workspace-toast-disabled-synchronized-inputs = Disabled all synchronized inputs.
 workspace-toast-conversation-deleted = Conversation deleted
+workspace-toast-conversations-deleted = { $count ->
+        [one] Deleted 1 conversation
+       *[other] Deleted { $count } conversations
+    }
+workspace-toast-all-conversations-deleted = All conversations deleted
 workspace-search-repos-placeholder = Search repos
 workspace-search-tabs-placeholder = Search tabs...
 terminal-onekey-search-placeholder = Search saved SSH credentials...
@@ -2736,7 +2741,23 @@ conversation-untitled = Untitled conversation
 conversation-deleted = Deleted conversation
 workspace-conversation-list-no-matching = No matching conversations
 workspace-conversation-list-delete = Delete
+workspace-conversation-delete-confirm-title = Delete '{ $title }'?
+workspace-conversation-delete-confirm-title-multiple = { $count ->
+        [one] Delete 1 conversation?
+       *[other] Delete { $count } conversations?
+    }
+workspace-conversation-delete-confirm-title-all = Delete all conversations?
+workspace-conversation-delete-confirm-title-default = Delete conversation?
+workspace-conversation-delete-confirm-description = This conversation will be permanently deleted. This action cannot be undone.
+workspace-conversation-delete-confirm-description-multiple = These conversations will be permanently deleted. This action cannot be undone.
+workspace-conversation-delete-confirm-description-all = All conversations will be permanently deleted. This action cannot be undone.
+workspace-conversation-list-select = Select
+workspace-conversation-list-delete-all = Delete all
+workspace-conversation-list-cancel = Cancel
+workspace-conversation-list-select-all = Select all
+workspace-conversation-list-delete-selected = Delete ({ $count })
 workspace-conversation-list-delete-in-progress-error = Conversations cannot be deleted while in progress.
+workspace-conversation-list-delete-all-partial = Some conversations were not deleted (in-progress or ambient).
 workspace-conversation-list-delete-ambient-tooltip = Ambient agent conversations cannot be deleted
 workspace-conversation-list-fork-new-pane = Fork in new pane
 workspace-conversation-list-fork-new-tab = Fork in new tab

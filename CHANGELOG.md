@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 - **AI / BYOP**:port opencode `applyCaching`,启用 prompt caching;`write_to_long_running_shell_command` 在 line 模式下拒绝嵌入 LF;BYOP LRC monitor fallback 改走 silent subtask;`cancel_execution` 50ms 窗口内 sender 泄漏修复(#134 follow-up,#137)
+- **对话历史**:对话列表面板新增多选批量删除(选择 → 勾选 → 删除选中 N)与"删除全部"功能;进行中/ambient 对话受保护不可删;确认弹窗接入 en/ja/zh-CN 多语言
 - **云端剥离 Phase 1–2**:增加 `cloud-disabled` channel 谓词;清理 billing/pricing、referral/reward、cloud sharing dialog UI;退订 RTC UpdateManager;退役 notebook/folder sync queue
 - **平台**:修复 Spotlight/Finder/Launchpad 启动 macOS 时的 panic;`run_shell_command` stdout 兜底回退至 command grid
 - **基建**:`.gitattributes` 强制 LF;新增 stale bot 与 Claude Code GitHub workflow

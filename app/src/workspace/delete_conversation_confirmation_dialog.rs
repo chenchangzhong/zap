@@ -40,9 +40,14 @@ const DIALOG_WIDTH: f32 = 460.;
 
 #[derive(Clone)]
 pub struct DeleteConversationDialogSource {
-    pub conversation_id: AIConversationId,
+    /// 单条删除时的会话 ID;批量/清空场景为 `None`。
+    pub conversation_id: Option<AIConversationId>,
     pub conversation_title: String,
     pub terminal_view_id: Option<warpui::EntityId>,
+    /// 批量删除的会话 ID 列表;为空表示单条删除(走 `conversation_id`)。
+    pub conversation_ids: Vec<AIConversationId>,
+    /// 是否删除全部历史。
+    pub delete_all: bool,
 }
 
 pub struct DeleteConversationConfirmationDialog {
@@ -100,18 +105,43 @@ impl View for DeleteConversationConfirmationDialog {
             .with_margin_right(12.)
             .finish();
 
-        let title = self
+        let (title, description) = self
             .source
             .as_ref()
-            .map(|s| format!("Delete '{}'?", s.conversation_title))
-            .unwrap_or_else(|| "Delete conversation?".into());
+            .map(|s| {
+                if s.delete_all {
+                    (
+                        crate::t!("workspace-conversation-delete-confirm-title-all"),
+                        crate::t!("workspace-conversation-delete-confirm-description-all"),
+                    )
+                } else if !s.conversation_ids.is_empty() {
+                    (
+                        crate::t!(
+                            "workspace-conversation-delete-confirm-title-multiple",
+                            count = s.conversation_ids.len()
+                        ),
+                        crate::t!("workspace-conversation-delete-confirm-description-multiple"),
+                    )
+                } else {
+                    (
+                        crate::t!(
+                            "workspace-conversation-delete-confirm-title",
+                            title = s.conversation_title.clone()
+                        ),
+                        crate::t!("workspace-conversation-delete-confirm-description"),
+                    )
+                }
+            })
+            .unwrap_or_else(|| {
+                (
+                    crate::t!("workspace-conversation-delete-confirm-title-default"),
+                    String::new(),
+                )
+            });
 
         let dialog = Dialog::new(
             title,
-            Some(
-                "This conversation will be permanently deleted. This action cannot be undone."
-                    .into(),
-            ),
+            Some(description),
             UiComponentStyles {
                 width: Some(DIALOG_WIDTH),
                 ..dialog_styles(appearance)

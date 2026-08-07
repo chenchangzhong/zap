@@ -213,4 +213,9 @@ impl ConversationListViewModel {
     pub fn current_ids(&self) -> impl Iterator<Item = &ConversationOrTaskId> {
         self.filtered_items.iter().map(|item| &item.id)
     }
+
+    /// Returns all conversation/task ids before any search filtering is applied.
+    pub fn all_ids(&self) -> impl Iterator<Item = &ConversationOrTaskId> {
+        self.cached_conversation_or_task_ids.iter()
+    }
 }

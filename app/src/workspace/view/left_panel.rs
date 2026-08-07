@@ -119,9 +119,11 @@ pub enum LeftPanelEvent {
     },
     NewConversationInNewTab,
     ShowDeleteConfirmationDialog {
-        conversation_id: AIConversationId,
+        conversation_id: Option<AIConversationId>,
         conversation_title: String,
         terminal_view_id: Option<warpui::EntityId>,
+        conversation_ids: Vec<AIConversationId>,
+        delete_all: bool,
     },
     /// 用户从 SSH 管理器树点击 server / 双击 / 右键 "编辑" → 主窗口应在中央
     /// 区开/聚焦 `SshServerPane`(具体 `WorkspaceView::open_ssh_server`)。
@@ -319,11 +321,15 @@ impl LeftPanelView {
                 conversation_id,
                 conversation_title,
                 terminal_view_id,
+                conversation_ids,
+                delete_all,
             } => {
                 ctx.emit(LeftPanelEvent::ShowDeleteConfirmationDialog {
                     conversation_id: *conversation_id,
                     conversation_title: conversation_title.clone(),
                     terminal_view_id: *terminal_view_id,
+                    conversation_ids: conversation_ids.clone(),
+                    delete_all: *delete_all,
                 });
             }
         });

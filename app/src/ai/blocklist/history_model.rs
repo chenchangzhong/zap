@@ -1435,29 +1435,65 @@ impl BlocklistAIHistoryModel {
         terminal_view_id: Option<EntityId>,
         ctx: &mut ModelContext<Self>,
     ) {
-        let conversation_title = self
-            .conversations_by_id
-            .get(&conversation_id)
-            .and_then(|c| c.title().map(|t| t.to_string()));
+        self.delete_conversations([conversation_id], terminal_view_id, ctx);
+    }
 
-        self.remove_conversation_from_memory(conversation_id, terminal_view_id, ctx);
+    /// Permanently delete multiple conversations at once.
+    ///
+    /// 批量删除:一次移除内存索引,持久化按批下发(agent 对话走
+    /// `DeleteMultiAgentConversations` 的批量 `eq_any`),并为每条对话发出
+    /// `DeletedConversation` 事件,让订阅方(对话列表、AgentConversationsModel)
+    /// 刷新缓存。
+    pub fn delete_conversations(
+        &mut self,
+        conversation_ids: impl IntoIterator<Item = AIConversationId>,
+        terminal_view_id: Option<EntityId>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let conversation_ids: Vec<AIConversationId> = conversation_ids.into_iter().collect();
+        if conversation_ids.is_empty() {
+            return;
+        }
 
-        // Delete persisted conversation from sqlite.
+        // 在移除内存之前收集标题与解析出的 owner view,供事件携带。
+        let mut conversations: Vec<(AIConversationId, Option<String>, Option<EntityId>)> =
+            Vec::with_capacity(conversation_ids.len());
+        for &conversation_id in &conversation_ids {
+            let conversation_title = self
+                .conversations_by_id
+                .get(&conversation_id)
+                .and_then(|c| c.title().map(|t| t.to_string()));
+            // 显式传入的 view 优先;批量/清空场景为 None 时,通过 live 索引
+            // 反查对话的 owner view,避免 per-terminal-view 索引残留。
+            let resolved_terminal_view_id = terminal_view_id
+                .or_else(|| self.terminal_view_id_for_conversation(&conversation_id));
+            self.remove_conversation_from_memory(
+                conversation_id,
+                resolved_terminal_view_id,
+                ctx,
+            );
+            conversations.push((conversation_id, conversation_title, resolved_terminal_view_id));
+        }
+
+        // Delete persisted conversations from sqlite.
         let model_event_sender = GlobalResourceHandlesProvider::as_ref(ctx)
             .get()
             .model_event_sender
             .clone();
-        let conversation_id_string = conversation_id.to_string();
+        let conversation_id_strings: Vec<String> =
+            conversation_ids.iter().map(|id| id.to_string()).collect();
         ctx.spawn(
             async move {
                 if let Some(sender) = model_event_sender {
-                    if let Err(e) = sender.send(ModelEvent::DeleteAIConversation {
-                        conversation_id: conversation_id_string.clone(),
-                    }) {
-                        log::error!("Error sending DeleteAIConversation event: {e:?}");
+                    for conversation_id in &conversation_id_strings {
+                        if let Err(e) = sender.send(ModelEvent::DeleteAIConversation {
+                            conversation_id: conversation_id.clone(),
+                        }) {
+                            log::error!("Error sending DeleteAIConversation event: {e:?}");
+                        }
                     }
                     if let Err(e) = sender.send(ModelEvent::DeleteMultiAgentConversations {
-                        conversation_ids: vec![conversation_id_string],
+                        conversation_ids: conversation_id_strings,
                     }) {
                         log::error!("Error sending DeleteMultiAgentConversations event: {e:?}");
                     }
@@ -1466,15 +1502,52 @@ impl BlocklistAIHistoryModel {
             |_, _, _| {},
         );
 
-        // Always emit the event so subscribers (e.g. AgentConversationsModel,
+        // Always emit the events so subscribers (e.g. AgentConversationsModel,
         // the conversation list UI) can refresh their caches. Historical-only
         // conversations have no terminal_view_id; handlers that filter on it
         // already tolerate `None`.
-        ctx.emit(BlocklistAIHistoryEvent::DeletedConversation {
-            terminal_view_id,
-            conversation_id,
-            conversation_title,
-        });
+        for (conversation_id, conversation_title, resolved_terminal_view_id) in conversations {
+            ctx.emit(BlocklistAIHistoryEvent::DeletedConversation {
+                terminal_view_id: resolved_terminal_view_id,
+                conversation_id,
+                conversation_title,
+            });
+        }
+    }
+
+    /// Permanently delete all conversations (both live and historical-only).
+    ///
+    /// 进行中与 ambient agent 对话不删除(与单条/批量删除的保护一致)。
+    /// 返回被跳过的对话数量。
+    pub fn delete_all_conversations(&mut self, ctx: &mut ModelContext<Self>) -> usize {
+        // 两个 map 的 key 会重叠(live 对话同时持有 metadata),先去重。
+        let conversation_ids: HashSet<AIConversationId> = self
+            .conversations_by_id
+            .keys()
+            .chain(self.all_conversations_metadata.keys())
+            .copied()
+            .collect();
+
+        let mut to_delete = Vec::new();
+        let mut skipped = 0;
+        for conversation_id in conversation_ids {
+            let conversation = self.conversations_by_id.get(&conversation_id);
+            // live 对话可能没有 metadata(restore 路径不写 metadata),ambient
+            // 判定必须同时看 live 对话的 task_id 与 metadata 标记。
+            let is_ambient = conversation.is_some_and(|c| c.task_id().is_some())
+                || self
+                    .all_conversations_metadata
+                    .get(&conversation_id)
+                    .is_some_and(|m| m.is_ambient_agent_conversation());
+            let is_done = conversation.is_none_or(|c| c.status().is_done());
+            if is_ambient || !is_done {
+                skipped += 1;
+            } else {
+                to_delete.push(conversation_id);
+            }
+        }
+        self.delete_conversations(to_delete, None, ctx);
+        skipped
     }
 
     /// Remove a conversation from all in-memory storage.

@@ -33,7 +33,8 @@ use warp_multi_agent_api as api;
 
 use super::{
     convert_persisted_conversation_to_ai_conversation_with_metadata, AIConversationMetadata,
-    AIQueryHistoryOutputStatus, BlocklistAIHistoryModel, PersistedAIInput, PersistedAIInputType,
+    AIQueryHistoryOutputStatus, BlocklistAIHistoryEvent, BlocklistAIHistoryModel, PersistedAIInput,
+    PersistedAIInputType,
 };
 
 fn initialize_history_model_test_app(app: &mut App) {
@@ -1420,5 +1421,533 @@ fn test_set_server_conversation_token_rebinds_reverse_index() {
                 Some(conversation_id),
             );
         });
+    });
+}
+
+/// Builds an `AIConversationMetadata` entry with an optional ambient agent task id.
+fn create_conversation_metadata(
+    id: AIConversationId,
+    ambient_agent_task_id: Option<AmbientAgentTaskId>,
+) -> AIConversationMetadata {
+    AIConversationMetadata {
+        id,
+        title: "Test Conversation".to_string(),
+        initial_query: String::new(),
+        last_modified_at: Utc::now().naive_utc(),
+        initial_working_directory: None,
+        credits_spent: Some(5.0),
+        server_conversation_token: Some(ServerConversationToken::new(format!("token-{id}"))),
+        is_restorable_locally: false,
+        artifacts: Vec::new(),
+        ambient_agent_task_id,
+    }
+}
+
+/// Collects the `DeletedConversation` ids emitted on the model.
+fn emitted_deleted_conversation_ids(
+    emitted_events: &std::cell::RefCell<Vec<BlocklistAIHistoryEvent>>,
+) -> Vec<AIConversationId> {
+    emitted_events
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            BlocklistAIHistoryEvent::DeletedConversation { conversation_id, .. } => {
+                Some(*conversation_id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Receives exactly `expected_count` messages from the mock model event channel,
+/// then asserts no further messages are pending. Returns the received events.
+fn collect_model_events(
+    receiver: &std::sync::mpsc::Receiver<ModelEvent>,
+    expected_count: usize,
+) -> Vec<ModelEvent> {
+    let mut events = Vec::new();
+    for _ in 0..expected_count {
+        events.push(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("expected a model event"),
+        );
+    }
+    match receiver.try_recv() {
+        Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected) => {}
+        Ok(extra) => panic!("unexpected extra model event: {extra:?}"),
+    }
+    events
+}
+
+#[test]
+fn test_delete_all_conversations_dedups_conversation_present_in_both_maps() {
+    use crate::ai::agent::conversation::{AIConversation, ConversationStatus};
+
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut global_resource_handles = GlobalResourceHandles::mock(&mut app);
+        global_resource_handles.model_event_sender = Some(sender);
+        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
+
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let terminal_view_id = EntityId::new();
+
+        let emitted_events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let emitted_events = emitted_events.clone();
+            app.update(|ctx| {
+                ctx.subscribe_to_model(&history_model, move |_, event, _| {
+                    emitted_events.borrow_mut().push(event.clone());
+                });
+            });
+        }
+
+        // One conversation that exists BOTH as a live conversation (restored,
+        // completed) and as a historical metadata entry.
+        let conversation_id = history_model.update(&mut app, |model, ctx| {
+            let conversation = AIConversation::new(false);
+            let id = conversation.id();
+            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+            model
+                .conversations_by_id
+                .get_mut(&id)
+                .unwrap()
+                .update_status(ConversationStatus::Success, terminal_view_id, ctx);
+            model
+                .all_conversations_metadata
+                .insert(id, create_conversation_metadata(id, None));
+            id
+        });
+
+        let skipped = history_model
+            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(skipped, 0, "no conversations should be skipped");
+
+        // The overlapping conversation must be deleted exactly once: one
+        // DeleteAIConversation event and one DeleteMultiAgentConversations
+        // batch containing the id a single time.
+        let events = collect_model_events(&receiver, 2);
+        let delete_ai_events: Vec<&ModelEvent> = events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::DeleteAIConversation { .. }))
+            .collect();
+        assert_eq!(delete_ai_events.len(), 1, "dedup failed: duplicate delete events");
+        assert!(matches!(
+            delete_ai_events[0],
+            ModelEvent::DeleteAIConversation {
+                conversation_id: deleted_id,
+            } if deleted_id == &conversation_id.to_string()
+        ));
+        let multi_agent_events: Vec<&ModelEvent> = events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::DeleteMultiAgentConversations { .. }))
+            .collect();
+        assert_eq!(multi_agent_events.len(), 1);
+        assert!(matches!(
+            multi_agent_events[0],
+            ModelEvent::DeleteMultiAgentConversations { conversation_ids }
+                if conversation_ids == &vec![conversation_id.to_string()]
+        ));
+
+        // Exactly one DeletedConversation event for the deduped id.
+        let deleted_ids = emitted_deleted_conversation_ids(&emitted_events);
+        assert_eq!(deleted_ids, vec![conversation_id]);
+
+        // The owning terminal view must be resolved and cleaned up: the live
+        // conversation is removed from the per-view index, and a
+        // RemoveConversation event fires with the resolved view.
+        let remove_events: Vec<EntityId> = emitted_events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                BlocklistAIHistoryEvent::RemoveConversation {
+                    terminal_view_id, ..
+                } => Some(*terminal_view_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(remove_events, vec![terminal_view_id]);
+
+        history_model.read(&app, |model, _| {
+            assert!(model.conversations_by_id.is_empty());
+            assert!(model.all_conversations_metadata.is_empty());
+            assert!(
+                model
+                    .live_conversation_ids_for_terminal_view
+                    .get(&terminal_view_id)
+                    .is_none_or(|ids| ids.is_empty()),
+                "live conversation index must be cleaned up for the owning terminal view"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_delete_all_conversations_skips_ambient_conversations() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut global_resource_handles = GlobalResourceHandles::mock(&mut app);
+        global_resource_handles.model_event_sender = Some(sender);
+        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
+
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+
+        let regular_id = AIConversationId::new();
+        let ambient_id = AIConversationId::new();
+        let ambient_task_id: AmbientAgentTaskId =
+            uuid::Uuid::new_v4().to_string().parse().unwrap();
+
+        history_model.update(&mut app, |model, _| {
+            model
+                .all_conversations_metadata
+                .insert(regular_id, create_conversation_metadata(regular_id, None));
+            model.all_conversations_metadata.insert(
+                ambient_id,
+                create_conversation_metadata(ambient_id, Some(ambient_task_id)),
+            );
+        });
+
+        let skipped = history_model
+            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(skipped, 1, "the ambient conversation must count as skipped");
+
+        // Only the regular conversation is deleted.
+        let events = collect_model_events(&receiver, 2);
+        let delete_ai_events: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::DeleteAIConversation { conversation_id } => {
+                    Some(conversation_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delete_ai_events, vec![regular_id.to_string()]);
+
+        history_model.read(&app, |model, _| {
+            assert!(
+                model.get_conversation_metadata(&ambient_id).is_some(),
+                "ambient conversation must not be deleted"
+            );
+            assert!(
+                model.get_conversation_metadata(&regular_id).is_none(),
+                "regular conversation must be deleted"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_delete_all_conversations_skips_live_ambient_conversation_without_metadata() {
+    use crate::ai::agent::conversation::{AIConversation, ConversationStatus};
+
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut global_resource_handles = GlobalResourceHandles::mock(&mut app);
+        global_resource_handles.model_event_sender = Some(sender);
+        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
+
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let terminal_view_id = EntityId::new();
+        let ambient_task_id: AmbientAgentTaskId =
+            uuid::Uuid::new_v4().to_string().parse().unwrap();
+
+        // A live, completed conversation owned by an ambient agent task.
+        // `restore_conversations` never writes `all_conversations_metadata`, so
+        // this conversation has NO metadata entry: only the live task_id check
+        // can identify it as ambient.
+        let conversation_id = history_model.update(&mut app, |model, ctx| {
+            let conversation = AIConversation::new(false);
+            let id = conversation.id();
+            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+            model
+                .conversations_by_id
+                .get_mut(&id)
+                .unwrap()
+                .update_status(ConversationStatus::Success, terminal_view_id, ctx);
+            model
+                .conversations_by_id
+                .get_mut(&id)
+                .unwrap()
+                .set_task_id(ambient_task_id);
+            id
+        });
+
+        history_model.read(&app, |model, _| {
+            assert!(
+                !model.all_conversations_metadata.contains_key(&conversation_id),
+                "precondition: restore path must not write all_conversations_metadata"
+            );
+        });
+
+        let skipped = history_model
+            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(skipped, 1, "the live ambient conversation must count as skipped");
+
+        // Nothing is deleted: no DeleteAIConversation event and no
+        // DeleteMultiAgentConversations batch payload at all.
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+
+        history_model.read(&app, |model, _| {
+            let conversation = model
+                .conversations_by_id
+                .get(&conversation_id)
+                .expect("live ambient conversation must remain in conversations_by_id");
+            assert_eq!(conversation.task_id(), Some(ambient_task_id));
+        });
+    });
+}
+
+#[test]
+fn test_delete_all_conversations_skips_live_ambient_conversation_and_deletes_companion() {
+    use crate::ai::agent::conversation::{AIConversation, ConversationStatus};
+
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut global_resource_handles = GlobalResourceHandles::mock(&mut app);
+        global_resource_handles.model_event_sender = Some(sender);
+        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
+
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let terminal_view_id = EntityId::new();
+        let ambient_task_id: AmbientAgentTaskId =
+            uuid::Uuid::new_v4().to_string().parse().unwrap();
+
+        let companion_id = AIConversationId::new();
+        let ambient_id = history_model.update(&mut app, |model, ctx| {
+            // 1 deletable companion: historical-only, non-ambient metadata.
+            model
+                .all_conversations_metadata
+                .insert(companion_id, create_conversation_metadata(companion_id, None));
+
+            // 1 live ambient conversation: restored (no metadata), completed,
+            // owned by an ambient agent task.
+            let conversation = AIConversation::new(false);
+            let id = conversation.id();
+            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+            model
+                .conversations_by_id
+                .get_mut(&id)
+                .unwrap()
+                .update_status(ConversationStatus::Success, terminal_view_id, ctx);
+            model
+                .conversations_by_id
+                .get_mut(&id)
+                .unwrap()
+                .set_task_id(ambient_task_id);
+            id
+        });
+
+        let skipped = history_model
+            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(skipped, 1, "only the live ambient conversation must be skipped");
+
+        // The companion is deleted: one DeleteAIConversation event and one
+        // DeleteMultiAgentConversations batch containing ONLY the companion id.
+        let events = collect_model_events(&receiver, 2);
+        let delete_ai_events: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::DeleteAIConversation { conversation_id } => {
+                    Some(conversation_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delete_ai_events, vec![companion_id.to_string()]);
+        let multi_agent_events: Vec<&ModelEvent> = events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::DeleteMultiAgentConversations { .. }))
+            .collect();
+        assert_eq!(multi_agent_events.len(), 1);
+        assert!(matches!(
+            multi_agent_events[0],
+            ModelEvent::DeleteMultiAgentConversations { conversation_ids }
+                if conversation_ids == &vec![companion_id.to_string()]
+        ));
+
+        history_model.read(&app, |model, _| {
+            assert!(
+                model.conversations_by_id.contains_key(&ambient_id),
+                "live ambient conversation must remain live"
+            );
+            assert!(
+                model.get_conversation_metadata(&companion_id).is_none(),
+                "companion conversation must be deleted"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_delete_all_conversations_skips_in_progress_conversations() {
+    use crate::ai::agent::conversation::{AIConversation, ConversationStatus};
+
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut global_resource_handles = GlobalResourceHandles::mock(&mut app);
+        global_resource_handles.model_event_sender = Some(sender);
+        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
+
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let terminal_view_id = EntityId::new();
+
+        let in_progress_id = history_model.update(&mut app, |model, ctx| {
+            let in_progress = AIConversation::new(false); // status is InProgress
+            let id = in_progress.id();
+            model.restore_conversations(terminal_view_id, vec![in_progress], ctx);
+
+            // A separate, completed conversation that should be deleted.
+            let completed = AIConversation::new(false);
+            let completed_id = completed.id();
+            model.restore_conversations(terminal_view_id, vec![completed], ctx);
+            model
+                .conversations_by_id
+                .get_mut(&completed_id)
+                .unwrap()
+                .update_status(ConversationStatus::Success, terminal_view_id, ctx);
+            model
+                .all_conversations_metadata
+                .insert(completed_id, create_conversation_metadata(completed_id, None));
+            id
+        });
+
+        let skipped = history_model
+            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(skipped, 1, "the in-progress conversation must count as skipped");
+
+        let events = collect_model_events(&receiver, 2);
+        let delete_ai_events: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::DeleteAIConversation { conversation_id } => {
+                    Some(conversation_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !delete_ai_events.iter().any(|id| *id == in_progress_id.to_string()),
+            "in-progress conversation must not be deleted"
+        );
+        assert_eq!(delete_ai_events.len(), 1, "only the completed conversation is deleted");
+
+        history_model.read(&app, |model, _| {
+            assert!(
+                model.conversations_by_id.contains_key(&in_progress_id),
+                "in-progress conversation must remain live"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_delete_all_conversations_returns_skipped_count_for_mixed_state() {
+    use crate::ai::agent::conversation::AIConversation;
+
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut global_resource_handles = GlobalResourceHandles::mock(&mut app);
+        global_resource_handles.model_event_sender = Some(sender);
+        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
+
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let terminal_view_id = EntityId::new();
+
+        let deletable_id = AIConversationId::new();
+        let ambient_id = AIConversationId::new();
+        let ambient_task_id: AmbientAgentTaskId =
+            uuid::Uuid::new_v4().to_string().parse().unwrap();
+
+        let in_progress_id = history_model.update(&mut app, |model, ctx| {
+            // 1 deletable: historical-only, non-ambient metadata.
+            model
+                .all_conversations_metadata
+                .insert(deletable_id, create_conversation_metadata(deletable_id, None));
+            // 1 ambient: metadata owned by an ambient agent task.
+            model.all_conversations_metadata.insert(
+                ambient_id,
+                create_conversation_metadata(ambient_id, Some(ambient_task_id)),
+            );
+            // 1 in-progress: live conversation that has not finished.
+            let in_progress = AIConversation::new(false);
+            let id = in_progress.id();
+            model.restore_conversations(terminal_view_id, vec![in_progress], ctx);
+            id
+        });
+
+        let skipped = history_model
+            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(skipped, 2, "ambient + in-progress conversations must be skipped");
+
+        // Only the deletable conversation produces a DeleteAIConversation event.
+        let events = collect_model_events(&receiver, 2);
+        let delete_ai_events: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::DeleteAIConversation { conversation_id } => {
+                    Some(conversation_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delete_ai_events, vec![deletable_id.to_string()]);
+
+        history_model.read(&app, |model, _| {
+            assert!(model.get_conversation_metadata(&deletable_id).is_none());
+            assert!(model.get_conversation_metadata(&ambient_id).is_some());
+            assert!(model.conversations_by_id.contains_key(&in_progress_id));
+        });
+    });
+}
+
+#[test]
+fn test_delete_all_conversations_empty_model_returns_zero() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut global_resource_handles = GlobalResourceHandles::mock(&mut app);
+        global_resource_handles.model_event_sender = Some(sender);
+        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
+
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+
+        let emitted_events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let emitted_events = emitted_events.clone();
+            app.update(|ctx| {
+                ctx.subscribe_to_model(&history_model, move |_, event, _| {
+                    emitted_events.borrow_mut().push(event.clone());
+                });
+            });
+        }
+
+        let skipped = history_model
+            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(skipped, 0);
+
+        // No persistence events and no emitted deletion events.
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(emitted_deleted_conversation_ids(&emitted_events).is_empty());
     });
 }
