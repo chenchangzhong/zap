@@ -86,6 +86,7 @@ fn interleave_conversations_only_inserts_into_current_session_segment() {
         .map(|e| match &e.item {
             MenuItem::Command { command, .. } => command.as_str(),
             MenuItem::Conversation { title, .. } => title.as_str(),
+            MenuItem::AIPrompt { query_text, .. } => query_text.as_str(),
         })
         .collect::<Vec<_>>();
 

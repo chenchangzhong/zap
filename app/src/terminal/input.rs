@@ -1639,6 +1639,10 @@ pub struct Input {
     /// of using this flag.
     is_editor_empty_on_last_edit: bool,
 
+    /// 置位期间对 buffer 的写入来自菜单预览(如 ↑ 历史菜单选中 / 开头项),而非用户
+    /// 真实键入——用于抑制 slash 接管误触发。
+    is_menu_driven_buffer_write: bool,
+
     /// Weak handle to this input view for drop target data
     weak_view_handle: WeakViewHandle<Input>,
 
@@ -3198,6 +3202,7 @@ impl Input {
             inline_terminal_menu_positioner,
             cached_agent_mode_hint_key: None,
             is_editor_empty_on_last_edit: is_editor_empty,
+            is_menu_driven_buffer_write: false,
             weak_view_handle: ctx.handle(),
             agent_status_view,
             agent_view_controller,
@@ -3508,9 +3513,23 @@ impl Input {
         ctx.notify();
     }
 
-    fn open_slash_commands_menu(&mut self, ctx: &mut ViewContext<Self>) {
-        // Don't open menu if there's a long-running command — unless the CLI agent
-        // rich input is open (the CLI agent itself is the long-running command).
+    /// 在 `f` 执行期间标记 buffer 写入为菜单驱动(预览/选中回填),而非用户键入。
+    /// 用于抑制 slash 接管误触发:↑ 历史菜单浏览 / 开头项时,回填文本也会进入
+    /// slash Composing 分支,但那不是用户真实输入 /。
+    fn with_menu_driven_buffer_write<F>(
+        &mut self,
+        f: F,
+        ctx: &mut ViewContext<Self>,
+    ) where
+        F: FnOnce(&mut Self, &mut ViewContext<Self>),
+    {
+        self.is_menu_driven_buffer_write = true;
+        f(self, ctx);
+        self.is_menu_driven_buffer_write = false;
+    }
+
+    /// slash 菜单能否打开:长运行命令运行时(且非 CLI agent 输入)不允许打开。
+    fn can_open_slash_commands_menu(&self, ctx: &ViewContext<Self>) -> bool {
         let is_cli_agent_input =
             CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.terminal_view_id);
         if !is_cli_agent_input
@@ -3521,6 +3540,15 @@ impl Input {
                 .active_block()
                 .is_active_and_long_running()
         {
+            return false;
+        }
+        true
+    }
+
+    fn open_slash_commands_menu(&mut self, ctx: &mut ViewContext<Self>) {
+        // Don't open menu if there's a long-running command — unless the CLI agent
+        // rich input is open (the CLI agent itself is the long-running command).
+        if !self.can_open_slash_commands_menu(ctx) {
             return;
         }
         self.suggestions_mode_model.update(ctx, |model, ctx| {
@@ -4147,28 +4175,35 @@ impl Input {
                 command,
                 linked_workflow_data,
             } => {
-                if let Some((workflow_type, workflow_source)) = linked_workflow_data
-                    .as_ref()
-                    .and_then(|linked_workflow_data| linked_workflow_data.linked_workflow(ctx))
-                {
-                    // TODO(ben): We should include the chosen env vars in the history
-                    // entry.
-                    let env_vars = workflow_type.as_workflow().default_env_vars();
-                    self.insert_workflow_into_input(
-                        workflow_type,
-                        workflow_source,
-                        WorkflowSelectionSource::UpArrowHistory,
-                        None,
-                        Some(command),
-                        env_vars,
-                        /*should_show_more_info_view=*/ false,
-                        ctx,
-                    );
-                } else {
-                    self.editor.update(ctx, |editor, ctx| {
-                        editor.set_buffer_text_ignoring_undo(command, ctx);
-                    });
-                }
+                self.with_menu_driven_buffer_write(
+                    |me, ctx| {
+                        if let Some((workflow_type, workflow_source)) = linked_workflow_data
+                            .as_ref()
+                            .and_then(|linked_workflow_data| {
+                                linked_workflow_data.linked_workflow(ctx)
+                            })
+                        {
+                            // TODO(ben): We should include the chosen env vars in the history
+                            // entry.
+                            let env_vars = workflow_type.as_workflow().default_env_vars();
+                            me.insert_workflow_into_input(
+                                workflow_type,
+                                workflow_source,
+                                WorkflowSelectionSource::UpArrowHistory,
+                                None,
+                                Some(command),
+                                env_vars,
+                                /*should_show_more_info_view=*/ false,
+                                ctx,
+                            );
+                        } else {
+                            me.editor.update(ctx, |editor, ctx| {
+                                editor.set_buffer_text_ignoring_undo(command, ctx);
+                            });
+                        }
+                    },
+                    ctx,
+                );
 
                 // In fullscreen agent view, lock to Shell mode so the '!' indicator is
                 // rendered while cycling through shell command history.
@@ -4190,18 +4225,28 @@ impl Input {
                 });
             }
             inline_history::InlineHistoryMenuEvent::SelectAIPrompt { query_text } => {
-                self.editor.update(ctx, |editor, ctx| {
-                    editor.set_buffer_text_ignoring_undo(query_text, ctx);
-                });
+                self.with_menu_driven_buffer_write(
+                    |me, ctx| {
+                        me.editor.update(ctx, |editor, ctx| {
+                            editor.set_buffer_text_ignoring_undo(query_text, ctx);
+                        });
+                    },
+                    ctx,
+                );
 
                 self.ai_input_model.update(ctx, |ai_input_model, ctx| {
                     ai_input_model.set_input_type(InputType::AI, ctx);
                 });
             }
             inline_history::InlineHistoryMenuEvent::SelectConversation => {
-                self.editor.update(ctx, |editor, ctx| {
-                    editor.set_buffer_text_ignoring_undo("", ctx);
-                });
+                self.with_menu_driven_buffer_write(
+                    |me, ctx| {
+                        me.editor.update(ctx, |editor, ctx| {
+                            editor.set_buffer_text_ignoring_undo("", ctx);
+                        });
+                    },
+                    ctx,
+                );
             }
             inline_history::InlineHistoryMenuEvent::Close => {
                 if self

@@ -203,9 +203,24 @@ impl Input {
                 if self.suggestions_mode_model.as_ref(ctx).is_closed() {
                     self.open_slash_commands_menu(ctx);
                 } else if !self.suggestions_mode_model.as_ref(ctx).is_slash_commands() {
-                    self.slash_command_model.update(ctx, |model, ctx| {
-                        model.disable(ctx);
-                    });
+                    if self.is_menu_driven_buffer_write {
+                        // 菜单预览回填(如 ↑ 历史菜单选中 / 开头项)不是用户键入 /,
+                        // 不接管当前菜单。
+                    } else if self.can_open_slash_commands_menu(ctx) {
+                        // 输入 / 优先级最高:其它菜单(如 ↑ 打开的 inline history 菜单)
+                        // 打开时,先关闭它们再打开 slash 菜单,而不是禁用 slash。
+                        // 注:close_input_suggestions 会顺带触发一次 ai_input_detection
+                        // 后台任务;输入类型锁定时(rich input 恒锁定)该任务在
+                        // detect_and_set_input_type 首行即 return,无实际影响。
+                        self.close_input_suggestions(false, ctx);
+                        self.open_slash_commands_menu(ctx);
+                    } else {
+                        // slash 菜单当前打不开(长运行命令守卫):回退旧语义,禁用
+                        // slash 且不动当前菜单,避免"菜单关了却开不了 slash"。
+                        self.slash_command_model.update(ctx, |model, ctx| {
+                            model.disable(ctx);
+                        });
+                    }
                 }
             }
             SlashCommandEntryState::SlashCommand(detected_command) => {

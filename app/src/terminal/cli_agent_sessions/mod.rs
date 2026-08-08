@@ -2,6 +2,8 @@ pub mod event;
 pub mod listener;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod plugin_manager;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod omp_session_history;
 
 use std::collections::{HashMap, HashSet};
 

@@ -13,6 +13,11 @@ use crate::input_suggestions::{HistoryInputSuggestion, HistoryOrder};
 use crate::search::data_source::{Query, QueryFilter, QueryResult};
 use crate::search::mixer::DataSourceRunErrorWrapper;
 use crate::search::SyncDataSource;
+#[cfg(not(target_family = "wasm"))]
+use crate::terminal::cli_agent_sessions::omp_session_history;
+use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+#[cfg(not(target_family = "wasm"))]
+use crate::terminal::CLIAgent;
 use crate::terminal::history::UpArrowHistoryConfig;
 use crate::terminal::history::{History, LinkedWorkflowData};
 use crate::terminal::input::inline_history::search_item::InlineHistoryItem;
@@ -197,6 +202,70 @@ impl InlineHistoryMenuDataSource {
         });
         conversation_entries
     }
+
+    /// 当前 CLI agent 会话在 `~/.omp/agent/sessions/` 下以 jsonl 记录用户消息,
+    /// 这里按需从磁盘读取当前会话的用户消息作为历史条目。Zap 自身不持久化任何内容。
+    ///
+    /// 返回 `Some(entries)` 表示定位到了 omp 会话(新会话无消息时为空的 `Some`);
+    /// 返回 `None` 表示不是 omp 或无法定位,调用方回退其它历史来源。
+    #[cfg(not(target_family = "wasm"))]
+    fn build_omp_prompt_entries(
+        &self,
+        trimmed_query: &str,
+        prefix_match_len: usize,
+        app: &AppContext,
+    ) -> Option<Vec<MenuEntry>> {
+        let Some(session) = CLIAgentSessionsModel::as_ref(app).session(self.terminal_view_id)
+        else {
+            return None;
+        };
+        if session.agent != CLIAgent::OhMyPi {
+            return None;
+        }
+        let session_id = session.session_context.session_id.as_deref();
+        // 优先用 OSC777 上报的启动 cwd(与 ttys 映射记录的一致);shell 实时 cwd
+        // 会随 cd 漂移,只在没有上报时作兜底。
+        let cwd = session
+            .session_context
+            .cwd
+            .as_deref()
+            .or(self
+                .active_session
+                .as_ref(app)
+                .current_working_directory()
+                .map(String::as_str));
+
+        omp_session_history::read_omp_user_messages(session_id, cwd).map(|messages| {
+            messages
+                .into_iter()
+                .filter_map(|message| {
+                    if !trimmed_query.is_empty() && !message.text.starts_with(trimmed_query) {
+                        return None;
+                    }
+                    Some(MenuEntry {
+                        order: HistoryOrder::CurrentSession,
+                        sort_timestamp: message.timestamp,
+                        item: MenuItem::AIPrompt {
+                            query_text: message.text,
+                            display_timestamp: message.timestamp,
+                            prefix_match_len,
+                        },
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// WASM 上没有本地 omp 会话文件,无法定位,返回 `None`。
+    #[cfg(target_family = "wasm")]
+    fn build_omp_prompt_entries(
+        &self,
+        _trimmed_query: &str,
+        _prefix_match_len: usize,
+        _app: &AppContext,
+    ) -> Option<Vec<MenuEntry>> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -218,6 +287,11 @@ enum MenuItem {
     Command {
         command: String,
         linked_workflow_data: Option<LinkedWorkflowData>,
+        display_timestamp: DateTime<Local>,
+        prefix_match_len: usize,
+    },
+    AIPrompt {
+        query_text: String,
         display_timestamp: DateTime<Local>,
         prefix_match_len: usize,
     },
@@ -272,10 +346,23 @@ impl SyncDataSource for InlineHistoryMenuDataSource {
         let include_conversations =
             query.filters.is_empty() || query.filters.contains(&QueryFilter::Conversations);
 
+        let include_omp_prompts =
+            query.filters.is_empty() || query.filters.contains(&QueryFilter::PromptHistory);
+        // omp 会话定位成功(Some,可能为空的新会话)时,菜单只展示 omp 用户消息,
+        // 命令历史/会话条目全部让位;定位失败(None,非 omp 或读不到映射)才回退原历史。
+        let omp_entries = if include_omp_prompts {
+            self.build_omp_prompt_entries(trimmed_query, prefix_match_len, app)
+        } else {
+            None
+        };
+        let omp_only = omp_entries.is_some();
+
         let history = History::handle(app).as_ref(app);
         let all_live_session_ids = history.all_live_session_ids();
 
-        let command_entries = if include_commands {
+        let command_entries = if omp_only || !include_commands {
+            Vec::new()
+        } else {
             history
                 .up_arrow_suggestions_for_terminal_view(
                     self.terminal_view_id,
@@ -316,16 +403,16 @@ impl SyncDataSource for InlineHistoryMenuDataSource {
                     })
                 })
                 .collect::<Vec<_>>()
-        } else {
-            Vec::new()
         };
 
-        let conversation_entries = if include_conversations {
-            self.build_conversation_entries(trimmed_query, app)
-        } else {
+        let conversation_entries = if omp_only || !include_conversations {
             Vec::new()
+        } else {
+            self.build_conversation_entries(trimmed_query, app)
         };
-        let merged_entries = interleave_conversations(command_entries, conversation_entries);
+        let mut all_timestamped_entries = omp_entries.unwrap_or_default();
+        all_timestamped_entries.extend(conversation_entries);
+        let merged_entries = interleave_conversations(command_entries, all_timestamped_entries);
 
         let mut results: Vec<QueryResult<AcceptHistoryItem>> = Vec::new();
         for entry in merged_entries {
@@ -350,6 +437,12 @@ impl SyncDataSource for InlineHistoryMenuDataSource {
                     display_timestamp,
                     prefix_match_len,
                 } => InlineHistoryItem::command(command, linked_workflow_data, display_timestamp)
+                    .with_prefix_match_len(prefix_match_len),
+                MenuItem::AIPrompt {
+                    query_text,
+                    display_timestamp,
+                    prefix_match_len,
+                } => InlineHistoryItem::ai_prompt(query_text, display_timestamp)
                     .with_prefix_match_len(prefix_match_len),
             };
 
