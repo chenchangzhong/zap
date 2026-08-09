@@ -5247,6 +5247,104 @@ fn submit_cli_agent_rich_input_opencode_defers_enter_and_close() {
 }
 
 #[test]
+fn submit_cli_agent_rich_input_keeps_editor_focus_by_default() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        // 默认配置(缺省)下 focus_terminal_after_submit = false。
+        // 用不可能匹配任何命令项的 token,保证解析结果确定性 false,
+        // 不受用户主目录下 builtin_commands.json 的实际内容影响。
+
+        let (terminal, _) = submit_rich_input_and_collect_pty_writes(
+            &mut app,
+            CLIAgent::OhMyPi,
+            "/no_such_command_test",
+        );
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                view.input.as_ref(ctx).editor().is_focused(ctx),
+                "focus must stay on rich input when per-command setting is unset/false"
+            );
+        });
+    })
+}
+
+/// 临时改写 `~/.omp/agent/builtin_commands.json`,drop 时(含 panic)恢复原状。
+struct OmpCommandsConfigRestore {
+    path: std::path::PathBuf,
+    backup: Option<String>,
+}
+
+impl Drop for OmpCommandsConfigRestore {
+    fn drop(&mut self) {
+        match &self.backup {
+            Some(content) => {
+                let _ = std::fs::write(&self.path, content);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+#[test]
+fn submit_cli_agent_rich_input_focuses_terminal_when_configured() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        // 临时把 /resume 配置成 focus_terminal_after_submit=true,测完恢复原状。
+        let config_path = dirs::home_dir()
+            .expect("home dir")
+            .join(".omp/agent/builtin_commands.json");
+        let backup = std::fs::read_to_string(&config_path).ok();
+        // 恢复 guard 在写入前构造:若 create_dir_all / write 失败 panic,
+        // Drop 会在 unwind 时用 backup 恢复原文件(含被截断的中间状态)。
+        let _restore = OmpCommandsConfigRestore {
+            path: config_path.clone(),
+            backup,
+        };
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).expect("create omp agent dir");
+        }
+        std::fs::write(
+            &config_path,
+            r#"{"version":1,"commands":[
+                {"name":"/resume","description":"d","group":"session","focus_terminal_after_submit":true}
+            ]}"#,
+        )
+        .expect("write temp builtin commands");
+
+        let (terminal, _) =
+            submit_rich_input_and_collect_pty_writes(&mut app, CLIAgent::OhMyPi, "/resume");
+
+        // 焦点切换推迟到 submit 事件链之后一拍执行,轮询等待生效。
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                !view.input.as_ref(ctx).editor().is_focused(ctx)
+            }),
+            "focus must move off rich input when per-command setting is true"
+        );
+        terminal.read(&app, |view, ctx| {
+            let window_id = ctx
+                .window_ids()
+                .into_iter()
+                .next()
+                .expect("test window");
+            assert_eq!(
+                ctx.focused_view_id(window_id),
+                Some(view.view_id),
+                "terminal view must hold focus after configured submit"
+            );
+        });
+    })
+}
+
+#[test]
 fn drag_drop_image_in_cli_agent_long_running_command_pastes_via_clipboard() {
     // Regression test: dropping an image file into a tab where a CLI agent
     // (e.g. Claude Code) is the foreground long-running process should

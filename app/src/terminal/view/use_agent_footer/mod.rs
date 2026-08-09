@@ -13,6 +13,7 @@ use crate::terminal::cli_agent_sessions::{
     event::{CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventType},
     CLIAgentInputEntrypoint, CLIAgentSessionsModel,
 };
+use crate::search::slash_command_menu::omp_commands;
 use crate::util::image::{infer_mime_type, MAX_IMAGE_SIZE_BYTES_FOR_CLI_AGENT, MIME_SNIFF_BYTES};
 use base64::Engine;
 use warpui::clipboard::{ClipboardContent, ImageData};
@@ -626,6 +627,28 @@ impl TerminalView {
         }
     }
 
+    /// 提交后按 omp per-command 配置 `focus_terminal_after_submit` 决定是否
+    /// 把焦点切回终端 TUI。值在 submit 入口算好传入(命令文本在入口可见)。
+    ///
+    /// 不能同步切:提交流程 flush 时会处理 PTY/session 事件,其订阅者回调
+    /// (如 Input 的焦点恢复逻辑)会追加 Focus effect 覆盖同步的 focus_self。
+    /// 推迟到下一事件循环,等效于用户 cmd-up 切焦点的时机——那时没有
+    /// 抢焦点的在途 effect,终局焦点才能落在 TUI。
+    fn maybe_focus_terminal_after_submit(
+        &mut self,
+        focus_terminal_after_submit: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if focus_terminal_after_submit {
+            ctx.spawn(
+                async move {},
+                move |me, _, ctx| {
+                    me.focus_terminal(ctx);
+                },
+            );
+        }
+    }
+
     pub(super) fn submit_cli_agent_rich_input(
         &mut self,
         text: String,
@@ -682,6 +705,8 @@ impl TerminalView {
             .map(|s| rich_input_submit_strategy(s.agent))
             .unwrap_or(RichInputSubmitStrategy::Inline);
 
+        let focus_terminal_after_submit = omp_commands::should_focus_terminal_after_submit(&text);
+
         let text_bytes = text.into_bytes();
 
         // Clear the buffer eagerly so that any close path (auto-dismiss,
@@ -720,11 +745,11 @@ impl TerminalView {
             ctx.spawn(
                 Timer::after(CLI_AGENT_PTY_WRITE_DELAY),
                 move |me, _, ctx| {
-                    me.paste_images_then_submit_text(images, rest, strategy, ctx);
+                    me.paste_images_then_submit_text(images, rest, strategy, focus_terminal_after_submit, ctx);
                 },
             );
         } else {
-            self.paste_images_then_submit_text(images, text_bytes, strategy, ctx);
+            self.paste_images_then_submit_text(images, text_bytes, strategy, focus_terminal_after_submit, ctx);
         }
     }
 
@@ -736,6 +761,9 @@ impl TerminalView {
     /// editor (e.g. shared-session viewer follow-up prompts). Returns
     /// without writing if there is no active CLI agent session or the text
     /// is empty.
+    ///
+    /// 程序化提交(如 agent-SDK 发送退出命令)不触发 per-command 焦点切换,
+    /// 该功能仅作用于用户在 rich input 中的提交。
     #[cfg(feature = "local_tty")]
     pub(crate) fn submit_text_to_cli_agent_pty(
         &mut self,
@@ -749,13 +777,13 @@ impl TerminalView {
             return;
         };
 
-        let text_bytes = text.into_bytes();
-        if text_bytes.is_empty() {
+        if text.is_empty() {
             return;
         }
+        let text_bytes = text.into_bytes();
 
         let strategy = rich_input_submit_strategy(agent);
-        self.write_cli_agent_text_then_submit(text_bytes, strategy, ctx);
+        self.write_cli_agent_text_then_submit(text_bytes, strategy, false, ctx);
     }
 
     /// Simulates clipboard image paste for each pending image attachment by
@@ -772,6 +800,7 @@ impl TerminalView {
         images: Vec<ImageContext>,
         text_bytes: Vec<u8>,
         strategy: RichInputSubmitStrategy,
+        focus_terminal_after_submit: bool,
         ctx: &mut ViewContext<Self>,
     ) {
         // Bail if the rich input session was closed before we got here.
@@ -780,7 +809,7 @@ impl TerminalView {
         }
 
         if images.is_empty() {
-            self.write_cli_agent_text_then_submit(text_bytes, strategy, ctx);
+            self.write_cli_agent_text_then_submit(text_bytes, strategy, focus_terminal_after_submit, ctx);
             return;
         }
 
@@ -836,7 +865,12 @@ impl TerminalView {
                 if !ok || !me.has_active_cli_agent_input_session(ctx) {
                     return;
                 }
-                me.write_cli_agent_text_then_submit(text_bytes, strategy, ctx);
+                me.write_cli_agent_text_then_submit(
+                    text_bytes,
+                    strategy,
+                    focus_terminal_after_submit,
+                    ctx,
+                );
             },
         );
     }
@@ -954,6 +988,7 @@ impl TerminalView {
         &mut self,
         text_bytes: Vec<u8>,
         strategy: RichInputSubmitStrategy,
+        focus_terminal_after_submit: bool,
         ctx: &mut ViewContext<Self>,
     ) {
         match strategy {
@@ -962,11 +997,13 @@ impl TerminalView {
                 bytes.extend_from_slice(b"\r");
                 self.write_user_bytes_to_pty(bytes, ctx);
                 self.maybe_close_rich_input_after_submit(ctx);
+                self.maybe_focus_terminal_after_submit(focus_terminal_after_submit, ctx);
             }
             RichInputSubmitStrategy::BracketedPaste => {
                 self.write_cli_agent_text(&text_bytes, strategy, ctx);
                 self.write_user_bytes_to_pty(b"\r".to_vec(), ctx);
                 self.maybe_close_rich_input_after_submit(ctx);
+                self.maybe_focus_terminal_after_submit(focus_terminal_after_submit, ctx);
             }
             RichInputSubmitStrategy::DelayedEnter => {
                 self.write_user_bytes_to_pty(text_bytes, ctx);
@@ -975,6 +1012,7 @@ impl TerminalView {
                     move |me, _, ctx| {
                         me.write_user_bytes_to_pty(b"\r".to_vec(), ctx);
                         me.maybe_close_rich_input_after_submit(ctx);
+                        me.maybe_focus_terminal_after_submit(focus_terminal_after_submit, ctx);
                     },
                 );
             }
@@ -985,6 +1023,7 @@ impl TerminalView {
                     move |me, _, ctx| {
                         me.write_user_bytes_to_pty(b"\r".to_vec(), ctx);
                         me.maybe_close_rich_input_after_submit(ctx);
+                        me.maybe_focus_terminal_after_submit(focus_terminal_after_submit, ctx);
                     },
                 );
             }

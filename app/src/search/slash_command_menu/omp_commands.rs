@@ -13,6 +13,9 @@ pub struct OmpCommandDefinition {
     pub description: String,
     #[serde(default)]
     pub group: String,
+    /// 提交该命令后是否把焦点切回终端 TUI（per-command 配置，缺省 false）
+    #[serde(default)]
+    pub focus_terminal_after_submit: bool,
 }
 
 /// OMP 命令清单（JSON 文件根结构）
@@ -143,6 +146,39 @@ pub fn all_omp_commands(skill_items: Vec<OmpCommandItem>) -> Vec<OmpCommandItem>
     commands
 }
 
+/// 从 builtin_commands.json 内容解析提交 `command_text` 后是否把焦点切回 TUI。
+/// 取首个空白分隔 token 匹配命令项 name;无匹配 / 属性缺失 / JSON 非法 → 默认 false。
+fn resolve_focus_terminal_after_submit(content: &str, command_text: &str) -> bool {
+    let file = match serde_json::from_str::<OmpCommandsFile>(content) {
+        Ok(file) => file,
+        Err(e) => {
+            log::warn!("Failed to parse OMP builtin commands config: {e}");
+            return false;
+        }
+    };
+    let command = command_text.split_whitespace().next().unwrap_or("");
+    file.commands
+        .iter()
+        .find(|c| c.name == command)
+        .map(|c| c.focus_terminal_after_submit)
+        .unwrap_or(false)
+}
+
+/// 提交 `command_text` 后是否把焦点切回终端 TUI。文件/属性缺失 → 默认 false。
+pub fn should_focus_terminal_after_submit(command_text: &str) -> bool {
+    let Some(agent_dir) = omp_agent_dir() else {
+        return false;
+    };
+    let path = agent_dir.join("builtin_commands.json");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => resolve_focus_terminal_after_submit(&content, command_text),
+        Err(e) => {
+            log::warn!("Failed to read OMP builtin commands from {:?}: {e}", path);
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +208,33 @@ Content"#;
     fn test_parse_frontmatter_no_frontmatter() {
         let md = "Just content";
         assert!(parse_frontmatter_description(md).is_none());
+    }
+
+    #[test]
+    fn test_resolve_focus_terminal_after_submit_per_command() {
+        let content = r#"{"version":1,"commands":[
+            {"name":"/resume","description":"d","group":"session","focus_terminal_after_submit":true},
+            {"name":"/plan","description":"d","group":"top","focus_terminal_after_submit":false},
+            {"name":"/model","description":"d","group":"top"}
+        ]}"#;
+        // 命令项显式 true
+        assert!(resolve_focus_terminal_after_submit(content, "/resume"));
+        // 命令项显式 false(与缺省是不同 serde 路径)
+        assert!(!resolve_focus_terminal_after_submit(content, "/plan"));
+        // 命令项缺省 → false
+        assert!(!resolve_focus_terminal_after_submit(content, "/model"));
+        // 带参数仍匹配命令名
+        assert!(resolve_focus_terminal_after_submit(content, "/resume 019fbc91-a15f"));
+        // 前导空白不影响命令名提取
+        assert!(resolve_focus_terminal_after_submit(content, "  /resume"));
+        // 非命令文本 → 默认 false
+        assert!(!resolve_focus_terminal_after_submit(content, "fix the bug"));
+    }
+
+    #[test]
+    fn test_resolve_focus_terminal_after_submit_defaults_false_on_failure() {
+        assert!(!resolve_focus_terminal_after_submit("not json", "/resume"));
+        assert!(!resolve_focus_terminal_after_submit("", "/resume"));
+        assert!(!resolve_focus_terminal_after_submit(r#"{"version":1,"commands":[]}"#, "/resume"));
     }
 }
