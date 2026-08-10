@@ -6898,6 +6898,85 @@ fn set_active_block_agent_driving(view: &mut TerminalView, conversation_id: AICo
         .set_agent_interaction_mode_for_requested_command(action_id, None, conversation_id);
 }
 
+/// AI block 自己持有文字选区,与模型的点选区(point-based selection)相互独立,
+/// 因此必须通过 `AIBlockEvent::SelectionChanged` 告知模型"哪个 rich content block
+/// 有活跃选区"。否则 `selection_to_string` 返回空,复制路径产出空剪贴板
+/// (即 #12079 中 `mouse_down` 的 `if !handled` guard 引入的回归)。
+#[test]
+fn copy_selected_text_from_ai_block() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        // 插入一个带 user query 的 AI block。
+        terminal.update(&mut app, |view, ctx| {
+            let _ = append_exchange_with_inputs_and_handle_event(
+                view,
+                vec![AIAgentInput::UserQuery {
+                    query: "the quick brown fox".to_owned(),
+                    context: Default::default(),
+                    static_query_type: None,
+                    referenced_attachments: Default::default(),
+                    user_query_mode: UserQueryMode::Normal,
+                    running_command: None,
+                    intended_agent: None,
+                }],
+                ctx,
+            );
+        });
+
+        let ai_block = terminal.read(&app, |view, _| {
+            view.rich_content_views
+                .iter()
+                .find_map(|rich_content| {
+                    rich_content
+                        .ai_block_metadata()
+                        .map(|metadata| metadata.ai_block_handle.clone())
+                })
+                .expect("an AI block should have been inserted")
+        });
+
+        // 模拟 AI block 内的 block 级文字选区并通知终端 view(等价于真实拖选时
+        // `SelectableArea` 的选区回调 + `AIBlockAction::SelectText` 派发)。
+        ai_block.update(&mut app, |block, ctx| {
+            block.set_block_level_selected_text_for_test(Some("quick brown".to_owned()));
+            block.handle_action(&AIBlockAction::SelectText, ctx);
+        });
+
+        // 此时模型必须记录 AI block 有活跃文字选区,这正是复制/插入路径
+        // (经由 `selection_to_string`)找到选中文字的依据,也是 #12079 回归破坏的部分。
+        // 这里断言模型记录而非剪贴板字符串,因为跨 view 读取选中文字需要 active window,
+        // 而 headless 测试环境不提供(端到端剪贴板行为由集成测试覆盖)。
+        terminal.read(&app, |view, ctx| {
+            let semantic_selection = SemanticSelection::as_ref(ctx);
+            let model = view.model.lock();
+            assert!(
+                model
+                    .block_list()
+                    .has_renderable_selection(semantic_selection, false),
+                "the model must record the AI block's text selection so copy/insert can find it"
+            );
+        });
+
+        // 清除 AI block 选区必须同时清除模型记录的选区,否则后续复制/插入会拿到过期文字。
+        ai_block.update(&mut app, |block, ctx| {
+            block.set_block_level_selected_text_for_test(None);
+            block.handle_action(&AIBlockAction::SelectText, ctx);
+        });
+        terminal.read(&app, |view, ctx| {
+            let semantic_selection = SemanticSelection::as_ref(ctx);
+            let model = view.model.lock();
+            assert!(
+                !model
+                    .block_list()
+                    .has_renderable_selection(semantic_selection, false),
+                "clearing the AI block selection should clear the model's recorded selection"
+            );
+        });
+    })
+}
+
 #[test]
 fn cmd_k_does_not_clear_buffer_when_agent_is_driving_command() {
     App::test((), |mut app| async move {

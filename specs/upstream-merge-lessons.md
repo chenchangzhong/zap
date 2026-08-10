@@ -920,6 +920,13 @@ git rebase --onto HEAD <剔除的commit> main
 > （「修复 Oz agent 标签页无法复制文字，并移植 3 条上游修复」，27 文件 +1527/-135）
 > 做逐符号归属比对，检查移植是否忠实于上游。
 >
+> **归属标注更正（2026-08-10，见 §26）**：`f7e298027` 的**主体代码**
+> （`sync_ai_block_model_selection`、`remove_rich_content` 不清
+> `rich_content_selections` 等复制修复链路）实为上游 `b2804a091`（#12892）
+> 的移植，commit message 的「修复 Oz agent 标签页…」措辞掩盖了"主体即移植"
+> 这一事实。§26 已补上该 commit 缺失的测试部分（view 层单测 + 集成测试）。
+> git 历史不可改写，此处文档层面标注清楚。
+>
 > 结果：**3 处偏差，全部已修**。其余全部逐字 IDENTICAL。
 
 ### 18.1 新判据：移植源必须是上游的**最终**版本
@@ -1525,5 +1532,104 @@ lifecycle 栈（§21）按 §21.4 方案 A 执行。全部执行记录见 §23�
 
 ---
 
-*文档版本：v2.4*
+## 26. 移植补齐（2026-08-10）：AI block 复制修复的测试覆盖 + queued prompt 选区
+
+> 触发：§18 回查确认 `f7e298027` 实为上游 `b2804a091`（#12892）的代码搬入，
+> 但**测试部分未搬**（§18.4 只补了 guard 测试，`b2804a091` 自带的 view 层单测
+> 与集成测试都没带过来），且两个 `_for_test` 辅助函数因此在本地零调用者。
+> 本轮补齐测试覆盖、消掉死代码，并移植上游 `35d951cdc`（#10481
+> "Make queued prompt text selectable"）补上 queued prompt 选区能力。
+
+### 26.1 做了什么
+
+| 项 | 内容 |
+|----|------|
+| 步骤 1 | 照搬上游 `b2804a091` 的 view 层单测 `copy_selected_text_from_ai_block`（`view_test.rs`），适配本地 `append_exchange_with_inputs_and_handle_event`（上游是单参版）；`set_block_level_selected_text_for_test` 死代码消除 |
+| 步骤 2 | 照搬上游集成测试 `test_copy_selection_within_ai_block`（`agent_mode.rs`）+ 手动 runner + nextest 注册；`simulate_text_selection_for_test` 死代码消除 |
+| 步骤 3 | 移植上游 `35d951cdc` 的 5 文件（`pending_user_query_block.rs` / `selection.rs` / `view.rs` / `pending_user_query.rs` / `rich_content.rs`），让 queued prompt 文字可选中可复制；**刻意不引入**上游 `TranscriptScope` 拆分与 Rust 2024 let-chain（保持本地 `agent_view_state` 命名与语法，避免跨层重构） |
+
+### 26.2 移植中发现的上游演进（重要）
+
+**`35d951cdc` 不是该功能的最终形态**——后续 `98af7b654`（#11439 "queued
+prompts list UI"）把 `35d951cdc` 加在 `view.rs` 的**四个 pending 选区接入点全部移除**，
+换成新的 queued prompt 面板架构（多 prompt 队列、编辑、排序、折叠）。
+
+- 本地没有 #11439（面板架构是更大的 UI 重构，未拣入），所以本地移植
+  `35d951cdc` 的接入点是**正确的**——在旧 pending block UI 下需要这些接入。
+- 但**下一轮同步 #11439 时**：要么整体替换 pending block 机制（含本次 5 文件改动），
+  要么明确保留旧 UI。届时本节的移植记录是 #11439 的"反向清单"。
+
+### 26.3 继承缺陷记录（与上游一致，非移植偏差）
+
+1. **四入口优先级不一致**：`copy()` 的 pending 分支在 grid `selection_to_string`
+   **之前**；`selected_text()` / `maybe_copy_selection_to_clipboard()` /
+   `context_menu_copy_selected_text()` 是 **grid 优先** `or_else(pending)`。
+   评审曾尝试统一为 pending 优先，但会引入对称残留（先拖 queued prompt 再拖
+   AI block 时复制残留 pending 文本）——而上游 grid 优先在该场景正确（AIBlock
+   有模型同步）。**保持与上游一致**，未改优先级。
+2. **互斥不对称**：AIBlock `SelectionChanged` 只 `sync_ai_block_model_selection`、
+   不清其它 rich content 选区；pending `TextSelected` 清其它。上游同样如此。
+3. **grid 残留遮蔽**：拖选 queued prompt 时 `SelectableArea` 消费 mouse-down，
+   模型旧点选区不清除，grid 优先会返回残留文本——上游固有（`35d951cdc` 原样）。
+
+### 26.4 已修：右键 "Insert into input" 缺口
+
+`35d951cdc` 只给四个入口加了 pending fallback，**漏了
+`context_menu_insert_selected_text`**（右键菜单 "Insert into input"）。本地补上，
+用同模式（grid 优先 `or_else(pending)`），与上游四个接入点一致。这是对上游
+缺口的**补缺**，不改任何既有优先级。
+
+### 26.5 验证状态
+
+| 项 | 结果 |
+|----|------|
+| 假绿判定 | 置空 `sync_ai_block_model_selection` 函数体 → 新单测 FAIL（断言打在同步路径上） |
+| `cargo check -p warp --all-targets` | 0 error |
+| `cargo nextest run -p warp copy_selected_text_from_ai_block selection` | 110/110 passed |
+| `cargo nextest run -p integration test_copy_selection_within_ai_block` | 1 passed（剪贴板断言拿到期望文本） |
+| 手动 runner | `cargo run -p integration --bin integration -- test_copy_selection_within_ai_block` 全 9 步 succeeded |
+| code review（2 reviewer 并行） | 3 findings：优先级不一致（B1，回退保持上游一致）、右键 Insert 缺口（A1，已修）、import 折叠（A2，已修） |
+| release 正式版构建 | `./script/macos/bundle --channel oss --selfsign --nouniversal --arch aarch64` 成功，`codesign --verify --deep --strict` OK |
+
+### 26.6 #11439 评估（2026-08-10）
+
+**结论：独立计划级移植，不建议混入本次；本地保留 35d951cdc 接入是正确且必要的。**
+
+`98af7b654`（#11439）结构：27 文件 +2449/-213。核心是每 conversation 多队列模型
+`QueuedQueryModel`（`queued_query.rs`：append/pop/reorder/edit/autofire）+ 新面板
+`QueuedPromptsPanelView`（`queued_prompts_panel.rs` 841 行）；`view.rs` 225 行、
+`input.rs` 65 行、telemetry 83 行、workspace/shared_session 联动。
+
+**与本次移植的关系**：
+
+1. `98af7b654` 删除了 `35d951cdc` 加在 view.rs 的 `pending_user_query_selected_text`
+   方法 + 4 处接入点，**但没有替代读取路径**（`queued_query.rs` 无 selected_text）。
+   即上游在该重构中**回退了 cloud mode pending block 的选区复制能力**
+   （保留 SelectableArea 接线与 `TextSelected` 事件，但复制路径不再读它）。
+2. pending block 机制本身**保留**：上游改成 `insert_cloud_mode_queued_user_query_block`
+   （带 `PendingUserQueryKind::CloudMode`）；本地对应入口是
+   `insert_ambient_agent_queued_user_query_block`（无 kind 参数），需适配。
+3. 本地没有 QueuedQueryModel/面板，queued prompt 全部走 pending block
+   （`/queue`、`/compact-and`、`/fork-and-compact`、ambient run 初始 prompt），
+   所以**本地必须保留 35d951cdc 接入点**——照搬 #11439 的接入删除会让
+   queued prompt 复制能力整体回退，且无替代。
+
+**移植 #11439 的完整清单（若开下一轮）**：
+
+- 引入 `queued_query.rs` 多队列模型 + `queued_prompts_panel.rs` 面板 + 测试（+1171 行新文件）
+- 适配 `view.rs` 225 行：`drain_queued_prompts`、`QueuedQueryModel` 接线、删除 35d951cdc 接入（**需先决定本地 pending block 选区复制如何保留**——方案 A：保留接入点，面板与 block 并存；方案 B：仿上游删接入、接受 cloud/ambient 场景复制回退）
+- 本地 `insert_ambient_agent_queued_user_query_block` 对齐 `PendingUserQueryKind`
+- `input.rs`/`input/agent.rs`/`slash_commands` 队列提交路径
+- telemetry 83 行（本地 telemetry 已精简为 no-op 宏集，参考 §23 先例）
+- workspace 面板挂载（`workspace/view.rs`、`action.rs`）
+- 与本地 OMP 集成（agent view、ambient run、shared_session）冲突排查
+- 全量测试 + review
+
+**§18 归属标注（已更正，2026-08-10）**：`f7e298027` 主体代码实为上游
+`b2804a091`（#12892）移植，commit message 措辞有误导；已在 §18 引言标注清楚
+（git 历史不可改写，文档层面更正），§26 补上了该 commit 缺失的测试部分。
+
+---
+
+*文档版本：v2.5*
 *下次合并前必读*

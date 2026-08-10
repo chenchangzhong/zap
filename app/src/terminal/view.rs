@@ -11933,9 +11933,32 @@ impl TerminalView {
             .input_mode
             .value();
         let inverted = input_mode.is_inverted_blocklist();
-        self.model
+        // 与上游 `35d951cdc` 一致:grid 点选区优先,pending 块选区兜底。
+        // 已知继承缺陷:拖选 queued prompt 时 `SelectableArea` 消费 mouse-down,模型旧点选区
+        // 不清除,故此时 grid 可能返回残留文本而非 pending 选区(上游 `35d951cdc` 固有,
+        // 本地照搬保持一致;后续上游 `98af7b654` 用 queued prompt 面板重构了此机制)。
+        let blocklist_selected_text = self
+            .model
             .lock()
-            .selection_to_string(semantic_selection, inverted, ctx)
+            .selection_to_string(semantic_selection, inverted, ctx);
+        blocklist_selected_text.or_else(|| self.pending_user_query_selected_text(ctx))
+    }
+
+    /// 返回 pending user query block 内的选中文字(若有)。
+    fn pending_user_query_selected_text(&self, ctx: &AppContext) -> Option<String> {
+        let view_id = self.pending_user_query_view_id?;
+        self.rich_content_views
+            .iter()
+            .find_map(|rich_content| match rich_content.metadata() {
+                Some(RichContentMetadata::PendingUserQuery {
+                    pending_user_query_block_handle,
+                }) if pending_user_query_block_handle.id() == view_id => {
+                    pending_user_query_block_handle
+                        .as_ref(ctx)
+                        .selected_text(ctx)
+                }
+                _ => None,
+            })
     }
 
     /// Gets the selected text from the terminal input editor, if any.
@@ -14038,6 +14061,14 @@ impl TerminalView {
             .clone();
         if let Some(text) = error_selected_text.read().clone().filter(|t| !t.is_empty()) {
             ctx.clipboard().write(ClipboardContent::plain_text(text));
+            return;
+        }
+
+        // queued prompt 的选区优先于 grid 选区:拖选 pending block 时 `SelectableArea`
+        // 消费了 mouse-down,模型的旧点选区不会被清除,若先查 grid 会复制到残留的旧文本。
+        if let Some(selected_text) = self.pending_user_query_selected_text(ctx) {
+            ctx.clipboard()
+                .write(ClipboardContent::plain_text(selected_text));
             return;
         }
 
@@ -16290,10 +16321,12 @@ impl TerminalView {
     fn maybe_copy_selection_to_clipboard(&mut self, ctx: &mut ViewContext<Self>) {
         let selection_settings = SelectionSettings::handle(ctx);
         let semantic_selection = SemanticSelection::as_ref(ctx);
+        // 与上游 `35d951cdc` 一致:grid 点选区优先,pending 块选区兜底。
         let model = self.model.lock();
-        if let Some(selected) =
-            model.selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx)
-        {
+        let selected_text = model
+            .selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx)
+            .or_else(|| self.pending_user_query_selected_text(ctx));
+        if let Some(selected) = selected_text {
             selection_settings.update(ctx, |selection_settings, ctx| {
                 selection_settings
                     .maybe_copy_on_select(ClipboardContent::plain_text(selected), ctx);
@@ -18165,6 +18198,18 @@ impl TerminalView {
                         env_var_collection_block.clear_selection(ctx);
                     });
                 }
+                Some(RichContentMetadata::PendingUserQuery {
+                    pending_user_query_block_handle,
+                }) => {
+                    if exempt_rich_content_view_id
+                        .is_some_and(|view_id| pending_user_query_block_handle.id() == view_id)
+                    {
+                        continue;
+                    }
+                    pending_user_query_block_handle.update(ctx, |block, ctx| {
+                        block.clear_selection(ctx);
+                    });
+                }
                 Some(RichContentMetadata::WarpifySuccessBlock { .. }) => {
                     // TODO(Simon): We should be checking for WarpifySuccessBlocks here as well.
                     // The `WarpifySuccessBlock` implements a `SelectableArea`.
@@ -18936,11 +18981,12 @@ impl TerminalView {
             let semantic_selection = SemanticSelection::as_ref(ctx);
             // Note: we purposely separate this expression here, to avoid locking the TerminalModel for the duration of the `if let`
             // block, since downstream functions may need the lock (`Input::insert_internal`).
-            let selected_text = self.model.lock().selection_to_string(
-                semantic_selection,
-                self.is_inverted_blocklist(ctx),
-                ctx,
-            );
+            // pending user query block 的选区不记录在模型里,需要在模型之外兜底
+            // (与 `context_menu_copy_selected_text` 保持一致)。
+            let model = self.model.lock();
+            let selected_text = model
+                .selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx)
+                .or_else(|| self.pending_user_query_selected_text(ctx));
             if let Some(selected_text) = selected_text {
                 // We put everything from the selection into the input box, even
                 // if it includes non-printable characters. Note that this is
@@ -19083,9 +19129,11 @@ impl TerminalView {
         {
             let semantic_selection = SemanticSelection::as_ref(ctx);
             let model = self.model.lock();
-            if let Some(selected_text) =
-                model.selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx)
-            {
+            // 与上游 `35d951cdc` 一致:grid 点选区优先,pending 块选区兜底。
+            let selected_text = model
+                .selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx)
+                .or_else(|| self.pending_user_query_selected_text(ctx));
+            if let Some(selected_text) = selected_text {
                 ctx.clipboard()
                     .write(ClipboardContent::plain_text(selected_text));
             }

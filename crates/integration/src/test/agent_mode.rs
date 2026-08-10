@@ -326,6 +326,48 @@ T This is a dummy title
     builder
 }
 
+/// 标记为 AI block 内选中文字的内容,供复制回归测试使用。
+const AI_BLOCK_SELECTED_TEXT: &str = "agent mode and this is my dummy output";
+
+/// 复制"完全落在 AI block 内部"的选区的回归测试(在 AI 回复里选中文字后复制)。
+/// 这正是 #12079 的 `mouse_down` `if !handled` guard 破坏的场景:AI block 的
+/// `SelectableArea` 消费了 mouse-down,终端模型选区从未开始,复制时
+/// `selection_to_string` 返回空。
+///
+/// 与 `*_through_ai_*` 系列测试不同,这里的选区**不**从 command block 开始,
+/// 因此没有点选区可以回落 —— 它专门覆盖修复所针对的纯 AI block 路径。
+///
+/// 这里按 `SelectableArea` 在纯 block 内拖选时的做法模拟选区(写入 block 级选中文字
+/// 并通知终端 view),而不依赖对布局敏感的像素坐标(后者正是 `*_through_ai_*`
+/// 测试目前被 ignore 的原因)。
+pub fn test_copy_selection_within_ai_block() -> Builder {
+    builder_with_setup()
+        .with_step(
+            new_step_with_default_assertions("Select text within the AI block").with_action(
+                |app, _, _| {
+                    let window_id = app.window_ids()[0];
+                    let terminal_view = single_terminal_view_for_tab(app, window_id, 0);
+                    let ai_block = terminal_view
+                        .read(app, |view, _| view.last_ai_block())
+                        .expect("AI block exists");
+                    ai_block.update(app, |block, ctx| {
+                        block.simulate_text_selection_for_test(
+                            Some(AI_BLOCK_SELECTED_TEXT.to_owned()),
+                            ctx,
+                        );
+                    });
+                },
+            ),
+        )
+        .with_step(
+            new_step_with_default_assertions("Copy the in-AI-block selection")
+                .with_keystrokes(&[cmd_or_ctrl_shift("c")])
+                .add_assertion(assert_clipboard_contains_string(
+                    AI_BLOCK_SELECTED_TEXT.to_owned(),
+                )),
+        )
+}
+
 pub fn test_selection_first_to_last_through_ai_simple() -> Builder {
     select_first_to_last_through_ai_simple(false)
 }

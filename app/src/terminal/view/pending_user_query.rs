@@ -51,22 +51,30 @@ impl TerminalView {
                 ctx,
             )
         });
-        if show_close_button || show_send_now_button {
-            ctx.subscribe_to_view(&handle, move |me, _, event, ctx| match event {
-                PendingUserQueryBlockEvent::Dismissed => {
+        ctx.subscribe_to_view(&handle, move |me, block, event, ctx| match event {
+            PendingUserQueryBlockEvent::Dismissed => {
+                if show_close_button {
                     me.remove_pending_user_query_block(ctx);
                 }
-                PendingUserQueryBlockEvent::SendNow => {
+            }
+            PendingUserQueryBlockEvent::SendNow => {
+                if show_send_now_button {
                     me.send_queued_prompt_now(prompt_for_send_now.clone(), ctx);
                 }
-            });
-        }
+            }
+            PendingUserQueryBlockEvent::TextSelected => {
+                // 确保整个终端 view 内只有一个活跃文字选区。
+                me.clear_selected_text_except(Some(block.id()), ctx);
+            }
+        });
         let view_id = handle.id();
 
         self.insert_rich_content(
             None,
-            handle,
-            Some(RichContentMetadata::PendingUserQuery),
+            handle.clone(),
+            Some(RichContentMetadata::PendingUserQuery {
+                pending_user_query_block_handle: handle,
+            }),
             super::rich_content::RichContentInsertionPosition::PinToBottom,
             ctx,
         );
