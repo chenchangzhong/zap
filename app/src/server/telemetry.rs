@@ -26,6 +26,7 @@ use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::blocklist::CommandExecutionPermissionAllowedReason;
 use crate::ai::blocklist::InputType;
+use crate::ai::blocklist::QueuedQueryOrigin;
 use crate::ai::mcp::TemplateVariable;
 use crate::ai::predict::generate_ai_input_suggestions::GenerateAIInputSuggestionsRequest;
 use crate::ai::predict::generate_ai_input_suggestions::GenerateAIInputSuggestionsResponseV2;
@@ -1105,6 +1106,26 @@ pub enum SlashMenuSource {
 pub enum LoginEventSource {
     OnboardingSlide,
     AuthModal,
+}
+
+/// Origin of a queued prompt, mirrored for telemetry so we don't pull serde derives onto the
+/// canonical `QueuedQueryOrigin` enum (which doesn't otherwise need them).
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryQueuedQueryOrigin {
+    InitialCloudMode,
+    QueueSlashCommand,
+    AutoQueueToggle,
+}
+
+impl From<QueuedQueryOrigin> for TelemetryQueuedQueryOrigin {
+    fn from(origin: QueuedQueryOrigin) -> Self {
+        match origin {
+            QueuedQueryOrigin::InitialCloudMode => Self::InitialCloudMode,
+            QueuedQueryOrigin::QueueSlashCommand => Self::QueueSlashCommand,
+            QueuedQueryOrigin::AutoQueueToggle => Self::AutoQueueToggle,
+        }
+    }
 }
 
 /// Details about which type of slash command was accepted
@@ -2543,6 +2564,25 @@ pub enum TelemetryEvent {
         /// Required minimum glibc reported by the script. Empty when
         /// the unsupported classification was not glibc-related.
         required_glibc: String,
+    },
+    /// Emitted when the user commits a non-empty edit to a queued prompt row.
+    QueuedPromptEdited {
+        origin: TelemetryQueuedQueryOrigin,
+    },
+    /// Emitted when the user deletes a queued prompt row via the trash button or the
+    /// commit-empty edit shortcut.
+    QueuedPromptDeleted {
+        origin: TelemetryQueuedQueryOrigin,
+    },
+    /// Emitted when the user reorders a queued prompt row via drag-and-drop.
+    QueuedPromptReordered {
+        origin: TelemetryQueuedQueryOrigin,
+        from_index: usize,
+        to_index: usize,
+    },
+    /// Emitted when the user toggles the queued prompts panel collapse state.
+    QueuedPromptPanelCollapseToggled {
+        collapsed: bool,
     },
 }
 
@@ -4024,6 +4064,24 @@ impl TelemetryEvent {
             | TelemetryEvent::OpenAuthPrivacySettings { source } => Some(json!({
                 "source": source,
             })),
+            TelemetryEvent::QueuedPromptEdited { origin } => Some(json!({
+                "origin": origin,
+            })),
+            TelemetryEvent::QueuedPromptDeleted { origin } => Some(json!({
+                "origin": origin,
+            })),
+            TelemetryEvent::QueuedPromptReordered {
+                origin,
+                from_index,
+                to_index,
+            } => Some(json!({
+                "origin": origin,
+                "from_index": from_index,
+                "to_index": to_index,
+            })),
+            TelemetryEvent::QueuedPromptPanelCollapseToggled { collapsed } => Some(json!({
+                "collapsed": collapsed,
+            })),
         }
     }
 
@@ -4426,7 +4484,11 @@ impl TelemetryEvent {
             | TelemetryEvent::RemoteServerClientRequestError { .. }
             | TelemetryEvent::RemoteServerMessageDecodingError { .. }
             | TelemetryEvent::RemoteServerSetupDuration { .. }
-            | TelemetryEvent::RemoteServerHostUnsupported { .. } => false,
+            | TelemetryEvent::RemoteServerHostUnsupported { .. }
+            | TelemetryEvent::QueuedPromptEdited { .. }
+            | TelemetryEvent::QueuedPromptDeleted { .. }
+            | TelemetryEvent::QueuedPromptReordered { .. }
+            | TelemetryEvent::QueuedPromptPanelCollapseToggled { .. } => false,
             #[cfg(feature = "local_fs")]
             TelemetryEvent::CodePaneOpened { .. }
             | TelemetryEvent::CodePanelsFileOpened { .. }

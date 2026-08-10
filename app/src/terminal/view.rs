@@ -8,6 +8,10 @@ mod bookmarks;
 pub mod init;
 pub mod inline_banner;
 pub mod load_ai_conversation;
+pub(crate) mod queued_prompts_panel;
+#[cfg(test)]
+#[path = "view/queued_prompts_tests.rs"]
+mod queued_prompts_tests;
 use crate::ai::block_context::BlockContext;
 #[cfg(feature = "local_fs")]
 use crate::ai::skills::SkillOpenOrigin;
@@ -85,7 +89,9 @@ use crate::ai::blocklist::block::status_bar::BlocklistAIStatusBarEvent;
 use crate::ai::blocklist::usage::conversation_usage_view::{
     ConversationUsageInfo, ConversationUsageView, DisplayMode, TimingInfo,
 };
-use crate::ai::blocklist::{block_context_from_terminal_model, SlashCommandRequest};
+use crate::ai::blocklist::{
+    block_context_from_terminal_model, AutofireAction, QueuedQueryModel, SlashCommandRequest,
+};
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentModel, AIDocumentVersion};
 use crate::ai::loading::shimmering_warp_loading_text;
 #[cfg(feature = "local_fs")]
@@ -4367,6 +4373,98 @@ impl TerminalView {
             .push(Box::new(callback));
     }
 
+    fn handle_finished_conversation(
+        &mut self,
+        conversation_id: AIConversationId,
+        finish_reason: FinishReason,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let queued_prompt = self.queued_prompt_callback.take();
+        let callbacks = self
+            .conversation_completed_callbacks
+            .drain(..)
+            .collect_vec();
+        for callback in callbacks {
+            callback(self, finish_reason, ctx);
+        }
+        if let Some(callback) = queued_prompt {
+            callback(self, finish_reason, ctx);
+        }
+        self.drain_queued_prompts(conversation_id, finish_reason, ctx);
+    }
+
+    /// Drains one prompt from the queued-query singleton for `conversation_id` when that
+    /// conversation finishes.
+    fn drain_queued_prompts(
+        &mut self,
+        conversation_id: AIConversationId,
+        finish_reason: FinishReason,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match finish_reason {
+            FinishReason::Complete => {
+                let input_is_empty = self.input.as_ref(ctx).buffer_text(ctx).is_empty();
+                let first_row_is_in_edit_mode =
+                    QueuedQueryModel::as_ref(ctx).first_row_is_in_edit_mode(conversation_id);
+                if first_row_is_in_edit_mode && !input_is_empty {
+                    return;
+                }
+
+                let action = QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.pop_for_autofire(conversation_id, ctx)
+                });
+                match action {
+                    Some(AutofireAction::Submit { text }) => {
+                        self.input.update(ctx, |input, ctx| {
+                            input.submit_queued_prompt(text, ctx);
+                        });
+                    }
+                    Some(AutofireAction::PopFromEditMode { text }) => {
+                        self.input.update(ctx, |input, ctx| {
+                            if input.buffer_text(ctx).is_empty() {
+                                input.replace_buffer_content(&text, ctx);
+                                input.focus_input_box(ctx);
+                            }
+                        });
+                    }
+                    None => {}
+                }
+            }
+            FinishReason::Error
+            | FinishReason::Cancelled
+            | FinishReason::CancelledDuringRequestedCommandExecution => {
+                // Only restore the head into the input when the user is
+                // currently viewing this conversation in agent view. Cancels
+                // triggered by exiting the agent view leave `agent_view_state`
+                // Inactive by the time the cancel fires, so the head stays in
+                // the queue and re-entering the agent view shows the same
+                // queue the user left.
+                let is_active_in_agent_view = self
+                    .agent_view_controller
+                    .as_ref(ctx)
+                    .agent_view_state()
+                    .active_conversation_id()
+                    == Some(conversation_id);
+                if !is_active_in_agent_view {
+                    return;
+                }
+
+                let input_is_empty = self.input.as_ref(ctx).buffer_text(ctx).is_empty();
+                if !input_is_empty {
+                    return;
+                }
+
+                let popped = QueuedQueryModel::handle(ctx)
+                    .update(ctx, |model, ctx| model.pop_front(conversation_id, ctx));
+                if let Some(query) = popped {
+                    self.input.update(ctx, |input, ctx| {
+                        input.replace_buffer_content(query.text(), ctx);
+                    });
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "local_fs")]
     fn handle_git_repo_status_event(&mut self, ctx: &mut ViewContext<Self>) {
         if let Some(deferred) = self.deferred_code_review_open.take() {
@@ -4537,17 +4635,7 @@ impl TerminalView {
             }
 
             if let Some(reason) = finish_reason {
-                let queued_prompt = self.queued_prompt_callback.take();
-                let callbacks = self
-                    .conversation_completed_callbacks
-                    .drain(..)
-                    .collect_vec();
-                for callback in callbacks {
-                    callback(self, reason, ctx);
-                }
-                if let Some(callback) = queued_prompt {
-                    callback(self, reason, ctx);
-                }
+                self.handle_finished_conversation(*conversation_id, reason, ctx);
             }
 
             // If the most recent action in the current interaction turn created or updated a plan
@@ -4878,9 +4966,6 @@ impl TerminalView {
                 // When the pending query state is updated (i.e. a conversation is selected or un-selected),
                 // update the title to reflect that selected conversation change.
                 self.update_pane_configuration(ctx);
-                ctx.notify();
-            }
-            BlocklistAIContextEvent::QueueNextPromptToggled => {
                 ctx.notify();
             }
         }
@@ -5294,14 +5379,18 @@ impl TerminalView {
             BlocklistAIHistoryEvent::UpdatedConversationMetadata { .. } => {
                 self.update_pane_configuration(ctx);
             }
+            BlocklistAIHistoryEvent::RemoveConversation { .. }
+            | BlocklistAIHistoryEvent::DeletedConversation { .. } => {
+                // Queue cleanup for removed/deleted conversations is handled by
+                // `QueuedQueryModel` itself, which subscribes to these same history
+                // events; no per-view cleanup is needed here.
+            }
             BlocklistAIHistoryEvent::CreatedSubtask { .. }
             | BlocklistAIHistoryEvent::UpdatedAutoexecuteOverride { .. }
             | BlocklistAIHistoryEvent::UpdatedTodoList { .. }
-            | BlocklistAIHistoryEvent::RemoveConversation { .. }
             | BlocklistAIHistoryEvent::RestoredConversations { .. }
             | BlocklistAIHistoryEvent::UpgradedTask { .. }
             | BlocklistAIHistoryEvent::UpdatedConversationArtifacts { .. }
-            | BlocklistAIHistoryEvent::DeletedConversation { .. }
             | BlocklistAIHistoryEvent::ConversationAgentIdAssigned { .. } => {}
         }
         ctx.notify();
@@ -11933,32 +12022,9 @@ impl TerminalView {
             .input_mode
             .value();
         let inverted = input_mode.is_inverted_blocklist();
-        // 与上游 `35d951cdc` 一致:grid 点选区优先,pending 块选区兜底。
-        // 已知继承缺陷:拖选 queued prompt 时 `SelectableArea` 消费 mouse-down,模型旧点选区
-        // 不清除,故此时 grid 可能返回残留文本而非 pending 选区(上游 `35d951cdc` 固有,
-        // 本地照搬保持一致;后续上游 `98af7b654` 用 queued prompt 面板重构了此机制)。
-        let blocklist_selected_text = self
-            .model
+        self.model
             .lock()
-            .selection_to_string(semantic_selection, inverted, ctx);
-        blocklist_selected_text.or_else(|| self.pending_user_query_selected_text(ctx))
-    }
-
-    /// 返回 pending user query block 内的选中文字(若有)。
-    fn pending_user_query_selected_text(&self, ctx: &AppContext) -> Option<String> {
-        let view_id = self.pending_user_query_view_id?;
-        self.rich_content_views
-            .iter()
-            .find_map(|rich_content| match rich_content.metadata() {
-                Some(RichContentMetadata::PendingUserQuery {
-                    pending_user_query_block_handle,
-                }) if pending_user_query_block_handle.id() == view_id => {
-                    pending_user_query_block_handle
-                        .as_ref(ctx)
-                        .selected_text(ctx)
-                }
-                _ => None,
-            })
+            .selection_to_string(semantic_selection, inverted, ctx)
     }
 
     /// Gets the selected text from the terminal input editor, if any.
@@ -14061,14 +14127,6 @@ impl TerminalView {
             .clone();
         if let Some(text) = error_selected_text.read().clone().filter(|t| !t.is_empty()) {
             ctx.clipboard().write(ClipboardContent::plain_text(text));
-            return;
-        }
-
-        // queued prompt 的选区优先于 grid 选区:拖选 pending block 时 `SelectableArea`
-        // 消费了 mouse-down,模型的旧点选区不会被清除,若先查 grid 会复制到残留的旧文本。
-        if let Some(selected_text) = self.pending_user_query_selected_text(ctx) {
-            ctx.clipboard()
-                .write(ClipboardContent::plain_text(selected_text));
             return;
         }
 
@@ -16321,11 +16379,9 @@ impl TerminalView {
     fn maybe_copy_selection_to_clipboard(&mut self, ctx: &mut ViewContext<Self>) {
         let selection_settings = SelectionSettings::handle(ctx);
         let semantic_selection = SemanticSelection::as_ref(ctx);
-        // 与上游 `35d951cdc` 一致:grid 点选区优先,pending 块选区兜底。
         let model = self.model.lock();
-        let selected_text = model
-            .selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx)
-            .or_else(|| self.pending_user_query_selected_text(ctx));
+        let selected_text =
+            model.selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx);
         if let Some(selected) = selected_text {
             selection_settings.update(ctx, |selection_settings, ctx| {
                 selection_settings
@@ -18198,18 +18254,7 @@ impl TerminalView {
                         env_var_collection_block.clear_selection(ctx);
                     });
                 }
-                Some(RichContentMetadata::PendingUserQuery {
-                    pending_user_query_block_handle,
-                }) => {
-                    if exempt_rich_content_view_id
-                        .is_some_and(|view_id| pending_user_query_block_handle.id() == view_id)
-                    {
-                        continue;
-                    }
-                    pending_user_query_block_handle.update(ctx, |block, ctx| {
-                        block.clear_selection(ctx);
-                    });
-                }
+                Some(RichContentMetadata::PendingUserQuery { .. }) => {}
                 Some(RichContentMetadata::WarpifySuccessBlock { .. }) => {
                     // TODO(Simon): We should be checking for WarpifySuccessBlocks here as well.
                     // The `WarpifySuccessBlock` implements a `SelectableArea`.
@@ -18746,8 +18791,7 @@ impl TerminalView {
     }
 
     fn active_ai_block(&self, ctx: &AppContext) -> Option<&ViewHandle<AIBlock>> {
-        // Skip trailing non-AI items (usage footers, pending user query blocks)
-        // as they don't impact the conversation state.
+        // Skip trailing non-AI items (usage footers) as they don't impact the conversation state.
         let candidate = self
             .rich_content_views
             .iter()
@@ -18981,12 +19025,9 @@ impl TerminalView {
             let semantic_selection = SemanticSelection::as_ref(ctx);
             // Note: we purposely separate this expression here, to avoid locking the TerminalModel for the duration of the `if let`
             // block, since downstream functions may need the lock (`Input::insert_internal`).
-            // pending user query block 的选区不记录在模型里,需要在模型之外兜底
-            // (与 `context_menu_copy_selected_text` 保持一致)。
             let model = self.model.lock();
-            let selected_text = model
-                .selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx)
-                .or_else(|| self.pending_user_query_selected_text(ctx));
+            let selected_text =
+                model.selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx);
             if let Some(selected_text) = selected_text {
                 // We put everything from the selection into the input box, even
                 // if it includes non-printable characters. Note that this is
@@ -19129,10 +19170,8 @@ impl TerminalView {
         {
             let semantic_selection = SemanticSelection::as_ref(ctx);
             let model = self.model.lock();
-            // 与上游 `35d951cdc` 一致:grid 点选区优先,pending 块选区兜底。
-            let selected_text = model
-                .selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx)
-                .or_else(|| self.pending_user_query_selected_text(ctx));
+            let selected_text =
+                model.selection_to_string(semantic_selection, self.is_inverted_blocklist(ctx), ctx);
             if let Some(selected_text) = selected_text {
                 ctx.clipboard()
                     .write(ClipboardContent::plain_text(selected_text));
@@ -24366,8 +24405,13 @@ impl TypedActionView for TerminalView {
                 ctx.notify();
             }
             ToggleQueueNextPrompt => {
-                self.ai_context_model.update(ctx, |context_model, ctx| {
-                    context_model.toggle_queue_next_prompt(ctx);
+                let Some(conversation_id) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation_id(self.view_id)
+                else {
+                    return;
+                };
+                QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.toggle_queue_next_prompt(conversation_id, ctx);
                 });
                 ctx.notify();
             }

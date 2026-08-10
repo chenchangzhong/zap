@@ -1595,6 +1595,9 @@ fn initialize_app(
     }
     ctx.add_singleton_model(|_| CLIAgentSessionsModel::new());
     ctx.add_singleton_model(BlocklistAIPermissions::new);
+    // Per-conversation queued prompts. Registered after the history model
+    // since it subscribes to history events for cleanup.
+    ctx.add_singleton_model(ai::blocklist::QueuedQueryModel::new);
     // 通知中心单例 model:必须排在 BlocklistAIHistoryModel
     // 和 CLIAgentSessionsModel 之后注册,因为构造时会订阅这两个 model。
     ctx.add_singleton_model(crate::notifications::model::NotificationsModel::new);
@@ -2277,6 +2280,10 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
     // Issue #72: HTTP 代理设置页面。不走 channel 判断,所有 channel 含 zap-oss
     // 默认启用,作为企业 VPN / 公司代理场景的基本能力。
     flags.insert(FeatureFlag::HttpProxySettings);
+
+    // queued prompts 列表 UI(移植上游 #11439)。不走 channel 判断,所有 channel
+    // 含 zap-oss 默认启用:`/queue` 命令、排队面板与状态栏 auto-queue 按钮。
+    flags.insert(FeatureFlag::QueueSlashCommand);
 
     let extra_flags: &[FeatureFlag] = &[
         #[cfg(feature = "autoupdate")]

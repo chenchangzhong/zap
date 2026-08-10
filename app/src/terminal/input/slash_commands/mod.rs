@@ -21,7 +21,9 @@ use crate::ai::blocklist::agent_view::{
     AgentViewEntryOrigin, DismissalStrategy, EphemeralMessage, ENTER_OR_EXIT_CONFIRMATION_WINDOW,
 };
 use crate::ai::blocklist::drive_object_attachment_for_reference;
-use crate::ai::blocklist::BlocklistAIHistoryModel;
+use crate::ai::blocklist::{
+    BlocklistAIHistoryModel, QueuedQuery, QueuedQueryModel, QueuedQueryOrigin,
+};
 use crate::cloud_object::{model::persistence::ObjectStoreModel, ObjectType};
 use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::search::slash_command_menu::static_commands::commands::{self, COMMAND_REGISTRY};
@@ -781,8 +783,12 @@ impl Input {
                     .is_some_and(|c| c.status().is_in_progress() || c.status().is_blocked());
 
                 if is_in_progress {
-                    ctx.dispatch_typed_action(&WorkspaceAction::QueuePromptForConversation {
-                        prompt,
+                    QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+                        model.append(
+                            conversation_id,
+                            QueuedQuery::new(prompt, QueuedQueryOrigin::QueueSlashCommand),
+                            ctx,
+                        );
                     });
                 } else {
                     self.submit_queued_prompt(prompt, ctx);

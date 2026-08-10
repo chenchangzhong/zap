@@ -37,7 +37,8 @@ use crate::{
             },
             BlocklistAIActionEvent, BlocklistAIActionModel, BlocklistAIContextEvent,
             BlocklistAIContextModel, BlocklistAIController, BlocklistAIHistoryEvent,
-            BlocklistAIInputEvent, BlocklistAIInputModel, ResponseStreamId,
+            BlocklistAIInputEvent, BlocklistAIInputModel, QueuedQueryEvent, QueuedQueryModel,
+            ResponseStreamId,
         },
         llms::LLMPreferences,
         AgentTip,
@@ -216,11 +217,12 @@ impl BlocklistAIStatusBar {
             }
         });
         ctx.subscribe_to_model(&context_model, |_, _, event, ctx| {
-            if matches!(
-                event,
-                BlocklistAIContextEvent::PendingQueryStateUpdated
-                    | BlocklistAIContextEvent::QueueNextPromptToggled
-            ) {
+            if matches!(event, BlocklistAIContextEvent::PendingQueryStateUpdated) {
+                ctx.notify();
+            }
+        });
+        ctx.subscribe_to_model(&QueuedQueryModel::handle(ctx), |_, _, event, ctx| {
+            if matches!(event, QueuedQueryEvent::QueueNextPromptToggled { .. }) {
                 ctx.notify();
             }
         });
@@ -832,10 +834,8 @@ impl BlocklistAIStatusBar {
                     ButtonProps {
                         button_handle: &self.state_handles.queue_next_prompt_button,
                         keystroke: self.queue_next_prompt_keystroke.as_ref(),
-                        is_active: self
-                            .context_model
-                            .as_ref(app)
-                            .is_queue_next_prompt_enabled(),
+                        is_active: QueuedQueryModel::as_ref(app)
+                            .is_queue_next_prompt_enabled(conversation.id()),
                     },
                 ),
                 stop_button: Some(ButtonProps {

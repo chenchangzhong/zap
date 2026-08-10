@@ -6,6 +6,7 @@ pub mod code_block;
 mod context_model;
 mod controller;
 mod passive_suggestions;
+pub(crate) mod queued_query;
 pub(super) use controller::RequestInput;
 pub mod history_model;
 pub mod inline_action;
@@ -75,5 +76,9 @@ pub use controller::input_context::{
     BLOCK_CONTEXT_ATTACHMENT_REGEX, DIFF_HUNK_ATTACHMENT_REGEX, DRIVE_OBJECT_ATTACHMENT_REGEX,
 };
 pub use permissions::{BlocklistAIPermissions, CommandExecutionPermissionAllowedReason};
+pub(crate) use queued_query::{
+    AutofireAction, QueuedQuery, QueuedQueryEvent, QueuedQueryId, QueuedQueryModel,
+    QueuedQueryOrigin,
+};
 pub use suggestion_chip_view::*;
 pub use view_util::error_color;

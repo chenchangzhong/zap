@@ -86,6 +86,7 @@ use crate::terminal::model::session::active_session::ActiveSession;
 use crate::terminal::package_installers::command_at_cursor_has_common_package_installer_prefix;
 use crate::terminal::prompt_render_helper::should_render_ps1_prompt;
 use crate::terminal::universal_developer_input::AtContextMenuDisabledReason;
+use crate::terminal::view::queued_prompts_panel::{QueuedPromptsPanelEvent, QueuedPromptsPanelView};
 use crate::terminal::view::CodeDiffAction;
 use crate::terminal::CLIAgent;
 use crate::util::bindings::keybinding_name_to_normalized_string;
@@ -112,9 +113,9 @@ use crate::{
             render_ai_follow_up_icon, telemetry_banner::should_collect_ai_ugc_telemetry,
             BlocklistAIContextEvent, BlocklistAIContextModel, BlocklistAIController,
             BlocklistAIControllerEvent, BlocklistAIHistoryEvent, BlocklistAIHistoryModel,
-            BlocklistAIInputEvent, BlocklistAIInputModel, InputConfig, InputType,
-            BLOCK_CONTEXT_ATTACHMENT_REGEX, DIFF_HUNK_ATTACHMENT_REGEX,
-            DRIVE_OBJECT_ATTACHMENT_REGEX,
+            BlocklistAIInputEvent, BlocklistAIInputModel, InputConfig, InputType, QueuedQuery,
+            QueuedQueryModel, QueuedQueryOrigin, BLOCK_CONTEXT_ATTACHMENT_REGEX,
+            DIFF_HUNK_ATTACHMENT_REGEX, DRIVE_OBJECT_ATTACHMENT_REGEX,
         },
         llms::{LLMPreferences, LLMPreferencesEvent},
         predict::next_command_model::{
@@ -1647,6 +1648,9 @@ pub struct Input {
     weak_view_handle: WeakViewHandle<Input>,
 
     agent_status_view: ViewHandle<BlocklistAIStatusBar>,
+    /// Optional queued-prompts panel rendered between `agent_status_view` and the input editor.
+    /// Constructed in [`Input::new`] when [`FeatureFlag::QueueSlashCommand`] is enabled.
+    queued_prompts_panel: Option<ViewHandle<QueuedPromptsPanelView>>,
     agent_view_controller: ModelHandle<AgentViewController>,
     agent_shortcut_view_model: ModelHandle<AgentShortcutViewModel>,
     ambient_agent_view_model: ModelHandle<AmbientAgentViewModel>,
@@ -2856,7 +2860,6 @@ impl Input {
                         })
                         .collect_vec();
                 }
-                BlocklistAIContextEvent::QueueNextPromptToggled => {}
             }
             ctx.notify();
         });
@@ -3123,6 +3126,15 @@ impl Input {
         let deferred_remote_operations =
             DeferredRemoteOperations::new(model.lock().block_list().active_block_id().clone());
 
+        let queued_prompts_panel = FeatureFlag::QueueSlashCommand.is_enabled().then(|| {
+            let panel =
+                ctx.add_typed_action_view(|ctx| QueuedPromptsPanelView::new(terminal_view_id, ctx));
+            ctx.subscribe_to_view(&panel, |me, _, event, ctx| {
+                me.handle_queued_prompts_panel_event(event, ctx);
+            });
+            panel
+        });
+
         // Use persisted menu sizes from settings, or fall back to defaults
         let input_settings = InputSettings::as_ref(ctx);
         let completions_menu_width = *input_settings.completions_menu_width.value();
@@ -3205,6 +3217,7 @@ impl Input {
             is_menu_driven_buffer_write: false,
             weak_view_handle: ctx.handle(),
             agent_status_view,
+            queued_prompts_panel,
             agent_view_controller,
             agent_input_footer,
             harness_selector,
@@ -3276,6 +3289,26 @@ impl Input {
 
     pub fn agent_status_bar(&self) -> &ViewHandle<BlocklistAIStatusBar> {
         &self.agent_status_view
+    }
+
+    /// Handles events from the queued-prompts panel: places deleted-row text into an empty editor,
+    /// and refocuses the input editor when an inline edit finishes.
+    fn handle_queued_prompts_panel_event(
+        &mut self,
+        event: &QueuedPromptsPanelEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            QueuedPromptsPanelEvent::RowDeleted { text } => {
+                if self.buffer_text(ctx).is_empty() {
+                    self.replace_buffer_content(text, ctx);
+                }
+                self.focus_input_box(ctx);
+            }
+            QueuedPromptsPanelEvent::EditEnded => {
+                self.focus_input_box(ctx);
+            }
+        }
     }
 
     pub fn agent_input_footer(&self) -> &ViewHandle<AgentInputFooter> {
@@ -12269,14 +12302,6 @@ impl Input {
             return false;
         }
 
-        if !self
-            .ai_context_model
-            .as_ref(ctx)
-            .is_queue_next_prompt_enabled()
-        {
-            return false;
-        }
-
         if !self.ai_input_model.as_ref(ctx).is_ai_input_enabled() {
             return false;
         }
@@ -12289,9 +12314,11 @@ impl Input {
             return false;
         };
 
-        let history = BlocklistAIHistoryModel::handle(ctx);
-        let should_queue = history
-            .as_ref(ctx)
+        if !QueuedQueryModel::as_ref(ctx).is_queue_next_prompt_enabled(conversation_id) {
+            return false;
+        }
+
+        let should_queue = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)
             .is_some_and(|c| {
                 !c.is_empty() && (c.status().is_in_progress() || c.status().is_blocked())
@@ -12334,7 +12361,14 @@ impl Input {
         self.editor.update(ctx, |editor, ctx| {
             editor.clear_buffer(ctx);
         });
-        ctx.dispatch_typed_action(&WorkspaceAction::QueuePromptForConversation { prompt });
+
+        QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new(prompt, QueuedQueryOrigin::AutoQueueToggle),
+                ctx,
+            );
+        });
 
         true
     }

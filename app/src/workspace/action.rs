@@ -475,10 +475,6 @@ pub enum WorkspaceAction {
         /// Optional prompt to send after summarization completes successfully.
         initial_prompt: Option<String>,
     },
-    /// Queue a prompt to be sent after the current conversation finishes.
-    QueuePromptForConversation {
-        prompt: String,
-    },
     /// Install the Zap CLI command to /usr/local/bin
     #[cfg(target_os = "macos")]
     InstallCLI,
@@ -824,7 +820,6 @@ impl WorkspaceAction {
             | RunCommand { .. }
             | InsertInInput { .. }
             | InsertForkSlashCommand
-            | QueuePromptForConversation { .. }
             | UndoTrash(_)
             | OpenFilePath { .. }
             | ViewObjectInWarpDrive(_)

@@ -110,6 +110,7 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(NotebookManager::mock);
     // Zap(本地化,Phase 5):`PreferencesSyncer` 已物理删除,test singleton 不再需要。
     app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+    app.add_singleton_model(crate::ai::blocklist::QueuedQueryModel::new);
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
     app.add_singleton_model(AgentConversationsModel::new);
     app.add_singleton_model(crate::ai::agent_providers::AgentProviderSecrets::new);

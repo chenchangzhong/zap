@@ -800,7 +800,6 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::OzPlatformSkills,
     FeatureFlag::AgentViewBlockContext,
     FeatureFlag::PendingUserQueryIndicator,
-    FeatureFlag::QueueSlashCommand,
     // End manually enabled Code features.
     FeatureFlag::DirectoryTabColors,
     FeatureFlag::EditableMarkdownMermaid,
