@@ -12536,10 +12536,14 @@ impl Input {
                     // handler show the error toast.
                     None => return false,
                 }
-            } else if !slash_command_is_submitted_as_prompt(&detected.command) {
+            } else if !slash_command_is_submitted_as_prompt(&detected.command)
+                && detected.command.name != commands::COMPACT_AND.name
+            {
                 // 产生动作的 slash command(如 /fork)立即执行,不能被 prompt 排队捕获——
                 // 它们 emit 动作而不是把输入复述进会话。绕过队列让 slash-command 执行器
                 // 现在处理;向会话提交 prompt 的命令才落进队列。
+                // `/compact-and` 例外:即使排队模式,它也要被捕获排队——压缩等当前回复
+                // 结束后执行,再排队其 follow-up(上游 098c307c7 同款)。
                 return false;
             } else {
                 prompt
