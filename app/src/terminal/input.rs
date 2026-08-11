@@ -4655,9 +4655,7 @@ impl Input {
         filename_arg: Option<String>,
         ctx: &mut ViewContext<Self>,
     ) {
-        use chrono::Local;
-        use std::fs;
-        use std::path::PathBuf;
+        use std::error::Error as _;
 
         let history = BlocklistAIHistoryModel::handle(ctx);
         let Some(conversation) = history
@@ -4674,77 +4672,35 @@ impl Input {
             return;
         };
 
-        // Determine the filename
-        let filename = if let Some(name) = filename_arg.as_ref().filter(|s| !s.trim().is_empty()) {
-            name.trim().to_string()
-        } else {
-            // Generate default filename: timestamp-conversation_title.md
-            let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-            let title = conversation
-                .title()
-                .unwrap_or_else(|| "conversation".to_string())
-                .chars()
-                .map(|c| {
-                    // Replace spaces with underscores, keep alphanumeric, underscores, and hyphens
-                    if c.is_whitespace() {
-                        '_'
-                    } else if c.is_alphanumeric() || c == '_' || c == '-' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect::<String>();
-            format!("{timestamp}-{title}.md")
-        };
-
-        // Ensure the filename has .md extension
-        let filename = if !filename.ends_with(".md") {
-            format!("{filename}.md")
-        } else {
-            filename
-        };
-
-        let current_dir = self
-            .active_block_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.current_working_directory())
-            .map(PathBuf::from)
-            .or_else(|| {
-                log::debug!(
-                    "No CWD from active_block_metadata, falling back to std::env::current_dir()"
-                );
-                std::env::current_dir().ok()
-            })
-            .unwrap_or_else(|| {
-                log::warn!("Failed to determine current directory, using '.'");
-                PathBuf::from(".")
-            });
-
-        let file_path = current_dir.join(&filename);
-
         let action_model = self.ai_action_model.as_ref(ctx);
         let conversation_text = conversation.export_to_markdown(Some(action_model));
 
-        // Check if file already exists and warn user
-        let file_exists = file_path.exists();
-        if file_exists {
-            let window_id = ctx.window_id();
-            let display_path = file_path.display().to_string();
-            ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
-                let toast = DismissibleToast::default(format!(
-                    "File {display_path} already exists and will be overwritten"
-                ));
-                toast_stack.add_ephemeral_toast(toast, window_id, ctx);
-            });
-        }
+        let current_directory = self
+            .active_block_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.current_working_directory());
 
-        // Write to file
-        match fs::write(&file_path, conversation_text) {
-            Ok(_) => {
+        match crate::ai::conversation_export::export_conversation_markdown(
+            current_directory,
+            filename_arg.as_deref(),
+            conversation.title().as_deref(),
+            &conversation_text,
+        ) {
+            Ok(export) => {
+                if export.overwrote_existing() {
+                    let window_id = ctx.window_id();
+                    let display_path = export.path().display().to_string();
+                    ToastStack::handle(ctx).update(ctx, move |toast_stack, ctx| {
+                        let toast = DismissibleToast::default(format!(
+                            "File {display_path} already exists and will be overwritten"
+                        ));
+                        toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+                    });
+                }
+
                 // Show success toast
                 let window_id = ctx.window_id();
-                let display_path = file_path.display().to_string();
+                let display_path = export.path().display().to_string();
                 ToastStack::handle(ctx).update(ctx, move |toast_stack, ctx| {
                     let toast = DismissibleToast::default(format!(
                         "Conversation exported to {display_path}"
@@ -4752,36 +4708,16 @@ impl Input {
                     toast_stack.add_ephemeral_toast(toast, window_id, ctx);
                 });
             }
-            Err(e) => {
+            Err(error) => {
                 // Show error toast with user-friendly message
-                let user_message = match e.kind() {
-                    std::io::ErrorKind::PermissionDenied => {
-                        format!(
-                            "Permission denied writing to {}. Check file permissions.",
-                            file_path.display()
-                        )
-                    }
-                    std::io::ErrorKind::NotFound => {
-                        format!(
-                            "Directory not found: {}",
-                            file_path
-                                .parent()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default()
-                        )
-                    }
-                    std::io::ErrorKind::AlreadyExists => {
-                        format!("File {} already exists", file_path.display())
-                    }
-                    _ => {
-                        format!("Failed to export to {}: {}", file_path.display(), e)
-                    }
-                };
-
+                let user_message = error.user_message();
                 log::error!(
                     "Failed to write conversation to file {}: {}",
-                    file_path.display(),
-                    e
+                    error.path().display(),
+                    error
+                        .source()
+                        .map(|source| source.to_string())
+                        .unwrap_or_default()
                 );
                 let window_id = ctx.window_id();
                 ToastStack::handle(ctx).update(ctx, move |toast_stack, ctx| {

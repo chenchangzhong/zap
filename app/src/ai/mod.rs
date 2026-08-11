@@ -20,6 +20,8 @@ pub(crate) mod blocklist;
 pub(crate) mod byop_compaction;
 pub(crate) mod byop_readiness;
 pub mod control_code_parser;
+#[cfg(feature = "local_fs")]
+pub(crate) mod conversation_export;
 pub(crate) mod conversation_navigation;
 pub(crate) mod conversation_status_ui;
 pub(crate) mod conversation_utils;
