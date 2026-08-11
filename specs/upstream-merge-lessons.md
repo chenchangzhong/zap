@@ -2,8 +2,9 @@
 
 > **同步边界**：`7cbb22d5c` 之后拣入 34 commit（散点，非连续区间；详见 §19）
 > **✅ 遗漏修复（2026-08-05）**：terminal lifecycle recovery 栈 6 commit（#12853/#12854/#12855/#12856/#12858/#12859）已按方案 A 完整移植（详见 §21.4/§23）；§22 重扫发现的 5 件遗漏已全部拣入（zsh glitch 剥离 #14166/#12438、尾点链接 #12965、Hermes BracketedPaste #14367、系统终止 #12480、O(1) 焦点 #13113，详见 §23）
-> Zap 分支：`5e5dc06da7b8e8273b874a33f8c7946c575654e7`
-> 最后核验：2026-08-05，`cargo check -p warp` 通过（0 error）；全量 `cargo test -p warp --lib` 3802 通过 / 28 失败（与基线 worktree 复现的既有失败完全一致，新增归零）；9 个 reviewer 并行评审整改后提交 `81bbcf869`
+> **✅ 本轮移植（2026-08-11）**：Cmd-Up 导航 `da4da09f8`（#14685）+ conversation_export 抽离 `a77348c67`（#13603 GUI 侧）+ framework 补移植 `Container::with_foreground_border`（#13056），3 commit（详见 §27）
+> Zap 分支：`2d0942210`
+> 最后核验：2026-08-11，`cargo check -p warp --all-targets` 通过（0 error）；导航 7 + export 4 + queued 28 + selection 111 + container 单测全绿；4 reviewer 并行评审（1 P1 + 4 P3 已处理）；正式版 bundle 构建成功（签名非 adhoc）
 >
 > 历轮边界：
 >
@@ -20,6 +21,7 @@
 > | 八 | `f7e298027` 移植偏差回查 | — | 2026-08-04 | §18（修 3 处偏差） |
 > | 九 | `7cbb22d5c` 后 34 个拣入 | 34 | 2026-08-05 | §19 |
 > | 十 | lifecycle 栈 6 commit + 5 件遗漏 | 11 | 2026-08-05 | §21–§23（提交 `81bbcf869`） |
+| 十一 | Cmd-Up #14685 + export #13603 + foreground_border #13056 | 3 | 2026-08-11 | §27（提交 `2d0942210`） |
 >
 > **⚠️ 算待评估区间只能用上面的边界 hash**：本 fork 与上游无 merge-base
 > （浅克隆，历史断开）。`git rev-list HEAD..upstream/master` 会把全部历史
@@ -47,6 +49,7 @@
 | `FeatureFlag` promote 类（加 variant + 列表） | 可拣 | §0 教训（需手动补 Cargo feature 定义） |
 | 纯加法的事件/枚举变体 | 可拣 | §14 第 1 项（`StopFailure` 先例） |
 | 来自**未合并分支**的 commit | 查分支 tip | §18.1（初版可能已被 review 否决） |
+| 上游 `elements/gui/` 路径下的 framework 改动（如 `Container::with_foreground_border`） | 按平铺路径适配移植 | §27.2（本地未跟随 #12633 目录重构，gui/ 文件本地天然缺失） |
 
 ### 移植前四问（§14 / §18 教训提炼）
 
@@ -1631,5 +1634,81 @@ prompts list UI"）把 `35d951cdc` 加在 `view.rs` 的**四个 pending 选区�
 
 ---
 
-*文档版本：v2.5*
+## 27. 移植记录（2026-08-11）：Cmd-Up 导航 + conversation_export 抽离 + foreground_border 补移植
+
+> 触发：用户要求执行 `port-cmd-up-export-plan.md`。两个上游改动合并一轮移植：
+> `da4da09f8`（#14685 "Navigate Agent Mode prompts with Cmd-Up"）与
+> `a77348c67`（#13603 "Add low-effort slash commands to TUI"，GUI 侧
+> conversation_export 抽离），并补移植 #13056 的 `Container::with_foreground_border`
+>（导航环渲染需要）。
+
+### 27.1 做了什么
+
+| 项 | 内容 |
+|----|------|
+| Cmd-Up 导航（#14685，7 生产文件） | AIBlock 加 `is_agent_transcript_navigation_target` 标记；`blocks.rs` 导航数据层（`RichContentItem::is_agent_transcript_user_query`、`AgentTranscriptNavigableItem`、`agent_transcript_navigable_items()`、`set_agent_transcript_user_query_for_rich_content`、sumtree 重建 `..*item` 保留新字段）；`view.rs` 导航状态机（Cmd-Up/Down 分支、navigate/apply/sync、越过最新停靠点滚到底、`ExitedAgentView` 复位、`AppendedExchange` 置位）；`load_ai_conversation.rs`/`rich_content.rs` 挂载置位 |
+| conversation_export（#13603 GUI 侧） | 照上游 `a77348c67` 抽离 `/export-to-file` 写入逻辑到独立模块（118 行 + 4 测试），`input.rs` 调用方保留 toast/i18n/buffer 清理；文件名规则/CWD 回退/错误分类/toast **逐字节不变**（debug log 文案恢复本地原） |
+| framework 补移植（#13056） | `Container::with_foreground_border`（前景边框，不占布局，区别于 `with_border` 的 inset 语义） |
+
+### 27.2 关键适配（本地/上游分叉，勿当 bug）
+
+1. **`elements/gui/` 目录重构未跟随**：上游 #12633（"Add TUI API surface… tui"）把
+   warpui_core 的 `elements/*.rs` 全部移进 `elements/gui/` 子目录（TUI seam）。
+   本地删除 TUI、未跟随该重构（`git log main -- …/elements/gui/` = 0），故
+   #13056 加在 `gui/container.rs` 的 `with_foreground_border` 本地缺失。
+   **同步规则**：上游落在 `elements/gui/*.rs` 的 framework 改动，按平铺路径
+   `elements/*.rs` 适配移植（#13056 内容 0 差异，仅路径不同）。
+2. **`transcript_scope` → `agent_view_state`**：上游
+   `BlockFilter::commands().matches(block, &self.transcript_scope)` 改本地
+   `matches(block, &self.agent_view_state)`（本地全仓无 TranscriptScope）。
+3. **let-chains 不适用**：本地 2021 edition，上游 `if let … && …` 改嵌套 `if`。
+4. **测试环境差异**：本地 `add_window_with_terminal` 后首个 block 是 bootstrap stage
+   （`should_hide_block` 永久隐藏、高度 0），测试需 `set_show_bootstrap_block(true)`
+   使其可见；`GlobalResourceHandlesProvider` 测试初始化缺注册（退出 agent view
+   路径会访问），统一在 `initialize_app_for_terminal_view` 注册 mock，并清理
+   5 处既有手动注册（double-registration panic）。
+5. **`terminal_surface_id` → `terminal_view_id`**：上游测试事件字段名本地不同。
+
+### 27.3 导航环颜色（对上游可见性 bug 的本地修正）
+
+上游导航环用 `theme.accent()`，但**头像背景就是 accent 色**
+（`blended_colors::accent(theme)` = `theme.accent()`，两处同色），环被头像吞没。
+上游 GUI 验证不完整（Linux 沙箱按键不生效、从未看到环渲染）故未发现。
+本地改为 **`theme.ansi_fg_magenta()`**——与 `/agent` 斜杠命令强调色一致
+（`add_slash_command_highlight` 用 ansi magenta），在 accent 头像上高对比。
+配合 `with_foreground_border`（不占布局、同心居中）。**这是对上游缺陷的修正，
+非移植偏差**；若上游后续调整环样式需按此复核。
+
+### 27.4 验证状态
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp --all-targets` | 0 error |
+| 导航测试（blocks 1 + view 6） | 7/7 passed |
+| conversation_export 4 测试 | 4/4 passed |
+| queued_prompts 27 + copy_selected 111 | 全绿 |
+| container 单测 | passed |
+| code review（4 reviewer 并行） | 1 P1（5 处 GlobalResourceHandlesProvider double-registration panic，已修）+ 4 P3（2 修：debug log 文案、无效循环；2 有意保持：覆盖 toast 时机、注释语言） |
+| 正式版 bundle | `./script/macos/bundle --channel oss --selfsign --nouniversal --arch aarch64` 成功，签名非 adhoc |
+
+### 27.5 提交
+
+| commit | 内容 |
+|--------|------|
+| `a1fa3927a` | feat(warpui_core): 移植 Container::with_foreground_border（#13056） |
+| `9426efb2d` | refactor(ai): 抽离 conversation_export（#13603） |
+| `2d0942210` | feat(terminal): Agent Mode Cmd-Up/Cmd-Down 导航（#14685） |
+
+### 27.6 后续注意
+
+- 导航环颜色是本地定制（ansi magenta，§27.3），与上游 accent 方案不同，属已知差异。
+- 覆盖 toast 时机：写入失败时不再先弹"将被覆盖"警告（上游提取行为，罕见错误路径，
+  有意保持）。
+- 新注释保持英文（照上游、维护 cherry-pick 兼容面）；本地自写注释用中文。
+- `port-cmd-up-export-plan.md` / `cmd-up-execute-handoff.md` 是执行计划/交接文档，
+  未入库（untracked），本轮完成后可归档或删除。
+
+---
+
+*文档版本：v2.6*
 *下次合并前必读*
