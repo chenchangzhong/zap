@@ -222,7 +222,11 @@ impl BlocklistAIStatusBar {
             }
         });
         ctx.subscribe_to_model(&QueuedQueryModel::handle(ctx), |_, _, event, ctx| {
-            if matches!(event, QueuedQueryEvent::QueueNextPromptToggled { .. }) {
+            if matches!(
+                event,
+                QueuedQueryEvent::QueueNextPromptToggled { .. }
+                    | QueuedQueryEvent::DefaultModeChanged
+            ) {
                 ctx.notify();
             }
         });
@@ -834,8 +838,11 @@ impl BlocklistAIStatusBar {
                     ButtonProps {
                         button_handle: &self.state_handles.queue_next_prompt_button,
                         keystroke: self.queue_next_prompt_keystroke.as_ref(),
-                        is_active: QueuedQueryModel::as_ref(app)
-                            .is_queue_next_prompt_enabled(conversation.id()),
+                        is_active: QueuedQueryModel::as_ref(app).is_queue_next_prompt_enabled(
+                            conversation.id(),
+                            active_block,
+                            app,
+                        ),
                     },
                 ),
                 stop_button: Some(ButtonProps {

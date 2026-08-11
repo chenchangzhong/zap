@@ -2608,8 +2608,6 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::ConversationsAsContext,
         #[cfg(feature = "incremental_auto_reload")]
         FeatureFlag::IncrementalAutoReload,
-        #[cfg(feature = "pending_user_query_indicator")]
-        FeatureFlag::PendingUserQueryIndicator,
         #[cfg(feature = "queue_slash_command")]
         FeatureFlag::QueueSlashCommand,
         #[cfg(feature = "kitty_keyboard_protocol")]

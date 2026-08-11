@@ -264,8 +264,6 @@ ai-block-open-all-in-code-review = 在代码评审中全部打开
 ai-block-dont-show-again = 不再显示
 ai-block-rewind = 回退
 ai-block-rewind-tooltip = 回退到此命令块之前
-ai-block-remove-queued-prompt = 移除排队提示
-ai-block-send-now = 立即发送
 ai-block-check-now =  · 立即检查
 ai-block-check-now-tooltip = 让智能体现在检查此命令，跳过计时器。
 ai-block-resume-conversation = 继续对话
@@ -1005,6 +1003,8 @@ settings-ai-use-agent-footer-description = 在长时间运行的命令中提示�
 settings-ai-show-conversation-history = 在工具面板中显示会话历史
 settings-ai-thinking-display = 智能体思考显示
 settings-ai-thinking-display-description = 控制推理/思考过程的显示方式。
+settings-ai-prompt-submission-mode = 提示词提交默认行为
+settings-ai-prompt-submission-mode-description = 智能体仍在回复时提交新提示词的处理方式。可用自动排队开关按会话单独覆盖。
 settings-ai-conversation-layout-label = 打开已有智能体会话时的首选布局
 settings-ai-conversation-layout-newtab = 新标签页
 settings-ai-conversation-layout-splitpane = 拆分窗格
@@ -2234,6 +2234,10 @@ toggle-suffix-memory-stats = 内存统计
 agent-thinking-display-show-collapse = 设置 Agent 思考展示：展示并折叠
 agent-thinking-display-always-show = 设置 Agent 思考展示：始终展示
 agent-thinking-display-never-show = 设置 Agent 思考展示：从不展示
+
+# Set default prompt submission mode
+agent-prompt-submission-interrupt = 设置提示词提交默认行为：打断当前回复
+agent-prompt-submission-queue = 设置提示词提交默认行为：排队等回复结束
 
 # --- ANCHOR-SUB-EXTERNAL-EDITOR (settings-external-editor) ---
 settings-external-editor-choose-default = 选择打开文件链接的编辑器

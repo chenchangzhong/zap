@@ -268,7 +268,6 @@ pub static QUEUE: LazyLock<StaticCommand> = LazyLock::new(|| StaticCommand {
     icon_path: "bundled/svg/clock-plus.svg",
     availability: Availability::AGENT_VIEW
         | Availability::ACTIVE_CONVERSATION
-        | Availability::NO_LRC_CONTROL
         | Availability::AI_ENABLED,
     auto_enter_ai_mode: true,
     argument: Some(Argument::required().with_hint_text(t_static!("slash-cmd-queue-hint"))),

@@ -575,10 +575,6 @@ pub enum FeatureFlag {
     /// content changes via auto-reload.
     CodeReviewScrollPreservation,
 
-    /// Shows a pending user query indicator during summarization when a follow-up
-    /// prompt is queued via `/fork-and-compact` or `/compact-and`.
-    PendingUserQueryIndicator,
-
     /// Gates the `/queue` slash command, which lets users queue a follow-up prompt
     /// while the agent is mid-response.
     QueueSlashCommand,
@@ -799,7 +795,6 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::LocalComputerUse,
     FeatureFlag::OzPlatformSkills,
     FeatureFlag::AgentViewBlockContext,
-    FeatureFlag::PendingUserQueryIndicator,
     // End manually enabled Code features.
     FeatureFlag::DirectoryTabColors,
     FeatureFlag::EditableMarkdownMermaid,

@@ -5,12 +5,11 @@ use warp_core::features::FeatureFlag;
 use warp_core::semantic_selection::SemanticSelection;
 use warpui::{
     elements::{
-        get_rich_content_position_id, ChildView, Container, CrossAxisAlignment, Expanded, Flex,
-        ParentElement, SavePosition, SelectableArea, SelectionHandle, Text,
+        get_rich_content_position_id, Container, CrossAxisAlignment, Expanded, Flex, ParentElement,
+        SavePosition, SelectableArea, SelectionHandle, Text,
     },
     fonts::{Properties, Style, Weight},
     AppContext, Element, Entity, EntityId, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle,
 };
 
 use crate::{
@@ -19,14 +18,13 @@ use crate::{
     },
     appearance::Appearance,
     terminal::{block_list_element::BlockListMenuSource, view::TerminalAction},
-    ui_components::{blended_colors, icons::Icon},
-    view_components::action_button::{ActionButton, ButtonSize, NakedTheme},
+    ui_components::blended_colors,
 };
 
 /// Renders a pending user query block with dimmed text and a "Queued" badge.
-/// Displayed when a follow-up prompt is queued via `/fork-and-compact <prompt>`,
-/// `/compact-and <prompt>`, `/queue <prompt>`, or for the initial prompt of a
-/// non-Oz ambient run waiting for its harness CLI to start.
+/// Only used for the initial prompt of a non-Oz ambient run waiting for its harness CLI to
+/// start; queued follow-up prompts (`/queue`, `/compact-and`, `/fork-and-compact`) live in the
+/// queued prompts panel instead.
 pub struct PendingUserQueryBlock {
     prompt: String,
     user_display_name: String,
@@ -36,8 +34,6 @@ pub struct PendingUserQueryBlock {
     /// 放在 `RwLock` 里,好让 `SelectableArea` 在选区结束时同步写入,
     /// 使终端 view 能立刻读到该值以支持 copy-on-select。
     selected_text: Arc<RwLock<Option<String>>>,
-    close_button: Option<ViewHandle<ActionButton>>,
-    send_now_button: Option<ViewHandle<ActionButton>>,
 }
 
 impl PendingUserQueryBlock {
@@ -45,30 +41,8 @@ impl PendingUserQueryBlock {
         prompt: String,
         user_display_name: String,
         profile_image_path: Option<String>,
-        show_close_button: bool,
-        show_send_now_button: bool,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
-        let close_button = show_close_button.then(|| {
-            ctx.add_typed_action_view(|_| {
-                ActionButton::new(crate::t!("ai-block-remove-queued-prompt"), NakedTheme)
-                    .with_icon(Icon::X)
-                    .with_size(ButtonSize::XSmall)
-                    .on_click(|ctx| {
-                        ctx.dispatch_typed_action(PendingUserQueryBlockAction::Dismiss);
-                    })
-            })
-        });
-        let send_now_button = show_send_now_button.then(|| {
-            ctx.add_typed_action_view(|_| {
-                ActionButton::new(crate::t!("ai-block-send-now"), NakedTheme)
-                    .with_icon(Icon::Play)
-                    .with_size(ButtonSize::XSmall)
-                    .on_click(|ctx| {
-                        ctx.dispatch_typed_action(PendingUserQueryBlockAction::SendNow);
-                    })
-            })
-        });
         Self {
             prompt,
             user_display_name,
@@ -76,8 +50,6 @@ impl PendingUserQueryBlock {
             view_id: ctx.view_id(),
             selection_handle: Default::default(),
             selected_text: Default::default(),
-            close_button,
-            send_now_button,
         }
     }
 
@@ -96,14 +68,10 @@ impl PendingUserQueryBlock {
 
 #[derive(Clone, Debug)]
 pub enum PendingUserQueryBlockAction {
-    Dismiss,
-    SendNow,
     SelectText,
 }
 
 pub enum PendingUserQueryBlockEvent {
-    Dismissed,
-    SendNow,
     TextSelected,
 }
 
@@ -116,12 +84,6 @@ impl TypedActionView for PendingUserQueryBlock {
 
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
-            PendingUserQueryBlockAction::Dismiss => {
-                ctx.emit(PendingUserQueryBlockEvent::Dismissed);
-            }
-            PendingUserQueryBlockAction::SendNow => {
-                ctx.emit(PendingUserQueryBlockEvent::SendNow);
-            }
             PendingUserQueryBlockAction::SelectText => {
                 ctx.emit(PendingUserQueryBlockEvent::TextSelected);
             }
@@ -213,25 +175,11 @@ impl View for PendingUserQueryBlock {
             text_column = text_column.should_support_rect_select();
         }
 
-        let mut buttons_column = Flex::column().with_spacing(2.);
-        if let Some(close_button) = &self.close_button {
-            buttons_column.add_child(ChildView::new(close_button).finish());
-        }
-        if let Some(send_now_button) = &self.send_now_button {
-            buttons_column.add_child(ChildView::new(send_now_button).finish());
-        }
-
-        let mut row = Flex::row()
+        let row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Start)
             .with_child(avatar)
-            .with_child(Expanded::new(1., text_column.finish()).finish());
-        if self.close_button.is_some() || self.send_now_button.is_some() {
-            let buttons = Container::new(buttons_column.finish())
-                .with_margin_left(8.)
-                .finish();
-            row.add_child(buttons);
-        }
-        let row = row.finish();
+            .with_child(Expanded::new(1., text_column.finish()).finish())
+            .finish();
 
         Container::new(row)
             .with_horizontal_padding(CONTENT_HORIZONTAL_PADDING)

@@ -223,8 +223,6 @@ ai-block-open-all-in-code-review = すべてコードレビューで開く
 ai-block-dont-show-again = 次回から表示しない
 ai-block-rewind = 巻き戻し
 ai-block-rewind-tooltip = このブロックの直前まで巻き戻す
-ai-block-remove-queued-prompt = キュー中のプロンプトを削除
-ai-block-send-now = 今すぐ送信
 ai-block-check-now =  · 今すぐ確認
 ai-block-check-now-tooltip = タイマーをスキップしてエージェントに今このコマンドを確認させる。
 ai-block-resume-conversation = 会話を再開
@@ -959,6 +957,8 @@ settings-ai-use-agent-footer-description = 長時間実行コマンドで「フ�
 settings-ai-show-conversation-history = ツールパネルに会話履歴を表示
 settings-ai-thinking-display = エージェントの思考表示
 settings-ai-thinking-display-description = 推論や思考のトレースの表示方法を制御します。
+settings-ai-prompt-submission-mode = プロンプト送信の既定動作
+settings-ai-prompt-submission-mode-description = エージェントが応答中に新しいプロンプトを送信したときの動作。自動キュー切り替えで会話ごとに上書きできます。
 settings-ai-conversation-layout-label = 既存のエージェント会話を開く際の優先レイアウト
 settings-ai-conversation-layout-newtab = 新しいタブ
 settings-ai-conversation-layout-splitpane = 分割ペイン
@@ -2216,6 +2216,10 @@ toggle-suffix-memory-stats = メモリ統計
 agent-thinking-display-show-collapse = エージェント思考表示を設定: 表示して折りたたむ
 agent-thinking-display-always-show = エージェント思考表示を設定: 常に表示
 agent-thinking-display-never-show = エージェント思考表示を設定: 表示しない
+
+# Set default prompt submission mode
+agent-prompt-submission-interrupt = プロンプト送信の既定動作を設定: 応答を中断
+agent-prompt-submission-queue = プロンプト送信の既定動作を設定: 応答完了までキュー
 
 # --- ANCHOR-SUB-EXTERNAL-EDITOR (settings-external-editor) ---
 settings-external-editor-choose-default = ファイルリンクを開くエディタを選択

@@ -90,7 +90,8 @@ use crate::ai::blocklist::usage::conversation_usage_view::{
     ConversationUsageInfo, ConversationUsageView, DisplayMode, TimingInfo,
 };
 use crate::ai::blocklist::{
-    block_context_from_terminal_model, AutofireAction, QueuedQueryModel, SlashCommandRequest,
+    block_context_from_terminal_model, is_lrc_auto_queue_active, AutofireAction, QueuedQuery,
+    QueuedQueryId, QueuedQueryModel, QueuedQueryOrigin, SlashCommandRequest,
 };
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentModel, AIDocumentVersion};
 use crate::ai::loading::shimmering_warp_loading_text;
@@ -2717,11 +2718,6 @@ pub struct TerminalView {
     /// Used to remove the block when summarization completes or is cancelled.
     pending_user_query_view_id: Option<EntityId>,
 
-    /// Callback for the queued prompt that fires when the current conversation finishes.
-    /// Stored separately from `conversation_completed_callbacks` so that queuing a prompt
-    /// (via `/queue`, `/compact-and`, etc.) does not wipe unrelated callbacks.
-    queued_prompt_callback: Option<ConversationFinishedCallback>,
-
     /// Per-session PTY recorder for writing PTY bytes to a file.
     pty_recorder: ModelHandle<PtyRecorder>,
 
@@ -4040,7 +4036,6 @@ impl TerminalView {
             pane_stack: None,
             ephemeral_message_model,
             pending_user_query_view_id: None,
-            queued_prompt_callback: None,
             pty_recorder: ctx
                 .add_model(|ctx| PtyRecorder::new(inactive_pty_reads_rx, window_id, ctx)),
             active_viewer_driven_size: None,
@@ -4379,7 +4374,6 @@ impl TerminalView {
         finish_reason: FinishReason,
         ctx: &mut ViewContext<Self>,
     ) {
-        let queued_prompt = self.queued_prompt_callback.take();
         let callbacks = self
             .conversation_completed_callbacks
             .drain(..)
@@ -4387,10 +4381,101 @@ impl TerminalView {
         for callback in callbacks {
             callback(self, finish_reason, ctx);
         }
-        if let Some(callback) = queued_prompt {
-            callback(self, finish_reason, ctx);
-        }
         self.drain_queued_prompts(conversation_id, finish_reason, ctx);
+    }
+
+    /// Sends the leading prompts that were auto-queued during an agent-requested long-running
+    /// command ([`QueuedQueryOrigin::LrcAutoQueue`]) to the agent, in queue order. Invoked when the
+    /// command finishes — these rows were queued "until the command finishes", unlike other queued
+    /// rows, which wait for the end of the full response.
+    pub(crate) fn send_lrc_queued_prompts(
+        &mut self,
+        conversation_id: AIConversationId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let editing_front_lrc_row = QueuedQueryModel::as_ref(ctx)
+            .editing_row(conversation_id)
+            .is_some_and(|query_id| {
+                QueuedQueryModel::as_ref(ctx)
+                    .queue(conversation_id)
+                    .first()
+                    .is_some_and(|row| {
+                        row.id() == query_id && row.origin() == QueuedQueryOrigin::LrcAutoQueue
+                    })
+            });
+        if editing_front_lrc_row {
+            let queued_prompts_panel = self.input.as_ref(ctx).queued_prompts_panel().cloned();
+            let Some(queued_prompts_panel) = queued_prompts_panel else {
+                return;
+            };
+            queued_prompts_panel.update(ctx, |panel, ctx| {
+                panel.commit_edit(ctx);
+            });
+        }
+
+        let rows: Vec<(QueuedQueryId, String)> = QueuedQueryModel::as_ref(ctx)
+            .queue(conversation_id)
+            .iter()
+            .take_while(|row| row.origin() == QueuedQueryOrigin::LrcAutoQueue)
+            .map(|row| (row.id(), row.text().to_owned()))
+            .collect();
+        // 只发队首,余下的 LrcAutoQueue 行留在队列里,靠会话完成后 `drain_queued_prompts`
+        // 链式推进——`submit_queued_prompt` 每次都会先取消同会话的 in-flight stream,
+        // 循环内连发会让除最后一条外的 prompt 全部被自己的下一次提交取消。
+        let Some((query_id, text)) = rows.into_iter().next() else {
+            return;
+        };
+        self.input.update(ctx, |input, ctx| {
+            input.submit_queued_prompt(text, conversation_id, query_id, ctx);
+        });
+        QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+            model.remove_fired_row(conversation_id, query_id, ctx);
+        });
+    }
+
+    /// Advances the queued-prompts queue after a dispatched queued command's block completes.
+    /// Runs after input cleanup so queued-command draft preservation can observe the in-flight
+    /// flag first.
+    /// No-ops unless a queued command is in flight for a conversation owned by this terminal view;
+    /// clearing the flag before draining keeps repeated calls idempotent.
+    pub(crate) fn on_queued_command_finished(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(conversation_id) = QueuedQueryModel::as_ref(ctx)
+            .command_in_flight_for_terminal_view(
+                self.view_id,
+                BlocklistAIHistoryModel::as_ref(ctx),
+            )
+        else {
+            return;
+        };
+        QueuedQueryModel::handle(ctx).update(ctx, |model, _ctx| {
+            model.clear_command_in_flight(conversation_id);
+        });
+        self.drain_queued_prompts(conversation_id, FinishReason::Complete, ctx);
+    }
+
+    /// Files a follow-up prompt that will run after the next conversation finishes on
+    /// `conversation_id`. Used by `/compact-and` (targets the active conversation) and
+    /// `/fork-and-compact` (targets the newly forked conversation, which may differ from the
+    /// currently selected one).
+    pub fn enqueue_followup_prompt(
+        &mut self,
+        prompt: String,
+        origin: QueuedQueryOrigin,
+        conversation_id: AIConversationId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // 捕获当前暂存的附件随排队行走;压缩类 slash command 不会消费暂存区,
+        // 所以此时仍在的附件属于这条后续 prompt。
+        let attachments = self.ai_context_model.update(ctx, |context_model, ctx| {
+            context_model.take_pending_attachments(ctx)
+        });
+        QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new_with_attachments(prompt, origin, attachments),
+                ctx,
+            );
+        });
     }
 
     /// Drains one prompt from the queued-query singleton for `conversation_id` when that
@@ -4410,21 +4495,63 @@ impl TerminalView {
                     return;
                 }
 
-                let action = QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
-                    model.pop_for_autofire(conversation_id, ctx)
-                });
+                // 先 peek 队首的动作而不移除行,发送路径才能按 id 读到该行的附件;
+                // 发送完成后再通过 `remove_fired_row` 移除。
+                let action = QueuedQueryModel::as_ref(ctx).peek_autofire(conversation_id);
                 match action {
-                    Some(AutofireAction::Submit { text }) => {
+                    Some(AutofireAction::Submit { query_id, text }) => {
                         self.input.update(ctx, |input, ctx| {
-                            input.submit_queued_prompt(text, ctx);
+                            input.submit_queued_prompt(text, conversation_id, query_id, ctx);
+                        });
+                        QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+                            model.remove_fired_row(conversation_id, query_id, ctx);
                         });
                     }
-                    Some(AutofireAction::PopFromEditMode { text }) => {
-                        self.input.update(ctx, |input, ctx| {
-                            if input.buffer_text(ctx).is_empty() {
+                    Some(AutofireAction::ExecuteCommand { query_id, command }) => {
+                        let started = self.input.update(ctx, |input, ctx| {
+                            input.execute_queued_command(&command, conversation_id, ctx)
+                        });
+                        // 命令无法启动(如 precmd 未就绪)时不会有完成事件;用户已有草稿则保留
+                        // 该行,否则把命令回填进空输入并移除该行,队列不会卡死。
+                        if started {
+                            QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+                                model.remove_fired_row(conversation_id, query_id, ctx);
+                            });
+                        } else if self.input.as_ref(ctx).buffer_text(ctx).is_empty() {
+                            self.input.update(ctx, |input, ctx| {
+                                input.replace_buffer_content(&command, ctx);
+                                input.set_input_mode_terminal(/* steal_focus */ false, ctx);
+                            });
+                            QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+                                model.remove_fired_row(conversation_id, query_id, ctx);
+                            });
+                        }
+                    }
+                    Some(AutofireAction::PopFromEditMode {
+                        query_id,
+                        text,
+                        attachments,
+                        is_command,
+                    }) => {
+                        if self.input.as_ref(ctx).buffer_text(ctx).is_empty() {
+                            self.input.update(ctx, |input, ctx| {
                                 input.replace_buffer_content(&text, ctx);
-                                input.focus_input_box(ctx);
+                                if is_command {
+                                    // 回填的命令保持 shell 模式,免得被当 agent prompt 提交。
+                                    input.set_input_mode_terminal(/* steal_focus */ true, ctx);
+                                } else {
+                                    input.focus_input_box(ctx);
+                                }
+                            });
+                            // 命令不带附件;只对 prompt 摆回附件。
+                            if !is_command {
+                                self.ai_context_model.update(ctx, |context_model, ctx| {
+                                    context_model.append_pending_attachments(attachments, ctx);
+                                });
                             }
+                        }
+                        QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+                            model.remove_fired_row(conversation_id, query_id, ctx);
                         });
                     }
                     None => {}
@@ -4457,9 +4584,21 @@ impl TerminalView {
                 let popped = QueuedQueryModel::handle(ctx)
                     .update(ctx, |model, ctx| model.pop_front(conversation_id, ctx));
                 if let Some(query) = popped {
+                    let is_command = query.is_command();
                     self.input.update(ctx, |input, ctx| {
                         input.replace_buffer_content(query.text(), ctx);
+                        if is_command {
+                            // 回填的命令保持 shell 模式,免得被当 agent prompt 提交。
+                            input.set_input_mode_terminal(/* steal_focus */ false, ctx);
+                        }
                     });
+                    // 命令不带附件;只对 prompt 摆回附件,手动重新提交时仍带着它们。
+                    if !is_command {
+                        self.ai_context_model.update(ctx, |context_model, ctx| {
+                            context_model
+                                .append_pending_attachments(query.attachments().to_vec(), ctx);
+                        });
+                    }
                 }
             }
         }
@@ -5626,6 +5765,15 @@ impl TerminalView {
                 );
                 self.cli_subagent_views.remove(block_id);
 
+                // 命令结束——清掉 LRC 作用域的 auto-queue override,让会话回到命令前的
+                // 排队状态,然后把「直到命令结束才发」的排队 prompt 投递给 agent。
+                if let Some(conversation_id) = conversation_id {
+                    QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+                        model.clear_queue_next_lrc_prompt_override(*conversation_id, ctx);
+                    });
+                    self.send_lrc_queued_prompts(*conversation_id, ctx);
+                }
+
                 // SSH 等交互式 CLI subagent 会话结束后，Live 卡片会被回收，
                 // 但用户仍应能在终端里看到折叠的只读终端交互卡片（与重开历史时一致）。
                 // 这里在 block 仍持有匹配 metadata 的前提下，用 RestoredReadOnly 模式重建。
@@ -6399,6 +6547,7 @@ impl TerminalView {
                             participant_id: participant_id.clone(),
                             block_id: model.block_list().active_block_id().clone(),
                             ai_metadata: Some(agent_metadata.clone()),
+                            preserve_input: false,
                         }
                     }
                 }
@@ -7217,7 +7366,9 @@ impl TerminalView {
     /// (e.g. another session).
     ///
     /// Skips the steal when the user is navigating another AI block / code diff
-    /// (e.g. arrowing diff hunks), unless the target block is blocked on user input.
+    /// (e.g. arrowing diff hunks), unless the target block is blocked on user input. Also skips
+    /// while the queued-prompt inline editor is focused, so async AI/tool updates don't blur it
+    /// and end the edit.
     ///
     /// Warning: this should not be called when focusing the [`TerminalView`]. It could
     /// lead to a focus cycle because [`AIBlock::try_focus`] conditionally yields focus
@@ -7228,6 +7379,9 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) {
         if !ctx.is_self_or_child_focused() {
+            return;
+        }
+        if self.is_queued_prompt_inline_editor_focused(ctx) {
             return;
         }
         let target_needs_attention = block.as_ref(ctx).is_blocked_on_user_confirmation(ctx);
@@ -7252,6 +7406,13 @@ impl TerminalView {
                 .ai_block_metadata()
                 .is_some_and(|metadata| ancestors.contains(&metadata.ai_block_handle.id()))
         })
+    }
+
+    /// Returns `true` if the queued-prompts panel's inline edit editor holds focus.
+    fn is_queued_prompt_inline_editor_focused(&self, ctx: &AppContext) -> bool {
+        self.input
+            .as_ref(ctx)
+            .is_queued_prompt_inline_editor_focused(ctx)
     }
 
     #[cfg(not(windows))]
@@ -9174,11 +9335,12 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         // Only reset focus if this terminal is focused; don't steal it from another part
-        // of the app, or from an AI block / code diff the user is navigating.
+        // of the app, or from an interactive child the user is navigating/editing.
         let reset_focus = ctx.is_self_or_child_focused()
             && !self.find_bar.is_self_or_child_focused(ctx)
             && !self.block_filter_editor.is_self_or_child_focused(ctx)
-            && !self.is_any_ai_block_focused(ctx);
+            && !self.is_any_ai_block_focused(ctx)
+            && !self.is_queued_prompt_inline_editor_focused(ctx);
         if reset_focus {
             self.redetermine_global_focus_with_policy(selection_focus_policy, ctx);
         }
@@ -10092,6 +10254,16 @@ impl TerminalView {
                             },
                             ctx,
                         );
+                    }
+                }
+
+                // Advance the queued-prompts queue when a dispatched queued command's block
+                // completes. `on_queued_command_finished` no-ops unless a queued command is in
+                // flight, and the `!was_part_of_agent_interaction` filter keeps agent-executed
+                // command blocks (including LRC snapshots) from advancing the queue.
+                if let BlockType::User(user_block_completed) = &block_type {
+                    if !user_block_completed.was_part_of_agent_interaction {
+                        self.on_queued_command_finished(ctx);
                     }
                 }
 
@@ -20661,10 +20833,17 @@ impl TerminalView {
             ctx,
         );
 
-        let context = self
+        let mut context = self
             .ai_context_model
             .as_ref(ctx)
             .pending_context(ctx, true /* is_user_query */);
+        // pending_context 不再隐式附带附件(见 `BlocklistAIContextModel::pending_context`),
+        // inline review 保持原行为:live 暂存附件照常带上。
+        context.extend(
+            self.ai_context_model
+                .as_ref(ctx)
+                .pending_attachment_context(),
+        );
 
         let code_review_input = AIAgentInput::CodeReview {
             context: context.into(),
@@ -24410,8 +24589,22 @@ impl TypedActionView for TerminalView {
                 else {
                     return;
                 };
+                // LRC 自动排队生效期间,开关作用域是该命令:命令结束后会话回到
+                // 命令前的排队状态。
+                let lrc_auto_queue_active = {
+                    let terminal_model = self.model.lock();
+                    is_lrc_auto_queue_active(
+                        terminal_model.block_list().active_block(),
+                        conversation_id,
+                        ctx,
+                    )
+                };
                 QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
-                    model.toggle_queue_next_prompt(conversation_id, ctx);
+                    if lrc_auto_queue_active {
+                        model.toggle_queue_next_prompt_during_lrc(conversation_id, ctx);
+                    } else {
+                        model.toggle_queue_next_prompt(conversation_id, ctx);
+                    }
                 });
                 ctx.notify();
             }

@@ -273,8 +273,6 @@ ai-block-open-all-in-code-review = Open all in code review
 ai-block-dont-show-again = Don't show again
 ai-block-rewind = Rewind
 ai-block-rewind-tooltip = Rewind to before this block
-ai-block-remove-queued-prompt = Remove queued prompt
-ai-block-send-now = Send now
 ai-block-check-now =  · Check now
 ai-block-check-now-tooltip = Ask the agent to check this command now, skipping its timer.
 ai-block-resume-conversation = Resume conversation
@@ -1026,6 +1024,8 @@ settings-ai-use-agent-footer-description = Shows hint to use the "Full Terminal 
 settings-ai-show-conversation-history = Show conversation history in tools panel
 settings-ai-thinking-display = Agent thinking display
 settings-ai-thinking-display-description = Controls how reasoning/thinking traces are displayed.
+settings-ai-prompt-submission-mode = Default prompt submission mode
+settings-ai-prompt-submission-mode-description = What happens when you submit a new prompt while the agent is still responding. You can override this per conversation using the auto-queue toggle.
 settings-ai-conversation-layout-label = Preferred layout when opening existing agent conversations
 settings-ai-conversation-layout-newtab = New Tab
 settings-ai-conversation-layout-splitpane = Split Pane
@@ -2314,6 +2314,10 @@ toggle-suffix-memory-stats = memory statistics
 agent-thinking-display-show-collapse = Set agent thinking display: show & collapse
 agent-thinking-display-always-show = Set agent thinking display: always show
 agent-thinking-display-never-show = Set agent thinking display: never show
+
+# Set default prompt submission mode
+agent-prompt-submission-interrupt = Set default prompt submission: interrupt response
+agent-prompt-submission-queue = Set default prompt submission: queue until response finishes
 
 # --- ANCHOR-SUB-EXTERNAL-EDITOR (settings-external-editor) ---
 settings-external-editor-choose-default = Choose an editor to open file links

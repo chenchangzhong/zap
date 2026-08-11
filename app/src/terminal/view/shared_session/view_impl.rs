@@ -823,6 +823,12 @@ impl TerminalView {
                 let role = &role;
                 editor.set_interaction_state(role.into(), ctx);
             });
+            // 角色决定能否发送 prompt,队列面板的回车提示必须跟随同步。
+            if let Some(panel) = input.queued_prompts_panel().cloned() {
+                panel.update(ctx, |panel, ctx| {
+                    panel.set_can_send_prompt(role.can_execute(), ctx);
+                });
+            }
         });
     }
 

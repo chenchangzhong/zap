@@ -47,6 +47,7 @@ use crate::{
             },
             todos::AIAgentTodoList,
             AIAgentOutputMessage, AIAgentOutputMessageType, MessageToAIAgentOutputMessageError,
+            SummarizationType,
         },
         blocklist::BlocklistAIHistoryEvent,
     },
@@ -678,6 +679,30 @@ impl AIConversation {
         self.conversation_usage_metadata.was_summarized
     }
 
+    /// Returns true if the conversation is currently being summarized.
+    ///
+    /// Mirrors the check in `BlockModelHelper::is_conversation_summarization_active`: an
+    /// in-flight `ConversationSummary` message (no `finished_duration`) as the latest output
+    /// message of the latest exchange.
+    pub fn is_summarizing(&self) -> bool {
+        let Some(exchange) = self.latest_exchange() else {
+            return false;
+        };
+        let Some(output) = exchange.output_status.output() else {
+            return false;
+        };
+        output.get().messages.last().is_some_and(|m| {
+            matches!(
+                m.message,
+                AIAgentOutputMessageType::Summarization {
+                    finished_duration: None,
+                    summarization_type: SummarizationType::ConversationSummary,
+                    ..
+                }
+            )
+        })
+    }
+
     pub fn context_window_usage(&self) -> f32 {
         self.conversation_usage_metadata.context_window_usage
     }
@@ -1039,7 +1064,6 @@ impl AIConversation {
             .map(|(_, source)| source.clone())
             .collect()
     }
-
 
     /// Returns the titles from the CreateDocuments request corresponding to the given action ID (if any).
     /// This is used by shared-session viewers to use the correct document titles from the original CreateDocuments action.

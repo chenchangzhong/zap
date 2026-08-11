@@ -356,7 +356,9 @@ impl Input {
             }
             SlashCommandsEvent::SelectedOmpCommand { text } => {
                 self.close_slash_commands_menu(ctx);
-                ctx.emit(Event::SubmitCLIAgentInput { text: format!("{text} ") });
+                ctx.emit(Event::SubmitCLIAgentInput {
+                    text: format!("{text} "),
+                });
             }
         }
     }
@@ -756,10 +758,18 @@ impl Input {
                 // menu 路径无参数时 argument 是 Some(""),规范化为 None,避免摘要后
                 // 触发一次空 user query 浪费 token。
                 let initial_prompt = argument.cloned().filter(|p: &String| !p.is_empty());
-                ctx.dispatch_typed_action(&WorkspaceAction::SummarizeAIConversation {
+                let action = WorkspaceAction::SummarizeAIConversation {
                     prompt: None,
                     initial_prompt,
-                });
+                };
+                if is_queued_prompt {
+                    // 该 `/compact-and` 是队列自动触发的:此刻我们仍在
+                    // `QueuedQueryModel` 的 drain 回调里,同步 dispatch 会在同一帧内
+                    // 再次更新 view 树,触发 `Circular view update`。延后一帧派发。
+                    ctx.dispatch_typed_action_deferred(action);
+                } else {
+                    ctx.dispatch_typed_action(&action);
+                }
             }
             queue if command.name == commands::QUEUE.name => {
                 let Some(conversation_id) = self
@@ -777,21 +787,42 @@ impl Input {
                 };
 
                 let history = BlocklistAIHistoryModel::handle(ctx);
-                let is_in_progress = history
+                // 空会话的状态默认是 `InProgress`,但其实什么都没跑,这里排除掉,
+                // 让提示词直接发出而不是排队。
+                let should_queue = history
                     .as_ref(ctx)
                     .conversation(&conversation_id)
-                    .is_some_and(|c| c.status().is_in_progress() || c.status().is_blocked());
+                    .is_some_and(|c| {
+                        !c.is_empty() && (c.status().is_in_progress() || c.status().is_blocked())
+                    });
 
-                if is_in_progress {
+                if should_queue {
+                    let attachments = self.ai_context_model.update(ctx, |context_model, ctx| {
+                        context_model.take_pending_attachments(ctx)
+                    });
                     QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
                         model.append(
                             conversation_id,
-                            QueuedQuery::new(prompt, QueuedQueryOrigin::QueueSlashCommand),
+                            QueuedQuery::new_with_attachments(
+                                prompt,
+                                QueuedQueryOrigin::QueueSlashCommand,
+                                attachments,
+                            ),
                             ctx,
                         );
                     });
                 } else {
-                    self.submit_queued_prompt(prompt, ctx);
+                    // 会话不在进行中:立即作为常规(非排队行)用户查询发出,走 live staging
+                    // 并重置,而不是当作排队行触发。
+                    self.ai_controller.update(ctx, move |controller, ctx| {
+                        controller.send_user_query_in_conversation(
+                            prompt,
+                            conversation_id,
+                            None,
+                            ctx,
+                        );
+                    });
+                    ctx.emit(Event::ExecuteAIQuery);
                 }
             }
             open_repo if command.name == commands::OPEN_REPO.name => {
@@ -828,7 +859,7 @@ impl Input {
                 });
             }
             command_that_just_sends_ai_request_with_prefix
-                if command.name == commands::INIT.name || command.name == commands::PLAN.name =>
+                if slash_command_is_submitted_as_prompt(command) =>
             {
                 // These slash commands just send AI requests with the slash command text as a
                 // prefix, and special handling is done downstream as an implementation detail
@@ -918,9 +949,7 @@ impl Input {
             SlashCommandEntryState::SkillCommand(detected_skill) => {
                 let reference = detected_skill.reference.clone();
                 let user_query = detected_skill.argument.clone();
-                self.execute_skill_command(
-                    reference, user_query, /*is_queued_prompt*/ false, ctx,
-                )
+                self.execute_skill_command(reference, user_query, None, None, ctx)
             }
             SlashCommandEntryState::None
             | SlashCommandEntryState::Composing { .. }
@@ -968,15 +997,29 @@ impl Input {
             SlashCommandEntryState::SkillCommand(detected_skill) => {
                 let reference = detected_skill.reference.clone();
                 let user_query = detected_skill.argument.clone();
-                self.execute_skill_command(
-                    reference, user_query, /*is_queued_prompt*/ false, ctx,
-                )
+                self.execute_skill_command(reference, user_query, None, None, ctx)
             }
             SlashCommandEntryState::None
             | SlashCommandEntryState::Composing { .. }
             | SlashCommandEntryState::DisabledUntilEmptyBuffer => false,
         }
     }
+}
+
+/// Whether executing the static slash `command` submits its text to the conversation as an AI
+/// prompt (handled downstream like a normal user query) rather than performing an immediate
+/// local action.
+///
+/// This is the single source of truth for the "reiterated as a prompt vs handled immediately"
+/// distinction, used by the prompt-queue gate so action commands like `/fork` run now instead of
+/// being captured as queued rows.
+///
+/// 与上游的分叉:上游为 `COMPACT || PLAN || ORCHESTRATE`;本地无 `ORCHESTRATE` 命令,
+/// 且 `/compact` 走独立 arm 直接 dispatch `SummarizeAIConversation`(不是 prompt-prefix 臂),
+/// 因此这里实现为 `INIT || PLAN` —— 与本地
+/// `command_that_just_sends_ai_request_with_prefix` 臂保持一致。
+pub(crate) fn slash_command_is_submitted_as_prompt(command: &StaticCommand) -> bool {
+    command.name == commands::INIT.name || command.name == commands::PLAN.name
 }
 
 #[cfg(all(test, feature = "local_fs", windows))]
@@ -1040,3 +1083,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod mod_tests;

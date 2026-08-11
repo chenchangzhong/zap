@@ -110,7 +110,7 @@ fn queue_next_prompt_toggle_defaults_false_and_emits_event() {
     with_model(|mut app, model, events| {
         let conv = AIConversationId::new();
         model.read(&app, |model, _| {
-            assert!(!model.is_queue_next_prompt_enabled(conv));
+            assert!(!model.is_queue_next_prompt_toggle_enabled(conv));
         });
 
         model.update(&mut app, |model, ctx| {
@@ -118,7 +118,7 @@ fn queue_next_prompt_toggle_defaults_false_and_emits_event() {
         });
 
         model.read(&app, |model, _| {
-            assert!(model.is_queue_next_prompt_enabled(conv));
+            assert!(model.is_queue_next_prompt_toggle_enabled(conv));
         });
 
         let evts = events.borrow();
@@ -138,8 +138,8 @@ fn toggle_state_is_isolated_per_conversation() {
 
         model.update(&mut app, |m, ctx| m.toggle_queue_next_prompt(conv_a, ctx));
         model.read(&app, |m, _| {
-            assert!(m.is_queue_next_prompt_enabled(conv_a));
-            assert!(!m.is_queue_next_prompt_enabled(conv_b));
+            assert!(m.is_queue_next_prompt_toggle_enabled(conv_a));
+            assert!(!m.is_queue_next_prompt_toggle_enabled(conv_b));
         });
     });
 }
@@ -194,26 +194,35 @@ fn pop_front_removes_head_and_emits_removed() {
 }
 
 #[test]
-fn pop_for_autofire_returns_submit_for_user_managed_head() {
+fn peek_autofire_returns_submit_without_removing_the_row() {
     with_model(|mut app, model, _events| {
         let conv = AIConversationId::new();
         append_user(&model, &mut app, conv, "first");
         append_user(&model, &mut app, conv, "second");
 
-        let action = model.update(&mut app, |m, ctx| m.pop_for_autofire(conv, ctx));
+        let action = model.read(&app, |m, _| m.peek_autofire(conv));
         match action {
-            Some(AutofireAction::Submit { text }) => assert_eq!(text, "first"),
+            Some(AutofireAction::Submit { text, .. }) => assert_eq!(text, "first"),
             other => panic!("expected Submit, got {other:?}"),
         }
 
+        // Peek 不移除行:队列仍有两行。
+        model.read(&app, |model, _| {
+            assert_eq!(model.queue(conv).len(), 2);
+        });
+
+        // remove_fired_row 只移除目标行。
+        let query_id = model.read(&app, |m, _| m.queue(conv)[0].id());
+        model.update(&mut app, |m, ctx| m.remove_fired_row(conv, query_id, ctx));
         model.read(&app, |model, _| {
             assert_eq!(model.queue(conv).len(), 1);
+            assert_eq!(model.queue(conv)[0].text(), "second");
         });
     });
 }
 
 #[test]
-fn pop_for_autofire_returns_last_committed_text_when_first_row_is_in_edit_mode() {
+fn peek_autofire_returns_last_committed_text_when_first_row_is_in_edit_mode() {
     // Per spec: even when the first row is in edit mode, auto-fire's PopFromEditMode action
     // carries the row's last-committed text, not any uncommitted live-editor buffer text.
     with_model(|mut app, model, _events| {
@@ -222,11 +231,16 @@ fn pop_for_autofire_returns_last_committed_text_when_first_row_is_in_edit_mode()
         append_user(&model, &mut app, conv, "second");
         model.update(&mut app, |m, ctx| m.enter_edit_mode(conv, id_a, ctx));
 
-        let action = model.update(&mut app, |m, ctx| m.pop_for_autofire(conv, ctx));
+        let action = model.read(&app, |m, _| m.peek_autofire(conv));
         match action {
-            Some(AutofireAction::PopFromEditMode { text }) => assert_eq!(text, "first"),
+            Some(AutofireAction::PopFromEditMode { text, .. }) => assert_eq!(text, "first"),
             other => panic!("expected PopFromEditMode, got {other:?}"),
         }
+        // 行未移除,edit 状态保留;remove_fired_row 才清 edit。
+        model.read(&app, |model, _| {
+            assert_eq!(model.editing_row(conv), Some(id_a));
+        });
+        model.update(&mut app, |m, ctx| m.remove_fired_row(conv, id_a, ctx));
         model.read(&app, |model, _| {
             assert_eq!(model.editing_row(conv), None);
         });
@@ -432,7 +446,7 @@ fn delete_conversation_drops_only_that_conversation_state() {
 
         model.read(&app, |m, _| {
             assert!(!m.has_queue(conv_a));
-            assert!(!m.is_queue_next_prompt_enabled(conv_a));
+            assert!(!m.is_queue_next_prompt_toggle_enabled(conv_a));
             let b = m.queue(conv_b);
             assert_eq!(b.len(), 1);
             assert_eq!(b[0].text(), "b1");

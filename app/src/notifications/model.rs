@@ -20,7 +20,7 @@ use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity};
 
 use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
 use crate::ai::artifacts::Artifact;
-use crate::ai::blocklist::BlocklistAIHistoryEvent;
+use crate::ai::blocklist::{BlocklistAIHistoryEvent, QueuedQueryModel};
 use crate::notifications::item::{
     NotificationCategory, NotificationId, NotificationItem, NotificationItems, NotificationOrigin,
     NotificationSourceAgent,
@@ -297,6 +297,12 @@ impl NotificationsModel {
                 self.remove_notification_by_source(origin, ctx);
             }
             ConversationStatus::Success => {
+                // 有排队的后续提示词会在本次对话结束后立刻自动发出:此时对话并未真正
+                // 停下,弹完成通知只是噪音。pending artifacts 保持不动,等队列真正空了
+                // 那次结束时随通知一起 flush。
+                if QueuedQueryModel::as_ref(ctx).has_autofireable_prompt(conversation_id) {
+                    return;
+                }
                 let artifacts = self.flush_pending_artifacts(conversation_id);
                 self.add_notification(
                     title,

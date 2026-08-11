@@ -1116,6 +1116,10 @@ pub enum TelemetryQueuedQueryOrigin {
     InitialCloudMode,
     QueueSlashCommand,
     AutoQueueToggle,
+    LrcAutoQueue,
+    PendingLrcAutoQueue,
+    CompactAndSlashCommand,
+    ForkAndCompactSlashCommand,
 }
 
 impl From<QueuedQueryOrigin> for TelemetryQueuedQueryOrigin {
@@ -1124,6 +1128,10 @@ impl From<QueuedQueryOrigin> for TelemetryQueuedQueryOrigin {
             QueuedQueryOrigin::InitialCloudMode => Self::InitialCloudMode,
             QueuedQueryOrigin::QueueSlashCommand => Self::QueueSlashCommand,
             QueuedQueryOrigin::AutoQueueToggle => Self::AutoQueueToggle,
+            QueuedQueryOrigin::LrcAutoQueue => Self::LrcAutoQueue,
+            QueuedQueryOrigin::PendingLrcAutoQueue => Self::PendingLrcAutoQueue,
+            QueuedQueryOrigin::CompactAndSlashCommand => Self::CompactAndSlashCommand,
+            QueuedQueryOrigin::ForkAndCompactSlashCommand => Self::ForkAndCompactSlashCommand,
         }
     }
 }
@@ -2936,9 +2944,7 @@ impl TelemetryEvent {
                         ("warp_markdown_viewer", Some(*layout), None)
                     }
                     FileTarget::CodeEditor(layout) => ("warp_code_editor", Some(*layout), None),
-                    FileTarget::ImageViewer(layout) => {
-                        ("warp_image_viewer", Some(*layout), None)
-                    }
+                    FileTarget::ImageViewer(layout) => ("warp_image_viewer", Some(*layout), None),
                     FileTarget::EnvEditor => ("env_editor", None, None),
                     FileTarget::SystemDefault => ("system_default", None, None),
                     FileTarget::SystemGeneric => ("system_generic", None, None),

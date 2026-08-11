@@ -7002,3 +7002,281 @@ fn test_custom_terminal_page_scroll_binding_applies_when_prompt_is_focused() {
         });
     });
 }
+
+/// 进入 fullscreen agent view 并让 `QueuedQueryModel` 的某一行处于行内编辑态。
+/// 返回 `(window_id, terminal, input, editor, conversation_id)`。
+/// 主输入框保持为空,以便 `flags::EMPTY_INPUT_BUFFER` 与 `flags::ACTIVE_AGENT_VIEW` 同时置位 ——
+/// 这正是 shift-`?` 与 history-up 两条 Input 级绑定本来会激活的状态。
+async fn enter_agent_view_with_queued_row_in_edit_mode(
+    app: &mut App,
+    history_file_commands: Option<Vec<String>>,
+) -> (
+    WindowId,
+    ViewHandle<TerminalView>,
+    ViewHandle<Input>,
+    ViewHandle<EditorView>,
+    AIConversationId,
+) {
+    let (window_id, terminal) =
+        add_window_with_bootstrapped_terminal_and_window_id(app, history_file_commands, None).await;
+    let (input, editor) = terminal.read(app, |terminal, ctx| {
+        let input = terminal.input().clone();
+        let editor = input.as_ref(ctx).editor().clone();
+        (input, editor)
+    });
+
+    let conversation_id = terminal.update(app, |view, ctx| {
+        view.agent_view_controller().update(ctx, |controller, ctx| {
+            controller
+                .try_enter_agent_view(
+                    None,
+                    AgentViewEntryOrigin::Input {
+                        was_prompt_autodetected: false,
+                    },
+                    ctx,
+                )
+                .expect("Should be able to enter agent view")
+        })
+    });
+
+    // 排入一行并进入行内编辑态。文字内容与主输入框无关,主输入框始终为空。
+    QueuedQueryModel::handle(app).update(app, |model, ctx| {
+        let query_id = model.append(
+            conversation_id,
+            QueuedQuery::new(
+                "排队的提示词".to_owned(),
+                QueuedQueryOrigin::QueueSlashCommand,
+            ),
+            ctx,
+        );
+        model.enter_edit_mode(conversation_id, query_id, ctx);
+    });
+
+    input.read(app, |input, ctx| {
+        assert!(
+            input.buffer_text(ctx).is_empty(),
+            "主输入框必须为空,否则 EMPTY_INPUT_BUFFER 不置位,测试的对照分支就失去意义"
+        );
+    });
+
+    (window_id, terminal, input, editor, conversation_id)
+}
+
+#[test]
+fn test_shift_question_mark_does_not_open_shortcuts_while_editing_queued_prompt() {
+    App::test((), |mut app| async move {
+        // 绑定注册在 `init` 内、由该 flag 门控,故必须在 initialize_app 之前 override。
+        let _agent_view_flag = FeatureFlag::AgentView.override_enabled(true);
+        initialize_app(&mut app);
+
+        let (window_id, terminal, input, editor, conversation_id) =
+            enter_agent_view_with_queued_row_in_edit_mode(&mut app, None).await;
+        let focus_path = [terminal.id(), input.id(), editor.id()];
+        let question_mark = Keystroke::parse("shift-?").unwrap();
+
+        // 行内编辑中:该按键属于行内编辑器,Input 级绑定必须不消费它,快捷键面板保持关闭。
+        let handled = app
+            .dispatch_keystroke(window_id, &focus_path, &question_mark, false)
+            .unwrap();
+        assert!(
+            !handled,
+            "行内编辑队列行时 shift-? 不应被 Input 的 ToggleAgentViewShortcuts 绑定消费"
+        );
+        input.read(&app, |input, ctx| {
+            assert!(
+                !input
+                    .agent_shortcut_view_model
+                    .as_ref(ctx)
+                    .is_shortcut_view_open(),
+                "行内编辑队列行时输入 ? 不应弹出快捷键面板"
+            );
+        });
+
+        // 对照分支:退出行内编辑后,同一按键在同一状态下必须照常打开面板 ——
+        // 证明该绑定本来就是激活的,上面的 false 不是因为绑定压根没生效。
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.cancel_edit(conversation_id, ctx);
+        });
+
+        let handled = app
+            .dispatch_keystroke(window_id, &focus_path, &question_mark, false)
+            .unwrap();
+        assert!(
+            handled,
+            "退出行内编辑后 shift-? 必须被 Input 消费,否则本测试的第一段断言无法证明任何事情"
+        );
+        input.read(&app, |input, ctx| {
+            assert!(
+                input
+                    .agent_shortcut_view_model
+                    .as_ref(ctx)
+                    .is_shortcut_view_open(),
+                "退出行内编辑后输入 ? 应打开快捷键面板"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_up_arrow_does_not_open_command_history_while_editing_queued_prompt() {
+    App::test((), |mut app| async move {
+        let _agent_view_flag = FeatureFlag::AgentView.override_enabled(true);
+        initialize_app(&mut app);
+
+        let history_file_commands = vec!["cd ~".to_string(), "ls".to_string()];
+        let (_window_id, _terminal, input, _editor, conversation_id) =
+            enter_agent_view_with_queued_row_in_edit_mode(&mut app, Some(history_file_commands))
+                .await;
+
+        // ① keymap context:history-up 固定绑定的谓词靠该 context 的否定来让位给行内编辑器。
+        input.read(&app, |input, ctx| {
+            assert!(
+                input
+                    .keymap_context(ctx)
+                    .set
+                    .contains(QUEUED_PROMPT_INLINE_EDITOR_OPEN_CONTEXT),
+                "行内编辑队列行时必须置位 {QUEUED_PROMPT_INLINE_EDITOR_OPEN_CONTEXT},否则 history-up 绑定仍会激活"
+            );
+        });
+
+        // ② 更直接的可观察量:即使 Up 动作真的到达 Input,也不得拉起命令历史。
+        input.update(&mut app, |input, ctx| {
+            input.handle_action(&InputAction::Up, ctx);
+        });
+        input.read(&app, |input, ctx| {
+            assert!(
+                matches!(
+                    input.suggestions_mode_model.as_ref(ctx).mode(),
+                    InputSuggestionsMode::Closed
+                ),
+                "行内编辑队列行时按 ↑ 不应打开命令历史"
+            );
+            assert!(
+                input.buffer_text(ctx).is_empty(),
+                "行内编辑队列行时按 ↑ 不应把历史命令回填进主输入框"
+            );
+        });
+
+        // 对照分支:退出行内编辑后,context 消失且 ↑ 照常拉起命令历史。
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.cancel_edit(conversation_id, ctx);
+        });
+        input.read(&app, |input, ctx| {
+            assert!(
+                !input
+                    .keymap_context(ctx)
+                    .set
+                    .contains(QUEUED_PROMPT_INLINE_EDITOR_OPEN_CONTEXT),
+                "退出行内编辑后必须清掉 {QUEUED_PROMPT_INLINE_EDITOR_OPEN_CONTEXT}"
+            );
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.handle_action(&InputAction::Up, ctx);
+        });
+        input.read(&app, |input, ctx| {
+            assert!(
+                matches!(
+                    input.suggestions_mode_model.as_ref(ctx).mode(),
+                    InputSuggestionsMode::HistoryUp { .. }
+                ),
+                "退出行内编辑后按 ↑ 必须照常拉起命令历史,否则上面的断言无法证明任何事情"
+            );
+        });
+    });
+}
+
+/// 空输入回车 send-now 的 Input 级契约(步骤 4.3):主输入框为空且队列非空时,按回车
+/// 必须把**队首**行从队列里消费掉(走面板 SendNow 路径);输入框有文字时回车走原有
+/// 提交流程,**不得**消费任何排队行。守的是回车链插入位置:误吞正常回车或漏发队首行
+/// 都会让某一段变红。
+#[test]
+fn test_enter_with_empty_input_sends_top_queued_row_and_non_empty_input_does_not() {
+    App::test((), |mut app| async move {
+        // 面板在 `Input::new` 里由该 flag 门控,先打开,保证 `queued_prompts_panel` 存在。
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let (_window_id, terminal) =
+            add_window_with_bootstrapped_terminal_and_window_id(&mut app, None, None).await;
+        let (input, editor) = terminal.read(&app, |terminal, ctx| {
+            let input = terminal.input().clone();
+            let editor = input.as_ref(ctx).editor().clone();
+            (input, editor)
+        });
+
+        // 建会话并排两行,主输入框保持为空。
+        let conversation_id = terminal.update(&mut app, |view, ctx| {
+            let terminal_view_id = view.view_id();
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                let conv = history.start_new_conversation(terminal_view_id, false, false, ctx);
+                history.set_active_conversation_id(conv, terminal_view_id, ctx);
+                conv
+            })
+        });
+        let (head_id, tail_text) = QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            let head_id = model.append(
+                conversation_id,
+                QueuedQuery::new(
+                    "队首提示词".to_owned(),
+                    QueuedQueryOrigin::QueueSlashCommand,
+                ),
+                ctx,
+            );
+            model.append(
+                conversation_id,
+                QueuedQuery::new(
+                    "队尾提示词".to_owned(),
+                    QueuedQueryOrigin::QueueSlashCommand,
+                ),
+                ctx,
+            );
+            (head_id, "队尾提示词".to_owned())
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(input.buffer_text(ctx).is_empty(), "主输入框必须为空(前置)");
+        });
+
+        // ① 空输入 + 队列非空:回车消费队首行,队尾留在队列里。
+        // 说明:直接经 `EditorAction::Enter` 走编辑器 keymap 的同一条处理链
+        // (EditorView 的 enter() → emit EditorEvent::Enter → Input::input_enter →
+        // enter_sends_queued_prompt → send_top_queued_prompt_now),与真实按键等效。
+        editor.update(&mut app, |editor, ctx| {
+            editor.handle_action(&EditorAction::Enter, ctx);
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(
+                queue.len(),
+                1,
+                "空输入回车必须恰好消费队首一行,队列从 2 变 1"
+            );
+            assert_ne!(queue[0].id(), head_id, "被消费的必须是队首行,不能是第二行");
+            assert_eq!(queue[0].text(), tail_text, "剩下的是队尾行");
+        });
+
+        // ② 输入框写入文字后:回车不得消费任何排队行。
+        editor.update(&mut app, |editor, ctx| {
+            editor.set_buffer_text("手动输入的文字", ctx);
+        });
+        input.read(&app, |input, ctx| {
+            assert!(
+                !input.buffer_text(ctx).is_empty(),
+                "主输入框必须有文字(前置)"
+            );
+        });
+
+        editor.update(&mut app, |editor, ctx| {
+            editor.handle_action(&EditorAction::Enter, ctx);
+        });
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert_eq!(
+                model.queue(conversation_id).len(),
+                1,
+                "输入框非空时回车不得吞掉排队行"
+            );
+        });
+    });
+}

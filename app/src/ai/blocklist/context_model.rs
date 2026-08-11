@@ -429,81 +429,87 @@ impl BlocklistAIContextModel {
         agent_view_controller: ModelHandle<AgentViewController>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        ctx.subscribe_to_model(model_event_dispatcher, move |me, _, event, ctx| match event {
-            ModelEvent::BlockCompleted(BlockCompletedEvent {
-                block_type: BlockType::User(user_block_completed),
-                block_id,
-                ..
-            }) => {
-                // If AgentViewBlockContext is enabled and we're in agent view, track user-executed
-                // blocks for auto-attachment as context.
-                if FeatureFlag::AgentViewBlockContext.is_enabled()
-                    && me.agent_view_controller.as_ref(ctx).is_fullscreen()
-                    && !user_block_completed.was_part_of_agent_interaction
+        ctx.subscribe_to_model(
+            model_event_dispatcher,
+            move |me, _, event, ctx| match event {
+                ModelEvent::BlockCompleted(BlockCompletedEvent {
+                    block_type: BlockType::User(user_block_completed),
+                    block_id,
+                    ..
+                }) => {
+                    // If AgentViewBlockContext is enabled and we're in agent view, track user-executed
+                    // blocks for auto-attachment as context.
+                    if FeatureFlag::AgentViewBlockContext.is_enabled()
+                        && me.agent_view_controller.as_ref(ctx).is_fullscreen()
+                        && !user_block_completed.was_part_of_agent_interaction
+                    {
+                        me.auto_attached_agent_view_user_block_ids
+                            .push(block_id.clone());
+                    }
+
+                    // If the block that finished was part of an agent interaction (i.e. LRC finishing),
+                    // we should preserve input context.
+                    if !FeatureFlag::AgentViewBlockContext.is_enabled()
+                        && !user_block_completed.was_part_of_agent_interaction
+                    {
+                        me.reset_context_to_default(ctx);
+                    }
+                }
+                ModelEvent::BlockMetadataReceived(block_metadata_received) => {
+                    let pwd = block_metadata_received
+                        .block_metadata
+                        .current_working_directory()
+                        .map(|s| PathBuf::from(s.to_owned()));
+                    let session_id = block_metadata_received.block_metadata.session_id();
+
+                    if let Some(session_id) = session_id {
+                        let active_session = sessions.as_ref(ctx).get(session_id);
+                        if let Some(active_session) = active_session {
+                            me.update_directory_context(
+                                pwd.map(|p| p.to_string_lossy().to_string()),
+                                active_session.home_dir().map(|sq| sq.to_owned()),
+                                ctx,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            },
+        );
+
+        ctx.subscribe_to_model(
+            &BlocklistAIHistoryModel::handle(ctx),
+            |me, _, event, ctx| {
+                if event
+                    .terminal_view_id()
+                    .is_some_and(|id| id != me.terminal_view_id)
                 {
-                    me.auto_attached_agent_view_user_block_ids
-                        .push(block_id.clone());
+                    return;
                 }
 
-                // If the block that finished was part of an agent interaction (i.e. LRC finishing),
-                // we should preserve input context.
-                if !FeatureFlag::AgentViewBlockContext.is_enabled()
-                    && !user_block_completed.was_part_of_agent_interaction
-                {
-                    me.reset_context_to_default(ctx);
-                }
-            }
-            ModelEvent::BlockMetadataReceived(block_metadata_received) => {
-                let pwd = block_metadata_received
-                    .block_metadata
-                    .current_working_directory()
-                    .map(|s| PathBuf::from(s.to_owned()));
-                let session_id = block_metadata_received.block_metadata.session_id();
-
-                if let Some(session_id) = session_id {
-                    let active_session = sessions.as_ref(ctx).get(session_id);
-                    if let Some(active_session) = active_session {
-                        me.update_directory_context(
-                            pwd.map(|p| p.to_string_lossy().to_string()),
-                            active_session.home_dir().map(|sq| sq.to_owned()),
+                match event {
+                    BlocklistAIHistoryEvent::ClearedConversationsInTerminalView { .. } => {
+                        me.set_pending_query_state(PendingQueryState::default(), ctx);
+                        if FeatureFlag::AgentView.is_enabled() {
+                            me.agent_view_controller.update(ctx, |controller, ctx| {
+                                controller.exit_agent_view(ctx);
+                            });
+                        }
+                    }
+                    BlocklistAIHistoryEvent::SplitConversation {
+                        new_conversation_id,
+                        ..
+                    } => {
+                        me.set_pending_query_state_for_existing_conversation(
+                            *new_conversation_id,
+                            AgentViewEntryOrigin::AgentRequestedNewConversation,
                             ctx,
                         );
                     }
+                    _ => {}
                 }
-            }
-            _ => {}
-        });
-
-        ctx.subscribe_to_model(&BlocklistAIHistoryModel::handle(ctx), |me, _, event, ctx| {
-            if event
-                .terminal_view_id()
-                .is_some_and(|id| id != me.terminal_view_id)
-            {
-                return;
-            }
-
-            match event {
-                BlocklistAIHistoryEvent::ClearedConversationsInTerminalView { .. } => {
-                    me.set_pending_query_state(PendingQueryState::default(), ctx);
-                    if FeatureFlag::AgentView.is_enabled() {
-                        me.agent_view_controller.update(ctx, |controller, ctx| {
-                            controller.exit_agent_view(ctx);
-                        });
-                    }
-                }
-                BlocklistAIHistoryEvent::SplitConversation {
-                    new_conversation_id,
-                    ..
-                } => {
-                    me.set_pending_query_state_for_existing_conversation(
-                        *new_conversation_id,
-                        AgentViewEntryOrigin::AgentRequestedNewConversation,
-                        ctx,
-                    );
-                }
-                _ => {}
-            }
-        });
+            },
+        );
 
         ctx.subscribe_to_model(&LLMPreferences::handle(ctx), |me, _, event, ctx| {
             if let LLMPreferencesEvent::UpdatedActiveAgentModeLLM = event {
@@ -748,28 +754,41 @@ impl BlocklistAIContextModel {
             if let Some(selected_text) = &self.pending_context_selected_text {
                 context.push(AIAgentContext::SelectedText(selected_text.clone()));
             }
+        }
 
-            // Add images from pending attachments
-            for attachment in &self.pending_attachments {
-                if let PendingAttachment::Image(image) = attachment {
+        context
+    }
+
+    /// 把当前 live 暂存附件拆成 context(图片→`Image`;文件→inline `File` content)。
+    ///
+    /// 附件不再由 [`Self::pending_context`] 隐式附带——调用方显式决定来源:直接提交取 live
+    /// 暂存,排队行触发取行自带附件(`QueuedQuery::attachments`)。否则排队行会把用户
+    /// 下一条草稿的附件发走,而直接提交则因两条推送路径重复发附件。
+    pub(crate) fn pending_attachment_context(&self) -> Vec<AIAgentContext> {
+        Self::attachment_context_for(&self.pending_attachments)
+    }
+
+    /// 把一组附件拆成 context(图片→`Image`;文件→inline `File` content)。供 live 暂存
+    /// 与排队行附件共用,保证两条路径的 inline 文件语义一致。
+    pub(crate) fn attachment_context_for(attachments: &[PendingAttachment]) -> Vec<AIAgentContext> {
+        let mut context = Vec::new();
+        for attachment in attachments {
+            match attachment {
+                PendingAttachment::Image(image) => {
                     context.push(AIAgentContext::Image(image.clone()));
                 }
-            }
-
-            // Zap P0/P1: 把 PendingFile 同步读入并以 AIAgentContext::File 推进 context。
-            // - text-like (UTF-8 解析成功) → StringContent → 走 user_context.rs::render_file
-            //   渲染成 <file> XML 块(BYOP)/ api::input_context::File(warp-own)
-            // - binary (PDF / 音频 / 其它) → BinaryContent → 走 BYOP user_context Binary
-            //   ContentPart 升级路径(warp-own 在 convert.rs:759 直接丢弃,无副作用)
-            for attachment in &self.pending_attachments {
-                if let PendingAttachment::File(file) = attachment {
+                // Zap P0/P1: 把 PendingFile 同步读入并以 AIAgentContext::File 推进 context。
+                // - text-like (UTF-8 解析成功) → StringContent → 走 user_context.rs::render_file
+                //   渲染成 <file> XML 块(BYOP)/ api::input_context::File(warp-own)
+                // - binary (PDF / 音频 / 其它) → BinaryContent → 走 BYOP user_context Binary
+                //   ContentPart 升级路径(warp-own 在 convert.rs:759 直接丢弃,无副作用)
+                PendingAttachment::File(file) => {
                     if let Some(file_context) = read_pending_file_for_context(file) {
                         context.push(AIAgentContext::File(file_context));
                     }
                 }
             }
         }
-
         context
     }
 
@@ -1324,6 +1343,23 @@ impl BlocklistAIContextModel {
             });
         }
         self.pending_attachments.clear();
+    }
+
+    /// Drains all pending attachments, returning them, and emits the same update event as
+    /// [`Self::clear_pending_attachments`] so the input's attachment chips disappear. Used to
+    /// move staged attachments onto a queued prompt row at enqueue time.
+    pub fn take_pending_attachments(
+        &mut self,
+        ctx: &mut ModelContext<Self>,
+    ) -> Vec<PendingAttachment> {
+        if !self.pending_attachments.is_empty() {
+            ctx.emit(BlocklistAIContextEvent::UpdatedPendingContext {
+                previous_block_ids: self.pending_context_block_ids.clone(),
+                requires_block_resync: false,
+                requires_text_resync: false,
+            });
+        }
+        std::mem::take(&mut self.pending_attachments)
     }
 }
 

@@ -1,4 +1,7 @@
 use super::SlashCommandEntryState;
+use crate::ai::blocklist::{
+    BlocklistAIHistoryModel, QueuedQuery, QueuedQueryModel, QueuedQueryOrigin,
+};
 use crate::report_if_error;
 use crate::search::slash_command_menu::static_commands::commands;
 use crate::settings::AISettings;
@@ -453,9 +456,29 @@ fn test_submit_queued_prompt_routes_plain_text_to_conversation() {
 
         // submit_queued_prompt with plain text should not panic or crash.
         // It routes through detect_command (returning None) and falls through
-        // to send_user_query_in_new_conversation.
+        // to send_queued_user_query_in_conversation. A fired row always belongs
+        // to the conversation that finished, so seed one plus a queued row id.
+        let (conversation_id, query_id) = terminal.update(&mut app, |terminal, ctx| {
+            let terminal_view_id = terminal.id();
+            let conversation_id = BlocklistAIHistoryModel::handle(ctx)
+                .update(ctx, |history, ctx| {
+                    history.start_new_conversation(terminal_view_id, false, false, ctx)
+                });
+            let query_id = QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+                model.append(
+                    conversation_id,
+                    QueuedQuery::new(
+                        "fix the tests".to_string(),
+                        QueuedQueryOrigin::AutoQueueToggle,
+                    ),
+                    ctx,
+                )
+            });
+            (conversation_id, query_id)
+        });
+
         input.update(&mut app, |input, ctx| {
-            input.submit_queued_prompt("fix the tests".to_string(), ctx);
+            input.submit_queued_prompt("fix the tests".to_string(), conversation_id, query_id, ctx);
         });
     });
 }
@@ -485,9 +508,25 @@ fn test_submit_queued_prompt_detects_slash_command() {
 
         if let Some(command_text) = command_with_arg {
             // submit_queued_prompt should detect the slash command and route through
-            // execute_slash_command. This should not panic.
+            // execute_slash_command. This should not panic. Seed a conversation and a
+            // queued row id, since fired rows always carry both.
+            let (conversation_id, query_id) = terminal.update(&mut app, |terminal, ctx| {
+                let terminal_view_id = terminal.id();
+                let conversation_id =
+                    BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                        history.start_new_conversation(terminal_view_id, false, false, ctx)
+                    });
+                let query_id = QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.append(
+                        conversation_id,
+                        QueuedQuery::new(command_text.clone(), QueuedQueryOrigin::AutoQueueToggle),
+                        ctx,
+                    )
+                });
+                (conversation_id, query_id)
+            });
             input.update(&mut app, |input, ctx| {
-                input.submit_queued_prompt(command_text, ctx);
+                input.submit_queued_prompt(command_text, conversation_id, query_id, ctx);
             });
         }
     });

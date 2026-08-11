@@ -154,7 +154,11 @@ fn run_shell_command_tool() -> api::message::tool_call::Tool {
     })
 }
 
-fn tool_call_message_with_tool(id: &str, call_id: &str, tool: api::message::tool_call::Tool) -> api::Message {
+fn tool_call_message_with_tool(
+    id: &str,
+    call_id: &str,
+    tool: api::message::tool_call::Tool,
+) -> api::Message {
     api::Message {
         id: id.to_string(),
         task_id: "root-task".to_string(),
@@ -475,11 +479,7 @@ fn test_cli_subagent_serialized_block_preserves_block_id_and_metadata() {
             api::Task {
                 id: "root-task".to_string(),
                 messages: vec![
-                    tool_call_message_with_tool(
-                        "tool-call-1",
-                        "call-1",
-                        run_shell_command_tool(),
-                    ),
+                    tool_call_message_with_tool("tool-call-1", "call-1", run_shell_command_tool()),
                     tool_call_result_message_with_result(
                         "tool-result-1",
                         "call-1",
@@ -953,8 +953,10 @@ fn silent_lrc_cli_subtask_is_included_in_active_tasks() {
 
 #[test]
 fn silent_lrc_cli_subtask_detection_requires_no_matching_tool_call() {
-    let subtask =
-        Task::new_byop_silent_cli_subtask(BlockId::from("block-1".to_string()), "root-task".to_string());
+    let subtask = Task::new_byop_silent_cli_subtask(
+        BlockId::from("block-1".to_string()),
+        "root-task".to_string(),
+    );
     let subtask_source = subtask.source().expect("silent subtask 直接 Server-backed");
     let root = api::Task {
         id: "root-task".to_string(),
@@ -975,9 +977,13 @@ fn silent_lrc_cli_subtask_detection_requires_no_matching_tool_call() {
 #[test]
 fn cli_subtask_with_matching_tool_call_is_not_flagged_silent() {
     // 有真实 Subagent ToolCall 的 CLI subtask 走 DFS 语义,不能误判为 silent。
-    let subtask =
-        Task::new_byop_silent_cli_subtask(BlockId::from("block-1".to_string()), "root-task".to_string());
-    let params = subtask.subagent_params().expect("silent subtask 带 SubagentParams");
+    let subtask = Task::new_byop_silent_cli_subtask(
+        BlockId::from("block-1".to_string()),
+        "root-task".to_string(),
+    );
+    let params = subtask
+        .subagent_params()
+        .expect("silent subtask 带 SubagentParams");
     let subtask_source = subtask.source().expect("silent subtask 直接 Server-backed");
     let root = api::Task {
         id: "root-task".to_string(),
@@ -1044,12 +1050,114 @@ fn finished_cli_subtask_stays_excluded_from_active_tasks() {
         summary: String::new(),
         server_data: String::new(),
     };
-    let conversation = AIConversation::new_restored(
-        AIConversationId::new(),
-        vec![root, subtask],
-        None,
-    )
-    .unwrap();
+    let conversation =
+        AIConversation::new_restored(AIConversationId::new(), vec![root, subtask], None).unwrap();
     let active = conversation.compute_active_tasks();
     assert!(!active.iter().any(|t| t.id == sub_id));
+}
+
+/// 构造一条 `Summarization` 服务端消息。`finished_duration` 为 `None` 表示压缩仍在进行中。
+fn conversation_summary_message(
+    id: &str,
+    request_id: &str,
+    finished_duration: Option<prost_types::Duration>,
+) -> api::Message {
+    api::Message {
+        id: id.to_string(),
+        task_id: "root-task".to_string(),
+        server_message_data: String::new(),
+        citations: vec![],
+        message: Some(api::message::Message::Summarization(
+            api::message::Summarization {
+                finished_duration,
+                summary_type: Some(
+                    api::message::summarization::SummaryType::ConversationSummary(
+                        api::message::summarization::ConversationSummary {
+                            summary: "对话摘要".to_string(),
+                            token_count: 42,
+                        },
+                    ),
+                ),
+            },
+        )),
+        request_id: request_id.to_string(),
+        timestamp: None,
+    }
+}
+
+fn restored_conversation_with_messages(messages: Vec<api::Message>) -> AIConversation {
+    AIConversation::new_restored(
+        AIConversationId::new(),
+        vec![api::Task {
+            id: "root-task".to_string(),
+            messages,
+            dependencies: None,
+            description: String::new(),
+            summary: String::new(),
+            server_data: String::new(),
+        }],
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn is_summarizing_is_false_without_any_exchange() {
+    let conversation = restored_conversation_with_messages(vec![]);
+
+    assert!(!conversation.is_summarizing());
+}
+
+#[test]
+fn is_summarizing_is_true_for_in_flight_conversation_summary() {
+    // 最新 exchange 的最新输出消息是未完成的 ConversationSummary(无 finished_duration)。
+    let conversation = restored_conversation_with_messages(vec![
+        user_query_message("user-0", "request-0", "/compact"),
+        conversation_summary_message("summary-0", "request-0", None),
+    ]);
+
+    assert!(conversation.is_summarizing());
+}
+
+#[test]
+fn is_summarizing_is_false_once_summary_reports_finished_duration() {
+    // 同一条消息带上 finished_duration 后,压缩已结束,不再算「正在压缩」。
+    let conversation = restored_conversation_with_messages(vec![
+        user_query_message("user-0", "request-0", "/compact"),
+        conversation_summary_message(
+            "summary-0",
+            "request-0",
+            Some(prost_types::Duration {
+                seconds: 3,
+                nanos: 0,
+            }),
+        ),
+    ]);
+
+    assert!(!conversation.is_summarizing());
+}
+
+#[test]
+fn is_summarizing_is_false_when_summary_is_not_the_latest_output_message() {
+    // 压缩之后 agent 又输出了正文 —— 最新输出消息不是 Summarization,不算正在压缩。
+    let conversation = restored_conversation_with_messages(vec![
+        user_query_message("user-0", "request-0", "/compact"),
+        conversation_summary_message("summary-0", "request-0", None),
+        agent_output_message("agent-0", "request-0"),
+    ]);
+
+    assert!(!conversation.is_summarizing());
+}
+
+#[test]
+fn is_summarizing_only_considers_the_latest_exchange() {
+    // 上一轮的未完成压缩不能让新一轮 exchange 也显示为正在压缩。
+    let conversation = restored_conversation_with_messages(vec![
+        user_query_message("user-0", "request-0", "/compact"),
+        conversation_summary_message("summary-0", "request-0", None),
+        user_query_message("user-1", "request-1", "继续"),
+        agent_output_message("agent-1", "request-1"),
+    ]);
+
+    assert!(!conversation.is_summarizing());
 }

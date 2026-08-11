@@ -395,6 +395,127 @@ impl ThinkingDisplayMode {
     }
 }
 
+/// 用户在 agent 还在回复上一条提示词时提交新提示词的默认行为。
+///
+/// 这是「没有 per-conversation 覆盖」时使用的默认值;per-conversation 覆盖存在
+/// `QueuedQueryModel` 上,优先级高于本设置。
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    EnumIter,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Default behavior when submitting a new prompt while the agent is still responding.",
+    rename_all = "snake_case"
+)]
+pub enum PromptSubmissionMode {
+    /// 取消进行中的回复,立刻提交新提示词(默认)。
+    #[default]
+    Interrupt,
+    /// 把新提示词挂起,等进行中的回复结束后再提交。
+    Queue,
+}
+
+settings::macros::implement_setting_for_enum!(
+    PromptSubmissionMode,
+    AISettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    private: false,
+    toml_path: "agents.warp_agent.other.default_prompt_submission_mode",
+    description: "Default behavior when submitting a new prompt while the agent is still responding.",
+    feature_flag: FeatureFlag::QueueSlashCommand,
+);
+
+impl PromptSubmissionMode {
+    /// Display name for the settings dropdown.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            PromptSubmissionMode::Interrupt => "Interrupt response",
+            PromptSubmissionMode::Queue => "Queue until response finishes",
+        }
+    }
+
+    pub fn command_palette_description(&self) -> String {
+        match self {
+            PromptSubmissionMode::Interrupt => crate::t!("agent-prompt-submission-interrupt"),
+            PromptSubmissionMode::Queue => crate::t!("agent-prompt-submission-queue"),
+        }
+    }
+}
+
+/// What happens when a prompt is submitted while an agent controls an agent-requested
+/// long-running command (LRC).
+///
+/// Only consulted when [`PromptSubmissionMode`] is `Interrupt`: in `Queue` mode
+/// prompts always queue until the full response finishes, so this setting is
+/// hidden and ignored.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    EnumIter,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "What happens when a prompt is submitted while an agent controls an agent-requested long-running command.",
+    rename_all = "snake_case"
+)]
+pub enum LongRunningCommandSubmissionMode {
+    /// Send the prompt to the agent immediately, steering it mid-command.
+    SendImmediately,
+    /// Queue the prompt and send it to the agent when the command finishes
+    /// (default).
+    #[default]
+    QueueUntilCommandCompletes,
+}
+
+settings::macros::implement_setting_for_enum!(
+    LongRunningCommandSubmissionMode,
+    AISettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    private: false,
+    toml_path: "agents.warp_agent.other.long_running_command_submission_mode",
+    description: "What happens when a prompt is submitted while an agent controls an agent-requested long-running command.",
+    feature_flag: FeatureFlag::QueueSlashCommand,
+);
+
+impl LongRunningCommandSubmissionMode {
+    /// Display name for the settings dropdown.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            LongRunningCommandSubmissionMode::SendImmediately => "Send immediately",
+            LongRunningCommandSubmissionMode::QueueUntilCommandCompletes => {
+                "Queue until command finishes"
+            }
+        }
+    }
+
+    pub fn command_palette_description(&self) -> &'static str {
+        match self {
+            LongRunningCommandSubmissionMode::SendImmediately => {
+                "Set long-running command submission: send immediately"
+            }
+            LongRunningCommandSubmissionMode::QueueUntilCommandCompletes => {
+                "Set long-running command submission: queue until command finishes"
+            }
+        }
+    }
+}
+
 /// Tracks the state of the quota reset banner
 #[derive(
     Debug,
@@ -1762,6 +1883,15 @@ define_settings_group!(AISettings, settings: [
 
     // Controls how agent thinking/reasoning traces are displayed.
     thinking_display_mode: ThinkingDisplayMode,
+
+    // 用户在 agent 还在回复时提交新提示词的默认行为。per-conversation 覆盖存在
+    // `QueuedQueryModel` 上;本设置是没有覆盖时的回落值。
+    default_prompt_submission_mode: PromptSubmissionMode,
+
+    // agent 控制的 agent-requested 长命令期间提交提示词的行为。仅在
+    // `default_prompt_submission_mode` 为 `Interrupt` 时被读取;per-command 手动覆盖
+    // 存在 `QueuedQueryModel` 上。
+    long_running_command_submission_mode: LongRunningCommandSubmissionMode,
 
     // Whether agent-executed shell commands should be included in command history
     // (up-arrow, Ctrl-R search, inline history menu).

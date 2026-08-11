@@ -25,13 +25,14 @@ use crate::settings::{
     AgentModeCommandExecutionPredicate, AgentModeQuerySuggestionsEnabled,
     AutoApproveBypassesCommandDenylist, AwsBedrockAutoLogin, AwsBedrockCredentialsEnabled,
     FileBasedMcpEnabled, GitOperationsAutogenEnabled, IncludeAgentCommandsInHistory,
-    IntelligentAutosuggestionsEnabled, MemoryEnabled, NLDInTerminalEnabled,
-    NaturalLanguageAutosuggestionsEnabled, RuleSuggestionsEnabled, ShouldRenderCLIAgentToolbar,
+    IntelligentAutosuggestionsEnabled, LongRunningCommandSubmissionMode, MemoryEnabled,
+    NLDInTerminalEnabled, NaturalLanguageAutosuggestionsEnabled, PromptSubmissionMode,
+    RuleSuggestionsEnabled, ShouldRenderCLIAgentToolbar,
     ShouldRenderUseAgentToolbarForUserCommands, ShowAgentTips, ShowAgentZeroStateHints,
     ShowConversationHistory, ShowHintText, ThinkingDisplayMode, VoiceInputEnabled,
 };
-use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::cli_agent::{CLIAgentInstallEvent, CLIAgentInstallModel};
+use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::CLIAgent;
 use crate::view_components::{
     action_button::{ActionButton, ButtonSize, SecondaryTheme},
@@ -50,14 +51,14 @@ use warp_core::features::FeatureFlag;
 use warp_core::ui::theme::color::internal_colors;
 use warpui::elements::{
     Border, ChildView, ConstrainedBox, CornerRadius, CrossAxisAlignment, Dismiss, Empty, Expanded,
-    Fill, Hoverable, HyperlinkLens, MainAxisAlignment, MainAxisSize, MouseStateHandle, Radius, Shrinkable,
-    Text,
+    Fill, Hoverable, HyperlinkLens, MainAxisAlignment, MainAxisSize, MouseStateHandle, Radius,
+    Shrinkable, Text,
 };
 use warpui::fonts::{Properties, Weight};
-use warpui::platform::Cursor;
-use warpui::text_layout::TextAlignment;
 use warpui::id;
 use warpui::keymap::ContextPredicate;
+use warpui::platform::Cursor;
+use warpui::text_layout::TextAlignment;
 use warpui::ui_components::slider::SliderStateHandle;
 use warpui::{
     elements::{
@@ -288,6 +289,54 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             .collect();
         app.register_fixed_bindings(mode_bindings);
     }
+    if FeatureFlag::QueueSlashCommand.is_enabled() {
+        use warpui::keymap::FixedBinding;
+
+        let ai_context = context.clone() & id!(flags::IS_ANY_AI_ENABLED);
+        let mode_bindings: Vec<FixedBinding> = PromptSubmissionMode::iter()
+            .map(|mode| {
+                let context_flag = match mode {
+                    PromptSubmissionMode::Interrupt => flags::PROMPT_SUBMISSION_INTERRUPT,
+                    PromptSubmissionMode::Queue => flags::PROMPT_SUBMISSION_QUEUE,
+                };
+                FixedBinding::empty(
+                    mode.command_palette_description(),
+                    builder(SettingsAction::AI(
+                        AISettingsPageAction::SetPromptSubmissionMode(mode),
+                    )),
+                    ai_context.clone() & !id!(context_flag),
+                )
+                .with_group(bindings::BindingGroup::WarpAi.as_str())
+            })
+            .collect();
+        app.register_fixed_bindings(mode_bindings);
+
+        // LRC 提交模式只在默认提交模式为 Interrupt 时生效(并被显示),palette 条目
+        // 同样以此为 gate。
+        let lrc_mode_bindings: Vec<FixedBinding> = LongRunningCommandSubmissionMode::iter()
+            .map(|mode| {
+                let context_flag = match mode {
+                    LongRunningCommandSubmissionMode::SendImmediately => {
+                        flags::LRC_SUBMISSION_SEND_IMMEDIATELY
+                    }
+                    LongRunningCommandSubmissionMode::QueueUntilCommandCompletes => {
+                        flags::LRC_SUBMISSION_QUEUE_UNTIL_COMMAND_COMPLETES
+                    }
+                };
+                FixedBinding::empty(
+                    mode.command_palette_description(),
+                    builder(SettingsAction::AI(
+                        AISettingsPageAction::SetLongRunningCommandSubmissionMode(mode),
+                    )),
+                    ai_context.clone()
+                        & id!(flags::PROMPT_SUBMISSION_INTERRUPT)
+                        & !id!(context_flag),
+                )
+                .with_group(bindings::BindingGroup::WarpAi.as_str())
+            })
+            .collect();
+        app.register_fixed_bindings(lrc_mode_bindings);
+    }
     ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(
         vec![ToggleSettingActionPair::new(
             &crate::t!("toggle-suffix-nl-autosuggestions"),
@@ -389,6 +438,8 @@ pub struct AISettingsPageView {
     last_synced_context_window_editor_value: Option<u32>,
 
     thinking_display_mode_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    default_prompt_submission_mode_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    lrc_submission_mode_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
     #[cfg(feature = "local_fs")]
     conversation_layout_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
 
@@ -522,6 +573,29 @@ impl AISettingsPageView {
             thinking_display_mode_dropdown.update(ctx, |dropdown, ctx| {
                 dropdown.set_selected_by_action(
                     AISettingsPageAction::SetThinkingDisplayMode(current_mode),
+                    ctx,
+                );
+            });
+        }
+
+        let default_prompt_submission_mode_dropdown =
+            OtherAIWidget::create_default_prompt_submission_mode_dropdown(ctx);
+        {
+            let current_mode = AISettings::as_ref(ctx).default_prompt_submission_mode;
+            default_prompt_submission_mode_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetPromptSubmissionMode(current_mode),
+                    ctx,
+                );
+            });
+        }
+
+        let lrc_submission_mode_dropdown = OtherAIWidget::create_lrc_submission_mode_dropdown(ctx);
+        {
+            let current_mode = AISettings::as_ref(ctx).long_running_command_submission_mode;
+            lrc_submission_mode_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetLongRunningCommandSubmissionMode(current_mode),
                     ctx,
                 );
             });
@@ -931,6 +1005,30 @@ impl AISettingsPageView {
                         .update(ctx, |dropdown, ctx| {
                             dropdown.set_selected_by_action(
                                 AISettingsPageAction::SetThinkingDisplayMode(current_mode),
+                                ctx,
+                            );
+                        });
+                }
+                AISettingsChangedEvent::PromptSubmissionMode { .. } => {
+                    let current_mode = *AISettings::as_ref(ctx)
+                        .default_prompt_submission_mode
+                        .value();
+                    me.default_prompt_submission_mode_dropdown
+                        .update(ctx, |dropdown, ctx| {
+                            dropdown.set_selected_by_action(
+                                AISettingsPageAction::SetPromptSubmissionMode(current_mode),
+                                ctx,
+                            );
+                        });
+                }
+                AISettingsChangedEvent::LongRunningCommandSubmissionMode { .. } => {
+                    let current_mode = AISettings::as_ref(ctx).long_running_command_submission_mode;
+                    me.lrc_submission_mode_dropdown
+                        .update(ctx, |dropdown, ctx| {
+                            dropdown.set_selected_by_action(
+                                AISettingsPageAction::SetLongRunningCommandSubmissionMode(
+                                    current_mode,
+                                ),
                                 ctx,
                             );
                         });
@@ -1388,6 +1486,8 @@ impl AISettingsPageView {
             mcp_denylist_dropdown,
             mcp_denylist_mouse_state_handles,
             thinking_display_mode_dropdown,
+            default_prompt_submission_mode_dropdown,
+            lrc_submission_mode_dropdown,
             #[cfg(feature = "local_fs")]
             conversation_layout_dropdown,
             profile_views,
@@ -2228,6 +2328,8 @@ pub enum AISettingsPageAction {
     /// 切换「显示 Agent 快捷键提示」设置（零状态三件套 + message bar 底部 4 项 hint）。
     ToggleShowAgentZeroStateHints,
     SetThinkingDisplayMode(ThinkingDisplayMode),
+    SetPromptSubmissionMode(PromptSubmissionMode),
+    SetLongRunningCommandSubmissionMode(LongRunningCommandSubmissionMode),
     RemoveCLIAgentToolbarEnabledCommand(String),
     RemoveFromCommandExecutionAllowlist(AgentModeCommandExecutionPredicate),
     RemoveFromCommandExecutionDenylist(AgentModeCommandExecutionPredicate),
@@ -2771,6 +2873,22 @@ impl TypedActionView for AISettingsPageView {
                 });
                 ctx.notify();
             }
+            AISettingsPageAction::SetPromptSubmissionMode(mode) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .default_prompt_submission_mode
+                        .set_value(*mode, ctx));
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::SetLongRunningCommandSubmissionMode(mode) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .long_running_command_submission_mode
+                        .set_value(*mode, ctx));
+                });
+                ctx.notify();
+            }
             AISettingsPageAction::RemoveCLIAgentToolbarEnabledCommand(command) => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     settings.remove_cli_agent_footer_enabled_command(command, ctx);
@@ -3200,11 +3318,7 @@ impl TypedActionView for AISettingsPageView {
                     ctx,
                 );
                 ctx.notify();
-                show_provider_toast(
-                    ctx,
-                    true,
-                    crate::t!("settings-agent-providers-saved-toast"),
-                );
+                show_provider_toast(ctx, true, crate::t!("settings-agent-providers-saved-toast"));
             }
             AISettingsPageAction::SaveAgentProviderEditsThen {
                 provider_id,
@@ -3585,13 +3699,14 @@ impl TypedActionView for AISettingsPageView {
                     let mut providers = settings.agent_providers.value().clone();
                     if let Some(p) = providers.iter_mut().find(|p| p.id == *provider_id) {
                         // Helper: find a catalog model matching a possibly-stripped local ID.
-                        let find_cat_model = |local_id: &str| -> Option<&crate::ai::agent_providers::models_dev::Model> {
-                            cat_models.get(local_id)
-                                .or_else(|| {
-                                    cat_models.values().find(|m| {
-                                        m.id.ends_with(&format!("/{local_id}"))
-                                    })
-                                })
+                        let find_cat_model = |local_id: &str| -> Option<
+                            &crate::ai::agent_providers::models_dev::Model,
+                        > {
+                            cat_models.get(local_id).or_else(|| {
+                                cat_models
+                                    .values()
+                                    .find(|m| m.id.ends_with(&format!("/{local_id}")))
+                            })
                         };
                         // 既有 id 用 catalog 元数据覆盖;catalog 多出的追加;本地多出的(用户自定义)保留。
                         for local_model in p.models.iter_mut() {
@@ -3624,7 +3739,10 @@ impl TypedActionView for AISettingsPageView {
                         let existing: std::collections::HashSet<String> =
                             p.models.iter().map(|m| m.id.clone()).collect();
                         for cat_m in cat_models.values() {
-                            let clean_id = crate::ai::agent_providers::models_dev::strip_uuid_prefix(&cat_m.id);
+                            let clean_id =
+                                crate::ai::agent_providers::models_dev::strip_uuid_prefix(
+                                    &cat_m.id,
+                                );
                             if !existing.contains(clean_id) {
                                 p.models.push(models_dev::into_agent_provider_model(cat_m));
                                 processed += 1;
@@ -5190,7 +5308,9 @@ impl AgentsWidget {
                     styles::description_font_color(ai_settings.is_any_ai_enabled(app), app).into(),
                     HighlightedHyperlink::default(),
                 )
-                .with_heading_to_font_size_multipliers(appearance.heading_font_size_multipliers().clone())
+                .with_heading_to_font_size_multipliers(
+                    appearance.heading_font_size_multipliers().clone(),
+                )
                 .with_hyperlink_font_color(appearance.theme().accent().into_solid())
                 .register_default_click_handlers_with_action_support(|hyperlink_lens, ctx, _app| {
                     match hyperlink_lens {
@@ -5364,7 +5484,7 @@ impl SettingsWidget for AIInputWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "oz agent ai input natural language detection autodetection prompt terminal command commands history shell executed execution"
+        "oz agent ai input natural language detection autodetection prompt terminal command commands history shell executed execution queue interrupt submission submit auto-queue response while responding default long-running long running lrc"
     }
 
     fn render(
@@ -5445,15 +5565,63 @@ impl SettingsWidget for AIInputWidget {
             app,
         ));
 
-        widget_children.push(render_ai_setting_toggle::<AutoApproveBypassesCommandDenylist>(
-            crate::t!("settings-ai-auto-approve-bypasses-command-denylist"),
-            AISettingsPageAction::ToggleAutoApproveBypassesCommandDenylist,
-            *ai_settings.auto_approve_bypasses_command_denylist,
-            is_any_ai_enabled,
-            self.auto_approve_bypasses_command_denylist_toggle.clone(),
-            &view.local_only_icon_tooltip_states,
-            app,
-        ));
+        widget_children.push(
+            render_ai_setting_toggle::<AutoApproveBypassesCommandDenylist>(
+                crate::t!("settings-ai-auto-approve-bypasses-command-denylist"),
+                AISettingsPageAction::ToggleAutoApproveBypassesCommandDenylist,
+                *ai_settings.auto_approve_bypasses_command_denylist,
+                is_any_ai_enabled,
+                self.auto_approve_bypasses_command_denylist_toggle.clone(),
+                &view.local_only_icon_tooltip_states,
+                app,
+            ),
+        );
+
+        if FeatureFlag::QueueSlashCommand.is_enabled() {
+            widget_children.push(render_dropdown_item(
+                appearance,
+                &crate::t!("settings-ai-prompt-submission-mode"),
+                Some(&crate::t!("settings-ai-prompt-submission-mode-description")),
+                None,
+                LocalOnlyIconState::for_setting(
+                    PromptSubmissionMode::storage_key(),
+                    PromptSubmissionMode::sync_to_cloud(),
+                    &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                    app,
+                ),
+                (!is_any_ai_enabled).then(|| appearance.theme().disabled_ui_text_color()),
+                &view.default_prompt_submission_mode_dropdown,
+            ));
+
+            // 只有 Interrupt 模式下才有意义:Queue 模式下 prompt 本来就排队到整个回复
+            // 结束,所以 LRC 模式隐藏。
+            if *ai_settings.default_prompt_submission_mode.value()
+                == PromptSubmissionMode::Interrupt
+            {
+                widget_children.push(
+                    Container::new(render_dropdown_item(
+                        appearance,
+                        "Default long-running command submission mode",
+                        Some(
+                            "What happens when you submit a prompt while an agent is driving an \
+                             agent-requested long-running command. Queued prompts are sent to the \
+                             agent when the command finishes.",
+                        ),
+                        None,
+                        LocalOnlyIconState::for_setting(
+                            LongRunningCommandSubmissionMode::storage_key(),
+                            LongRunningCommandSubmissionMode::sync_to_cloud(),
+                            &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                            app,
+                        ),
+                        (!is_any_ai_enabled).then(|| appearance.theme().disabled_ui_text_color()),
+                        &view.lrc_submission_mode_dropdown,
+                    ))
+                    .with_margin_top(styles::DESCRIPTION_MARGIN_BOTTOM)
+                    .finish(),
+                );
+            }
+        }
 
         Flex::column().with_children(widget_children).finish()
     }
@@ -5532,7 +5700,9 @@ impl AIInputWidget {
                         styles::description_font_color(is_toggleable, app).into(),
                         incorrect_autodetection_highlight_index,
                     )
-                    .with_heading_to_font_size_multipliers(appearance.heading_font_size_multipliers().clone())
+                    .with_heading_to_font_size_multipliers(
+                        appearance.heading_font_size_multipliers().clone(),
+                    )
                     .with_hyperlink_font_color(appearance.theme().accent().into_solid())
                     .register_default_click_handlers(|url, ctx, _| {
                         ctx.dispatch_typed_action(AISettingsPageAction::HyperlinkClick(url));
@@ -5583,7 +5753,9 @@ impl AIInputWidget {
                         styles::description_font_color(is_toggleable, app).into(),
                         incorrect_autodetection_highlight_index,
                     )
-                    .with_heading_to_font_size_multipliers(appearance.heading_font_size_multipliers().clone())
+                    .with_heading_to_font_size_multipliers(
+                        appearance.heading_font_size_multipliers().clone(),
+                    )
                     .with_hyperlink_font_color(appearance.theme().accent().into_solid())
                     .register_default_click_handlers(|url, ctx, _| {
                         ctx.dispatch_typed_action(AISettingsPageAction::HyperlinkClick(url));
@@ -5680,7 +5852,9 @@ impl SettingsWidget for MCPServersWidget {
                 styles::description_font_color(is_any_ai_enabled, app).into(),
                 self.mcp_docs_link_index.clone(),
             )
-            .with_heading_to_font_size_multipliers(appearance.heading_font_size_multipliers().clone())
+            .with_heading_to_font_size_multipliers(
+                appearance.heading_font_size_multipliers().clone(),
+            )
             .with_hyperlink_font_color(appearance.theme().accent().into_solid())
             .register_default_click_handlers(|url, ctx, _| {
                 ctx.dispatch_typed_action(AISettingsPageAction::HyperlinkClick(url));
@@ -5809,7 +5983,9 @@ impl AIFactWidget {
                 styles::description_font_color(ai_settings.is_any_ai_enabled(app), app).into(),
                 self.rules_link_index.clone(),
             )
-            .with_heading_to_font_size_multipliers(appearance.heading_font_size_multipliers().clone())
+            .with_heading_to_font_size_multipliers(
+                appearance.heading_font_size_multipliers().clone(),
+            )
             .with_hyperlink_font_color(appearance.theme().accent().into_solid())
             .register_default_click_handlers(|url, ctx, _| {
                 ctx.dispatch_typed_action(AISettingsPageAction::HyperlinkClick(url));
@@ -6037,6 +6213,51 @@ impl OtherAIWidget {
                 )
             })
             .collect();
+
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.set_menu_max_height(AI_SETTINGS_DROPDOWN_MAX_HEIGHT, ctx);
+            dropdown.add_items(items, ctx);
+            dropdown
+        })
+    }
+
+    fn create_default_prompt_submission_mode_dropdown(
+        ctx: &mut ViewContext<AISettingsPageView>,
+    ) -> ViewHandle<Dropdown<AISettingsPageAction>> {
+        let items: Vec<DropdownItem<AISettingsPageAction>> = PromptSubmissionMode::iter()
+            .map(|mode| {
+                DropdownItem::new(
+                    mode.display_name(),
+                    AISettingsPageAction::SetPromptSubmissionMode(mode),
+                )
+            })
+            .collect();
+
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.set_menu_max_height(AI_SETTINGS_DROPDOWN_MAX_HEIGHT, ctx);
+            dropdown.add_items(items, ctx);
+            dropdown
+        })
+    }
+
+    fn create_lrc_submission_mode_dropdown(
+        ctx: &mut ViewContext<AISettingsPageView>,
+    ) -> ViewHandle<Dropdown<AISettingsPageAction>> {
+        let items: Vec<DropdownItem<AISettingsPageAction>> =
+            LongRunningCommandSubmissionMode::iter()
+                .map(|mode| {
+                    DropdownItem::new(
+                        mode.display_name(),
+                        AISettingsPageAction::SetLongRunningCommandSubmissionMode(mode),
+                    )
+                })
+                .collect();
 
         ctx.add_typed_action_view(|ctx| {
             let mut dropdown = Dropdown::new(ctx);
@@ -6669,11 +6890,13 @@ impl CLIAgentWidget {
         });
 
         if is_clickable {
-            chip = chip.with_cursor(Cursor::PointingHand).on_click(move |ctx, _, _| {
-                ctx.dispatch_typed_action(AISettingsPageAction::ToggleCLIAgentPerAgent(
-                    agent, dimension,
-                ));
-            });
+            chip = chip
+                .with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::ToggleCLIAgentPerAgent(
+                        agent, dimension,
+                    ));
+                });
         }
 
         chip.finish()

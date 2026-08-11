@@ -1082,6 +1082,17 @@ impl BlocklistAIActionModel {
         }
     }
 
+    /// Returns true if the given shell command action is still running (snapshot not yet fired).
+    pub fn is_shell_command_action_pending(
+        &self,
+        action_id: &AIAgentActionId,
+        conversation_id: AIConversationId,
+    ) -> bool {
+        self.running_actions
+            .get(&conversation_id)
+            .is_some_and(|r| r.contains(action_id))
+    }
+
     /// Removes and returns all pending RequestCommandOutput actions for a conversation.
     fn drain_pending_request_command_actions(
         &mut self,

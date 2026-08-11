@@ -38,12 +38,12 @@ pub(crate) use context_model::{
     block_context_from_terminal_model, AttachmentType, BlocklistAIContextEvent,
     BlocklistAIContextModel, PendingAttachment, PendingFile, PendingQueryState,
 };
+#[cfg(test)]
+pub(crate) use controller::response_stream::ResponseStream;
 pub(crate) use controller::{
     response_stream::ResponseStreamId, BlocklistAIController, BlocklistAIControllerEvent,
     ClientIdentifiers, SessionContext, SlashCommandRequest,
 };
-#[cfg(test)]
-pub(crate) use controller::response_stream::ResponseStream;
 pub(crate) use history_model::{
     AIQueryHistory, AIQueryHistoryOutputStatus, BlocklistAIHistoryEvent, BlocklistAIHistoryModel,
     FORK_PREFIX, PRE_REWIND_PREFIX,
@@ -77,8 +77,8 @@ pub use controller::input_context::{
 };
 pub use permissions::{BlocklistAIPermissions, CommandExecutionPermissionAllowedReason};
 pub(crate) use queued_query::{
-    AutofireAction, QueuedQuery, QueuedQueryEvent, QueuedQueryId, QueuedQueryModel,
-    QueuedQueryOrigin,
+    is_lrc_auto_queue_active, AutofireAction, QueuedQuery, QueuedQueryEvent, QueuedQueryId,
+    QueuedQueryModel, QueuedQueryOrigin,
 };
 pub use suggestion_chip_view::*;
 pub use view_util::error_color;
