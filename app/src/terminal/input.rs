@@ -12378,6 +12378,18 @@ impl Input {
             );
         });
 
+        // 排队的 `/compact-and` 有专用执行路径:发 Summarize 请求并把 follow-up(连同排队行
+        // 的附件)排回队列,等压缩完成后再发(上游 execute_queued_compact_and 语义)。
+        let compact_and_argument = if prompt == commands::COMPACT_AND.name {
+            Some(None)
+        } else {
+            commands::strip_command_prefix(&prompt, commands::COMPACT_AND.name).map(Some)
+        };
+        if let Some(argument) = compact_and_argument {
+            self.execute_queued_compact_and(conversation_id, query_id, argument, ctx);
+            return;
+        }
+
         let detected = self
             .slash_command_model
             .as_ref(ctx)
@@ -12424,6 +12436,48 @@ impl Input {
         });
 
         ctx.emit(Event::ExecuteAIQuery);
+    }
+
+    /// Sends a queued `/compact-and` summary and stores its follow-up on the original
+    /// conversation. The follow-up carries the queued row's attachments (moved onto the row at
+    /// enqueue time), so the post-summary prompt keeps the context the user staged.
+    fn execute_queued_compact_and(
+        &mut self,
+        conversation_id: AIConversationId,
+        queued_query_id: QueuedQueryId,
+        initial_prompt: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let followup_attachments = QueuedQueryModel::as_ref(ctx)
+            .attachments_for(conversation_id, queued_query_id)
+            .to_vec();
+        self.ai_controller.update(ctx, move |controller, ctx| {
+            controller.send_queued_slash_command_request(
+                SlashCommandRequest::Summarize {
+                    prompt: None,
+                    // 手动 `/compact-and` 触发,非 token-overflow 自动压缩。
+                    overflow: false,
+                },
+                queued_query_id,
+                Some(conversation_id),
+                ctx,
+            );
+        });
+
+        let Some(initial_prompt) = initial_prompt.filter(|prompt| !prompt.trim().is_empty()) else {
+            return;
+        };
+        QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new_with_attachments(
+                    initial_prompt,
+                    QueuedQueryOrigin::CompactAndSlashCommand,
+                    followup_attachments,
+                ),
+                ctx,
+            )
+        });
     }
 
     /// Checks whether the current input should be queued instead of executed.

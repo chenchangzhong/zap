@@ -2949,6 +2949,15 @@ impl AIConversation {
         new_task_id
     }
 
+    /// 清掉在飞的 optimistic CLI subagent(不 emit UI 事件),模拟 subagent 把结果
+    /// 交回主 agent。移植上游 098c307c7 的 `clear_optimistic_cli_subagent_task_for_test`。
+    #[cfg(test)]
+    pub(crate) fn clear_optimistic_cli_subagent_task_for_test(&mut self) {
+        if let Some(task_id) = self.optimistic_cli_subagent_subtask_id.take() {
+            self.task_store.remove(&task_id);
+        }
+    }
+
     pub fn is_subagent_task_finished(
         &self,
         subagent_task_id: &TaskId,

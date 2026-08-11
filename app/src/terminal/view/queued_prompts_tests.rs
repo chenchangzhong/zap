@@ -6,14 +6,20 @@
 //! dozens of dependencies, so the drain tests below exercise the per-conversation singleton
 //! semantics that the drain path relies on. 面板测试则用 `with_panel` 起一个真实
 //! `TerminalView` 窗口,再手工构造面板(见该 helper 的注释)。
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use warpui::clipboard::ClipboardContent;
 use warpui::{App, EntityId, ModelHandle, SingletonEntity, TypedActionView, ViewHandle};
 
 use super::queued_prompts_panel::{QueuedPromptsPanelAction, QueuedPromptsPanelView};
 use super::rich_content::RichContentMetadata;
 use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::ImageContext;
+use crate::ai::blocklist::block::FinishReason;
 use crate::ai::blocklist::{
-    AutofireAction, BlocklistAIHistoryModel, QueuedQuery, QueuedQueryModel, QueuedQueryOrigin,
+    AutofireAction, BlocklistAIHistoryModel, PendingAttachment, QueuedQuery, QueuedQueryModel,
+    QueuedQueryOrigin,
 };
 use crate::editor::EditorView;
 use crate::features::FeatureFlag;
@@ -21,11 +27,13 @@ use crate::terminal::cli_agent_sessions::{
     CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext,
     CLIAgentSessionStatus, CLIAgentSessionsModel,
 };
+use crate::search::slash_command_menu::static_commands::commands;
 use crate::terminal::input::suggestions_mode_model::InputSuggestionsModeModel;
-use crate::terminal::input::InputSuggestionsMode;
+use crate::terminal::input::{Event as InputEvent, InputSuggestionsMode};
 use crate::test_util::settings::initialize_settings_for_tests;
 use crate::test_util::terminal::{add_window_with_terminal, initialize_app_for_terminal_view};
 use crate::util::truncation::truncate_from_end;
+use crate::{GlobalResourceHandles, GlobalResourceHandlesProvider};
 
 fn user_query(text: &str) -> QueuedQuery {
     QueuedQuery::new(text.to_owned(), QueuedQueryOrigin::QueueSlashCommand)
@@ -939,4 +947,116 @@ fn enter_send_target_is_none_while_cli_agent_rich_input_is_open() {
             );
         },
     );
+}
+
+
+fn image_attachment(file_name: &str) -> PendingAttachment {
+    PendingAttachment::Image(ImageContext {
+        data: String::new(),
+        mime_type: "image/png".to_owned(),
+        file_name: file_name.to_owned(),
+        is_figma: false,
+    })
+}
+
+/// 排队的 `/compact-and` 的执行契约(移植上游 098c307c7 的
+/// `lrc_finish_queued_compact_and_sends_followup_after_summary`),守三件事:
+///
+/// ① 命令结束投递到排队的 `/compact-and follow up` 行时,`execute_queued_compact_and`
+///    把 follow-up 以 `CompactAndSlashCommand` origin 排回队列,文本剥掉命令前缀;
+/// ② 该行的**附件被转移**到 follow-up 上 —— 用户暂存的上下文不能在压缩这一跳里丢掉;
+/// ③ follow-up 自身随后 drain 时正常提交为 AI 查询(恰 1 次 `ExecuteAIQuery`)且队列清空,
+///    即压缩这一跳没有把队列卡死,也没有重复发送。
+#[test]
+fn lrc_finish_queued_compact_and_sends_followup_after_summary() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        // `initialize_app_for_terminal_view` 不注册 provider;execute_queued_compact_and
+        // 的 Summarize 请求路径会读它(与 `with_singleton` 同款注册)。
+        let global_resource_handles = GlobalResourceHandles::mock(&mut app);
+        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        let _summarization = FeatureFlag::SummarizationConversationCommand.override_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let terminal_view_id = terminal.read(&app, |view, _| view.view_id);
+        let conversation_id =
+            BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+                let id = history.start_new_conversation(terminal_view_id, false, false, ctx);
+                history.set_active_conversation_id(id, terminal_view_id, ctx);
+                id
+            });
+
+        // 排一行带附件的 `/compact-and follow up`,模拟 LRC 期间自动排队的那条命令。
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new_with_attachments(
+                    format!("{} follow up", commands::COMPACT_AND.name),
+                    QueuedQueryOrigin::LrcAutoQueue,
+                    vec![image_attachment("queued-context.png")],
+                ),
+                ctx,
+            );
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.send_lrc_queued_prompts(conversation_id, ctx);
+        });
+
+        // ① + ②:follow-up 以 CompactAndSlashCommand 排回队列,并带着原行的附件。
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1, "原行离队 + follow-up 入队,净长度仍为 1");
+            assert_eq!(
+                queue[0].text(),
+                "follow up",
+                "排回队列的是剥掉 /compact-and 前缀后的 follow-up"
+            );
+            assert_eq!(
+                queue[0].origin(),
+                QueuedQueryOrigin::CompactAndSlashCommand,
+                "origin 必须切成 CompactAndSlashCommand,否则它会被当 LRC 行重复自动投递"
+            );
+            assert_eq!(
+                queue[0].attachments().len(),
+                1,
+                "排队行的附件必须转移到 follow-up 上,不能在压缩这一跳里丢失"
+            );
+            assert_eq!(
+                queue[0].attachments()[0].file_name(),
+                "queued-context.png",
+                "转移的必须是原来那个附件"
+            );
+        });
+
+        let ai_query_count = Rc::new(RefCell::new(0));
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let ai_query_count_for_subscription = ai_query_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &InputEvent, _| {
+                if matches!(event, InputEvent::ExecuteAIQuery) {
+                    *ai_query_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+
+        // ③:压缩完成后 follow-up 正常提交,队列清空。
+        terminal.update(&mut app, |view, ctx| {
+            view.drain_queued_prompts(conversation_id, FinishReason::Complete, ctx);
+        });
+
+        assert_eq!(
+            *ai_query_count.borrow(),
+            1,
+            "follow-up 必须恰好提交一次 AI 查询"
+        );
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(
+                model.queue(conversation_id).is_empty(),
+                "follow-up 发出后队列必须清空,不能卡住"
+            );
+        });
+    });
 }

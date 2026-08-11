@@ -1,7 +1,15 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 
 use super::*;
 use crate::ai::agent::DriveObjectPayload;
+use crate::ai::agent::{
+    AIAgentExchange, AIAgentInput, AIAgentOutputStatus, AIAgentActionId, UserQueryMode,
+};
+use crate::ai::agent::conversation::ConversationStatus;
+use crate::ai::agent::task::TaskId;
+use crate::ai::blocklist::ResponseStreamId;
+use crate::ai::llms::LLMId;
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::blocklist::{AIQueryHistory, BlocklistAIPermissions};
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
@@ -7276,6 +7284,218 @@ fn test_enter_with_empty_input_sends_top_queued_row_and_non_empty_input_does_not
                 model.queue(conversation_id).len(),
                 1,
                 "输入框非空时回车不得吞掉排队行"
+            );
+        });
+    });
+}
+
+
+/// 让当前 active block 进入「agent 正在驱动一条长跑命令(LRC)」状态,并返回一个
+/// in-progress 的会话 id。
+///
+/// 移植自上游 `input_tests.rs` 的 `simulate_agent_requested_lrc`,按本地事实改写:
+/// - 本地 `start_new_conversation` 是 4 参(上游 5 参);
+/// - 本地没有 `is_agent_requested_command`,断言改用 `is_agent_driving_command`
+///   (`queued_query.rs:762` 的 `is_lrc_auto_queue_active` 判的正是它);
+/// - 会话必须先被选中(agent view 已进入)再让 agent 请求命令,和产品顺序一致。
+fn simulate_agent_requested_lrc(
+    app: &mut App,
+    terminal: &ViewHandle<TerminalView>,
+) -> AIConversationId {
+    let terminal_view_id = terminal.read(app, |view, _| view.view_id());
+    let conversation_id = BlocklistAIHistoryModel::handle(app).update(app, |history, ctx| {
+        let conversation_id = history.start_new_conversation(terminal_view_id, false, false, ctx);
+        history.set_active_conversation_id(conversation_id, terminal_view_id, ctx);
+        // 会话必须非空且 in-progress,`maybe_queue_input_for_in_progress_conversation`
+        // 才会走排队分支(`is_empty()` 为真时直接返回 false)。
+        let exchange = AIAgentExchange {
+            id: AIAgentExchangeId::new(),
+            input: vec![AIAgentInput::UserQuery {
+                query: "run the dev server".to_owned(),
+                context: Default::default(),
+                static_query_type: None,
+                referenced_attachments: Default::default(),
+                user_query_mode: UserQueryMode::Normal,
+                running_command: None,
+                intended_agent: None,
+            }],
+            output_status: AIAgentOutputStatus::Streaming { output: None },
+            added_message_ids: HashSet::new(),
+            start_time: Local::now(),
+            finish_time: None,
+            time_to_first_token_ms: None,
+            working_directory: None,
+            model_id: LLMId::from("test-model"),
+            request_cost: None,
+            coding_model_id: LLMId::from("test-coding-model"),
+            cli_agent_model_id: LLMId::from("test-cli-agent-model"),
+            computer_use_model_id: LLMId::from("test-computer-use-model"),
+            response_initiator: None,
+        };
+        let response_stream_id = ResponseStreamId::new_for_test();
+        history
+            .conversation_mut(&conversation_id)
+            .expect("conversation should exist")
+            .append_reassigned_exchange(&response_stream_id, exchange, terminal_view_id, ctx)
+            .expect("exchange should append");
+        history.update_conversation_status(
+            terminal_view_id,
+            conversation_id,
+            ConversationStatus::InProgress,
+            ctx,
+        );
+        conversation_id
+    });
+
+    // 先选中会话(等价上游 `select_conversation`),再让 agent 起长跑命令 ——
+    // LRC 已激活后再选会话会被拒。
+    terminal.update(app, |view, ctx| {
+        view.ai_context_model().update(ctx, |context_model, ctx| {
+            context_model.set_pending_query_state_for_existing_conversation(
+                conversation_id,
+                AgentViewEntryOrigin::Input {
+                    was_prompt_autodetected: false,
+                },
+                ctx,
+            );
+        });
+    });
+
+    terminal.update(app, |view, _ctx| {
+        let mut model = view.model.lock();
+        model.simulate_long_running_block("sleep 10", "running");
+        let active_block = model.block_list_mut().active_block_mut();
+        let action_id = AIAgentActionId::from("test-action".to_owned());
+        let task_id = TaskId::new("test-task".to_owned());
+        active_block.set_agent_interaction_mode_for_requested_command(
+            action_id,
+            Some(task_id.clone()),
+            conversation_id,
+        );
+        active_block
+            .set_agent_interaction_mode_for_agent_monitored_command(&task_id, conversation_id)
+            .expect("agent-requested command should transition to agent-monitored");
+        assert!(active_block.is_agent_in_control());
+        assert!(active_block.is_agent_driving_command());
+    });
+    conversation_id
+}
+
+/// LRC 排队行的交接契约(移植上游 098c307c7 的
+/// `lrc_queued_prompts_wait_while_subagent_is_active`),一次守三件事:
+///
+/// ① `/compact-and <arg>` 在排队模式下被**捕获入队**,而不是绕过队列立即执行
+///    (`maybe_queue_input_for_in_progress_conversation` 的 COMPACT_AND 例外);
+/// ② 会话还有在飞的 CLI subagent 时,`send_lrc_queued_prompts` **不发送**
+///    (无 `ExecuteAIQuery`,行原样留在队列里);
+/// ③ subagent 交回主 agent 后(会话状态更新触发
+///    `maybe_send_lrc_queued_prompts_after_subagent_handoff` 的「之前有→现在无」转换),
+///    排队的 `/compact-and` 被执行:`execute_queued_compact_and` 把 follow-up 以
+///    `CompactAndSlashCommand` origin 排回队列,文本是剥掉命令前缀后的参数。
+#[test]
+fn lrc_queued_prompts_wait_while_subagent_is_active() {
+    App::test((), |mut app| async move {
+        // AgentView 关闭:`selected_conversation_id` 读 `pending_query_state`,
+        // 由上面的 `set_pending_query_state_for_existing_conversation` 直接置位。
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = simulate_agent_requested_lrc(&mut app, &terminal);
+        let terminal_view_id = terminal.read(&app, |view, _| view.view_id());
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        // ① `/compact-and test` 必须进队列(LrcAutoQueue),不能被 bypass 立即执行。
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.replace_buffer_content("/compact-and test", ctx);
+            input.input_enter(ctx);
+        });
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1, "/compact-and 必须被排队捕获,而不是绕过队列");
+            assert_eq!(queue[0].text(), "/compact-and test");
+            assert_eq!(queue[0].origin(), QueuedQueryOrigin::LrcAutoQueue);
+        });
+
+        // 造一个在飞的 CLI subagent:命令结束早于 subagent 把结果交回主 agent。
+        let active_block_id = terminal.read(&app, |view, _| {
+            view.model.lock().block_list().active_block().id().clone()
+        });
+        BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+            history
+                .conversation_mut(&conversation_id)
+                .expect("conversation should exist")
+                .create_optimistic_cli_subagent_task_silent(&active_block_id);
+            ctx.notify();
+        });
+        BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| {
+            assert!(
+                history
+                    .conversation(&conversation_id)
+                    .expect("conversation should exist")
+                    .has_active_subagent(),
+                "前置:必须真的有在飞 subagent,否则守卫分支不会被走到"
+            );
+        });
+
+        let ai_query_count = Rc::new(RefCell::new(0));
+        let ai_query_count_for_subscription = ai_query_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &Event, _| {
+                if matches!(event, Event::ExecuteAIQuery) {
+                    *ai_query_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+
+        // ② subagent 在飞:命令结束时的投递必须被守卫挡住。
+        terminal.update(&mut app, |view, ctx| {
+            view.send_lrc_queued_prompts(conversation_id, ctx);
+        });
+        assert_eq!(
+            *ai_query_count.borrow(),
+            0,
+            "subagent 在飞时不得发出任何 AI 查询"
+        );
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1, "被挡住的行必须原样留在队列里");
+            assert_eq!(queue[0].text(), "/compact-and test");
+            assert_eq!(
+                queue[0].origin(),
+                QueuedQueryOrigin::LrcAutoQueue,
+                "尚未投递,origin 不得变化"
+            );
+        });
+
+        // ③ subagent 交回:清掉在飞 subagent 后,会话状态更新触发「之前有→现在无」
+        //    转换,排队的 `/compact-and` 被执行并把 follow-up 排回队列。
+        BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+            history
+                .conversation_mut(&conversation_id)
+                .expect("conversation should exist")
+                .clear_optimistic_cli_subagent_task_for_test();
+            history.update_conversation_status(
+                terminal_view_id,
+                conversation_id,
+                ConversationStatus::InProgress,
+                ctx,
+            );
+        });
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1, "follow-up 必须恰好一行");
+            assert_eq!(
+                queue[0].text(),
+                "test",
+                "排回队列的是剥掉 /compact-and 前缀后的 follow-up 参数"
+            );
+            assert_eq!(
+                queue[0].origin(),
+                QueuedQueryOrigin::CompactAndSlashCommand,
+                "follow-up 必须以 CompactAndSlashCommand 排队,否则它会被当成 LRC 行再次自动发出"
             );
         });
     });
