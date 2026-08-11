@@ -2536,6 +2536,11 @@ pub struct TerminalView {
     /// Cached view ids for usage footers keyed by the AI block view id that owns them.
     usage_footer_view_ids: HashMap<EntityId, EntityId>,
 
+    /// Tracks whether a conversation's CLI subagent was active the last time an LRC command
+    /// finished but the subagent had not yet handed back to the main agent. LRC-queued prompts
+    /// wait for the handoff before firing (see [`Self::maybe_send_lrc_queued_prompts_after_subagent_handoff`]).
+    last_observed_active_subagent: HashMap<AIConversationId, bool>,
+
     // Whether the block onboarding view is active or not.
     block_onboarding_active: bool,
 
@@ -3025,6 +3030,9 @@ impl TerminalView {
                     was_ambient_agent,
                     ..
                 } => {
+                    // 退出 agent view 时清掉 subagent 观察状态,避免残留导致下次 LRC
+                    // 结束时误判「之前有 subagent」。
+                    me.last_observed_active_subagent.clear();
                     // Prompt suggestions should not follow the user back to terminal view.
                     me.clear_prompt_suggestions(ctx);
                     // For ambient agent sessions, pop the pane stack to return to the parent terminal.
@@ -3972,6 +3980,7 @@ impl TerminalView {
             active_filter_editor_block_index: None,
             rich_content_views: Vec::new(),
             usage_footer_view_ids: Default::default(),
+            last_observed_active_subagent: Default::default(),
             block_onboarding_active: false,
             onboarding_agentic_suggestions_block: None,
             onboarding_prompt_block: None,
@@ -4393,6 +4402,16 @@ impl TerminalView {
         conversation_id: AIConversationId,
         ctx: &mut ViewContext<Self>,
     ) {
+        // 命令完成可能早于 CLI subagent 把结果交回主 agent。这种情况下行留在队列里,
+        // 等 history 显示 subagent 消失后再发(见 maybe_send_lrc_queued_prompts_after_subagent_handoff)。
+        let has_active_subagent = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .is_some_and(|conversation| conversation.has_active_subagent());
+        if has_active_subagent {
+            self.last_observed_active_subagent
+                .insert(conversation_id, true);
+            return;
+        }
         let editing_front_lrc_row = QueuedQueryModel::as_ref(ctx)
             .editing_row(conversation_id)
             .is_some_and(|query_id| {
@@ -4431,6 +4450,32 @@ impl TerminalView {
         QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
             model.remove_fired_row(conversation_id, query_id, ctx);
         });
+    }
+
+    /// 当 conversation 的 CLI subagent 从「在飞」变为「已消失」时,把 LRC 期间排队的
+    /// prompt 发出。只在观察到从有到无的转换时触发,避免在 subagent 仍在活动时误发。
+    fn maybe_send_lrc_queued_prompts_after_subagent_handoff(
+        &mut self,
+        conversation_id: AIConversationId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let has_lrc_queued_prompt = QueuedQueryModel::as_ref(ctx)
+            .queue(conversation_id)
+            .first()
+            .is_some_and(|row| row.origin() == QueuedQueryOrigin::LrcAutoQueue);
+        if !has_lrc_queued_prompt {
+            return;
+        }
+        let has_active_subagent = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .is_some_and(|conversation| conversation.has_active_subagent());
+        let previously_had_active_subagent = self
+            .last_observed_active_subagent
+            .insert(conversation_id, has_active_subagent)
+            .unwrap_or(false);
+        if previously_had_active_subagent && !has_active_subagent {
+            self.send_lrc_queued_prompts(conversation_id, ctx);
+        }
     }
 
     /// Advances the queued-prompts queue after a dispatched queued command's block completes.
@@ -5177,6 +5222,9 @@ impl TerminalView {
                 response_stream_id,
                 ..
             } => {
+                // 新 exchange 到达时检查 LRC 排队 prompt 是否可在 subagent 交回后发出。
+                self.maybe_send_lrc_queued_prompts_after_subagent_handoff(*conversation_id, ctx);
+
                 // Close any open usage footer(s) when a new AI block is added
                 if !self.usage_footer_view_ids.is_empty() {
                     let owner_block_ids: Vec<EntityId> =
@@ -5232,6 +5280,7 @@ impl TerminalView {
                         return;
                     }
                 };
+                self.maybe_send_lrc_queued_prompts_after_subagent_handoff(*conversation_id, ctx);
                 let ai_block = ctx.add_typed_action_view(|ctx| {
                     AIBlock::new(
                         Rc::new(ai_block_model),
@@ -5410,6 +5459,9 @@ impl TerminalView {
                 is_restored,
                 ..
             } => {
+                // 会话状态变化时检查 LRC 排队 prompt 是否可在 subagent 交回后发出。
+                self.maybe_send_lrc_queued_prompts_after_subagent_handoff(*conversation_id, ctx);
+
                 // When the conversation state changes or a new conversation
                 // is selected, update the title to reflect that change.
                 self.update_pane_configuration(ctx);
@@ -5524,8 +5576,13 @@ impl TerminalView {
                 // `QueuedQueryModel` itself, which subscribes to these same history
                 // events; no per-view cleanup is needed here.
             }
-            BlocklistAIHistoryEvent::CreatedSubtask { .. }
-            | BlocklistAIHistoryEvent::UpdatedAutoexecuteOverride { .. }
+            BlocklistAIHistoryEvent::CreatedSubtask {
+                conversation_id, ..
+            } => {
+                // 新 CLI subagent 创建时检查 LRC 排队 prompt 是否可在 subagent 交回后发出。
+                self.maybe_send_lrc_queued_prompts_after_subagent_handoff(*conversation_id, ctx);
+            }
+            BlocklistAIHistoryEvent::UpdatedAutoexecuteOverride { .. }
             | BlocklistAIHistoryEvent::UpdatedTodoList { .. }
             | BlocklistAIHistoryEvent::RestoredConversations { .. }
             | BlocklistAIHistoryEvent::UpgradedTask { .. }
@@ -5771,6 +5828,8 @@ impl TerminalView {
                     QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
                         model.clear_queue_next_lrc_prompt_override(*conversation_id, ctx);
                     });
+                    // subagent 已结束,清掉观察标记;send_lrc 内部的守卫会重新评估。
+                    self.last_observed_active_subagent.remove(conversation_id);
                     self.send_lrc_queued_prompts(*conversation_id, ctx);
                 }
 
