@@ -31,6 +31,7 @@ use crate::auth::AuthStateProvider;
 use crate::changelog_model::ChangelogModel;
 use crate::pricing::PricingInfoModel;
 use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
+use crate::global_resource_handles::{GlobalResourceHandles, GlobalResourceHandlesProvider};
 use crate::terminal::view::inline_banner::ByoLlmAuthBannerSessionState;
 use crate::undo_close::UndoCloseStack;
 use crate::workspace::{OneTimeModalModel, WorkspaceRegistry};
@@ -59,6 +60,11 @@ use repo_metadata::watcher::DirectoryWatcher;
 /// Initializes all of the necessary models to use a terminal view.
 pub fn initialize_app_for_terminal_view(app: &mut App) {
     initialize_settings_for_tests(app);
+
+    // GlobalResourceHandlesProvider 生产环境由主程序注册；测试初始化补 mock（model_event_sender
+    // 为 None，访问时安全跳过），供 agent view 退出等路径查询。
+    let global_resource_handles = GlobalResourceHandles::mock(app);
+    app.add_singleton_model(move |_| GlobalResourceHandlesProvider::new(global_resource_handles));
 
     app.add_singleton_model(|_| ChangelogModel::new(Arc::new(http_client::Client::new())));
     app.add_singleton_model(|_| NetworkStatus::new());

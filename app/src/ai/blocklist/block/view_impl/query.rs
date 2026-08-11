@@ -5,8 +5,8 @@
 use warp_core::{features::FeatureFlag, ui::theme::color::internal_colors};
 use warpui::{
     elements::{
-        Container, CornerRadius, Flex, MainAxisAlignment, MainAxisSize, ParentElement, Radius,
-        Shrinkable, Wrap,
+        Border, Container, CornerRadius, Flex, MainAxisAlignment, MainAxisSize, ParentElement,
+        Radius, Shrinkable, Wrap,
     },
     fonts::{Properties, Style, Weight},
     ui_components::{
@@ -27,6 +27,12 @@ use pathfinder_color::ColorU;
 
 use super::common::{render_query_text, render_user_avatar, FindContext, QueryContextReference};
 
+/// Width of the ring drawn around the user avatar while agent-view transcript
+/// navigation targets this query. The ring uses the ANSI magenta color the app
+/// already uses for slash-command highlights, so it stays clearly visible against
+/// the avatar's accent-colored background.
+const NAVIGATION_RING_BORDER_WIDTH: f32 = 2.;
+
 /// Data required to render the AI block query component.
 #[derive(Copy, Clone, Debug)]
 pub(super) struct Props<'a> {
@@ -42,6 +48,7 @@ pub(super) struct Props<'a> {
     pub(super) attachments: &'a [(AttachmentType, String)],
     pub(super) context_references: &'a [QueryContextReference],
     pub(super) find_context: Option<FindContext<'a>>,
+    pub(super) is_agent_transcript_navigation_target: bool,
 }
 
 pub(super) fn maybe_render(props: Props, app: &AppContext) -> Option<Box<dyn Element>> {
@@ -60,6 +67,7 @@ pub(super) fn maybe_render(props: Props, app: &AppContext) -> Option<Box<dyn Ele
             props.attachments,
             props.context_references,
             props.find_context,
+            props.is_agent_transcript_navigation_target,
             app,
         )
     })
@@ -80,16 +88,31 @@ pub(crate) fn render_query(
     attachments: &[(AttachmentType, String)],
     context_references: &[QueryContextReference],
     find_context: Option<FindContext>,
+    is_agent_transcript_navigation_target: bool,
     app: &AppContext,
 ) -> Box<dyn Element> {
-    let avatar = Container::new(render_user_avatar(
+    let mut avatar_container = Container::new(render_user_avatar(
         user_display_name,
         profile_image_path,
         avatar_color,
         app,
     ))
-    .with_margin_right(16.)
-    .finish();
+    .with_margin_right(16.);
+    if is_agent_transcript_navigation_target {
+        // Cmd-Up/Cmd-Down transcript navigation is stopped on this query. The avatar is
+        // drawn in the theme accent color, so an accent ring would be invisible. Paint the
+        // ring in the ANSI magenta the app already uses to highlight slash commands like
+        // `/agent` — a distinct, highly visible emphasis color. The foreground border
+        // paints in a layer above the child and reserves no layout space, so the avatar
+        // row does not resize and the ring stays concentric.
+        let ring_color = Appearance::as_ref(app).theme().ansi_fg_magenta();
+        avatar_container = avatar_container
+            .with_foreground_border(
+                Border::all(NAVIGATION_RING_BORDER_WIDTH).with_border_fill(ring_color),
+            )
+            .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)));
+    }
+    let avatar = avatar_container.finish();
 
     let properties = Properties {
         style: Style::Normal,

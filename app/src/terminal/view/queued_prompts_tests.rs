@@ -33,7 +33,6 @@ use crate::terminal::input::{Event as InputEvent, InputSuggestionsMode};
 use crate::test_util::settings::initialize_settings_for_tests;
 use crate::test_util::terminal::{add_window_with_terminal, initialize_app_for_terminal_view};
 use crate::util::truncation::truncate_from_end;
-use crate::{GlobalResourceHandles, GlobalResourceHandlesProvider};
 
 fn user_query(text: &str) -> QueuedQuery {
     QueuedQuery::new(text.to_owned(), QueuedQueryOrigin::QueueSlashCommand)
@@ -971,10 +970,6 @@ fn image_attachment(file_name: &str) -> PendingAttachment {
 fn lrc_finish_queued_compact_and_sends_followup_after_summary() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
-        // `initialize_app_for_terminal_view` 不注册 provider;execute_queued_compact_and
-        // 的 Summarize 请求路径会读它(与 `with_singleton` 同款注册)。
-        let global_resource_handles = GlobalResourceHandles::mock(&mut app);
-        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
         let _agent_view = FeatureFlag::AgentView.override_enabled(true);
         let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
         let _summarization = FeatureFlag::SummarizationConversationCommand.override_enabled(true);

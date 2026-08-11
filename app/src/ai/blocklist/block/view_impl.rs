@@ -1041,6 +1041,8 @@ impl View for AIBlock {
                                 state: &self.find_state,
                             },
                         ),
+                        is_agent_transcript_navigation_target: self
+                            .is_agent_transcript_navigation_target(),
                     },
                     app,
                 ) {

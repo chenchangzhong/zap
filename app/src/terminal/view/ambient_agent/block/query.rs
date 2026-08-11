@@ -83,6 +83,7 @@ fn render_user_query(
             &[],
             &[],
             None,
+            false,
             app,
         )
         .with_content_item_spacing()
