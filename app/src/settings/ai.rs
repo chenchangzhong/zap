@@ -504,13 +504,13 @@ impl LongRunningCommandSubmissionMode {
         }
     }
 
-    pub fn command_palette_description(&self) -> &'static str {
+    pub fn command_palette_description(&self) -> String {
         match self {
             LongRunningCommandSubmissionMode::SendImmediately => {
-                "Set long-running command submission: send immediately"
+                crate::t!("agent-lrc-submission-send-immediately")
             }
             LongRunningCommandSubmissionMode::QueueUntilCommandCompletes => {
-                "Set long-running command submission: queue until command finishes"
+                crate::t!("agent-lrc-submission-queue-until-command-completes")
             }
         }
     }

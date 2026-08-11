@@ -1005,6 +1005,8 @@ settings-ai-thinking-display = 智能体思考显示
 settings-ai-thinking-display-description = 控制推理/思考过程的显示方式。
 settings-ai-prompt-submission-mode = 提示词提交默认行为
 settings-ai-prompt-submission-mode-description = 智能体仍在回复时提交新提示词的处理方式。可用自动排队开关按会话单独覆盖。
+settings-ai-lrc-submission-mode = 长命令执行期间提交默认行为
+settings-ai-lrc-submission-mode-description = 智能体正在驱动 agent 请求的长命令时提交提示词的处理方式。排队的提示词在命令结束时发送给智能体。
 settings-ai-conversation-layout-label = 打开已有智能体会话时的首选布局
 settings-ai-conversation-layout-newtab = 新标签页
 settings-ai-conversation-layout-splitpane = 拆分窗格
@@ -2238,6 +2240,8 @@ agent-thinking-display-never-show = 设置 Agent 思考展示：从不展示
 # Set default prompt submission mode
 agent-prompt-submission-interrupt = 设置提示词提交默认行为：打断当前回复
 agent-prompt-submission-queue = 设置提示词提交默认行为：排队等回复结束
+agent-lrc-submission-send-immediately = 设置长命令提交默认行为：立即发送
+agent-lrc-submission-queue-until-command-completes = 设置长命令提交默认行为：排队等命令结束
 
 # --- ANCHOR-SUB-EXTERNAL-EDITOR (settings-external-editor) ---
 settings-external-editor-choose-default = 选择打开文件链接的编辑器

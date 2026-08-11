@@ -5601,12 +5601,8 @@ impl SettingsWidget for AIInputWidget {
                 widget_children.push(
                     Container::new(render_dropdown_item(
                         appearance,
-                        "Default long-running command submission mode",
-                        Some(
-                            "What happens when you submit a prompt while an agent is driving an \
-                             agent-requested long-running command. Queued prompts are sent to the \
-                             agent when the command finishes.",
-                        ),
+                        &crate::t!("settings-ai-lrc-submission-mode"),
+                        Some(&crate::t!("settings-ai-lrc-submission-mode-description")),
                         None,
                         LocalOnlyIconState::for_setting(
                             LongRunningCommandSubmissionMode::storage_key(),

@@ -1026,6 +1026,8 @@ settings-ai-thinking-display = Agent thinking display
 settings-ai-thinking-display-description = Controls how reasoning/thinking traces are displayed.
 settings-ai-prompt-submission-mode = Default prompt submission mode
 settings-ai-prompt-submission-mode-description = What happens when you submit a new prompt while the agent is still responding. You can override this per conversation using the auto-queue toggle.
+settings-ai-lrc-submission-mode = Default long-running command submission mode
+settings-ai-lrc-submission-mode-description = What happens when you submit a prompt while an agent is driving an agent-requested long-running command. Queued prompts are sent to the agent when the command finishes.
 settings-ai-conversation-layout-label = Preferred layout when opening existing agent conversations
 settings-ai-conversation-layout-newtab = New Tab
 settings-ai-conversation-layout-splitpane = Split Pane
@@ -2318,6 +2320,8 @@ agent-thinking-display-never-show = Set agent thinking display: never show
 # Set default prompt submission mode
 agent-prompt-submission-interrupt = Set default prompt submission: interrupt response
 agent-prompt-submission-queue = Set default prompt submission: queue until response finishes
+agent-lrc-submission-send-immediately = Set long-running command submission: send immediately
+agent-lrc-submission-queue-until-command-completes = Set long-running command submission: queue until command finishes
 
 # --- ANCHOR-SUB-EXTERNAL-EDITOR (settings-external-editor) ---
 settings-external-editor-choose-default = Choose an editor to open file links
