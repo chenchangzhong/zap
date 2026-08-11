@@ -3,6 +3,7 @@
 > **同步边界**：`7cbb22d5c` 之后拣入 34 commit（散点，非连续区间；详见 §19）
 > **✅ 遗漏修复（2026-08-05）**：terminal lifecycle recovery 栈 6 commit（#12853/#12854/#12855/#12856/#12858/#12859）已按方案 A 完整移植（详见 §21.4/§23）；§22 重扫发现的 5 件遗漏已全部拣入（zsh glitch 剥离 #14166/#12438、尾点链接 #12965、Hermes BracketedPaste #14367、系统终止 #12480、O(1) 焦点 #13113，详见 §23）
 > **✅ 本轮移植（2026-08-11）**：Cmd-Up 导航 `da4da09f8`（#14685）+ conversation_export 抽离 `a77348c67`（#13603 GUI 侧）+ framework 补移植 `Container::with_foreground_border`（#13056），3 commit（详见 §27）
+> **✅ queued prompts 移植（2026-08-10）**：#11439（`98af7b654`）+ 其后 12 个演进 commit + `098c307c7`（LRC 交回守卫）已移植，本地 7 commit 提交链（详见 §28）
 > Zap 分支：`2d0942210`
 > 最后核验：2026-08-11，`cargo check -p warp --all-targets` 通过（0 error）；导航 7 + export 4 + queued 28 + selection 111 + container 单测全绿；4 reviewer 并行评审（1 P1 + 4 P3 已处理）；正式版 bundle 构建成功（签名非 adhoc）
 >
@@ -22,6 +23,7 @@
 > | 九 | `7cbb22d5c` 后 34 个拣入 | 34 | 2026-08-05 | §19 |
 > | 十 | lifecycle 栈 6 commit + 5 件遗漏 | 11 | 2026-08-05 | §21–§23（提交 `81bbcf869`） |
 | 十一 | Cmd-Up #14685 + export #13603 + foreground_border #13056 | 3 | 2026-08-11 | §27（提交 `2d0942210`） |
+| 十零 | queued prompts：#11439 + 12 演进 + 098c307c7 | 13 | 2026-08-10 | §28（提交 `4b2d5b855`→`9fb3abb`） |
 >
 > **⚠️ 算待评估区间只能用上面的边界 hash**：本 fork 与上游无 merge-base
 > （浅克隆，历史断开）。`git rev-list HEAD..upstream/master` 会把全部历史
@@ -1710,5 +1712,54 @@ prompts list UI"）把 `35d951cdc` 加在 `view.rs` 的**四个 pending 选区�
 
 ---
 
-*文档版本：v2.6*
+## 28. 移植记录（2026-08-10）：queued prompts 子系统（#11439 + 12 演进 + LRC 守卫）
+
+> 触发：`port-11439-plan.md`（已删）+ 交接文档。上游 `98af7b654`（#11439
+> "queued prompts list UI"）及其后到 `118c6a4ef` 的 12 个 queued-prompts 演进
+> commit、`098c307c7`（LRC subagent 交回守卫）分阶段移植。§26.6 曾评估 #11439
+> 并列出移植清单——本轮按该清单执行完毕。
+
+### 28.1 提交链（本地 7 commit，倒序 = 提交顺序）
+
+| commit | 内容 |
+|--------|------|
+| `4b2d5b855` | 移植 #11439（`98af7b654`）：`QueuedQueryModel` 单例（每会话多队列、行内编辑、拖拽重排）、`QueuedPromptsPanelView` 面板、`/queue` 与 auto-queue toggle 改道、`QueueSlashCommand` 从 DOGFOOD 移出无条件启用、telemetry 4 事件、测试 27 用例 |
+| `d0028a25d` | 移植 12 个演进 commit（`98af7b654` 之后到 `118c6a4ef`，5 批次）：① 面板 UI 细化（行文字号对齐、方向键/? 键行内、Copy 行动作）② compact 排队（CompactAnd/ForkAndCompact origin、`is_summarizing`、enqueue_followup_prompt、deferred dispatch）③ hover/拖柄 + paper cuts + 抑制完成通知 + 焦点抢占 ④ 排队 vs 打断设置（`default_prompt_submission_mode`）、send-now ⑤ 终端命令排队（`command_in_flight` + QueuedCommand）、LRC 自动排队设置（`long_running_command_submission_mode`）、LRC 快照竞态、action 类 slash command 立即执行 |
+| `177415197` | 补移植 `098c307c7` 的 LRC subagent 交回守卫 |
+| `5c7fcc4d2` | 排队模式下 `/compact-and` 不再被 bypass，恢复排队语义 |
+| `1e5d6bb80` | 排队 `/compact-and` 完整执行路径 + `098c307c7` 契约测试 |
+| `10deefa71` | 删除日语界面支持（Language 枚举删 Japanese + 删 `app/i18n/ja/warp.ftl`） |
+| `9fb3abb` | zh-CN 补译两处漏译（Agent 工作流、Warpify 子 shell） |
+
+### 28.2 适配决策（本地/上游差异）
+
+- 本地无 cloud mode / warp_tui：跳过 viewer 上传、PtyIntent、`is_agent_requested_command` 相关
+- 本地 flag 用 `QueueSlashCommand` 而非上游 `QueuedPromptsV2`
+- `is_lrc_auto_queue_active` 用本地 `is_agent_driving_command()` 替代上游组合判断
+- `slash_command_is_submitted_as_prompt` 本地为 INIT\|PLAN（上游含 ORCHESTRATE）
+- 附件从 pending_context 移出显式双源解析，修复直接 skill 调用附件重复发送与排队行吞下一条草稿附件
+- `send_lrc_queued_prompts` 只发队首，余下靠 drain 链推进，避免连发互相 cancel
+- `remove_pending_lrc_rows` 收窄到非 FollowUpSubmitted 的取消，保留排队输入
+- 测试基建：`initialize_app_for_terminal_view` 补 `QueuedQueryModel` 注册（input_test / workspace view_test / test_util）
+
+### 28.3 验证状态（2026-08-10 提交时）
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp` | 0 error |
+| queued 相关测试（queued_query 19 + queued_prompts 8 + 后续演进） | 全绿（交接文档记录 50 个 queued 测试） |
+| code review | review.json 记录（Approve with nits） |
+
+### 28.4 后续注意
+
+- 本地保留 `35d951cdc` 的 pending block 选区复制接入？——**已删**（与上游 #11439 一致，
+  接入点被面板架构替换；本地 queued prompt 文字可选中可复制由面板 SelectableArea 承接，
+  见 §26.3 继承缺陷第 3 项 grid 残留遮蔽为上游固有）。
+- `/compact-and` 排队语义（`5c7fcc4d2`）与 LRC 守卫（`177415197`）是本地对上游
+  `098c307c7` 的拆分布移植——上游单 commit，本地拆 3 步（守卫 → 排队例外 → 完整路径+测试），
+  后续同步若遇上游返工需合并核对。
+
+---
+
+*文档版本：v2.7*
 *下次合并前必读*
