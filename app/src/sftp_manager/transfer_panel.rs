@@ -345,7 +345,7 @@ mod tests {
             let root_view_id = app.root_view_id(window_id).expect("测试窗口应包含根视图");
             let presenter = Rc::new(RefCell::new(Presenter::new(window_id)));
             let invalidation = WindowInvalidation {
-                updated: HashSet::from([root_view_id]),
+                updated: [root_view_id].into_iter().collect(),
                 ..Default::default()
             };
 
