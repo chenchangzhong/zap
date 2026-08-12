@@ -159,7 +159,7 @@ fn test_flex_main_axis_alignment() {
 
         let mut presenter = Presenter::new(window_id);
 
-        let mut updated = HashSet::new();
+        let mut updated = crate::EntityIdSet::default();
         updated.insert(app.root_view_id(window_id).expect("root view should exist"));
         let invalidation = WindowInvalidation {
             updated,
@@ -528,7 +528,7 @@ fn test_flex_cross_axis_alignment() {
 
         let mut presenter = Presenter::new(window_id);
 
-        let mut updated = HashSet::new();
+        let mut updated = crate::EntityIdSet::default();
         updated.insert(app.root_view_id(window_id).expect("root view should exist"));
         let invalidation = WindowInvalidation {
             updated,

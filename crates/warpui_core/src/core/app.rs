@@ -63,10 +63,11 @@ use crate::{
     rendering,
     util::post_inc,
     Action, AddWindowOptions, AnyModel, AnyModelHandle, AnyView, ApplicationBundleInfo, CursorInfo,
-    CurrentRenderWindowGuard, Effect, Element, Entity, EntityId, Event, GetSingletonModelHandle,
-    ModelAsRef, ModelContext, ModelHandle, NextNewWindowsHasThisWindowsBoundsUponClose, Presenter,
-    ReadModel, ReadView, SingletonEntity, SpawnedFuture, TaskId, TypedActionView, UpdateModel,
-    UpdateView, View, ViewAsRef, ViewContext, ViewHandle, WindowId, WindowInvalidation,
+    CurrentRenderWindowGuard, Effect, Element, Entity, EntityId, EntityIdMap, EntityIdSet, Event,
+    GetSingletonModelHandle, ModelAsRef, ModelContext, ModelHandle,
+    NextNewWindowsHasThisWindowsBoundsUponClose, Presenter, ReadModel, ReadView, SingletonEntity,
+    SpawnedFuture, TaskId, TypedActionView, UpdateModel, UpdateView, View, ViewAsRef, ViewContext,
+    ViewHandle, WindowId, WindowInvalidation,
 };
 
 use super::{
@@ -582,7 +583,7 @@ pub struct AppContext {
     /////////////////////////
     // Fields from AppContext
     /////////////////////////
-    pub(super) models: HashMap<EntityId, Box<dyn AnyModel>>,
+    pub(super) models: EntityIdMap<Box<dyn AnyModel>>,
     /// A mapping from type ID -> handle to the single global model of that
     /// type.  The handle is a strong reference, ensuring the model will not be
     /// dropped during the lifetime of the application.
@@ -614,8 +615,8 @@ pub struct AppContext {
     keystroke_matcher: Matcher,
     next_task_id: usize,
     weak_self: rc::Weak<RefCell<Self>>,
-    pub(super) subscriptions: HashMap<EntityId, Vec<Subscription>>,
-    pub(super) observations: HashMap<EntityId, Vec<Observation>>,
+    pub(super) subscriptions: EntityIdMap<Vec<Subscription>>,
+    pub(super) observations: EntityIdMap<Vec<Observation>>,
     /// Tracks pending unsubscribes during event emission.
     /// When `emit_event` is processing callbacks, unsubscribes are deferred here to avoid
     /// O(N²) tombstone scanning. The unsubscribes are processed at the end of event emission.
@@ -692,7 +693,7 @@ pub struct AppContext {
     /// Visibility is `pub(super)` because the `view::handle` module needs to access
     /// this field for dynamic window lookup in `ViewHandle::window_id()`,
     /// `WeakViewHandle::upgrade()`, and `WeakViewHandle::window_id()`.
-    pub(super) view_to_window: HashMap<EntityId, WindowId>,
+    pub(super) view_to_window: EntityIdMap<WindowId>,
 
     /// Maps child view → parent view for views created via `add_typed_action_view_with_parent`.
     /// Unlike the presenter's layout-time parent map, this persists across renders and
@@ -701,12 +702,12 @@ pub struct AppContext {
     ///
     /// Populated by `add_typed_action_view_internal` when a parent_view_id is provided,
     /// and cleaned up in `remove_dropped_items` when views are dropped.
-    structural_child_to_parent: HashMap<EntityId, EntityId>,
+    structural_child_to_parent: EntityIdMap<EntityId>,
 
     /// Reverse of `structural_child_to_parent`: maps parent view → set of child views.
     /// Enables efficient traversal in `transfer_structural_children` without iterating
     /// all views in the source window.
-    structural_parent_to_children: HashMap<EntityId, HashSet<EntityId>>,
+    structural_parent_to_children: EntityIdMap<EntityIdSet>,
 
     /// When set, all focus changes to this window are suppressed.
     /// Used during tab drag to prevent the new window from stealing focus.
@@ -2569,11 +2570,11 @@ impl AppContext {
         self.window_invalidations.remove(&window_id);
         autotracking::close_window(window_id);
 
-        let mut subscriptions = HashMap::new();
-        let mut observations = HashMap::new();
+        let mut subscriptions = EntityIdMap::default();
+        let mut observations = EntityIdMap::default();
         // Back up view_to_window mappings so they can be restored if the window is reopened
         // via reopen_closed_window(). This preserves the view-to-window associations.
-        let mut view_to_window_backup = HashMap::new();
+        let mut view_to_window_backup = EntityIdMap::default();
         for view_id in view_ids.into_iter().flatten() {
             if let Some(subs) = self.subscriptions.remove(&view_id) {
                 subscriptions.insert(view_id, subs);
@@ -4362,9 +4363,9 @@ impl AddSingletonModel for AppContext {
 pub struct ClosedWindowData {
     pub window_id: WindowId,
     window: Window,
-    subscriptions: HashMap<EntityId, Vec<Subscription>>,
-    observations: HashMap<EntityId, Vec<Observation>>,
-    view_to_window: HashMap<EntityId, WindowId>,
+    subscriptions: EntityIdMap<Vec<Subscription>>,
+    observations: EntityIdMap<Vec<Observation>>,
+    view_to_window: EntityIdMap<WindowId>,
     // TODO(vorporeal): why is AppContext.window_bounds holding an option?
     bounds: Option<RectF>,
     fullscreen_state: FullscreenState,

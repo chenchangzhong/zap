@@ -80,7 +80,7 @@ fn test_scroll_to_position() {
 
         let mut presenter = Presenter::new(window_id);
 
-        let mut updated = HashSet::new();
+        let mut updated = crate::EntityIdSet::default();
         updated.insert(app.root_view_id(window_id).unwrap());
         let invalidation = WindowInvalidation {
             updated,

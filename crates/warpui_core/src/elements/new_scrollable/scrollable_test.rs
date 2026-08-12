@@ -562,7 +562,7 @@ impl TypedActionView for BasicScrollableView {
 }
 
 fn render(presenter: &mut Presenter, view_id: EntityId, ctx: &mut AppContext) {
-    let mut updated = HashSet::new();
+    let mut updated = crate::EntityIdSet::default();
     updated.insert(view_id);
     let invalidation = WindowInvalidation {
         updated,
