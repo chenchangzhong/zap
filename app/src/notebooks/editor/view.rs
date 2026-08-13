@@ -1892,6 +1892,20 @@ impl RichTextEditorView {
         };
 
         if let Some(url) = url {
+            // Markdown 片断链接(如 `[Goal](#goal)`)在 notebook 内直接滚动到
+            // 匹配标题,而不是走外部 URL/文件链接处理(上游 606e1653f)。
+            if url.starts_with('#')
+                && (cmd || matches!(self.interaction_state(ctx), InteractionState::Selectable))
+            {
+                let scrolled = self
+                    .model
+                    .update(ctx, |model, ctx| model.scroll_to_matching_header(&url, ctx));
+                if scrolled {
+                    self.open_link = None;
+                    ctx.notify();
+                    return;
+                }
+            }
             // In read-only comment chips (Selectable), open the link directly on
             // click instead of showing a tooltip.
             if cmd || matches!(self.interaction_state(ctx), InteractionState::Selectable) {
