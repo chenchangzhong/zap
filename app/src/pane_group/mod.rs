@@ -2065,6 +2065,15 @@ impl PaneGroup {
         self.panes_of::<AIDocumentPane>().map(|pane| pane.id())
     }
 
+    /// Iterate over the file notebook panes in this pane group.
+    pub fn file_notebook_panes<'a>(
+        &'a self,
+        app: &'a AppContext,
+    ) -> impl Iterator<Item = (PaneId, ViewHandle<FileNotebookView>)> + 'a {
+        self.panes_of::<FilePane>()
+            .map(move |pane| (pane.id(), pane.file_view(app)))
+    }
+
     fn visible_ai_document_panes(&self, ctx: &AppContext) -> Vec<(PaneId, AIDocumentId)> {
         self.panes_of::<AIDocumentPane>()
             .filter(|pane| !self.is_pane_hidden_for_close(pane.id()))

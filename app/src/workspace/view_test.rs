@@ -114,6 +114,8 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
     app.add_singleton_model(AgentConversationsModel::new);
     app.add_singleton_model(crate::ai::agent_providers::AgentProviderSecrets::new);
+    #[cfg(feature = "local_fs")]
+    app.add_singleton_model(warp_files::FileModel::new);
     app.add_singleton_model(crate::settings::CloudSyncTokenStore::new);
     app.add_singleton_model(LLMPreferences::new);
     app.add_singleton_model(|_| SettingsPaneManager::new());
@@ -2099,3 +2101,63 @@ fn test_standard_tab_context_menu_shows_hover_only_tab_bar() {
 
 // 已删:test_open_ambient_agent_setup_guide_action_opens_management_view_and_is_idempotent
 // agent_management_view 字段连同 agent setup guide 整片功能在 Phase 2c 已删。
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_open_file_notebook_focuses_existing_markdown_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let markdown_path = temp_dir.path().join("README.md");
+        std::fs::write(&markdown_path, "# Test\n").expect("failed to write markdown file");
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.open_file_with_target(
+                markdown_path.clone(),
+                FileTarget::MarkdownViewer(EditorLayout::SplitPane),
+                None,
+                CodeSource::Link {
+                    path: markdown_path.clone(),
+                    range_start: None,
+                    range_end: None,
+                },
+                ctx,
+            );
+        });
+
+        let markdown_pane_id = workspace.update(&mut app, |workspace, ctx| {
+            let pane_group = workspace.active_tab_pane_group();
+            pane_group.update(ctx, |pane_group, ctx| {
+                let markdown_panes = pane_group.file_notebook_panes(ctx).collect_vec();
+                assert_eq!(markdown_panes.len(), 1);
+                let pane_id = markdown_panes[0].0;
+
+                pane_group.add_terminal_pane(Direction::Right, None, ctx);
+                assert_ne!(pane_group.focused_pane_id(ctx), pane_id);
+
+                pane_id
+            })
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.open_file_with_target(
+                markdown_path.clone(),
+                FileTarget::MarkdownViewer(EditorLayout::SplitPane),
+                None,
+                CodeSource::Link {
+                    path: markdown_path,
+                    range_start: None,
+                    range_end: None,
+                },
+                ctx,
+            );
+        });
+
+        workspace.read(&app, |workspace, ctx| {
+            let pane_group = workspace.active_tab_pane_group().as_ref(ctx);
+            assert_eq!(pane_group.file_notebook_panes(ctx).count(), 1);
+            assert_eq!(pane_group.focused_pane_id(ctx), markdown_pane_id);
+        });
+    });
+}
