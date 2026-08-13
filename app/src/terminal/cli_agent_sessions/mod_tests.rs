@@ -454,6 +454,180 @@ fn model_switch_ready_updates_socket_id_without_overwriting_session_id() {
 }
 
 #[test]
+fn subagent_model_switch_ready_does_not_overwrite_main_session_socket() {
+    // 主会话 socket 已建立（id 与 OSC777 session_id 一致）。
+    let mut session = CLIAgentSession {
+        agent: CLIAgent::OhMyPi,
+        status: CLIAgentSessionStatus::InProgress,
+        session_context: CLIAgentSessionContext {
+            session_id: Some("019fbc8d-d85c-7000-99b8-25884842611d".to_owned()),
+            model_switch_socket_id: Some("019fbc8d-d85c-7000-99b8-25884842611d".to_owned()),
+            ..Default::default()
+        },
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        current_model: None,
+    };
+
+    // subagent 加载同一扩展后以自己的 session_id 上报 model_switch_ready。
+    let subagent_event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::ModelSwitchReady,
+        session_id: Some("019fbc92-0000-7000-0000-000000000000".to_owned()),
+        cwd: Some("/tmp".to_owned()),
+        project: Some("proj".to_owned()),
+        payload: CLIAgentEventPayload::default(),
+    };
+
+    session.apply_event(&subagent_event);
+
+    // 主会话的 socket 绑定不能被 subagent 的 socket id 覆盖。
+    assert_eq!(
+        session.session_context.model_switch_socket_id.as_deref(),
+        Some("019fbc8d-d85c-7000-99b8-25884842611d")
+    );
+    assert_eq!(
+        session.session_context.session_id.as_deref(),
+        Some("019fbc8d-d85c-7000-99b8-25884842611d")
+    );
+}
+
+#[test]
+fn session_start_clears_socket_then_matching_ready_rebinds() {
+    // 会话切换：session_start(新 id) 开启新绑定周期，随后的 model_switch_ready 重绑。
+    let mut session = CLIAgentSession {
+        agent: CLIAgent::OhMyPi,
+        status: CLIAgentSessionStatus::InProgress,
+        session_context: CLIAgentSessionContext {
+            session_id: Some("old-session".to_owned()),
+            model_switch_socket_id: Some("old-socket".to_owned()),
+            ..Default::default()
+        },
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        current_model: None,
+    };
+
+    let start = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::SessionStart,
+        session_id: Some("new-session".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+    session.apply_event(&start);
+
+    // session_start 清除旧 socket 绑定（新周期从空开始，避免陈旧绑定）。
+    assert_eq!(session.session_context.model_switch_socket_id, None);
+    assert_eq!(
+        session.session_context.session_id.as_deref(),
+        Some("new-session")
+    );
+
+    let ready = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::ModelSwitchReady,
+        session_id: Some("new-session".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+    session.apply_event(&ready);
+
+    // 新周期的 model_switch_ready 重新绑定 socket。
+    assert_eq!(
+        session.session_context.model_switch_socket_id.as_deref(),
+        Some("new-session")
+    );
+}
+
+#[test]
+fn ready_without_session_id_keeps_existing_socket_binding() {
+    // 扩展拿不到 sessionId 时发 null id 的 model_switch_ready：不得清空已建立的绑定。
+    let mut session = CLIAgentSession {
+        agent: CLIAgent::OhMyPi,
+        status: CLIAgentSessionStatus::InProgress,
+        session_context: CLIAgentSessionContext {
+            session_id: Some("main-session".to_owned()),
+            model_switch_socket_id: Some("main-socket".to_owned()),
+            ..Default::default()
+        },
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        current_model: None,
+    };
+
+    let event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::ModelSwitchReady,
+        session_id: None,
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+    session.apply_event(&event);
+
+    assert_eq!(
+        session.session_context.model_switch_socket_id.as_deref(),
+        Some("main-socket")
+    );
+}
+
+#[test]
+fn ready_accepts_any_id_when_socket_unbound() {
+    // 首次启动乱序（model_switch_ready 先于 session_start 到达）：socket 空时接受任意 id。
+    let mut session = CLIAgentSession {
+        agent: CLIAgent::OhMyPi,
+        status: CLIAgentSessionStatus::InProgress,
+        session_context: CLIAgentSessionContext::default(),
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        current_model: None,
+    };
+
+    let event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::ModelSwitchReady,
+        session_id: Some("first-ready".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+    session.apply_event(&event);
+
+    assert_eq!(
+        session.session_context.model_switch_socket_id.as_deref(),
+        Some("first-ready")
+    );
+}
+
+#[test]
 fn session_start_sets_plugin_version() {
     let mut session = CLIAgentSession { agent: CLIAgent::Claude,
     status: CLIAgentSessionStatus::InProgress,

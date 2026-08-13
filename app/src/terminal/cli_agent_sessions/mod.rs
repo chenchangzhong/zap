@@ -253,11 +253,25 @@ impl CLIAgentSession {
                 return None;
             }
             CLIAgentEventType::ModelSwitchReady => {
-                self.session_context.model_switch_socket_id = event.session_id.clone();
+                // 仅当 socket 尚未建立（首次启动 / resume）或事件 session_id 与已记录的
+                // 会话 id 匹配时才更新。subagent 等嵌套会话会加载同一扩展并以自己的
+                // session_id 上报 model_switch_ready，若无条件覆盖会把主会话的 socket
+                // 绑定指向子会话的 socket，导致主会话模型切换静默失败（无报错、无反应）。
+                if self.session_context.model_switch_socket_id.is_none()
+                    || self.session_context.session_id.as_deref() == event.session_id.as_deref()
+                {
+                    self.session_context.model_switch_socket_id = event.session_id.clone();
+                }
                 return None;
             }
             CLIAgentEventType::SessionStart => {
                 self.plugin_version = event.payload.plugin_version.clone();
+                // 新会话周期开始：socket 绑定由随后的 model_switch_ready 重新建立。
+                // 若不清除，主会话重建（进程重启 / session 切换）时旧绑定会残留，
+                // 且新 model_switch_ready 可能因扩展 socket 命名与 OSC777 id 不一致
+                // 而被 ModelSwitchReady 分支拒绝，留下指向失效 socket 的陈旧绑定。
+                // subagent 不上报 session_start，故此处清除不会放行其 model_switch_ready。
+                self.session_context.model_switch_socket_id = None;
                 return None;
             }
             CLIAgentEventType::Unknown(_) => return None,
