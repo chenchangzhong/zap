@@ -7,6 +7,7 @@ use pathfinder_geometry::vector::vec2f;
 use rand::{distributions::Alphanumeric, thread_rng, Rng as _};
 use std::{
     collections::HashMap,
+    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -2372,7 +2373,21 @@ impl CodeDiffView {
                             file_path_str = rename.to_string_lossy().to_string();
                         }
                         let was_edited = diff.diff_view.as_ref(ctx).was_edited();
-                        let changed_lines = diff.diff_view.as_ref(ctx).changed_lines(ctx);
+                        let editor_changed_lines = diff.diff_view.as_ref(ctx).changed_lines(ctx);
+                        let changed_lines = changed_lines_for_result(
+                            editor_changed_lines.clone(),
+                            diff.diff_view.as_ref(ctx).diff(),
+                        );
+                        let changed_lines_for_malformed_signal = if editor_changed_lines.is_empty()
+                        {
+                            changed_lines
+                                .iter()
+                                .cloned()
+                                .map(file_context_range_to_editor_range)
+                                .collect()
+                        } else {
+                            editor_changed_lines
+                        };
                         let has_malformed_terminal_signal = diff
                             .diff_view
                             .as_ref(ctx)
@@ -2380,7 +2395,7 @@ impl CodeDiffView {
                             .is_some_and(|editor_diff| {
                                 has_malformed_terminal_correction_signal(
                                     editor_diff,
-                                    &changed_lines,
+                                    &changed_lines_for_malformed_signal,
                                 )
                             });
 
@@ -2398,12 +2413,7 @@ impl CodeDiffView {
                         updated_files.push((
                             FileLocations {
                                 name: file_path_str,
-                                lines: if FeatureFlag::ChangedLinesOnlyApplyDiffResult.is_enabled()
-                                {
-                                    changed_lines
-                                } else {
-                                    vec![]
-                                },
+                                lines: changed_lines,
                             },
                             was_edited,
                         ));
@@ -3187,4 +3197,51 @@ fn keystroke_for_mode(key: &str, is_passive: bool) -> Keystroke {
         key: key.to_owned(),
         ..Default::default()
     }
+}
+
+/// 计算 apply-diff 结果里返回给 LLM 的变更行范围(1-based,file-context 坐标)。
+/// 优先用编辑器记录的变更行;为空时从 diff 增量推导(上游 89f61b63b)。
+fn changed_lines_for_result(
+    editor_changed_lines: Vec<Range<usize>>,
+    diff_type: Option<&DiffType>,
+) -> Vec<Range<usize>> {
+    if !editor_changed_lines.is_empty() {
+        return editor_changed_lines
+            .into_iter()
+            .map(editor_range_to_file_context_range)
+            .collect();
+    }
+
+    match diff_type {
+        Some(DiffType::Create { delta }) => inserted_content_range(1, &delta.insertion)
+            .into_iter()
+            .collect(),
+        Some(DiffType::Update { deltas, .. }) => deltas
+            .iter()
+            .filter_map(changed_line_range_for_delta)
+            .collect(),
+        Some(DiffType::Delete { .. }) | None => vec![],
+    }
+}
+
+fn changed_line_range_for_delta(delta: &DiffDelta) -> Option<Range<usize>> {
+    let replacement_range = &delta.replacement_line_range;
+    if replacement_range.start == replacement_range.end {
+        return inserted_content_range(replacement_range.start.max(1), &delta.insertion);
+    }
+
+    Some(replacement_range.clone())
+}
+
+fn inserted_content_range(start: usize, content: &str) -> Option<Range<usize>> {
+    let line_count = content.lines().count();
+    (line_count > 0).then_some(start..start + line_count)
+}
+
+fn editor_range_to_file_context_range(range: Range<usize>) -> Range<usize> {
+    range.start.saturating_add(1)..range.end.saturating_add(1)
+}
+
+fn file_context_range_to_editor_range(range: Range<usize>) -> Range<usize> {
+    range.start.saturating_sub(1)..range.end.saturating_sub(1)
 }

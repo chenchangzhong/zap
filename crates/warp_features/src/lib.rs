@@ -313,9 +313,6 @@ pub enum FeatureFlag {
     /// as model selectors are always shown when this flag is enabled.
     ProfilesDesignRevamp,
 
-    /// Enables return changed lines on apply diff result
-    ChangedLinesOnlyApplyDiffResult,
-
     /// Enables us to render linked code blocks
     LinkedCodeBlocks,
 
