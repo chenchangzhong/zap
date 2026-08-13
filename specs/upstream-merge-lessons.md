@@ -3,6 +3,7 @@
 > **同步边界**：`7cbb22d5c` 之后拣入 34 commit（散点，非连续区间；详见 §19）
 > **✅ 遗漏修复（2026-08-05）**：terminal lifecycle recovery 栈 6 commit（#12853/#12854/#12855/#12856/#12858/#12859）已按方案 A 完整移植（详见 §21.4/§23）；§22 重扫发现的 5 件遗漏已全部拣入（zsh glitch 剥离 #14166/#12438、尾点链接 #12965、Hermes BracketedPaste #14367、系统终止 #12480、O(1) 焦点 #13113，详见 §23）
 > **✅ 本轮移植（2026-08-13）**：性能优化 2 commit——imported-comments guard `922ba2584`（#13114）+ async blocklist find `fb5ad384a`（#9618，含后续 `cd745fac9` #11205 消费端）（详见 §29）
+> **✅ 本轮移植（2026-08-13）第二波**：`02c042063` → `5fb3144db` 区间筛出 6 个遗漏修复已移植——Core Text style runs 合并 `12e455c56`（#15043）、workflow 截断 panic `87a4e4b34`（#14933）、citation 降级 `80a203474`（#14915）、SSH wrapper RCS `f919f8935`（#13407）、code review renamed `724579a87`（#14655）、generator 进程组取消 `a4769955f`（#14853）；`46c0b5136`（#13405 Windows kaspersky 蓝屏）只记录待 Windows 版；`aa9f3a436`（#14854 context chips 活跃面）经核验本地 `FeatureFlag::AgentView` 默认关、无此 bug，**跳过**（详见 §30）
 > **✅ 本轮移植（2026-08-11）**：Cmd-Up 导航 `da4da09f8`（#14685）+ conversation_export 抽离 `a77348c67`（#13603 GUI 侧）+ framework 补移植 `Container::with_foreground_border`（#13056），3 commit（详见 §27）
 > **✅ queued prompts 移植（2026-08-10）**：#11439（`98af7b654`）+ 其后 12 个演进 commit + `098c307c7`（LRC 交回守卫）已移植，本地 7 commit 提交链（详见 §28）
 > Zap 分支：`ed3bb76af`
@@ -26,6 +27,7 @@
 | 十一 | Cmd-Up #14685 + export #13603 + foreground_border #13056 | 3 | 2026-08-11 | §27（提交 `2d0942210`） |
 | 十零 | queued prompts：#11439 + 12 演进 + 098c307c7 | 13 | 2026-08-10 | §28（提交 `4b2d5b855`→`9fb3abb`） |
 | 十二 | 性能优化：imported-comments guard #13114 + async find #9618(+#11205) | 2 | 2026-08-13 | §29（提交 `40d94c395`→`ed3bb76af`） |
+| 十三 | 遗漏修复 6 commit（Core Text / workflow panic / citation / SSH RCS / code review renamed / 进程组取消） | 6 | 2026-08-13 | §30（未提交，工作区） |
 >
 > **⚠️ 算待评估区间只能用上面的边界 hash**：本 fork 与上游无 merge-base
 > （浅克隆，历史断开）。`git rev-list HEAD..upstream/master` 会把全部历史
@@ -53,6 +55,8 @@
 | `FeatureFlag` promote 类（加 variant + 列表） | 可拣 | §0 教训（需手动补 Cargo feature 定义） |
 | 纯加法的事件/枚举变体 | 可拣 | §14 第 1 项（`StopFailure` 先例） |
 | 来自**未合并分支**的 commit | 查分支 tip | §18.1（初版可能已被 review 否决） |
+| Windows 专属修复（如 `46c0b5136` kaspersky 蓝屏） | **只记录，待发 Windows 版再合** | §30（用户决定：当前只处理 macOS） |
+| `aa9f3a436` #14854 context chips 活跃面 | **跳过**（本地 `FeatureFlag::AgentView` 默认关，无此 bug） | §30.4；未来 AgentView 默认开再移植 |
 | 上游 `elements/gui/` 路径下的 framework 改动（如 `Container::with_foreground_border`） | 按平铺路径适配移植 | §27.2（本地未跟随 #12633 目录重构，gui/ 文件本地天然缺失） |
 
 ### 移植前四问（§14 / §18 教训提炼）
@@ -1829,5 +1833,90 @@ prompts list UI"）把 `35d951cdc` 加在 `view.rs` 的**四个 pending 选区�
 
 ---
 
-*文档版本：v2.8*
+## 30. 移植记录（2026-08-13）：遗漏修复 6 commit（区间 `02c042063` → `5fb3144db`）
+
+> 触发：`02c042063` 之后 fetch 到 143 个新 commit（至 `5fb3144db`），系统性筛出
+> 遗漏的 macOS 相关修复。本轮移植 6 个行为保持修复；`46c0b5136`（Windows 专属）只记录
+> 待 Windows 版；`aa9f3a436`（context chips 活跃面）本地适配复杂，待评估。
+
+### 30.1 已移植（6 commit，工作区未提交）
+
+| commit | 内容 | 本地改动文件 |
+|--------|------|--------------|
+| `12e455c56` #15043 | Core Text 合并相邻相同 style runs——修复 macOS 11.98GB 内存尖峰（APP-5342），`create_attributed_string` 逐 run `set_attribute` 前合并同 style 连续 run，无分配 fast path | `crates/warpui/src/platform/mac/text_layout.rs` + `text_layout_test.rs`（3 测试） |
+| `87a4e4b34` #14933 | workflow 预览截断 `&content_preview[..197]` 撞多字节字符 panic（APP-5287）→ 用本地已有 `safe_truncate` | `app/src/search/ai_context_menu/workflows/data_source.rs` |
+| `80a203474` #14915 | citation 未知类型硬失败整条消息 → `filter_map` 降级跳过；Unknown 分支记录日志 | `app/src/ai/agent/api/convert_from.rs` + `crates/ai/src/agent/citation.rs` |
+| `f919f8935` #13407 | SSH wrapper `unset RCS; unset GLOBAL_RCS`（变量 no-op）→ `unsetopt ZLE RCS GLOBAL_RCS` | `app/assets/bundled/bootstrap/{bash_body,fish,zsh_body}.sh` |
+| `724579a87` #14655 | code review renamed 文件空 diff：工作树 vs HEAD 双路径 diff + baseline 从 `HEAD:old_path` 读 | `app/src/code_review/diff_state.rs`（2 处） |
+| `a4769955f` #14853 | generator 取消只杀直接子 PID → `ActiveProcessGroups` + `SpawnedChildCleanup` Drop 杀整个进程组 | `app/src/terminal/model/session/command_executor/local_command_executor.rs` |
+
+### 30.2 关键适配（本地/上游分叉，勿当 bug）
+
+1. **`12e455c56`**：本地 `create_attributed_string` 与上游修复前逐字同构；`Cow` 已 import；
+   let-chain（`if let Some(last) = merged.last_mut() && ...`）改嵌套 `if`（本地 2021 edition）。
+   测试文件本地叫 `text_layout_test.rs`（上游 `text_layout_tests.rs`），import 补 `FamilyId`。
+   `StyleAndFont` 本地已 `#[derive(PartialEq)]`。
+2. **`80a203474`**：上游 `report_error!` 用 `warp_errors::{ReportErrorLogMode, report_error}`
+   带 `extra:` + `OncePerRun`——本地无 `warp_errors`（已删，§7.3），本地 `report_error!` 是
+   `warp_core::errors` 单参 `($err:expr)` 形式，不支持 extra/OncePerRun。本地改为
+   `log::warn!`（crates/ai 已依赖 log）携带 `document_type` + `document_id_len`，保留诊断信息，
+   不上报链（本地 telemetry 为壳）。核心降级（`filter_map`）与上游一致。
+   另注意 `convert_from.rs` 的 `UnknownCitationTypeError` import 被 `CitationError` enum
+   （`#[from]`）使用，不能删。上游用 `report_error!` + `OncePerRun` 每轮运行只记录一次；
+   本地 `log::warn!` 无去重——若服务端持续返回未知类型会每消息一条 warn（本地日志不上报
+   Sentry，噪音可接受；如需可加 `OnceLock` 去重，非阻塞）。
+3. **`724579a87`**：本地 `get_file_content_at_head` 在 `diff_state.rs`（单文件，上游是
+   `diff_state/local.rs` 目录）；`old_path` 本地为 `String`（match 借用 `&String`，经 Deref
+   隐式 `&str` 传入 vec 与 `format!`）。两处改动与上游语义一致。上游 #14655 自带 2 个回归
+   测试（`renamed_file_content_at_head_reads_old_path`、`staged_rename_and_modify_produces_
+   non_empty_diff`），本地未带（沿用 §29「只移植生产代码」惯例；如需回归防线可后续补）。
+4. **`a4769955f`**：本地 `local_command_executor.rs` 与上游修复前同构；上游测试文件
+   `local_command_executor_tests.rs`（214 行）本地无，未带（§29 模式：只移植生产代码）。
+   `is_some_and` 是 std API，本地可用。本地 `safe_warn!` 保留（上游该处用 `log::warn`）。
+
+### 30.3 只记录、待 Windows 版（用户决定）
+
+**`46c0b5136` #13405**：Windows 每 session 全进程表 CPU 采样（`is_kaspersky_running`）触发
+`DPC_WATCHDOG_VIOLATION` 蓝屏。修复加 `KASPERSKY_RUNNING: OnceLock<bool>` 缓存 +
+`all_processes_refresh_kind()`（`refresh_processes_specifics` 不采样 CPU/内存）。**纯 Windows
+专属**：macOS 无 DPC 蓝屏机制，`all_processes_refresh_kind` 在非 Windows 是死代码。用户决策：
+**只记录，不移植；后续计划发布 Windows 版再合并**。移植时改动点：`app/src/system/info.rs` +
+`app/src/util/windows.rs`（本地与上游同构）。
+
+### 30.4 终局：`aa9f3a436` #14854（context chips 只跑活跃输入面）——跳过
+
+上游修复：PS1 用户（非 UDI、AgentView 关）时 CLI footer chip 仍每 30s 跑默认 Git diff 命令
+的后台浪费。修复拆三层独立活跃面（prompt / agent footer / cli_agent_footer）+ 订阅状态变化。
+
+**核验结论（2026-08-13）：本地默认无此 bug，不移植。**
+
+上游 bug 前提是 `FeatureFlag::AgentView` 全局启用时对无 CLI agent 的 pane 也无条件维护
+footer chip。本地 `FeatureFlag::AgentView` **不在任何 flag 列表**（`crates/warp_features/
+src/lib.rs` 的 DOGFOOD/PREVIEW/RELEASE_FLAGS 均无，只有 `AgentViewBlockContext`），
+`is_enabled()` 默认 `false`。因此本地 `chips_to_run`（`current_prompt.rs:1123`）的
+`if FeatureFlag::AgentView.is_enabled()` 分支默认不执行，CLI footer chip 不进 `chips_to_run`，
+`CurrentPrompt` 不会定时维护其 state → 不跑 Git diff。chip 命令执行完全由 `chips_to_run`
+驱动（定时器 / `run_chips`）；footer 渲染（`PromptType::cli_agent_chips`）只读已有 state，
+不触发执行。
+
+**若未来 AgentView 默认开启 / promote**，再按下方适配点移植（仍需本地适配）：
+
+1. 上游依赖 `AISettings::should_render_cli_agent_footer`（本地有）+ `AISettingsChangedEvent::
+   ShouldRenderCLIAgentToolbar`（本地无——本地 AISettings 是 per-agent 定制体系，事件变体
+   `CLIAgentToolbarEnabledCommands`/`IsAnyAIEnabled` 等，无单体 footer 开关事件）。
+2. 上游依赖 `session.agent.supports_cli_agent_footer()`（本地 `CLIAgent` 无此方法）。
+3. 上游 `subscribe_to_input_editor` 签名变更（`&self`→`&mut self` + 新参数），本地仅 1 调用点
+   （`input.rs:2627`）。
+
+### 30.5 验证状态（2026-08-13）
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp` | 0 error（首次报 `UnknownCitationTypeError` 缺失——73 行 `CitationError` 用 `#[from]`，恢复 import 后通过） |
+| `cargo test -p warpui text_layout` | 33/33（含 3 个新 merge 测试） |
+| `zsh -n` / `bash -n` bootstrap 脚本 | 语法通过 |
+
+---
+
+*文档版本：v2.9*
 *下次合并前必读*
