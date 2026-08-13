@@ -7504,7 +7504,8 @@ fn lrc_queued_prompts_wait_while_subagent_is_active() {
 #[test]
 fn renders_git_checkout_prompt_chip_command_as_single_shell_argument() {
     let command = PromptChipShellCommand::GitCheckout {
-        branch_name: "poc;id>/tmp/proof $(whoami) `id` | cat 'tail'".to_string(),
+        encoded_git_branch_on_click_value: "poc;id>/tmp/proof $(whoami) `id` | cat 'tail'"
+            .to_string(),
     };
 
     assert_eq!(
@@ -7522,6 +7523,50 @@ fn renders_git_checkout_prompt_chip_command_as_single_shell_argument() {
     assert_eq!(
         render_prompt_chip_shell_command(&command, ShellType::PowerShell),
         "git checkout 'poc;id>/tmp/proof $(whoami) `id` | cat ''tail'''"
+    );
+}
+
+#[test]
+fn renders_git_checkout_prompt_chip_command_changes_to_linked_worktree_path() {
+    use crate::context_chips::git_branch_on_click::GitBranchOnClickValue;
+
+    let encoded = GitBranchOnClickValue {
+        branch_name: "feature-a".to_string(),
+        worktree_path: Some("/tmp/repo feature-a".to_string()),
+        is_linked_worktree: true,
+    }
+    .encode();
+    let command = PromptChipShellCommand::GitCheckout {
+        encoded_git_branch_on_click_value: encoded,
+    };
+
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::Bash),
+        "cd '/tmp/repo feature-a'"
+    );
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::PowerShell),
+        "cd '/tmp/repo feature-a'"
+    );
+}
+
+#[test]
+fn renders_git_checkout_prompt_chip_command_reports_missing_linked_worktree_path() {
+    use crate::context_chips::git_branch_on_click::GitBranchOnClickValue;
+
+    let encoded = GitBranchOnClickValue {
+        branch_name: "feature-a".to_string(),
+        worktree_path: None,
+        is_linked_worktree: true,
+    }
+    .encode();
+    let command = PromptChipShellCommand::GitCheckout {
+        encoded_git_branch_on_click_value: encoded,
+    };
+
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::Bash),
+        "echo 'Branch '\\''feature-a'\\'' is already checked out in another worktree, but Warp couldn'\\''t find its path.'"
     );
 }
 
