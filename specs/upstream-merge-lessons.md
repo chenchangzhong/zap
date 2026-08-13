@@ -2,10 +2,11 @@
 
 > **同步边界**：`7cbb22d5c` 之后拣入 34 commit（散点，非连续区间；详见 §19）
 > **✅ 遗漏修复（2026-08-05）**：terminal lifecycle recovery 栈 6 commit（#12853/#12854/#12855/#12856/#12858/#12859）已按方案 A 完整移植（详见 §21.4/§23）；§22 重扫发现的 5 件遗漏已全部拣入（zsh glitch 剥离 #14166/#12438、尾点链接 #12965、Hermes BracketedPaste #14367、系统终止 #12480、O(1) 焦点 #13113，详见 §23）
+> **✅ 本轮移植（2026-08-13）**：性能优化 2 commit——imported-comments guard `922ba2584`（#13114）+ async blocklist find `fb5ad384a`（#9618，含后续 `cd745fac9` #11205 消费端）（详见 §29）
 > **✅ 本轮移植（2026-08-11）**：Cmd-Up 导航 `da4da09f8`（#14685）+ conversation_export 抽离 `a77348c67`（#13603 GUI 侧）+ framework 补移植 `Container::with_foreground_border`（#13056），3 commit（详见 §27）
 > **✅ queued prompts 移植（2026-08-10）**：#11439（`98af7b654`）+ 其后 12 个演进 commit + `098c307c7`（LRC 交回守卫）已移植，本地 7 commit 提交链（详见 §28）
-> Zap 分支：`2d0942210`
-> 最后核验：2026-08-11，`cargo check -p warp --all-targets` 通过（0 error）；导航 7 + export 4 + queued 28 + selection 111 + container 单测全绿；4 reviewer 并行评审（1 P1 + 4 P3 已处理）；正式版 bundle 构建成功（签名非 adhoc）
+> Zap 分支：`ed3bb76af`
+> 最后核验：2026-08-13，`cargo check -p warp`（默认）与 `--features async_find` 均通过；find 31 测试（含 21 async）+ blocklist 268 通过（8 个既有环境失败与改动无关）；4 reviewer 并行评审（2 P1 已修：mark 位置、cd745fac9 消费端 2 处）
 >
 > 历轮边界：
 >
@@ -24,6 +25,7 @@
 > | 十 | lifecycle 栈 6 commit + 5 件遗漏 | 11 | 2026-08-05 | §21–§23（提交 `81bbcf869`） |
 | 十一 | Cmd-Up #14685 + export #13603 + foreground_border #13056 | 3 | 2026-08-11 | §27（提交 `2d0942210`） |
 | 十零 | queued prompts：#11439 + 12 演进 + 098c307c7 | 13 | 2026-08-10 | §28（提交 `4b2d5b855`→`9fb3abb`） |
+| 十二 | 性能优化：imported-comments guard #13114 + async find #9618(+#11205) | 2 | 2026-08-13 | §29（提交 `40d94c395`→`ed3bb76af`） |
 >
 > **⚠️ 算待评估区间只能用上面的边界 hash**：本 fork 与上游无 merge-base
 > （浅克隆，历史断开）。`git rev-list HEAD..upstream/master` 会把全部历史
@@ -1761,5 +1763,71 @@ prompts list UI"）把 `35d951cdc` 加在 `view.rs` 的**四个 pending 选区�
 
 ---
 
-*文档版本：v2.7*
+## 29. 移植记录（2026-08-13）：性能优化 2 commit——imported-comments guard + async find
+
+> 触发：系统性搜上游性能/内存优化后筛出的「本地适用、未移植」候选。本轮合入
+> 2 个：`922ba2584`（imported-comments guard）+ `fb5ad384a`（async blocklist find）。
+> 上游 commit 不在本地对象库（浅克隆），实现以 worktree `/Users/zhong/project/.worktrees/upstream-master`
+>（02c04206）为权威照搬。官方设计文档 `specs/async-find/TECH.md`（worktree）。
+
+### 29.1 提交链（本地 2 commit，倒序 = 提交顺序）
+
+| commit | 内容 |
+|--------|------|
+| `ed3bb76af` | 移植 async find（`fb5ad384a` #9618 + 后续 `cd745fac9` #11205）：AsyncFindController 后台扫描、TerminalFindModel 三分支接入、BlockFindRenderData、grid_handler find_dirty_rows_range、三层 gating 默认关 |
+| `40d94c395` | 移植 imported-comments guard（`922ba2584` #13114）：conversation registry + disabled-state 重构 |
+
+### 29.2 关键适配（本地/上游分叉，勿当 bug）
+
+1. **let-chains 不适用**：本地非 2024 edition，上游 async_find.rs 的
+   `if let ... && let ...`（3 处）改嵌套 `if`，语义等价。
+2. **`define_settings_group!` 宏无 `surface` 字段**：本地宏版本旧（上游有），
+   加 `async_find_enabled` 设置时移除 `surface:` 行。
+3. **`TerminalFindModel::new` 签名**：`(terminal_model, ctx: &AppContext)`，按
+   `TerminalSettings::is_async_find_enabled()` 构造 controller（不是计划的
+   `&mut ModelContext` 猜测——以上游 worktree 为准）。
+4. **`FeatureFlag::AsyncFind` 不加 DOGFOOD_FLAGS**：worktree 02c04206 已从
+   DOGFOOD 移除（上游默认关 + 构建 feature + 用户设置），本地照搬。flag 关时
+   sync 路径逐字节等价。
+5. **event-listener 收归 workspace**：本地顶层 `[workspace.dependencies]` 加
+   `event-listener = "5.4.0"`，app 直接依赖改 `.workspace = true`；profile
+   `[profile.dev.package]` 加 `warp_terminal.opt-level = 3`（DFA 热循环）。
+6. **grid_handler 两处构造**（`new` + `new_for_split`）都要初始化
+   `find_dirty_rows_range: None`。
+
+### 29.3 review 发现的修复（4 reviewer 并行）
+
+| 发现 | 严重度 | 修复 |
+|------|--------|------|
+| mark 无条件（上游在 `if !cards.is_empty()` 内，本地在块外） | P1 | 移入 if 内，cards 为空不误标记 |
+| `cd745fac9` 消费端 2 处未接：`handle_find_match_focus_change` + `get_highlight_ranges_for_find_matches` 仍用旧 sync 路径 | P1 | 改用 `focused_rich_content_match_id()`，恢复 async 下 AI 高亮 + reasoning 自动展开 |
+| `update_find_dirty_rows_range` 无条件记录（flag 关时每 PTY pass 一次小分配） | P2 | **不改**——上游同样无条件（parity），量级可忽略 |
+
+> 教训：移植 async find 时，cd745fac9（#11205）的 **controller 侧**（统一
+> `FocusedMatchResolution` 缓存、`focused_rich_content_match_id()` helper）随主
+> commit 一起带上了，但 **AI block 侧 2 个消费点**（block.rs + common.rs）容易漏。
+> 审查时重点查「新 helper 的所有消费点是否接全」。
+
+### 29.4 验证状态（2026-08-13 提交时）
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp`（默认，flag 关） | 0 error，sync 路径与改动前逐字节等价 |
+| `cargo check -p warp --features async_find` | 0 error |
+| `cargo test -p warp terminal::find` | 31/31（含 21 async_find 测试） |
+| `cargo test -p warp ai::blocklist` | 268 通过；8 失败为基线既有（workspace settings 环境相关，stash 验证与改动无关） |
+
+### 29.5 后续注意
+
+- async find 三层 gating 默认关：app cargo feature `async_find` + `enabled_features()`
+  cfg 映射 + `FeatureFlag::AsyncFind` 枚举 + `experimental.async_find_enabled` 设置
+  （默认 false）。用户可在设置 opt-in 或编译 `--features async_find`。
+- 上游若后续 promote AsyncFind（加入 RELEASE_FLAGS / 默认开），本地一行放开即可。
+- 本次未评估合并的候选（watcher `d78ced530`/`50853a9b9`、telemetry 清理
+  `eca8c1a60`/`40f59b517`）：watcher 本地自研 BulkFilesystemWatcher 不同构且无同款
+  问题；telemetry 本地发送层已删（枚举为类型壳），删除无收益。均维持跳过。
+
+---
+
+*文档版本：v2.8*
 *下次合并前必读*
