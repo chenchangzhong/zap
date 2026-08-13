@@ -1081,6 +1081,7 @@ settings-features-open-links-in-desktop = Open links in desktop app
 settings-features-open-links-in-desktop-tooltip = Automatically open links in desktop app whenever possible.
 settings-features-restore-session = Restore windows, tabs, and panes on startup
 settings-features-persist-conversations = Save agent conversations to local history
+settings-features-preserve-input-focus-on-block-selection = Preserve input focus on block selection
 settings-features-show-sticky-command-header = Show sticky command header
 settings-features-show-link-tooltip = Show tooltip on click on links
 settings-features-show-quit-warning = Show warning before quitting/logging out

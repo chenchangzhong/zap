@@ -1058,6 +1058,7 @@ settings-features-open-links-in-desktop = 在桌面应用中打开链接
 settings-features-open-links-in-desktop-tooltip = 尽可能自动在桌面应用中打开链接。
 settings-features-restore-session = 启动时恢复窗口、标签页和面板
 settings-features-persist-conversations = 保存智能体对话到本地历史
+settings-features-preserve-input-focus-on-block-selection = 选择块时保持输入焦点
 settings-features-show-sticky-command-header = 显示固定的命令标题栏
 settings-features-show-link-tooltip = 点击链接时显示提示
 settings-features-show-quit-warning = 退出/登出前显示警告
