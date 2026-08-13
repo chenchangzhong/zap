@@ -40,7 +40,9 @@ use crate::ai::conversation_utils;
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentModel};
 use crate::ai::llms::LLMPreferences;
 use crate::ai::{
-    agent::{api::ServerConversationToken, conversation::AIConversationId, EntrypointType},
+    agent::{
+        api::ServerConversationToken, conversation::AIConversationId, AIAgentInput, EntrypointType,
+    },
     blocklist::{
         inline_action::code_diff_view::CodeDiffView,
         suggested_agent_mode_workflow_modal::{
@@ -833,6 +835,12 @@ enum PendingSessionConfigTabConfigChipTutorial {
     AfterSetupCommands {
         intention: OnboardingIntention,
     },
+}
+
+/// 取 rewind 预填充文本:与 rewind 菜单一致地走 `display_query`,使 slash 命令、
+/// skill 调用等非 `UserQuery` variant 的输入也能恢复文本(而非空输入)。
+fn query_for_rewind_prefill(inputs: &[AIAgentInput]) -> Option<String> {
+    inputs.iter().find_map(AIAgentInput::display_query)
 }
 
 /// Snapshot of a tab used to move it between workspaces or into a new window.
@@ -20406,12 +20414,7 @@ impl TypedActionView for Workspace {
                 let user_query = BlocklistAIHistoryModel::as_ref(ctx)
                     .conversation(conversation_id)
                     .and_then(|c| c.root_task_exchanges().find(|e| e.id == *exchange_id))
-                    .and_then(|e| {
-                        e.input
-                            .iter()
-                            .find(|i| i.is_user_query())
-                            .and_then(|i| i.user_query())
-                    });
+                    .and_then(|e| query_for_rewind_prefill(&e.input));
 
                 // Dispatch to the active terminal to execute the rewind
                 if let Some(terminal_view) = self

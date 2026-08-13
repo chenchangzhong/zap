@@ -1626,7 +1626,7 @@ impl View for RequestedCommandView {
                                     !exchange
                                         .input
                                         .iter()
-                                        .any(|input| input.user_query().is_some())
+                                        .any(|input| input.display_query().is_some())
                                 });
                             }
                         }

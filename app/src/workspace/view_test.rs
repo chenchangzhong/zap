@@ -68,6 +68,22 @@ use terminal::view::ActiveSessionState;
 use warpui::AddSingletonModel;
 use warpui::{platform::WindowStyle, App, ViewHandle};
 
+/// rewind 预填充与 rewind 菜单一致地走 `display_query`:非 `UserQuery` variant
+/// (如自定义 slash 命令 / skill 调用 / InitProjectRules)也能恢复文本,而非空输入。
+#[test]
+fn query_for_rewind_prefill_uses_custom_display_query_inputs() {
+    let context: std::sync::Arc<[crate::ai::agent::AIAgentContext]> = Vec::new().into();
+    let input = crate::ai::agent::AIAgentInput::InitProjectRules {
+        context,
+        display_query: Some("/custom-slash-command".to_string()),
+    };
+
+    assert_eq!(
+        query_for_rewind_prefill(&[input]),
+        Some("/custom-slash-command".to_string())
+    );
+}
+
 fn initialize_app(app: &mut App) {
     initialize_settings_for_tests(app);
     // SSH 管理器需要数据库路径(SshTreeChangedNotifier 构造时访问)。
