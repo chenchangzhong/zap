@@ -76,7 +76,10 @@ pub fn convert_persisted_conversation_to_ai_conversation_with_metadata(
 
     let conversation_data = serde_json::from_str::<AgentConversationData>(&conversation_data).ok();
 
-    match AIConversation::new_restored(conversation_id, tasks, conversation_data) {
+    // Local-DB restore: an empty `agent_tasks` row is the normal shape of a
+    // child conversation persisted before its first server response, so
+    // synthesize a fresh optimistic root rather than failing the restore.
+    match AIConversation::new_restored_synthesizing_on_empty(conversation_id, tasks, conversation_data) {
         Ok(mut conversation) => {
             // 持久化 Task 里的旧消息可能没有 CurrentTime/timestamp,恢复 exchange 时会退到
             // Unix epoch。SQLite 行级更新时间是这个会话最后写入的可靠兜底时间。
