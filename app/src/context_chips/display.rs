@@ -376,7 +376,7 @@ impl TypedActionView for PromptDisplay {
             PromptDisplayAction::SelectGitBranch { value } => {
                 ctx.emit(PromptDisplayEvent::TryExecuteCommand(
                     PromptChipShellCommand::GitCheckout {
-                        branch_name: value.clone(),
+                        encoded_git_branch_on_click_value: value.clone(),
                     },
                 ));
             }

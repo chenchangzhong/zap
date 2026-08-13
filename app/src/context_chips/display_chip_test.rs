@@ -1,5 +1,7 @@
-use super::{truncate_from_beginning, GitLineChanges};
+use super::{truncate_from_beginning, GitBranch, GitLineChanges};
+use crate::context_chips::git_branch_on_click::GitBranchOnClickValue;
 use crate::context_chips::{github_pr_display_text_from_url, ContextChipKind};
+use crate::ui_components::icons::Icon;
 
 #[test]
 fn test_github_pr_display_text_from_url() {
@@ -38,6 +40,25 @@ fn test_github_pr_chip_display_value_falls_back_to_raw_value() {
         ContextChipKind::GithubPullRequest.display_value(&value),
         "https://example.com/not-a-pr"
     );
+}
+
+#[test]
+fn test_git_branch_menu_icon_uses_branch_icon_for_normal_branch() {
+    let value = GitBranchOnClickValue::new("feature-a".to_string()).encode();
+
+    assert_eq!(GitBranch(value).icon_for_menu(), Icon::GitBranch);
+}
+
+#[test]
+fn test_git_branch_menu_icon_uses_worktree_icon_for_linked_worktree() {
+    let value = GitBranchOnClickValue {
+        branch_name: "feature-a".to_string(),
+        worktree_path: Some("/tmp/repo-feature-a".to_string()),
+        is_linked_worktree: true,
+    }
+    .encode();
+
+    assert_eq!(GitBranch(value).icon_for_menu(), Icon::Dataflow02);
 }
 
 #[test]

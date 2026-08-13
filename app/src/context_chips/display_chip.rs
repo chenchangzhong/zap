@@ -9,6 +9,7 @@ use crate::ai::{
 };
 use crate::code::editor::{add_color, remove_color};
 use crate::code_review::diff_state::DiffStats;
+use crate::context_chips::git_branch_on_click::GitBranchOnClickValue;
 use crate::context_chips::node_version_popup::{NodeVersionPopupEvent, NodeVersionPopupView};
 use crate::context_chips::spacing;
 use crate::settings::{AISettings, AISettingsChangedEvent, InputSettings};
@@ -442,17 +443,28 @@ pub struct DisplayChipConfig {
 #[derive(Debug, Clone)]
 pub struct GitBranch(String);
 
+impl GitBranch {
+    fn icon_for_menu(&self) -> Icon {
+        let branch = GitBranchOnClickValue::decode(&self.0);
+        if branch.is_linked_worktree {
+            Icon::Dataflow02
+        } else {
+            Icon::GitBranch
+        }
+    }
+}
+
 impl GenericMenuItem for GitBranch {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
     fn name(&self) -> String {
-        self.0.clone()
+        GitBranchOnClickValue::decode(&self.0).branch_name
     }
 
     fn icon(&self, _app: &AppContext) -> Option<Icon> {
-        Some(Icon::GitBranch)
+        Some(self.icon_for_menu())
     }
 
     fn action_data(&self) -> String {
@@ -557,7 +569,7 @@ impl DisplayChip {
 
                         ctx.emit(PromptDisplayChipEvent::TryExecuteCommand(
                             PromptChipShellCommand::GitCheckout {
-                                branch_name: git_branch.name(),
+                                encoded_git_branch_on_click_value: git_branch.action_data(),
                             },
                         ));
                         me.close_git_branch_menu(ctx);
@@ -1562,7 +1574,9 @@ pub enum PromptDisplayChipEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptChipShellCommand {
     GitCheckout {
-        branch_name: String,
+        /// 编码后的分支点击值(GitBranchOnClickValue::encode),包含
+        /// worktree 路径信息;由 render 端解码后决定 git checkout / cd / echo。
+        encoded_git_branch_on_click_value: String,
     },
     GitCreateAndCheckoutBranch {
         branch_name: String,

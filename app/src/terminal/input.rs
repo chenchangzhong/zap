@@ -926,8 +926,32 @@ fn render_prompt_chip_shell_command(
     shell_type: ShellType,
 ) -> String {
     match command {
-        PromptChipShellCommand::GitCheckout { branch_name } => {
-            format!("git checkout {}", shell_quote_arg(branch_name, shell_type))
+        PromptChipShellCommand::GitCheckout {
+            encoded_git_branch_on_click_value,
+        } => {
+            let branch =
+                crate::context_chips::git_branch_on_click::GitBranchOnClickValue::decode(
+                    encoded_git_branch_on_click_value,
+                );
+            if let Some(path) = branch.worktree_path {
+                format!("cd {}", shell_quote_arg(&path, shell_type))
+            } else if branch.is_linked_worktree {
+                format!(
+                    "echo {}",
+                    shell_quote_arg(
+                        &format!(
+                            "Branch '{}' is already checked out in another worktree, but Warp couldn't find its path.",
+                            branch.branch_name
+                        ),
+                        shell_type,
+                    )
+                )
+            } else {
+                format!(
+                    "git checkout {}",
+                    shell_quote_arg(&branch.branch_name, shell_type)
+                )
+            }
         }
         PromptChipShellCommand::GitCreateAndCheckoutBranch { branch_name } => {
             format!(
