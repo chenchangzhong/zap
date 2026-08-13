@@ -2,6 +2,7 @@
 
 > **同步边界**：`7cbb22d5c` 之后拣入 34 commit（散点，非连续区间；详见 §19）
 > **✅ 遗漏修复（2026-08-05）**：terminal lifecycle recovery 栈 6 commit（#12853/#12854/#12855/#12856/#12858/#12859）已按方案 A 完整移植（详见 §21.4/§23）；§22 重扫发现的 5 件遗漏已全部拣入（zsh glitch 剥离 #14166/#12438、尾点链接 #12965、Hermes BracketedPaste #14367、系统终止 #12480、O(1) 焦点 #13113，详见 §23）
+> **✅ 本轮移植（2026-08-13）第三波（盲区 59 候选）**：fork 点 `c325d146` → 最新区间 59 个漏合并修复已全部移植（P0 安全 4 / 崩溃死锁 5 / 竞态 4 + P1 19 + P2 27；5 个跳过：3fe061620 本地已等价、f6d8167f4 无 TabGroup、81cc895d1 部分已并入、429dbf2e3 已含本地、475fdb33e 设置页定制区无组件），详见 §31。fork 点定位方法见下方 ⚠️ 段（merge-base = `c325d146`）
 > **✅ 本轮移植（2026-08-13）**：性能优化 2 commit——imported-comments guard `922ba2584`（#13114）+ async blocklist find `fb5ad384a`（#9618，含后续 `cd745fac9` #11205 消费端）（详见 §29）
 > **✅ 本轮移植（2026-08-13）第二波**：`02c042063` → `5fb3144db` 区间筛出 6 个遗漏修复已移植——Core Text style runs 合并 `12e455c56`（#15043）、workflow 截断 panic `87a4e4b34`（#14933）、citation 降级 `80a203474`（#14915）、SSH wrapper RCS `f919f8935`（#13407）、code review renamed `724579a87`（#14655）、generator 进程组取消 `a4769955f`（#14853）；`46c0b5136`（#13405 Windows kaspersky 蓝屏）只记录待 Windows 版；`aa9f3a436`（#14854 context chips 活跃面）经核验本地 `FeatureFlag::AgentView` 默认关、无此 bug，**跳过**（详见 §30）
 > **✅ 本轮移植（2026-08-11）**：Cmd-Up 导航 `da4da09f8`（#14685）+ conversation_export 抽离 `a77348c67`（#13603 GUI 侧）+ framework 补移植 `Container::with_foreground_border`（#13056），3 commit（详见 §27）
@@ -28,11 +29,21 @@
 | 十零 | queued prompts：#11439 + 12 演进 + 098c307c7 | 13 | 2026-08-10 | §28（提交 `4b2d5b855`→`9fb3abb`） |
 | 十二 | 性能优化：imported-comments guard #13114 + async find #9618(+#11205) | 2 | 2026-08-13 | §29（提交 `40d94c395`→`ed3bb76af`） |
 | 十三 | 遗漏修复 6 commit（Core Text / workflow panic / citation / SSH RCS / code review renamed / 进程组取消） | 6 | 2026-08-13 | §30（未提交，工作区） |
+| 十四 | 盲区 59 候选（fork 点 `c325d146` 起：P0 13 + P1 19 + P2 27） | 54 commit | 2026-08-13 | §31 |
 >
-> **⚠️ 算待评估区间只能用上面的边界 hash**：本 fork 与上游无 merge-base
-> （浅克隆，历史断开）。`git rev-list HEAD..upstream/master` 会把全部历史
-> 算进去（曾得出 1795，真实待评估只有 4 个）。正确命令：
-> `git log <边界hash>..upstream/master`。
+> **⚠️ 待评估区间定位（2026-08-13 已修正）**：本 fork 早期是浅克隆、与上游「无 merge-base」，
+> 只能用手工边界 hash。**2026-08-13 已 `git fetch --unshallow upstream`**，本地不再是浅仓库，
+> 上游完整历史（2076 commit，从 `0dbd3d567` 根起）已拉入。**现在可用 merge-base 精确定位 fork 点**：
+>
+> ```bash
+> git merge-base HEAD upstream/master   # = c325d146（2026-04-28 #9329，真实分叉点）
+> git log $(git merge-base HEAD upstream/master)..upstream/master   # fork 后全部待对账 commit（2044）
+> ```
+>
+> 真实 fork 点 = `c325d146`（本地与上游最后共同祖先），非 `0dbd3d567`（上游根）。今后每轮
+> 以 `git merge-base HEAD upstream/master` 为起点，彻底消除盲区；不要再用历史手工边界 hash。
+> 旧记录：本 fork 曾浅克隆，`git rev-list HEAD..upstream/master` 会算错全部历史（曾得 1795，
+> 真实待评估只有 4 个），现因 unshallow 已失效。
 
 ---
 
@@ -1918,5 +1929,87 @@ src/lib.rs` 的 DOGFOOD/PREVIEW/RELEASE_FLAGS 均无，只有 `AgentViewBlockCon
 
 ---
 
-*文档版本：v2.9*
+## 31. 移植记录（2026-08-13）：盲区 59 候选（真实 fork 点 `c325d146` 之后）
+
+历轮对账从 07-24 起都只覆盖 `02c042063` 之后;04-28(fork 点)→ 06-23 的盲区从未可靠
+覆盖(§17 名不副实、§22 只扫 06-23 起)。本轮 `git fetch --unshallow upstream` 后用
+`git merge-base` 精确定位真实 fork 点 = `c325d146`,盲区 244 个 fix 候选逐符号对照本地,
+确认 59 个漏合并。**59 个全部移植完成**,每候选一个 commit,`cargo check -p warp` 0 error,
+`cargo test -p warpui text_layout` 33/33 回归通过。
+
+### 31.1 移植清单(commit 从早到晚)
+
+**P0 安全(4)**:shell_quote_arg 注入修复 `43f4f483e`(#25351)、is_file_path 转义
+`b6caa9576`(#26138)、display chip RCE `4295ec08d`(#25398)、markdown 链接伪装文件
+`7f0c4dd23`(#25353)。
+
+**P0 崩溃/死锁(5)**:OSC 1337 缺参 panic `b9cc454ca`(#12889)、flat_storage clear underflow
+`388f5dc12`(#12085)、watcher 创建 panic `21e70d566`(#10682)、WeakModelHandle 僵尸 handle
+`654940eda`(#11767)、secret redaction 三锁死锁 `29d88e468`(#11428)。
+
+**P0 竞态(4)**:规则文件 watcher 并发覆盖 `5146a5bff`(#10238)、requested commands 误取消
+`746726094`(#10241)、SessionBootstrapped 通知时序 `91b4f0971`(#10666)、git chip 初始化漏事件
+`1175e82f0`(#10265)。
+
+**P1 终端/渲染/可靠性(19)**:PTY 写阻塞丢响应 `e59c7a491`(#11906)、secret 多字节前缀脱敏
+`89c2193e5`(#9521)、softwrap glyph indices `87a73c465`(#10445)、Shift+Backspace→DEL
+`1df6ff130`(#11563)、bash HISTSIZE sentinel `4aa545819`(#10615)、SVG 光栅化缓存键
+`5c57b3850`(#12104)、IME 光标通知 `ab0815281`(#10443)、远程批量编辑顺序坐标
+`170304d79`(#10819)、会话恢复空任务 lenient `82ec31fd5`(#11814)、文件搜索 query 下推
+`723b445a6`(#12160)、symlink watcher absolute `9f459842c`(#11073)、file tree 单根增量刷新
+`bd7202f30`(#11863)、自定义主题同步 `6ab1c167c`(#9728)、markdown pane 去重聚焦
+`6c9604f15`(#12489)、AI 块本地图片缓存失效 `da6066b75`(#12840)、新克隆仓库卡 loading
+`5d8507e40`(#9998)、焦点抢占 `9e3d6826b`(#12833)、rewind prefill slash 命令
+`9eb570cd5`(#12149)。
+
+**P2 低优先(27)**:untracked dirs diff `802a881e5`(#12590)、Detecting 状态 `5bee7a759`
+(#12126)、global_buffer is_empty 守卫 `25bb50823`(#10823)、网络错误链 `5a9ea0ffb`(#12497)
++ `23b686302`(#12712)、text_file_reader max 守卫 `11f6f4a91`(#12642)、DirectoryFetcher
+深克隆 `01778efe7`(#12362)、params_modal Space 独占 `c4946001f`(#12004)、rc_file_paths
+TypedPathBuf `af5b45b6d`(#11896)、browser_url_handler 守卫 `ffe5cff65`(#11515)、Intel HD
+2500 渲染偏移 `f3dd3768f`(#11454)、openable_file_type 加 command `c23106005`(#10543)、
+append_unmatched_line_suffix `a1b76c288`(#11350)、is_pr_info_refreshing `e6df31bb6`
+(#12454)、ControlMaster 复用 `0f28bcb33`(#10188)、哈希 8hex + SUN_PATH guard
+`18baecd45`(#11207)、session_is_local 重构 `81cc895d1`(并入 ec68c3df2)、permanent_error
+backoff `50003a851`(#12756)、消息截断 MAX_MESSAGE_SIZE `d9dee18e1`(#12406)、
+OpenCLIAgentRichInput Toggle `aea652ade`(#12229)、worktree list `59e802ea2`(#12029)、
+scroll_to_matching_header `606e1653f`(#12254)、apply diff 变更行+上下文 `89f61b63b`
+(#12790)、HarnessSelected 刷新 pane header `99a8e5090`(#12645)。
+
+### 31.2 跳过项(5,均记录原因)
+
+| 候选 | 原因 |
+|------|------|
+| `3fe061620` 文件搜索截断(#12161) | 本地 repo_metadata 已重构:无 MAX_REPO_CONTENTS_RESULTS 上限/无 ExceededMaxResultSize,遍历天然返回全部,行为已等价 |
+| `f6d8167f4` ghost group 剪枝(#12340) | 本地无 TabGroup/group_id 特性(仅 pane_group,不同概念),无等价文件 |
+| `81cc895d1` repo detection 部分 | 本地无上游 #10921 对应代码;session_is_local 部分已随 5a9ea0ffb 提交带入 |
+| `429dbf2e3` 移除 is_cancelled 过滤(#12763) | 上游改动已含于本地 commit 8a4aa3b32;本地剩余 is_cancelled 过滤在 Zap BYOP 定制函数(有意引入),移除会破坏定制 |
+| `475fdb33e` ThemeChanged 订阅(#13000) | 上游改 custom_inference_modal.rs + ApiKeysWidget,本地设置页为 Zap 定制区(agent_providers_widget.rs),无对应组件 |
+
+### 31.3 关键适配点
+
+- **secret redaction 锁**:29d88e468 上游基于三 RwLock,本地(§31 前已改 Mutex<Arc<SecretsRegex>>
+  快照结构)直接在其上照搬,无冲突。
+- **4b 多字节脱敏**:89c2193e5 适配到 Mutex 快照结构,find.rs 加语法感知
+  `replace_unicode_word_boundaries`(处理 `\b`、`[\b]`、`\B`)+ count_preceding_backslashes。
+- **5w worktree**:59e802ea2 上游用 shell_single_quote 字符串命令;本地沿用类型化
+  `PromptChipShellCommand::GitCheckout { encoded_git_branch_on_click_value }`,render 端按
+  shell 类型解码渲染(PowerShell 也正确),比上游更安全,行为等价。
+- **secrets_tests 顺序依赖**:并行跑时 7/10 失败(全局 SECRETS_REGEX 快照被并行测试相互
+  覆盖,含 5 个既有未动测试),上游同款设计,单线程/隔离均通过;非本次移植引入。
+- **claude_md 测试**:crates/ai project_context 3 个 claude_md 测试在 HEAD 即失败(本地遗留
+  问题,与 CLAUDE.md 支持有关),非本轮引入。
+
+### 31.4 验证状态(2026-08-13)
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp` | 0 error(最终全量,54+1 个 commit) |
+| `cargo test -p warpui text_layout` | 33/33 |
+| 安全 4 个(P0)人工复核 | 注入路径全部经 shell_quote_arg 转义,无未转义拼接 |
+| 子代理并行 | 10 批并行移植,期间一次误 stash 事故(Main 已恢复),5q/5x 重放后内容一致 |
+
+---
+
+*文档版本:v2.10*
 *下次合并前必读*
