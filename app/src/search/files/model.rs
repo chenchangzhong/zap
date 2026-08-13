@@ -137,26 +137,28 @@ impl FileSearchModel {
     }
 
     /// Gets repository contents (files and directories) from the LocalRepoMetadataModel for the current working directory.
-    /// Results are cached per repo root and invalidated when the file tree changes.
+    ///
+    /// `query` 非空时,query 会被下推到 repo-metadata 遍历层作为过滤器,
+    /// 使结果上限(如有)作用于"匹配的文件"而非遍历顺序最先遇到的条目;
+    /// 这类 query 相关结果不缓存。`query` 为空(零状态)时返回完整未过滤内容,
+    /// 按 repo 根路径缓存,文件树变化时失效。
     #[cfg(feature = "local_fs")]
-    pub fn get_repo_contents(&self, app: &AppContext) -> Arc<Vec<FileSearchResult>> {
+    pub fn get_repo_contents(&self, query: &str, app: &AppContext) -> Arc<Vec<FileSearchResult>> {
         let Some(repo_root) = self.repo_root(app) else {
             return Arc::new(Vec::new());
         };
+
+        // Query-filtered results are query-specific, so bypass the per-repo
+        // cache and traverse the in-memory index fresh.
+        if !query.is_empty() {
+            return Arc::new(self.get_contents_from_repo(&repo_root, query, app));
+        }
 
         if let Some(cached) = self.repo_contents_cache.borrow().get(&repo_root) {
             return cached.clone();
         }
 
-        let repo_metadata = RepoMetadataModel::as_ref(app);
-        let Some(id) = repo_metadata::RepositoryIdentifier::try_local(&repo_root) else {
-            return Arc::new(Vec::new());
-        };
-        let contents = if repo_metadata.has_repository(&id, app) {
-            self.get_contents_from_repo(&repo_root, repo_metadata, GetContentsArgs::default(), app)
-        } else {
-            Vec::new()
-        };
+        let contents = self.get_contents_from_repo(&repo_root, query, app);
 
         let arc = Arc::new(contents);
         self.repo_contents_cache
@@ -172,7 +174,7 @@ impl FileSearchModel {
         &self,
         app: &AppContext,
     ) -> (Arc<Vec<FileSearchResult>>, HashSet<String>) {
-        let contents = self.get_repo_contents(app);
+        let contents = self.get_repo_contents("", app);
         let git_changed_files = self
             .repo_root(app)
             .and_then(|repo_root| self.get_git_changed_files(&repo_root).ok())
@@ -182,7 +184,7 @@ impl FileSearchModel {
 
     /// Gets repository contents from the LocalRepoMetadataModel for the current working directory (WASM stub)
     #[cfg(not(feature = "local_fs"))]
-    pub fn get_repo_contents(&self, _app: &AppContext) -> Arc<Vec<FileSearchResult>> {
+    pub fn get_repo_contents(&self, _query: &str, _app: &AppContext) -> Arc<Vec<FileSearchResult>> {
         Arc::new(Vec::new())
     }
 
@@ -195,13 +197,37 @@ impl FileSearchModel {
         (Arc::new(Vec::new()), HashSet::new())
     }
 
-    /// Helper method to get repository contents from a specific repository
+    /// 构建用于遍历 repo metadata 的 [`GetContentsArgs`]。
+    ///
+    /// 空 `query` 返回默认参数(不过滤)。非空 `query` 安装遍历过滤器,
+    /// 只保留 `relative_path` 生成的 repo 相对路径与 query 模糊匹配的条目。
+    /// 把 query 下推到遍历层,确保结果上限(如有)作用于"匹配的文件"而非
+    /// 遍历顺序最先遇到的条目。
+    #[cfg(feature = "local_fs")]
+    fn contents_args<F>(query: &str, relative_path: F) -> GetContentsArgs
+    where
+        F: for<'a> Fn(&repo_metadata::RepoContent<'a>) -> Option<String> + Send + Sync + 'static,
+    {
+        if query.is_empty() {
+            return GetContentsArgs::default();
+        }
+        let query = query.to_string();
+        GetContentsArgs::default().with_filter(move |content| {
+            relative_path(content)
+                .is_some_and(|path| FileSearchModel::fuzzy_match_path(&path, &query).is_some())
+        })
+    }
+
+    /// Gets repository contents for a local repo root, converting absolute
+    /// paths to repo-relative `FileSearchResult`s.
+    ///
+    /// `query` 非空时作为遍历过滤器下推(见 [`Self::contents_args`]),使
+    /// repo-metadata 结果上限(如有)作用于匹配文件而非遍历顺序最先遇到的条目。
     #[cfg(feature = "local_fs")]
     fn get_contents_from_repo(
         &self,
         repo_path: &Path,
-        repo_metadata: &repo_metadata::wrapper_model::RepoMetadataModel,
-        args: GetContentsArgs,
+        query: &str,
         app: &AppContext,
     ) -> Vec<FileSearchResult> {
         // Canonicalize the repository path to handle symlinks consistently
@@ -209,9 +235,26 @@ impl FileSearchModel {
             return Vec::new();
         };
 
+        let repo_metadata = RepoMetadataModel::as_ref(app);
         let Some(id) = repo_metadata::RepositoryIdentifier::try_local(repo_path) else {
             return Vec::new();
         };
+
+        let args = Self::contents_args(query, {
+            let canonical_repo_path = canonical_repo_path.clone();
+            move |content| {
+                let local = match content {
+                    repo_metadata::RepoContent::File(file) => file.path.to_local_path_lossy(),
+                    repo_metadata::RepoContent::Directory(dir) => dir.path.to_local_path_lossy(),
+                };
+                local
+                    .strip_prefix(&canonical_repo_path)
+                    .ok()
+                    .map(|relative| relative.to_string_lossy().to_string())
+            }
+        });
+
+        // 截断结果(按 repo metadata 预算封顶)有意原样使用,返回部分匹配而非空结果。
         if let Some(contents) = repo_metadata.get_repo_contents(&id, args, app) {
             contents
                 .iter()
