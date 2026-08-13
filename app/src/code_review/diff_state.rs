@@ -300,6 +300,9 @@ impl DiffMode {
 /// and changes against the main branch.
 #[derive(Clone, Default)]
 enum InternalDiffState {
+    /// Repo 检测已启动但尚未完成。此时还不知道路径是否在 git 仓库内,
+    /// 因此以加载态呈现,而不是过早给出 "not a repository" 结论。
+    Detecting,
     #[default]
     NotInRepository,
     Loading,
@@ -420,7 +423,11 @@ impl DiffStateModel {
         let model = Self {
             #[cfg(feature = "local_fs")]
             repository: None,
-            state: InternalDiffState::default(),
+            state: if repo_path.is_some() {
+                InternalDiffState::Detecting
+            } else {
+                InternalDiffState::NotInRepository
+            },
             #[cfg(feature = "local_fs")]
             subscriber_id: None,
             mode: DiffMode::default(),
@@ -443,7 +450,18 @@ impl DiffStateModel {
                 });
 
                 ctx.spawn(fut, move |me, repo_path_opt, ctx| {
-                    me.maybe_set_new_active_repository(repo_path_opt.as_deref(), ctx);
+                    if let Some(repo_path) = repo_path_opt.as_deref() {
+                        if let Some(repo_handle) = DetectedRepositories::as_ref(ctx)
+                            .get_watched_repo_for_path(repo_path, ctx)
+                        {
+                            me.set_active_repository(repo_handle, ctx);
+                            return;
+                        }
+                    }
+                    // Repo 检测完成但未找到仓库。通知订阅者(如 server model)
+                    // 排空 pending 响应并回落到 NotInRepository 状态。
+                    me.state = InternalDiffState::NotInRepository;
+                    ctx.emit(DiffStateModelEvent::NewDiffsComputed(None));
                 });
             }
         }
@@ -479,8 +497,8 @@ impl DiffStateModel {
 
     pub fn get(&self) -> DiffState {
         match &self.state {
+            InternalDiffState::Detecting | InternalDiffState::Loading => DiffState::Loading,
             InternalDiffState::NotInRepository => DiffState::NotInRepository,
-            InternalDiffState::Loading => DiffState::Loading,
             InternalDiffState::Loaded(diffs) => match &diffs.changes {
                 Ok(git_diff_data) => DiffState::Loaded(git_diff_data.clone()),
                 Err(err) => DiffState::Error(err.clone()),
