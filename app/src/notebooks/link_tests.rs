@@ -14,6 +14,7 @@ use warpui::{App, ModelHandle, WindowId};
 use crate::{
     notebooks::{file::is_markdown_file, link::LinkEvent},
     terminal::{model::session::Session, shell::ShellType},
+    test_util::settings::initialize_settings_for_tests,
     util::openable_file_type::FileTarget,
     workspace::ActiveSession,
 };
@@ -205,6 +206,44 @@ fn test_open_local_image_uses_system_generic_target() {
             }
             other => panic!("Expected OpenFileWithTarget event, got {other:?}"),
         }
+    });
+}
+
+#[test]
+fn test_open_extensionless_non_text_file_does_not_emit_open_event() {
+    // Regression test: an extensionless file (e.g. a disguised executable) is classified as
+    // binary by `is_file_openable_in_warp`, which previously routed it to `SystemGeneric` and
+    // ultimately `NSWorkspace.openURL` — allowing arbitrary code execution. After the fix,
+    // such files are revealed in Finder / Explorer instead of opened, so no `OpenFileWithTarget`
+    // event should be emitted.
+    App::test((), |mut app| async move {
+        let base = tempdir().unwrap();
+        let base_path = base.path();
+        let malicious_path = base_path.join("abc");
+        touch(&malicious_path).await;
+        initialize_settings_for_tests(&mut app);
+        let links = init_link_model(&mut app, Some(base_path));
+
+        let events = Arc::new(Mutex::new(vec![]));
+        {
+            let events = events.clone();
+            app.update(|ctx| {
+                ctx.subscribe_to_model(&links, move |_, event, _| {
+                    events.lock().push(event.clone());
+                })
+            });
+        }
+
+        links.update(&mut app, |links, ctx| {
+            links.open(local_file(&malicious_path), ctx);
+        });
+
+        let events = events.lock();
+        assert!(
+            events.is_empty(),
+            "Expected no LinkEvent to be emitted for an extensionless non-text file, \
+             but got: {events:?}"
+        );
     });
 }
 
