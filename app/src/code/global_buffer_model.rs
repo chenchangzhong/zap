@@ -1340,28 +1340,41 @@ impl GlobalBufferModel {
         };
 
         // Wire offsets are 1-indexed (matching CharOffset), so no conversion needed.
-        let new_version = ContentVersion::new();
+        //
+        // **Coordinate convention:** Each `TextEdit` in `edits` uses sequential
+        // coordinates — its offsets reference the buffer state *after* all
+        // preceding edits in the slice have been applied. This matches how the
+        // client constructs edits from `PreciseDelta.replaced_range`, which is
+        // resolved via anchors in intermediate buffer states. Edits are therefore
+        // applied one at a time rather than in a single batch call to
+        // `insert_at_char_offset_ranges` (which expects all offsets in the
+        // original-buffer coordinate space).
         buffer.update(ctx, |buffer, ctx| {
-            let max_offset = buffer.max_charoffset();
-            // wire offset 饱和转换 + clamp 到 buffer 末尾,双重防御。
-            let char_edits: Vec<(std::ops::Range<CharOffset>, String)> = edits
-                .iter()
-                .map(|edit| {
-                    let start = CharOffset::from(
-                        usize::try_from(edit.start_offset)
-                            .unwrap_or(usize::MAX)
-                            .min(max_offset.as_usize()),
-                    );
-                    let end = CharOffset::from(
-                        usize::try_from(edit.end_offset)
-                            .unwrap_or(usize::MAX)
-                            .min(max_offset.as_usize()),
-                    );
-                    (start..end, edit.text.clone())
-                })
-                .collect();
-
-            buffer.insert_at_char_offset_ranges(char_edits, new_version, ctx);
+            // Apply each edit sequentially: offsets are in sequential coordinates
+            // (each relative to the buffer after all preceding edits), so we must
+            // apply one at a time and recompute max_offset for each.
+            for edit in edits {
+                let max_offset = buffer.max_charoffset();
+                // wire offset 饱和转换 + clamp 到 buffer 末尾,双重防御。
+                let start = CharOffset::from(
+                    usize::try_from(edit.start_offset)
+                        .unwrap_or(usize::MAX)
+                        .min(max_offset.as_usize()),
+                );
+                let end = CharOffset::from(
+                    usize::try_from(edit.end_offset)
+                        .unwrap_or(usize::MAX)
+                        .min(max_offset.as_usize()),
+                );
+                buffer.insert_at_char_offset_ranges(
+                    vec![(start..end, edit.text.clone())],
+                    ContentVersion::new(),
+                    ctx,
+                );
+            }
+            // Allocate the final version after all per-edit versions so the
+            // monotonic ContentVersion counter moves forward.
+            buffer.set_version(ContentVersion::new());
         });
 
         true
