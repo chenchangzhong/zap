@@ -75,7 +75,7 @@ email_address = { git = "https://github.com/warpdotdev/rust-email_address", bran
 embed_plist = "1.2"
 enclose = "1.1.8"
 enum-iterator.workspace = true
-event-listener = "5.4.0"
+event-listener.workspace = true
 field_mask.workspace = true
 flate2 = "1.0.17"
 float-cmp.workspace = true
@@ -422,6 +422,7 @@ embed-resource = "3.0"
 # Note that we support channel-specific enables for these features
 [features]
 ai_resume_button = []
+async_find = []
 autoupdate = []
 figma_detection = []
 bundled_skills = []

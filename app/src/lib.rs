@@ -2286,6 +2286,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
     flags.insert(FeatureFlag::QueueSlashCommand);
 
     let extra_flags: &[FeatureFlag] = &[
+        #[cfg(feature = "async_find")]
+        FeatureFlag::AsyncFind,
         #[cfg(feature = "autoupdate")]
         FeatureFlag::Autoupdate,
         #[cfg(feature = "changelog")]
