@@ -2350,6 +2350,16 @@ impl DiffStateModel {
                 // all content as additions, which is the correct representation.
                 Some(String::new())
             }
+            GitFileStatus::Renamed { old_path } => {
+                // 工作树里文件只存在于新路径;HEAD 上它仍在旧路径。镜像 merge-base 路径
+                // (见 file_diff_for_path),从 old_path 读 baseline 内容。
+                log::debug!(
+                    "[GIT OPERATION] diff_state.rs get_file_content_at_head git show HEAD:{old_path}"
+                );
+                run_git_command(repo_path, &["show", &format!("HEAD:{old_path}")])
+                    .await
+                    .ok()
+            }
             _ => {
                 log::debug!(
                     "[GIT OPERATION] diff_state.rs get_file_content_at_head git show HEAD:{}",
@@ -2460,15 +2470,19 @@ impl DiffStateModel {
                         file_path_str,
                     ]
                 }
-                GitFileStatus::Renamed { .. } => {
-                    // For renamed files - compare against index
+                GitFileStatus::Renamed { old_path } => {
+                    // 直接对 HEAD 比较工作树,同时传新旧路径(镜像上方 merge-base 分支)。
+                    // 覆盖 rename 与内容修改的所有 staged/unstaged 组合:之前只对 index
+                    // 比较,当 rename 与修改都 staged 时工作树与 index 完全一致,会得到空 diff。
                     vec![
                         "diff",
                         "--no-ext-diff",
                         "--patch-with-raw",
                         "-z",
                         "--no-color",
+                        "HEAD",
                         "--",
+                        old_path,
                         file_path_str,
                     ]
                 }
