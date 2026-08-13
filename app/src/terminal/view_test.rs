@@ -5127,7 +5127,7 @@ fn cli_agent_rich_input_open_sets_terminal_keymap_context() {
     })
 }
 
-// 行为测试：当 rich input 已打开时，再次触发 OpenCLIAgentRichInput action
+// 行为测试：当 rich input 已打开时，再次触发 ToggleCLIAgentRichInput action
 // （即 Ctrl-G 实际命中绑定后被 dispatch 的 handler）应当关闭 rich input。
 // 这覆盖了本次修复的核心 toggle 路径。
 #[test]
@@ -5146,10 +5146,10 @@ fn ctrl_g_action_closes_open_cli_agent_rich_input() {
                 view.is_cli_agent_rich_input_open(ctx),
                 "rich input should be open before toggling"
             );
-            view.handle_action(&TerminalAction::OpenCLIAgentRichInput, ctx);
+            view.handle_action(&TerminalAction::ToggleCLIAgentRichInput, ctx);
             assert!(
                 !view.is_cli_agent_rich_input_open(ctx),
-                "OpenCLIAgentRichInput should close rich input when already open"
+                "ToggleCLIAgentRichInput should close rich input when already open"
             );
         });
     })

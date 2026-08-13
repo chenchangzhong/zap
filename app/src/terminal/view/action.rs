@@ -390,9 +390,9 @@ pub enum TerminalAction {
     },
     /// Toggle PTY recording for this session.
     ToggleSessionRecording,
-    /// Open the rich input editor for composing a prompt to send to a CLI agent.
+    /// Toggle the rich input editor for composing a prompt to send to a CLI agent.
     /// Triggered by Ctrl-G when a CLI agent is detected, or from the footer button.
-    OpenCLIAgentRichInput,
+    ToggleCLIAgentRichInput,
     /// 在 CLI agent rich input 打开时，用 cmd-up 把焦点切到终端 TUI。
     FocusCLIAgentTerminal,
     /// 在 CLI agent rich input 打开时，用 cmd-down 把焦点切回 rich input。
@@ -642,7 +642,7 @@ impl fmt::Debug for TerminalAction {
             ToggleUsageFooter => write!(f, "ToggleUsageFooter"),
             RevealChildAgent { .. } => write!(f, "RevealChildAgent"),
             ToggleSessionRecording => write!(f, "ToggleSessionRecording"),
-            OpenCLIAgentRichInput => write!(f, "OpenCLIAgentRichInput"),
+            ToggleCLIAgentRichInput => write!(f, "ToggleCLIAgentRichInput"),
             FocusCLIAgentTerminal => write!(f, "FocusCLIAgentTerminal"),
             FocusCLIAgentRichInput => write!(f, "FocusCLIAgentRichInput"),
         }
