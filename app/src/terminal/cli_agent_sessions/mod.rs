@@ -272,7 +272,20 @@ impl CLIAgentSession {
                 // 而被 ModelSwitchReady 分支拒绝，留下指向失效 socket 的陈旧绑定。
                 // subagent 不上报 session_start，故此处清除不会放行其 model_switch_ready。
                 self.session_context.model_switch_socket_id = None;
-                return None;
+                // 上一周期处于终态（omp plan 写完计划后执行、失败后重试、或进程内
+                // session 切换/恢复落在已完成会话上）时翻回 InProgress：这些场景下 omp
+                // 新开/切到会话不会发 prompt_submit（执行是自动的，恢复则停在输入等待），
+                // 若不翻回，状态会停留在 Success/Failed，标签栏图标无法反映会话回到活跃。
+                // 短暂误标（如恢复后停在输入等待）在下一次 Stop 时自愈。
+                // 进行中 / 阻塞等非终态保持原样。
+                if matches!(
+                    self.status,
+                    CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Failed { .. }
+                ) {
+                    CLIAgentSessionStatus::InProgress
+                } else {
+                    return None;
+                }
             }
             CLIAgentEventType::Unknown(_) => return None,
         };

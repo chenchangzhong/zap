@@ -499,6 +499,143 @@ fn subagent_model_switch_ready_does_not_overwrite_main_session_socket() {
 }
 
 #[test]
+fn session_start_from_success_flips_to_in_progress() {
+    // omp plan 模式：写完计划后 stop → Success，执行阶段新开会话(session_start)
+    // 自动执行不发 prompt_submit，需翻回 InProgress 让标签栏反映执行中。
+    let mut session = CLIAgentSession {
+        agent: CLIAgent::OhMyPi,
+        status: CLIAgentSessionStatus::Success,
+        session_context: CLIAgentSessionContext::default(),
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        current_model: None,
+    };
+
+    let event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::SessionStart,
+        session_id: Some("new-session".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+
+    let new_status = session.apply_event(&event).expect("status should flip");
+    assert_eq!(new_status, CLIAgentSessionStatus::InProgress);
+    assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+}
+
+#[test]
+fn session_start_from_failed_flips_to_in_progress() {
+    // 会话失败后重试：新 session_start 应翻回 InProgress。
+    let mut session = CLIAgentSession {
+        agent: CLIAgent::OhMyPi,
+        status: CLIAgentSessionStatus::Failed {
+            error_type: Some("error".to_owned()),
+            message: Some("boom".to_owned()),
+        },
+        session_context: CLIAgentSessionContext::default(),
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        current_model: None,
+    };
+
+    let event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::SessionStart,
+        session_id: Some("new-session".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+
+    let new_status = session.apply_event(&event).expect("status should flip");
+    assert_eq!(new_status, CLIAgentSessionStatus::InProgress);
+}
+
+#[test]
+fn session_start_keeps_in_progress_status() {
+    // 最常见状态（每次新启动、以及成功翻转后的目标状态）：session_start 必须保持
+    // InProgress（apply_event 返回 None），否则会误发 StatusChanged 触发多余更新。
+    let mut session = CLIAgentSession {
+        agent: CLIAgent::OhMyPi,
+        status: CLIAgentSessionStatus::InProgress,
+        session_context: CLIAgentSessionContext::default(),
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        current_model: None,
+    };
+
+    let event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::SessionStart,
+        session_id: Some("new-session".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+
+    assert!(session.apply_event(&event).is_none());
+    assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+}
+
+#[test]
+fn session_start_keeps_non_terminal_status() {
+    // 进行中 / 阻塞等非终态：session_start 不翻状态（apply_event 返回 None）。
+    let mut session = CLIAgentSession {
+        agent: CLIAgent::OhMyPi,
+        status: CLIAgentSessionStatus::Blocked {
+            message: Some("waiting".to_owned()),
+        },
+        session_context: CLIAgentSessionContext::default(),
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        current_model: None,
+    };
+
+    let event = CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::OhMyPi,
+        event: CLIAgentEventType::SessionStart,
+        session_id: Some("new-session".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+
+    assert!(session.apply_event(&event).is_none());
+    assert_eq!(
+        session.status,
+        CLIAgentSessionStatus::Blocked {
+            message: Some("waiting".to_owned()),
+        }
+    );
+}
+
+#[test]
 fn session_start_clears_socket_then_matching_ready_rebinds() {
     // 会话切换：session_start(新 id) 开启新绑定周期，随后的 model_switch_ready 重绑。
     let mut session = CLIAgentSession {
