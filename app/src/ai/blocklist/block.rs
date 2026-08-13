@@ -4043,6 +4043,10 @@ impl AIBlock {
 
         if !cards.is_empty() {
             self.has_imported_comments = true;
+            let conversation_id = self.client_ids.conversation_id;
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |model, _| {
+                model.mark_conversation_has_imported_comments(conversation_id);
+            });
         }
 
         self.imported_comments.insert(
@@ -5018,15 +5022,22 @@ impl AIBlock {
     /// bulk "Open all in code review" button based on whether the current working
     /// directory is still within the imported comments' repository.
     fn update_imported_comments_disabled_state(&mut self, ctx: &mut ViewContext<Self>) {
-        let canonical_cwd = self
-            .active_session
-            .as_ref(ctx)
-            .current_working_directory()
-            .and_then(|cwd| dunce::canonicalize(cwd).ok());
-
         if self.has_imported_comments {
+            let canonical_cwd = self
+                .active_session
+                .as_ref(ctx)
+                .current_working_directory()
+                .and_then(|cwd| dunce::canonicalize(cwd).ok());
             self.update_own_imported_comments_disabled_state(canonical_cwd.as_deref(), ctx);
-        } else if self.model.is_latest_non_passive_exchange_in_root_task(ctx) {
+        } else if BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation_has_imported_comments(&self.client_ids.conversation_id)
+            && self.model.is_latest_non_passive_exchange_in_root_task(ctx)
+        {
+            let canonical_cwd = self
+                .active_session
+                .as_ref(ctx)
+                .current_working_directory()
+                .and_then(|cwd| dunce::canonicalize(cwd).ok());
             self.update_open_all_button_disabled_state(canonical_cwd.as_deref(), ctx);
         } else {
             return;

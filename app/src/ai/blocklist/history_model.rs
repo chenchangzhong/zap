@@ -200,6 +200,9 @@ pub struct BlocklistAIHistoryModel {
     /// via `set_parent_for_conversation` and `restore_conversations`.
     children_by_parent: HashMap<AIConversationId, Vec<AIConversationId>>,
 
+    /// Conversations that have had at least one AIBlock receive imported review comments.
+    conversations_with_imported_comments: HashSet<AIConversationId>,
+
     #[cfg(feature = "local_fs")]
     db_connection: Option<Arc<Mutex<SqliteConnection>>>,
 }
@@ -401,6 +404,17 @@ impl BlocklistAIHistoryModel {
             .get(parent_id)
             .map(|v| v.as_slice())
             .unwrap_or_default()
+    }
+
+    /// Records that the given conversation has had at least one AIBlock receive
+    /// imported review comments.
+    pub fn mark_conversation_has_imported_comments(&mut self, id: AIConversationId) {
+        self.conversations_with_imported_comments.insert(id);
+    }
+
+    /// Whether any AIBlock in the given conversation has received imported review comments.
+    pub fn conversation_has_imported_comments(&self, id: &AIConversationId) -> bool {
+        self.conversations_with_imported_comments.contains(id)
     }
 
     /// Sets a live conversation's server token, and updates the mapping in the history
