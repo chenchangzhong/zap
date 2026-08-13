@@ -210,6 +210,9 @@ impl TerminalView {
                 ctx.notify();
             }
             AmbientAgentViewModelEvent::HarnessSelected => {
+                // 立即刷新 pane header,让 harness 图标在选择变化时马上更新
+                // (上游 99a8e5090,修复 pane header 延迟几秒才刷新)。
+                self.update_pane_configuration(ctx);
                 ctx.notify();
             }
         }
