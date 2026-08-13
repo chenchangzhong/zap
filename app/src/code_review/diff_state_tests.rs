@@ -236,3 +236,73 @@ fn test_parse_git_status_file_without_spaces_still_works() {
     assert_eq!(result[0].0, std::path::PathBuf::from("simple.txt"));
     assert_eq!(result[0].1, GitFileStatus::Modified);
 }
+
+#[tokio::test]
+async fn untracked_directory_diff_is_empty_and_non_binary() {
+    let repo_dir = tempfile::tempdir().expect("create temp repo dir");
+    std::fs::create_dir(repo_dir.path().join("nested-repo")).expect("create nested dir");
+
+    // `git status` 会把嵌套 repo/worktree 报告为单个 untracked 目录条目(带尾斜杠)。
+    // 它必须短路为空非二进制 diff —— 错误回退否则会误标为二进制,视图会渲染
+    // "Binary file - no diff available" 而不是 "New empty file"。
+    let diff = DiffStateModel::get_file_diff(
+        repo_dir.path(),
+        &std::path::PathBuf::from("nested-repo/"),
+        &GitFileStatus::Untracked,
+        false,
+        None,
+    )
+    .await
+    .expect("get_file_diff should succeed for an untracked directory");
+
+    assert!(!diff.is_binary);
+    assert_eq!(diff.hunks.len(), 0);
+    assert_eq!(diff.status, GitFileStatus::Untracked);
+}
+
+#[tokio::test]
+async fn untracked_directory_has_no_baseline_content() {
+    let repo_dir = tempfile::tempdir().expect("create temp repo dir");
+    std::fs::create_dir(repo_dir.path().join("nested-repo")).expect("create nested dir");
+    std::fs::write(repo_dir.path().join("new-file.txt"), "hello\n").expect("write file");
+
+    // 目录条目没有 baseline,因此不会为它构造 editor。
+    let dir_content = DiffStateModel::get_file_content_at_head(
+        repo_dir.path(),
+        &std::path::PathBuf::from("nested-repo/"),
+        &GitFileStatus::Untracked,
+    )
+    .await;
+    assert_eq!(dir_content, None);
+
+    // 普通 untracked 文件保留空 baseline。
+    let file_content = DiffStateModel::get_file_content_at_head(
+        repo_dir.path(),
+        &std::path::PathBuf::from("new-file.txt"),
+        &GitFileStatus::Untracked,
+    )
+    .await;
+    assert_eq!(file_content, Some(String::new()));
+}
+
+#[tokio::test]
+async fn num_lines_in_file_if_non_binary_counts_lines_in_text_file() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let file_path = dir.path().join("file.txt");
+    std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write file");
+
+    let num_lines = DiffStateModel::num_lines_in_file_if_non_binary(&file_path)
+        .await
+        .expect("counting a regular file should succeed");
+    assert_eq!(num_lines, Some(3));
+}
+
+#[tokio::test]
+async fn num_lines_in_file_if_non_binary_errors_for_directory() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+
+    // 目录不可计数。metadata 调用方把该错误逐条目降级为 0 行贡献,
+    // 而不是让整个 metadata 计算失败。
+    let result = DiffStateModel::num_lines_in_file_if_non_binary(dir.path()).await;
+    assert!(result.is_err());
+}
