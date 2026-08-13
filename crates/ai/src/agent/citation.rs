@@ -51,7 +51,17 @@ impl TryFrom<api::Citation> for AIAgentCitation {
             api::DocumentType::WebPage => Ok(AIAgentCitation::WebPage {
                 url: citation.document_id,
             }),
-            api::DocumentType::Unknown => Err(UnknownCitationTypeError),
+            api::DocumentType::Unknown => {
+                // 服务端把未知的 citation document_type 映射为 Unknown。记录原始值供诊断
+                // (只记 document_id 长度,不含值本身——LLM 派生内容可能携带 URL/路径等
+                // 用户数据),整条消息转换不受影响。
+                log::warn!(
+                    "Citation has an unrecognized document type; dropping it (document_type={}, document_id_len={})",
+                    citation.document_type,
+                    citation.document_id.len()
+                );
+                Err(UnknownCitationTypeError)
+            }
         }
     }
 }
