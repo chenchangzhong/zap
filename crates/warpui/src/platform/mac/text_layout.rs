@@ -453,6 +453,35 @@ fn apply_paragraph_style_settings(
     }
 }
 
+/// 合并相邻且同 style 的连续 run(无 gap)为单个 run。
+///
+/// Core Text 的 attribute-range 簿记成本随 attributed string 中不同 range 数量增长,即使许多
+/// range 样式相同也如此。预先合并相邻同 style run 能限制 range 数量且不改变视觉输出。
+fn merge_adjacent_identical_runs(
+    style_runs: &[(Range<usize>, StyleAndFont)],
+) -> Cow<'_, [(Range<usize>, StyleAndFont)]> {
+    // 常见情形已最大化合并时避免分配。
+    let first_mergeable = style_runs
+        .windows(2)
+        .position(|pair| pair[0].0.end == pair[1].0.start && pair[0].1 == pair[1].1);
+    let Some(first_mergeable) = first_mergeable else {
+        return Cow::Borrowed(style_runs);
+    };
+
+    let mut merged: Vec<(Range<usize>, StyleAndFont)> = Vec::with_capacity(style_runs.len());
+    merged.extend_from_slice(&style_runs[..first_mergeable]);
+    for (range, style) in &style_runs[first_mergeable..] {
+        if let Some(last) = merged.last_mut() {
+            if last.0.end == range.start && last.1 == *style {
+                last.0.end = range.end;
+                continue;
+            }
+        }
+        merged.push((range.clone(), *style));
+    }
+    Cow::Owned(merged)
+}
+
 /// Creates a `CFAttributedString` out of `text` with the correct font ranges based on `runs`.
 fn create_attributed_string(
     text: &str,
@@ -470,6 +499,9 @@ fn create_attributed_string(
     unsafe {
         CFAttributedStringBeginEditing(attributed_string.as_concrete_TypeRef());
     }
+
+    let style_runs = merge_adjacent_identical_runs(style_runs);
+    let style_runs = style_runs.as_ref();
 
     let mut utf16_lens = text.chars().map(|c| c.len_utf16());
     let mut prev_char_ix: usize = 0;
