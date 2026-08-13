@@ -4493,6 +4493,9 @@ impl Buffer {
         ctx: &mut ModelContext<Self>,
     ) {
         if edits.is_empty() {
+            // TODO: 临时方案。后续会支持增量更新后正确维护 undo stack。
+            self.reset_undo_stack();
+            self.set_version(new_version);
             return;
         }
 

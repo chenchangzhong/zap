@@ -539,14 +539,19 @@ impl GlobalBufferModel {
         state.set_base_content_version(new_version);
 
         if let Some(char_offset_edits) = char_offset_edits {
-            if let BufferSource::ServerLocal { sync_clock, .. } = &mut state.source {
-                let new_sv = sync_clock.bump_server();
-                ctx.emit(GlobalBufferModelEvent::ServerLocalBufferUpdated {
-                    file_id,
-                    edits: char_offset_edits,
-                    new_server_version: new_sv,
-                    expected_client_version: sync_clock.client_version,
-                });
+            // 跳过空 edits 广播 —— 文件 watcher 检测到写入但内容相同(如 save 后)。
+            // 发送空 BufferUpdatedPush 会让客户端推进 base_content_version 而不更新
+            // buffer version,造成虚假的 unsaved changes 状态。
+            if !char_offset_edits.is_empty() {
+                if let BufferSource::ServerLocal { sync_clock, .. } = &mut state.source {
+                    let new_sv = sync_clock.bump_server();
+                    ctx.emit(GlobalBufferModelEvent::ServerLocalBufferUpdated {
+                        file_id,
+                        edits: char_offset_edits,
+                        new_server_version: new_sv,
+                        expected_client_version: sync_clock.client_version,
+                    });
+                }
             }
         } else {
             ctx.emit(GlobalBufferModelEvent::BufferUpdatedFromFileEvent {
