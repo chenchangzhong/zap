@@ -724,6 +724,12 @@ fn should_fork_from_last_known_good_state(
             will_attempt_resume,
             ..
         } => !will_attempt_resume,
+        // A transient network failure that won't auto-resume can be retried from the last
+        // known good state just like any other non-resumable error.
+        RenderableAIError::TransientNetworkError {
+            will_attempt_resume,
+            ..
+        } => !will_attempt_resume,
         // Cloud startup failures mean the agent never started; there is no prior
         // successful state to fork from.
         RenderableAIError::CloudStartupFailed(_) => false,

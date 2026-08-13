@@ -18,7 +18,7 @@ use warp_core::features::FeatureFlag;
 
 #[cfg(test)]
 mod suggestion_test;
-use crate::ai::api_error::AIApiError;
+use crate::ai::api_error::{AIApiError, DeserializationError};
 use crate::ai::block_context::BlockContext;
 use crate::ai::blocklist::block::view_impl::output::are_all_text_sections_empty;
 use crate::ai::skills::SkillDescriptor;
@@ -684,7 +684,7 @@ impl AIAgentOutput {
 }
 
 /// Represents user visible errors.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub enum RenderableAIError {
     QuotaLimit,
     ServerOverloaded,
@@ -696,6 +696,16 @@ pub enum RenderableAIError {
     },
     AwsBedrockCredentialsExpiredOrInvalid {
         model_name: String,
+    },
+    /// A transient network failure (lost connection or truncated response stream). Carries its
+    /// own complete user-facing copy; `kind` preserves the structured cause (including the raw
+    /// API error) so user reports can disambiguate the different causes behind the shared message.
+    TransientNetworkError {
+        kind: TransientNetworkErrorKind,
+        will_attempt_resume: bool,
+        /// When `will_attempt_resume` is true, this indicates whether we're waiting for network
+        /// connectivity before attempting the resume.
+        waiting_for_network: bool,
     },
     CloudStartupFailed(String),
     Other {
@@ -718,6 +728,32 @@ impl RenderableAIError {
 }
 
 impl RenderableAIError {
+    const TRANSIENT_NETWORK_ERROR_MESSAGE: &'static str =
+        "Zap lost connection while receiving the agent response. This is usually temporary.";
+
+    /// Creates a transient network error. `kind` is the structured cause (including the raw API
+    /// error where one exists), preserved so user reports can disambiguate the different causes
+    /// behind the shared user-facing copy.
+    pub fn transient_network_error(
+        will_attempt_resume: bool,
+        waiting_for_network: bool,
+        kind: TransientNetworkErrorKind,
+    ) -> Self {
+        Self::TransientNetworkError {
+            kind,
+            will_attempt_resume,
+            waiting_for_network,
+        }
+    }
+
+    fn is_transient_network_transport_error(error: &reqwest::Error) -> bool {
+        // If reqwest has an HTTP status, the server responded. Preserve the existing generic
+        // rendering for those failures rather than calling them lost connections.
+        error.status().is_none()
+    }
+}
+
+impl RenderableAIError {
     pub fn is_invalid_api_key(&self) -> bool {
         matches!(self, Self::InvalidApiKey { .. })
     }
@@ -731,6 +767,9 @@ impl RenderableAIError {
         matches!(
             self,
             Self::Other {
+                will_attempt_resume: true,
+                ..
+            } | Self::TransientNetworkError {
                 will_attempt_resume: true,
                 ..
             }
@@ -749,17 +788,56 @@ impl RenderableAIError {
     }
 }
 
-impl From<&AIApiError> for RenderableAIError {
-    fn from(value: &AIApiError) -> Self {
-        match value {
+/// The cause behind a [`RenderableAIError::TransientNetworkError`]. Kept structured (rather than
+/// collapsed to a free-form string) so user reports preserve the raw error; rendered to text only
+/// at display time.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum TransientNetworkErrorKind {
+    /// A lost connection or truncated response stream — the raw underlying API error. Rendered via
+    /// `Debug` so reports preserve the full structured error rather than its terse `Display`.
+    #[error("{0:?}")]
+    Api(Arc<AIApiError>),
+    /// The response stream completed with an unfinished exchange and no error event.
+    #[error("stream completed with an unfinished exchange and no error event")]
+    UnfinishedExchange,
+    /// The conversation was left in a transient-error state but the last exchange carried no
+    /// structured error to surface.
+    #[error("no structured error on the last exchange")]
+    MissingExchangeError,
+}
+
+impl From<&Arc<AIApiError>> for RenderableAIError {
+    fn from(value: &Arc<AIApiError>) -> Self {
+        match value.as_ref() {
             AIApiError::QuotaLimit => Self::QuotaLimit,
             AIApiError::ServerOverloaded => Self::ServerOverloaded,
+            AIApiError::Transport(error)
+            | AIApiError::Deserialization(DeserializationError::Transport(error)) => {
+                // A transport error with no HTTP status is a lost-connection failure; one that
+                // carries a status means the server responded, so it gets generic rendering.
+                if Self::is_transient_network_transport_error(error) {
+                    Self::transient_network_error(
+                        false,
+                        false,
+                        TransientNetworkErrorKind::Api(value.clone()),
+                    )
+                } else {
+                    Self::Other {
+                        error_message: format!("Request failed with error: {value:?}"),
+                        will_attempt_resume: false,
+                        waiting_for_network: false,
+                    }
+                }
+            }
             AIApiError::Other(error) => Self::Other {
                 error_message: error.to_string(),
                 will_attempt_resume: false,
                 waiting_for_network: false,
             },
-            _ => Self::Other {
+            AIApiError::Deserialization(DeserializationError::Json(_))
+            | AIApiError::NoContextFound
+            | AIApiError::ErrorStatus(_, _)
+            | AIApiError::Stream { .. } => Self::Other {
                 error_message: format!("Request failed with error: {value:?}"),
                 will_attempt_resume: false,
                 waiting_for_network: false,
@@ -789,6 +867,13 @@ impl Display for RenderableAIError {
                 )
             }
             Self::CloudStartupFailed(message) => write!(f, "{message}"),
+            Self::TransientNetworkError { kind, .. } => {
+                write!(
+                    f,
+                    "{}\n\nDebug info: {kind}",
+                    Self::TRANSIENT_NETWORK_ERROR_MESSAGE
+                )
+            }
             Self::Other { error_message, .. } => write!(f, "{error_message}"),
             Self::AgentExitedShell => write!(f, "{}", Self::AGENT_EXITED_SHELL_MESSAGE),
         }

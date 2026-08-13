@@ -1,13 +1,16 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use warp_multi_agent_api::{FileContent, FileContentLineRange};
 
 use crate::ai::agent::{
     AIAgentOutput, AIAgentOutputMessage, AIAgentOutputMessageType, AIAgentText, AIAgentTextSection,
     AgentOutputImage, AgentOutputImageLayout, AgentOutputMermaidDiagram, AnyFileContent,
-    FileContext, FormattedTextWrapper, MessageId, ProgrammingLanguage,
+    FileContext, FormattedTextWrapper, MessageId, ProgrammingLanguage, RenderableAIError,
+    TransientNetworkErrorKind,
 };
+use crate::ai::api_error::AIApiError;
 use crate::terminal::shell::ShellType;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 
@@ -16,6 +19,40 @@ fn to_range(range: Range<u32>) -> Option<FileContentLineRange> {
         start: range.start,
         end: range.end,
     })
+}
+
+#[test]
+fn transient_network_error_includes_user_facing_message_and_debug_details() {
+    let error = RenderableAIError::transient_network_error(
+        false,
+        false,
+        TransientNetworkErrorKind::Api(Arc::new(AIApiError::Other(anyhow!("connection reset")))),
+    );
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.starts_with(
+            "Zap lost connection while receiving the agent response. This is usually temporary.\n\nDebug info: "
+        ),
+        "unexpected rendering: {rendered}"
+    );
+    // The raw underlying API error must survive into the debug section.
+    assert!(
+        rendered.contains("connection reset"),
+        "raw error detail should surface in debug info: {rendered}"
+    );
+    assert!(!error.will_attempt_resume());
+}
+
+#[test]
+fn transient_network_error_reports_pending_resume() {
+    let error = RenderableAIError::transient_network_error(
+        true,
+        false,
+        TransientNetworkErrorKind::Api(Arc::new(AIApiError::Other(anyhow!("connection reset")))),
+    );
+
+    assert!(error.will_attempt_resume());
 }
 
 #[test]

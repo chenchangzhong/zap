@@ -47,7 +47,7 @@ use crate::ai::{
         conversation::AIConversationId, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
         AIAgentExchangeId, AIAgentInput, AIAgentOutputStatus, AIIdentifiers, EntrypointType,
         FinishedAIAgentOutput, MessageId, RenderableAIError, RequestCost, RequestMetadata,
-        StaticQueryType, UserQueryMode,
+        StaticQueryType, TransientNetworkErrorKind, UserQueryMode,
     },
     llms::LLMPreferences,
 };
@@ -3583,8 +3583,13 @@ impl BlocklistAIController {
                             // 本地化后 BYOP 场景下不存在"购买额外 credits"业务。
                         }
 
-                        let mut renderable_error: RenderableAIError = e.as_ref().into();
+                        let mut renderable_error: RenderableAIError = (&e).into();
                         if let RenderableAIError::Other {
+                            will_attempt_resume,
+                            waiting_for_network,
+                            ..
+                        }
+                        | RenderableAIError::TransientNetworkError {
                             will_attempt_resume,
                             waiting_for_network,
                             ..
@@ -3685,14 +3690,13 @@ impl BlocklistAIController {
                 } else if is_any_exchange_unfinished {
                     log::warn!("AI response stream ended without emitting StreamFinished event.");
 
-                    let error_message = "Request did not successfully complete";
                     history_model.update(ctx, |history_model, ctx| {
                         history_model.mark_response_stream_completed_with_error(
-                            RenderableAIError::Other {
-                                error_message: error_message.to_string(),
-                                will_attempt_resume: false,
-                                waiting_for_network: false,
-                            },
+                            RenderableAIError::transient_network_error(
+                                false,
+                                false,
+                                TransientNetworkErrorKind::UnfinishedExchange,
+                            ),
                             &stream_id,
                             conversation_id,
                             self.terminal_view_id,
