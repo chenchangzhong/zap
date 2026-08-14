@@ -21,9 +21,22 @@ pub struct Scene {
     active_layer_index_stack: Vec1<ZIndex>,
     layers: Vec1<Layer>,
     overlay_layers: Vec<Layer>,
+    /// Native (platform-owned) view holes, e.g. an embedded WKWebView. These
+    /// float above all layers and are not part of hit-testing/clipping.
+    pub platform_views: Vec<PlatformView>,
     #[cfg(debug_assertions)]
     /// Custom panic location, set with [`Scene::set_location_for_panic_logging`]
     panic_location: Option<&'static std::panic::Location<'static>>,
+}
+
+/// A native view hole declared by the element tree. `rect` is in flipped
+/// logical coordinates (origin top-left), same as the rest of the scene.
+/// The platform layer maps `id` to an actual native view and positions it
+/// at `rect`; the view itself is not rendered by warpui.
+#[derive(Clone, Copy, Debug)]
+pub struct PlatformView {
+    pub rect: RectF,
+    pub id: u64,
 }
 
 #[derive(Clone, Default)]
@@ -399,6 +412,7 @@ impl Scene {
             active_layer_index_stack: vec1![ZIndex::Normal(0)],
             layers: vec1![Layer::default()],
             overlay_layers: Vec::new(),
+            platform_views: Vec::new(),
             #[cfg(debug_assertions)]
             panic_location: None,
         }
@@ -537,6 +551,114 @@ impl Scene {
         if self.active_layer_index_stack.pop().is_err() {
             panic!("popped the last layer from active_layer_index_stack");
         }
+    }
+
+    /// Declare a native view hole at `rect` (flipped logical coordinates).
+    /// The view floats above all layers and is positioned by the platform
+    /// layer, which maps `id` to an actual native view.
+    /// True if any overlay layer (floating UI like menus/modals) is present.
+    /// Used to hide native views (e.g. embedded webviews) that would otherwise
+    /// cover warpui-rendered floating UI.
+    pub fn has_overlay_layers(&self) -> bool {
+        !self.overlay_layers.is_empty()
+    }
+
+    /// Number of drawn rects per overlay layer (debug/observability).
+    pub fn overlay_layer_rect_counts(&self) -> Vec<usize> {
+        self.overlay_layers
+            .iter()
+            .map(|layer| layer.rects.len())
+            .collect()
+    }
+
+    /// All overlay-layer rects (debug/observability).
+    pub fn overlay_rects_for_debug(&self) -> Vec<RectF> {
+        self.overlay_layers
+            .iter()
+            .flat_map(|layer| layer.rects.iter().map(|rect| rect.bounds))
+            .collect()
+    }
+
+    /// Filters out platform views whose rect is covered by a drawn overlay-layer
+    /// rect (floating UI such as menus/modals). The platform layer hides the
+    /// corresponding native views so they don't cover warpui-rendered UI.
+    /// Overlay layers that exist without any drawn content (e.g. zero-size
+    /// placeholders) do not cover anything and leave views visible.
+    pub fn filter_platform_views_covered(&self, views: Vec<PlatformView>) -> Vec<PlatformView> {
+        views
+            .into_iter()
+            .filter(|view| {
+                !self.overlay_layers.iter().any(|layer| {
+                    layer
+                        .rects
+                        .iter()
+                        .any(|rect| rect.bounds.intersects(view.rect))
+                })
+            })
+            .collect()
+    }
+
+    /// Returns the largest rectangle of `rect` not covered by any drawn
+    /// overlay-layer rect (floating UI such as menus/modals), so native views
+    /// (e.g. embedded webviews) can shrink out of the way instead of hiding.
+    /// Returns `None` if `rect` is fully covered.
+    pub fn visible_platform_view_rect(&self, rect: RectF) -> Option<RectF> {
+        let mut visible = rect;
+        for layer in &self.overlay_layers {
+            for overlay in &layer.rects {
+                visible = Self::largest_remaining_rect(visible, overlay.bounds)?;
+            }
+        }
+        Some(visible)
+    }
+
+    /// Largest axis-aligned rectangle remaining after subtracting `overlay`
+    /// from `visible`, or `None` if nothing remains.
+    fn largest_remaining_rect(visible: RectF, overlay: RectF) -> Option<RectF> {
+        if !visible.intersects(overlay) {
+            return Some(visible);
+        }
+        let candidates = [
+            // Left of the overlay.
+            RectF::new(
+                vec2f(visible.min_x(), visible.min_y()),
+                vec2f((overlay.min_x() - visible.min_x()).max(0.), visible.height()),
+            ),
+            // Right of the overlay.
+            RectF::new(
+                vec2f(overlay.max_x(), visible.min_y()),
+                vec2f((visible.max_x() - overlay.max_x()).max(0.), visible.height()),
+            ),
+            // Above the overlay.
+            RectF::new(
+                vec2f(visible.min_x(), visible.min_y()),
+                vec2f(visible.width(), (overlay.min_y() - visible.min_y()).max(0.)),
+            ),
+            // Below the overlay.
+            RectF::new(
+                vec2f(visible.min_x(), overlay.max_y()),
+                vec2f(visible.width(), (visible.max_y() - overlay.max_y()).max(0.)),
+            ),
+        ];
+        candidates
+            .into_iter()
+            .filter(|candidate| candidate.width() > 0. && candidate.height() > 0.)
+            .max_by(|a, b| {
+                (a.width() * a.height())
+                    .total_cmp(&(b.width() * b.height()))
+            })
+    }
+
+    /// Declare a native view hole at `rect` (flipped logical coordinates).
+    /// The view floats above all layers and is positioned by the platform
+    /// layer, which maps `id` to an actual native view.
+    pub fn push_platform_view(&mut self, id: u64, rect: RectF) {
+        #[cfg(debug_assertions)]
+        let location = self.panic_location.take();
+        #[cfg(not(debug_assertions))]
+        let location = None;
+        Self::validate_rect(&rect, location);
+        self.platform_views.push(PlatformView { rect, id });
     }
 
     fn validate_rect(
@@ -695,8 +817,19 @@ impl Scene {
     }
 
     /// Get an iterator over all layers in order, from bottom to top
+    /// (normal layers first, then overlay layers).
     pub fn layers(&self) -> impl Iterator<Item = &Layer> {
         self.layers.iter().chain(self.overlay_layers.iter())
+    }
+
+    /// Get an iterator over the normal (non-overlay) layers.
+    pub fn normal_layers(&self) -> impl Iterator<Item = &Layer> {
+        self.layers.iter()
+    }
+
+    /// Get an iterator over the overlay layers.
+    pub fn overlay_layers(&self) -> impl Iterator<Item = &Layer> {
+        self.overlay_layers.iter()
     }
 
     /// Get the total number of layers

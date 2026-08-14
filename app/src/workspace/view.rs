@@ -10608,6 +10608,10 @@ impl Workspace {
             self.tabs.insert(new_idx, TabData::new(new_pane_group));
             self.activate_tab_internal(new_idx, ctx);
         }
+
+        // 与 `add_tab_with_shell` 等路径一致:显式请求重绘,否则 tab bar
+        // 不会立即显示新 tab(要等下一次用户交互触发渲染)。
+        ctx.notify();
     }
 
     pub fn add_tab_for_cloud_notebook(
@@ -19931,6 +19935,18 @@ impl TypedActionView for Workspace {
                         );
                     });
                 }
+            }
+            OpenBrowserPreview { url } => {
+                if !FeatureFlag::BrowserPane.is_enabled() {
+                    return;
+                }
+                let pane = crate::browser::BrowserPane::new(url.clone(), ctx);
+                let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
+                let new_idx = match new_tab_placement_setting {
+                    NewTabPlacement::AfterAllTabs => self.tab_count(),
+                    NewTabPlacement::AfterCurrentTab => self.active_tab_index + 1,
+                };
+                self.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
             }
             TabHoverWidthStart { width } => {
                 // Store the fixed width value for the tab to maintain consistent size during hover

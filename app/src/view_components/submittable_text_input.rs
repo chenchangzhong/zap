@@ -36,6 +36,10 @@ pub struct SubmittableTextInput {
     submit_button_state: MouseStateHandle,
     outer_margin_top: f32,
     outer_margin_bottom: f32,
+    /// 是否绘制外框。浏览器地址栏等内嵌场景设为 false 以获得无边框外观。
+    show_border: bool,
+    /// 获取焦点时的回调(如 blur webview 页面活跃元素)。
+    on_focus_callback: Option<Box<dyn FnMut(&AppContext)>>,
 }
 
 impl SubmittableTextInput {
@@ -61,7 +65,21 @@ impl SubmittableTextInput {
             submit_button_state: Default::default(),
             outer_margin_top: 10.,
             outer_margin_bottom: 10.,
+            show_border: true,
+            on_focus_callback: None,
         }
+    }
+
+    /// 是否绘制外框,默认 true。浏览器地址栏等内嵌场景传 false 去除边框。
+    pub fn with_border(mut self, show: bool) -> Self {
+        self.show_border = show;
+        self
+    }
+
+    /// 设置获取焦点时的回调(如 blur webview 页面活跃元素)。
+    pub fn with_on_focus_callback(mut self, cb: impl FnMut(&AppContext) + 'static) -> Self {
+        self.on_focus_callback = Some(Box::new(cb));
+        self
     }
 
     /// Validates the input contents using the provided `validator`
@@ -149,6 +167,9 @@ impl View for SubmittableTextInput {
         if focus_ctx.is_self_focused() {
             ctx.focus(&self.editor);
         }
+        if let Some(ref mut cb) = self.on_focus_callback {
+            cb(&*ctx);
+        }
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
@@ -176,7 +197,7 @@ impl View for SubmittableTextInput {
             submit_button = submit_button.disable();
         }
 
-        Container::new(
+        let mut container = Container::new(
             Flex::row()
                 .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
                 .with_main_axis_size(MainAxisSize::Max)
@@ -205,13 +226,15 @@ impl View for SubmittableTextInput {
                 ])
                 .finish(),
         )
-        .with_border(Border::all(1.).with_border_fill(border_fill))
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
         .with_margin_top(self.outer_margin_top)
         .with_margin_bottom(self.outer_margin_bottom)
         .with_padding_left(ui_font_size / 3.)
-        .with_padding_right(ui_font_size * 2. / 3.)
-        .finish()
+        .with_padding_right(ui_font_size * 2. / 3.);
+        if self.show_border {
+            container = container.with_border(Border::all(1.).with_border_fill(border_fill));
+        }
+        container.finish()
     }
 }
 

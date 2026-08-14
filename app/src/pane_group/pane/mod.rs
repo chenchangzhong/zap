@@ -33,6 +33,7 @@ pub mod workflow_pane;
 use std::{any::Any, fmt::Display};
 
 use crate::pane_group::focus_state::PaneFocusHandle;
+use crate::browser::BrowserPaneView;
 use crate::pane_group::pane::get_started_view::GetStartedView;
 use crate::ssh_manager::server_view::SshServerView;
 use crate::sftp_manager::browser::SftpBrowserView;
@@ -149,6 +150,7 @@ pub(crate) enum IPaneType {
     GetStarted,
     SshServer,
     Sftp,
+    Browser,
     DeferredPlaceholder,
     /// A pane type only for tests.
     #[cfg(test)]
@@ -174,6 +176,7 @@ impl Display for IPaneType {
             IPaneType::GetStarted => write!(f, "GetStarted"),
             IPaneType::SshServer => write!(f, "SSH Server"),
             IPaneType::Sftp => write!(f, "SFTP"),
+            IPaneType::Browser => write!(f, "Browser"),
             IPaneType::DeferredPlaceholder => write!(f, "Placeholder"),
             #[cfg(test)]
             IPaneType::Dummy => write!(f, "Dummy"),
@@ -298,6 +301,16 @@ impl PaneId {
     /// Creates a [`PaneId`] from a [`PaneView<ImageViewerView>`] entity ID.
     pub fn from_image_pane_view(image_pane_view: &ViewHandle<PaneView<ImageViewerView>>) -> Self {
         Self::new(IPaneType::ImageViewer, image_pane_view)
+    }
+
+    /// Creates a [`PaneId`] from a [`ViewContext<PaneView<BrowserPaneView>>`]
+    pub fn from_browser_pane_ctx(ctx: &ViewContext<PaneView<BrowserPaneView>>) -> Self {
+        Self::new_from_ctx(IPaneType::Browser, ctx)
+    }
+
+    /// Creates a [`PaneId`] from a [`PaneView<BrowserPaneView>`] entity ID.
+    pub fn from_browser_pane_view(browser_pane_view: &ViewHandle<PaneView<BrowserPaneView>>) -> Self {
+        Self::new(IPaneType::Browser, browser_pane_view)
     }
 
     /// Creates a [`PaneId`] from a [`PaneView<TextView>`] entity ID.
@@ -497,6 +510,9 @@ impl PaneId {
             }
             IPaneType::Sftp => {
                 ChildView::<PaneView<SftpBrowserView>>::with_id(self.0.pane_view_id).finish()
+            }
+            IPaneType::Browser => {
+                ChildView::<PaneView<BrowserPaneView>>::with_id(self.0.pane_view_id).finish()
             }
             IPaneType::DeferredPlaceholder => warpui::elements::Empty::new().finish(),
             #[cfg(test)]

@@ -1728,6 +1728,18 @@ impl crate::platform::Window for Window {
     }
 }
 
+impl raw_window_handle::HasWindowHandle for Window {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        self.inner
+            .borrow()
+            .as_ref()
+            .and_then(|inner| inner.window.window_handle().ok())
+            .ok_or(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
 impl platform::WindowContext for Window {
     fn size(&self) -> Vector2F {
         let scale_factor = self.backing_scale_factor() as f64;

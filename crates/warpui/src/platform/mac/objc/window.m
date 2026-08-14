@@ -342,6 +342,12 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
     // being created and positioned under the cursor.
     BOOL _suppressFrameConstraintsDuringDrag;
     BOOL _leftMouseDownStartedInNativeWindowChrome;
+    // 最近一次 LeftMouseDown 的 hitTest 目标。嵌入的原生视图(如 WKWebView)
+    // 需要后续的 MouseUp/MouseDragged 走系统默认分发,不能强制转发给
+    // contentView,否则 webview 收不到完整点击(无 click、无法拖动选中)。
+    // MRC 下不能声明 __weak,这里用普通指针:mouseDown 到 mouseUp 之间
+    // 目标视图必然存活(事件分发期间视图树不会被拆除)。
+    NSView *_leftMouseDownTarget;
 }
 
 @synthesize testMode;
@@ -475,6 +481,10 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
                 break;
             }
             _leftMouseDownStartedInNativeWindowChrome = [self eventIsOverResizeEdge:event];
+            // 记录本次 mouseDown 的命中目标,供后续 MouseUp/MouseDragged
+            // 决定走系统默认分发还是强制转发给 contentView。
+            NSPoint contentPoint = [self.contentView convertPoint:event.locationInWindow fromView:nil];
+            _leftMouseDownTarget = [self.contentView hitTest:contentPoint];
             [super sendEvent:event];
             break;
         }
@@ -491,6 +501,11 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
             if (@available(macOS 27, *)) {
                 if (_leftMouseDownStartedInNativeWindowChrome) {
                     [super sendEvent:event];
+                } else if ([_leftMouseDownTarget isKindOfClass:NSClassFromString(@"WKWebView")]) {
+                    // mouseDown 落在嵌入的 webview 上:后续事件走系统默认
+                    // 分发(发给 mouseDown 的目标),否则 webview 收不到
+                    // mouseUp,点击/拖动选中全部失效。
+                    [super sendEvent:event];
                 } else {
                     [self.contentView mouseUp:event];
                 }
@@ -498,10 +513,15 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
                 [self.contentView mouseUp:event];
             }
             _leftMouseDownStartedInNativeWindowChrome = NO;
+            // 事件序列结束,清掉目标引用,避免后续事件(RightMouseDown 等)
+            // 复用悬垂指针(webview 可能在 mouseUp 后被移除)。
+            _leftMouseDownTarget = nil;
             break;
         case NSEventTypeLeftMouseDragged:
             if (@available(macOS 27, *)) {
                 if (_leftMouseDownStartedInNativeWindowChrome) {
+                    [super sendEvent:event];
+                } else if ([_leftMouseDownTarget isKindOfClass:NSClassFromString(@"WKWebView")]) {
                     [super sendEvent:event];
                 } else {
                     [self.contentView mouseDragged:event];
@@ -510,13 +530,21 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
                 [self.contentView mouseDragged:event];
             }
             break;
-
         // The NSWindow's default sendEvent: implementation does not propagate RightMouseDown events
         // from the application title bar to the content view when running a development build
         // locally, though it is unclear why. This breaks the right-click context menu for tabs on
         // local builds, so we propagate the RightMouseDown event manually.
+        // 例外:鼠标落在嵌入的 webview 上时走默认分发,让 webview 的右键菜单可用。
         case NSEventTypeRightMouseDown:
-            [self.contentView rightMouseDown:event];
+            // 不用 _leftMouseDownTarget(属于上一次左键序列,可能已失效),
+            // 独立命中测试当前点是否落在嵌入的 webview 上。
+            NSPoint rightPoint = [self.contentView convertPoint:event.locationInWindow fromView:nil];
+            NSView *rightTarget = [self.contentView hitTest:rightPoint];
+            if ([rightTarget isKindOfClass:NSClassFromString(@"WKWebView")]) {
+                [super sendEvent:event];
+            } else {
+                [self.contentView rightMouseDown:event];
+            }
             break;
         default:
             [super sendEvent:event];
@@ -1063,6 +1091,11 @@ void open_url(NSString *urlString) {
     NSURL *url = [NSURL URLWithString:urlString];
     [[NSWorkspace sharedWorkspace] openURL:url];
 }
+
+void warp_focus_host_view(id window) {
+    [window makeFirstResponder:[window contentView]];
+}
+
 
 void hide_app() {
     NSApplication *app = [NSApplication sharedApplication];

@@ -13,6 +13,7 @@ mod app_state;
 mod auth;
 mod autoupdate;
 mod banner;
+mod browser;
 mod changelog_model;
 mod chip_configurator;
 mod cloud_object;
@@ -1442,6 +1443,18 @@ fn initialize_app(
 
     ctx.add_singleton_model(CustomSecretRegexUpdater::new);
 
+    // Web preview:全局 webview 管理器。每帧消费 platform-view 上报
+    // (渲染线程写入的暂存队列),把 webview 定位到场景声明的 rect。
+    if FeatureFlag::BrowserPane.is_enabled() {
+        ctx.add_singleton_model(|_| browser::BrowserWebViewManager::new());
+        ctx.on_frame_drawn(|ctx, window_id| {
+            browser::BrowserWebViewManager::handle(ctx).update(ctx, |manager, ctx| {
+                manager.drain_pending_platform_views(window_id);
+                manager.drain_pending_webview_focus(ctx);
+            });
+        });
+    }
+
     // Register initial keybindings prior to creating menus
     ai::init(ctx);
     app_services::init(ctx);
@@ -2017,9 +2030,19 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
             }
 
             if let Some(window_data) = closed_window_data {
+                let window_id = window_data.window_id;
                 UndoCloseStack::handle(ctx).update(ctx, |stack, ctx| {
                     stack.handle_window_closed(window_data, ctx);
                 });
+                // 销毁该窗口的 webview。窗口关闭走 HiddenForClose(仅隐藏,
+                // 供 undo 恢复),但窗口不恢复时 pane 的 Closed detach 不会
+                // 发生,webview 会泄漏;这里兜底清理。undo 恢复时
+                // `BrowserPaneView::handle_attach` 检测到 webview 缺失会重建。
+                // 仅当 BrowserPane 启用时 manager 才注册,未启用时 as_ref
+                // 会 panic,故此处按同一 flag 门控。
+                if FeatureFlag::BrowserPane.is_enabled() {
+                    browser::BrowserWebViewManager::as_ref(ctx).cleanup_window(window_id);
+                }
             }
             ctx.dispatch_global_action("workspace:save_app", &());
         })),
@@ -2276,6 +2299,11 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
     flags.insert(FeatureFlag::SshRemoteServer);
     #[cfg(all(debug_assertions, not(windows)))]
     flags.insert(FeatureFlag::ServerFileBrowser);
+
+    // Web preview:dogfood 灰度项,本地 dev(debug 构建)默认启用以便开发验证。
+    // wry 集成目前仅 macOS 实现,故只在该平台 debug 构建默认启用。
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    flags.insert(FeatureFlag::BrowserPane);
 
     // Issue #72: HTTP 代理设置页面。不走 channel 判断,所有 channel 含 zap-oss
     // 默认启用,作为企业 VPN / 公司代理场景的基本能力。

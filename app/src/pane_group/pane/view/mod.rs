@@ -71,7 +71,7 @@ pub struct PaneView<P: BackingView> {
 }
 
 impl<P: BackingView> PaneView<P> {
-    pub(super) fn new(
+    pub(crate) fn new(
         pane_id: PaneId,
         child: ViewHandle<P>,
         child_data: P::AssociatedData,

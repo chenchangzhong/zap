@@ -16,12 +16,27 @@ use crate::{
     appearance::Appearance,
     terminal::{
         links::directly_open_link_keybinding_string,
-        model::{ObfuscateSecrets, Secret},
+        model::{ObfuscateSecrets, RespectObfuscatedSecrets, Secret},
         safe_mode_settings::get_secret_obfuscation_mode,
         view::SecretTooltip,
         TerminalModel,
     },
 };
+
+/// Whether `url` points at a local dev server (localhost or loopback address),
+/// which is what the Web preview pane is designed to display.
+fn is_localhost_url(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|parsed| {
+        // 只接受 http/https:webview 无法加载 ftp/ssh 等 scheme,且与
+        // BrowserPaneView 地址栏的 is_http_url 校验保持一致。
+        matches!(parsed.scheme(), "http" | "https")
+            // 注意:`host_str()` 对 IPv6 返回带方括号的序列化形式(`[::1]`)。
+            && matches!(
+                parsed.host_str(),
+                Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+            )
+    })
+}
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "local_fs")] {
@@ -242,6 +257,22 @@ impl TerminalView {
                 detail,
             });
 
+            // Web preview:对 localhost URL 提供一个 "Open preview" 入口,
+            // 在新 tab 打开内嵌 webview(FeatureFlag::BrowserPane 灰度)。
+            if crate::features::FeatureFlag::BrowserPane.is_enabled() {
+                if let GridHighlightedLink::Url(url) = link {
+                    let url_str = model.link_at_range(url, RespectObfuscatedSecrets::No);
+                    if is_localhost_url(&url_str) {
+                        links.push(GridTooltipLink {
+                            text: crate::t!("terminal-open-browser-preview"),
+                            action: TerminalAction::OpenBrowserPreview { url: url_str },
+                            mouse_state: self.mouse_states.open_browser_preview_tooltip.clone(),
+                            detail: None,
+                        });
+                    }
+                }
+            }
+
             links.extend(open_in_warp);
             links.extend(show_in_file_explorer);
         }
@@ -356,4 +387,23 @@ fn render_tooltip(
             })
         })
         .finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_localhost_url;
+
+    #[test]
+    fn test_is_localhost_url() {
+        // Local dev servers trigger the Web preview entry point.
+        assert!(is_localhost_url("http://localhost:8080"));
+        assert!(is_localhost_url("http://localhost:3000/path?q=1"));
+        assert!(is_localhost_url("http://127.0.0.1:5173"));
+        assert!(is_localhost_url("http://127.0.0.1:8000/"));
+        // Non-local hosts and invalid input must not trigger it.
+        assert!(!is_localhost_url("https://example.com"));
+        assert!(!is_localhost_url("http://192.168.1.1:8080"));
+        assert!(!is_localhost_url("not a url"));
+        assert!(!is_localhost_url("localhost:8080"));
+    }
 }

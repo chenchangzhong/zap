@@ -444,7 +444,7 @@ pub enum FullscreenState {
     Maximized = 2,
 }
 
-pub trait Window: 'static + WindowContext + std::any::Any {
+pub trait Window: 'static + WindowContext + std::any::Any + raw_window_handle::HasWindowHandle {
     fn minimize(&self);
     fn toggle_maximized(&self);
     fn toggle_fullscreen(&self);
@@ -462,6 +462,22 @@ pub trait Window: 'static + WindowContext + std::any::Any {
     fn callbacks(&self) -> &WindowCallbacks;
 
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Registers a handler invoked after each rendered frame with the full
+    /// set of native view holes ([`crate::PlatformView`]s) declared by the
+    /// scene that frame. Defaults to a no-op; platforms with native view
+    /// support (e.g. embedded webviews on macOS) override this.
+    fn set_platform_view_handler(
+        &self,
+        _handler: Box<dyn FnMut(Vec<crate::PlatformView>) + Send>,
+    ) {
+    }
+
+    /// 让该窗口的 first responder 回到 content view(WarpHostView),
+    /// 确保键盘输入(含中文输入法)进入 Warp 而非嵌入的 webview。
+    fn focus_host_view(&self, window_id: WindowId) {
+        let _ = window_id;
+    }
 }
 
 pub trait WindowContext {

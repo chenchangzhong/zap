@@ -26,7 +26,7 @@ use warpui_core::fonts::{self, canvas, RasterizedGlyph, SubpixelAlignment};
 use warpui_core::platform::CapturedFrame;
 use warpui_core::rendering::texture_cache::TextureCache;
 use warpui_core::rendering::{self};
-use warpui_core::scene::{CornerRadius, GlyphFade, GlyphKey, Icon, Image, Layer, Scene};
+use warpui_core::scene::{CornerRadius, GlyphFade, GlyphKey, Icon, Image, Layer, PlatformView, Scene};
 
 use super::frame_capture::capture_frame;
 use crate::platform::mac::rendering::renderer::Device;
@@ -37,6 +37,59 @@ use crate::rendering::{get_best_dash_gap, GlyphCache, GlyphRasterBoundsFn, Raste
 const METAL_LIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
 static WRITE_LIB_TO_FILE: Once = Once::new();
 
+
+/// Subtract `hole` from `rect`, returning up to four axis-aligned sub-rects
+/// that cover the parts of `rect` outside `hole`.
+fn subtract_rect(rect: RectF, hole: RectF) -> Vec<RectF> {
+    if !rect.intersects(hole) {
+        return vec![rect];
+    }
+
+    let mut result = Vec::with_capacity(4);
+    let left_width = hole.min_x() - rect.min_x();
+    if left_width > 0. {
+        result.push(RectF::new(
+            vec2f(rect.min_x(), rect.min_y()),
+            vec2f(left_width, rect.height()),
+        ));
+    }
+    let right_width = rect.max_x() - hole.max_x();
+    if right_width > 0. {
+        result.push(RectF::new(
+            vec2f(hole.max_x(), rect.min_y()),
+            vec2f(right_width, rect.height()),
+        ));
+    }
+    let top_height = hole.min_y() - rect.min_y();
+    if top_height > 0. {
+        result.push(RectF::new(
+            vec2f(rect.min_x(), rect.min_y()),
+            vec2f(rect.width(), top_height),
+        ));
+    }
+    let bottom_height = rect.max_y() - hole.max_y();
+    if bottom_height > 0. {
+        result.push(RectF::new(
+            vec2f(rect.min_x(), hole.max_y()),
+            vec2f(rect.width(), bottom_height),
+        ));
+    }
+    result
+}
+
+/// Subtract all `holes` from `rect`, returning the remaining pieces.
+fn subtract_rects(rect: RectF, holes: &[RectF]) -> Vec<RectF> {
+    let mut pieces = vec![rect];
+    for hole in holes {
+        let mut next = Vec::new();
+        for piece in pieces {
+            next.extend(subtract_rect(piece, *hole));
+        }
+        pieces = next;
+    }
+    pieces.retain(|piece| piece.width() > 0. && piece.height() > 0.);
+    pieces
+}
 /// A structure to help manage a single rendering pass.
 struct RenderPass<'a> {
     drawable: &'a ProtocolObject<dyn CAMetalDrawable>,
@@ -339,38 +392,59 @@ impl<'a> Frame<'a> {
             zfar: 1.0,
         });
 
-        for layer in self.scene.layers() {
-            if let Some(bounds) = layer.clip_bounds {
-                // Make sure the scissor rect doesn't extend beyond the boundaries
-                // of the window, as required by the Metal API.
-                // API docs: https://developer.apple.com/documentation/metal/mtlrendercommandencoder/1515583-setscissorrect?language=objc
-                // Scissor test background reading: https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/By_example/Basic_scissoring
-                let device_bounds = RectF::new(Vector2F::zero(), self.ctx.drawable_size);
-                let bounds = (bounds * self.scene.scale_factor()).intersection(device_bounds);
-                if let Some(intersection) = bounds {
-                    self.command_encoder.setScissorRect(MTLScissorRect {
-                        x: intersection.origin_x().round() as usize,
-                        y: intersection.origin_y().round() as usize,
-                        width: intersection.width().round() as usize,
-                        height: intersection.height().round() as usize,
-                    });
-                } else {
-                    // The layer's clip bounds don't intersect the window bounds
-                    // at all; we can skip drawing anything in this layer.
-                    continue;
-                }
-            } else {
-                self.command_encoder.setScissorRect(MTLScissorRect {
-                    x: 0_usize,
-                    y: 0_usize,
-                    width: self.ctx.drawable_size.x() as usize,
-                    height: self.ctx.drawable_size.y() as usize,
-                });
-            }
-            self.draw_rects(layer);
-            self.draw_images(layer);
-            self.draw_glyphs(layer);
+        // Normal layers are rendered underneath embedded platform views (e.g.
+        // WKWebViews), so background rects must be split around those holes to
+        // avoid drawing over the native view.
+        let platform_view_holes: Vec<RectF> = self
+            .scene
+            .platform_views
+            .iter()
+            .map(|PlatformView { rect, .. }| *rect * self.scene.scale_factor())
+            // 未布局/隐藏的 platform view 上报零尺寸 rect(如 webview 刚创建时),
+            // 零尺寸 hole 会让 subtract_rect 产生残缺几何,直接跳过。
+            .filter(|rect| rect.width() > 0. && rect.height() > 0.)
+            .collect();
+        for layer in self.scene.normal_layers() {
+            self.draw_layer(layer, &platform_view_holes);
         }
+
+        // Overlay layers (menus, modals) render above platform views; no holes.
+        for layer in self.scene.overlay_layers() {
+            self.draw_layer(layer, &[]);
+        }
+    }
+
+    fn draw_layer(&mut self, layer: &Layer, platform_view_holes: &[RectF]) {
+        if let Some(bounds) = layer.clip_bounds {
+            // Make sure the scissor rect doesn't extend beyond the boundaries
+            // of the window, as required by the Metal API.
+            // API docs: https://developer.apple.com/documentation/metal/mtlrendercommandencoder/1515583-setscissorrect?language=objc
+            // Scissor test background reading: https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/By_example/Basic_scissoring
+            let device_bounds = RectF::new(Vector2F::zero(), self.ctx.drawable_size);
+            let bounds = (bounds * self.scene.scale_factor()).intersection(device_bounds);
+            if let Some(intersection) = bounds {
+                self.command_encoder.setScissorRect(MTLScissorRect {
+                    x: intersection.origin_x().round() as usize,
+                    y: intersection.origin_y().round() as usize,
+                    width: intersection.width().round() as usize,
+                    height: intersection.height().round() as usize,
+                });
+            } else {
+                // The layer's clip bounds don't intersect the window bounds
+                // at all; we can skip drawing anything in this layer.
+                return;
+            }
+        } else {
+            self.command_encoder.setScissorRect(MTLScissorRect {
+                x: 0_usize,
+                y: 0_usize,
+                width: self.ctx.drawable_size.x() as usize,
+                height: self.ctx.drawable_size.y() as usize,
+            });
+        }
+        self.draw_rects(layer, platform_view_holes);
+        self.draw_images(layer);
+        self.draw_glyphs(layer);
     }
 
     // Utility function to render image or icon in Metal.
@@ -550,7 +624,7 @@ impl<'a> Frame<'a> {
         }
     }
 
-    fn draw_rects(&self, layer: &Layer) {
+    fn draw_rects(&self, layer: &Layer, platform_view_holes: &[RectF]) {
         if layer.rects.is_empty() {
             // It's a mac assertion error to create an empty metal buffer, so exit early
             return;
@@ -568,9 +642,17 @@ impl<'a> Frame<'a> {
         }
 
         let mut per_rect_uniforms = Vec::new();
+        let scale_factor = self.scene.scale_factor();
         for rect in &layer.rects {
-            let scale_factor = self.scene.scale_factor();
             let bounds = rect.bounds * scale_factor;
+            let sub_bounds = if platform_view_holes.is_empty() {
+                vec![bounds]
+            } else {
+                subtract_rects(bounds, platform_view_holes)
+            };
+            if sub_bounds.is_empty() {
+                continue;
+            }
 
             let dash = rect
                 .border
@@ -632,40 +714,47 @@ impl<'a> Frame<'a> {
                 ));
             }
 
-            let min_dimension = f32::min(bounds.height(), bounds.width());
-            let corner_radius = crate::rendering::CornerRadius::from_ui_corner_radius(
-                rect.corner_radius,
-                scale_factor,
-                min_dimension,
-            );
+            for bounds in sub_bounds {
+                let min_dimension = f32::min(bounds.height(), bounds.width());
+                let corner_radius = crate::rendering::CornerRadius::from_ui_corner_radius(
+                    rect.corner_radius,
+                    scale_factor,
+                    min_dimension,
+                );
 
-            per_rect_uniforms.push(shader::PerRectUniforms::new(
-                bounds.origin().into(),
-                bounds.size().into(),
-                corner_radius,
-                rect.border.top_width() * scale_factor,
-                rect.border.right_width() * scale_factor,
-                rect.border.bottom_width() * scale_factor,
-                rect.border.left_width() * scale_factor,
-                rect.background.start().into(),
-                rect.background.end().into(),
-                rect.background.start_color().to_f32().into(),
-                rect.background.end_color().to_f32().into(),
-                rect.border.color.start().into(),
-                rect.border.color.end().into(),
-                rect.border.color.start_color().to_f32().into(),
-                rect.border.color.end_color().to_f32().into(),
-                false,
-                ColorU::transparent_black().to_f32().into(),
-                Vector2F::zero().into(),
-                ColorU::transparent_black().to_f32().into(),
-                0_f32,
-                0_f32,
-                dash_length,
-                gap_lengths.into(),
-                Vector2F::zero().into(),
-                vec2f(1.0, 1.0).into(),
-            ));
+                per_rect_uniforms.push(shader::PerRectUniforms::new(
+                    bounds.origin().into(),
+                    bounds.size().into(),
+                    corner_radius,
+                    rect.border.top_width() * scale_factor,
+                    rect.border.right_width() * scale_factor,
+                    rect.border.bottom_width() * scale_factor,
+                    rect.border.left_width() * scale_factor,
+                    rect.background.start().into(),
+                    rect.background.end().into(),
+                    rect.background.start_color().to_f32().into(),
+                    rect.background.end_color().to_f32().into(),
+                    rect.border.color.start().into(),
+                    rect.border.color.end().into(),
+                    rect.border.color.start_color().to_f32().into(),
+                    rect.border.color.end_color().to_f32().into(),
+                    false,
+                    ColorU::transparent_black().to_f32().into(),
+                    Vector2F::zero().into(),
+                    ColorU::transparent_black().to_f32().into(),
+                    0_f32,
+                    0_f32,
+                    dash_length,
+                    gap_lengths.into(),
+                    Vector2F::zero().into(),
+                    vec2f(1.0, 1.0).into(),
+                ));
+            }
+        }
+        if per_rect_uniforms.is_empty() {
+            // All rects were subtracted away by platform view holes; drawing
+            // nothing is correct, and Metal asserts on empty buffers.
+            return;
         }
         let per_rect_uniforms_buffer = new_metal_buffer(
             self.ctx.device,

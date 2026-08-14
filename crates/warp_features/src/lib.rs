@@ -159,6 +159,9 @@ pub enum FeatureFlag {
     /// Adds aliases for executing Zap Drive workflows.
     WorkflowAliases,
 
+    /// Enables an embedded webview pane for previewing localhost/dev-server URLs.
+    BrowserPane,
+
     SshDragAndDrop,
     DragTabsToWindows,
 
@@ -793,6 +796,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::FileGlobV2Warnings,
     FeatureFlag::SummarizationViaMessageReplacement,
     FeatureFlag::LocalComputerUse,
+    FeatureFlag::BrowserPane,
     FeatureFlag::OzPlatformSkills,
     FeatureFlag::AgentViewBlockContext,
     // End manually enabled Code features.

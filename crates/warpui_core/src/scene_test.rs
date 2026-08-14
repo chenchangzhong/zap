@@ -85,3 +85,21 @@ fn test_image_source_uv() {
     assert_eq!(images[0].source_uv, full_uv);
     assert_eq!(images[1].source_uv, source_uv);
 }
+
+#[test]
+fn test_push_platform_view() {
+    let mut scene = Scene::new(1., rendering::Config::default());
+    let rect = RectF::new(vec2f(10., 20.), vec2f(100., 50.));
+
+    scene.push_platform_view(42, rect);
+
+    assert_eq!(scene.platform_views.len(), 1);
+    let platform_view = scene.platform_views[0];
+    assert_eq!(platform_view.id, 42);
+    assert_eq!(platform_view.rect, rect);
+
+    // Platform views float above all layers: they must not land in any layer's
+    // rects (and therefore not in the hit map or clipping).
+    assert!(scene.layers.iter().all(|layer| layer.rects.is_empty()));
+    assert!(scene.overlay_layers.iter().all(|layer| layer.rects.is_empty()));
+}

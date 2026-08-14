@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +23,9 @@ use objc2_metal::{MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice};
 use objc2_quartz_core::CAMetalLayer;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{vec2f, Vector2F};
+use raw_window_handle::{
+    AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle,
+};
 use warpui_core::accessibility::AccessibilityContent;
 use warpui_core::actions::StandardAction;
 use warpui_core::event::ModifiersState;
@@ -34,7 +37,7 @@ use warpui_core::platform::{
 use warpui_core::r#async::{executor, Timer};
 use warpui_core::rendering::GPUPowerPreference;
 use warpui_core::windowing::WindowCallbacks;
-use warpui_core::{DisplayId, DisplayIdx, Event, OptionalPlatformWindow, Scene, WindowId};
+use warpui_core::{DisplayId, DisplayIdx, Event, OptionalPlatformWindow, PlatformView, Scene, WindowId};
 
 use super::delegate::DispatchDelegate;
 use super::rendering::{self, is_integrated_gpu, Device, RendererManager};
@@ -474,11 +477,17 @@ extern "C" {
         default_filename: &NSString,
         default_directory: &NSString,
     );
+    fn warp_focus_host_view(window: &NSWindow);
     fn open_url(urlString: &NSString);
     fn set_titlebar_height(window: &NSWindow, height: f64);
 }
 
 pub type FrameCaptureCallback = Box<dyn FnOnce(platform::CapturedFrame) + Send + 'static>;
+
+/// Receives the per-frame set of native view holes (`PlatformView`s) declared
+/// by the element tree. The app layer maps each `PlatformView.id` to an actual
+/// native view (e.g. an embedded WKWebView) and positions it at `rect`.
+pub type PlatformViewHandler = Box<dyn FnMut(Vec<PlatformView>) + Send>;
 
 pub struct WindowState {
     native_window: *mut NSWindow,
@@ -491,6 +500,8 @@ pub struct WindowState {
     executor: Rc<executor::Foreground>,
     ime_active: Cell<bool>,
     pub(super) capture_callback: RefCell<Option<FrameCaptureCallback>>,
+    platform_view_handler: RefCell<Option<PlatformViewHandler>>,
+    overlay_rects: RefCell<Vec<RectF>>,
 }
 
 impl Window {
@@ -618,6 +629,8 @@ impl Window {
                 renderer_manager: Some(renderer_manager),
                 device,
                 synthetic_drag_counter: Cell::new(0),
+                platform_view_handler: RefCell::new(None),
+                overlay_rects: RefCell::new(Vec::new()),
                 executor,
                 ime_active: Cell::new(false),
                 capture_callback: RefCell::new(None),
@@ -740,6 +753,13 @@ impl Window {
         // SAFETY: `find_window_with_id` enumerates AppKit's window list.
         if let Some(native_window) = unsafe { Self::find_window_with_id(window_id) } {
             Self::send_close_ime_msg(&native_window);
+        }
+    }
+
+    pub fn focus_host_view(window_id: WindowId) {
+        // SAFETY: `find_window_with_id` enumerates AppKit's window list.
+        if let Some(native_window) = unsafe { Self::find_window_with_id(window_id) } {
+            unsafe { warp_focus_host_view(&native_window); }
         }
     }
 
@@ -1027,6 +1047,33 @@ impl platform::Window for Window {
     fn set_titlebar_height(&self, height: f64) {
         self.0.set_titlebar_height(height);
     }
+
+    /// Registers a handler invoked at the end of every rendered frame with
+    /// the full set of `PlatformView`s declared by the scene that frame.
+    fn set_platform_view_handler(&self, handler: PlatformViewHandler) {
+        *self.0.platform_view_handler.borrow_mut() = Some(handler);
+    }
+
+    fn focus_host_view(&self, window_id: WindowId) {
+        Self::focus_host_view(window_id);
+    }
+}
+
+impl HasWindowHandle for Window {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        // SAFETY: `WindowState.native_window` is a live NSWindow for as long as
+        // the `Window` exists: the native window is only torn down in
+        // `warp_dealloc_window`, which runs when the window state is
+        // deallocated (and no `Window` outlives its window state).
+        let ns_view = unsafe {
+            (*self.0.native_window)
+                .contentView()
+                .ok_or(HandleError::Unavailable)?
+        };
+        let container: Retained<NSView> = unsafe { msg_send![&*ns_view, webViewContainer] };
+        let appkit_window_handle = AppKitWindowHandle::new(NonNull::from(&*container).cast());
+        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::AppKit(appkit_window_handle)) })
+    }
 }
 
 impl platform::WindowContext for Window {
@@ -1112,19 +1159,19 @@ impl WindowState {
             renderer.resize(self);
         }
     }
-
     /// Returns the window's backing `CAMetalLayer`.
     pub fn metal_layer(&self) -> Retained<CAMetalLayer> {
         let view = self
             .window()
             .contentView()
             .expect("WarpHostView content view");
-        let layer = view
+        let metal_view: Retained<NSView> = unsafe { msg_send![&*view, metalRenderView] };
+        let layer = metal_view
             .layer()
-            .expect("WarpHostView always has a backing layer");
+            .expect("MetalRenderView always has a backing layer");
         layer
             .downcast::<CAMetalLayer>()
-            .expect("backing layer is a CAMetalLayer")
+            .expect("MetalRenderView backing layer is a CAMetalLayer")
     }
 
     /// Returns the current [`Device`] for rendering. `None` if the window was configured with no
@@ -1256,14 +1303,15 @@ impl WindowExt for &dyn platform::Window {
 
 #[no_mangle]
 extern "C-unwind" fn warp_view_did_change_backing_properties(this: &Object, async_callback: bool) {
-    // SAFETY: `this` is a WarpHostView carrying the window-state ivar; its backing
-    // layer is always a CAMetalLayer.
+    // SAFETY: `this` is a WarpHostView carrying the window-state ivar; the
+    // actual CAMetalLayer now lives on its MetalRenderView subview.
     let (window, layer) = unsafe {
         let window = get_window_state(this);
         let view = &*(this as *const Object).cast::<NSView>();
-        let layer = view
+        let metal_view: Retained<NSView> = msg_send![view, metalRenderView];
+        let layer = metal_view
             .layer()
-            .expect("WarpHostView always has a backing layer");
+            .expect("MetalRenderView always has a backing layer");
         (window, layer)
     };
     layer.setContentsScale(window.backing_scale_factor());
@@ -1281,7 +1329,7 @@ extern "C-unwind" fn warp_view_did_change_backing_properties(this: &Object, asyn
         );
         layer
             .downcast_ref::<CAMetalLayer>()
-            .expect("WarpHostView backing layer is a CAMetalLayer")
+            .expect("MetalRenderView backing layer is a CAMetalLayer")
             .setDrawableSize(drawable_size);
     }
 
@@ -1352,14 +1400,15 @@ pub extern "C-unwind" fn warp_ime_position(object: &mut Object, content_rect: NS
 
 #[no_mangle]
 extern "C-unwind" fn warp_view_set_frame_size(this: &Object, size: NSSize, async_callback: bool) {
-    // SAFETY: `this` is a WarpHostView carrying the window-state ivar; its backing
-    // layer is always a CAMetalLayer.
+    // SAFETY: `this` is a WarpHostView carrying the window-state ivar; the
+    // actual CAMetalLayer now lives on its MetalRenderView subview.
     let (window, layer) = unsafe {
         let window = get_window_state(this);
         let view = &*(this as *const Object).cast::<NSView>();
-        let layer = view
+        let metal_view: Retained<NSView> = msg_send![view, metalRenderView];
+        let layer = metal_view
             .layer()
-            .expect("WarpHostView always has a backing layer");
+            .expect("MetalRenderView always has a backing layer");
         (window, layer)
     };
     // Manually convert the size into the drawable size by multiplying by the scale factor. For
@@ -1372,7 +1421,7 @@ extern "C-unwind" fn warp_view_set_frame_size(this: &Object, size: NSSize, async
     };
     layer
         .downcast_ref::<CAMetalLayer>()
-        .expect("WarpHostView backing layer is a CAMetalLayer")
+        .expect("MetalRenderView backing layer is a CAMetalLayer")
         .setDrawableSize(drawable_size);
 
     window.resize_renderer();
@@ -1453,10 +1502,35 @@ extern "C-unwind" fn warp_update_layer(this: &Object) {
             renderer.render(&scene, window.as_ref(), ctx.font_cache());
         });
 
+        // Report this frame's native view holes (e.g. embedded webviews) so the
+        // app layer can position its native views at the declared rects.
+        if let Some(handler) = window.platform_view_handler.borrow_mut().as_mut() {
+            let views = scene
+                .platform_views
+                .iter()
+                .map(|view| PlatformView {
+                    id: view.id,
+                    rect: view.rect,
+                })
+                .collect::<Vec<_>>();
+            handler(views);
+        }
+        *window.overlay_rects.borrow_mut() = scene.overlay_rects_for_debug();
+
         app::callback_dispatcher()
             .for_window(&Window(window.clone()))
             .frame_drawn();
     }
+}
+#[no_mangle]
+extern "C-unwind" fn warp_overlay_hit_test(this: &Object, x: f64, y: f64) -> bool {
+    let window = unsafe { get_window_state(this) };
+    let point = vec2f(x as f32, y as f32);
+    window
+        .overlay_rects
+        .borrow()
+        .iter()
+        .any(|rect| rect.contains_point(point))
 }
 
 /// Returns whether this event was handled.

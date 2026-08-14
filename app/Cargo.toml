@@ -139,6 +139,7 @@ prost.workspace = true
 prost-types.workspace = true
 rand.workspace = true
 rangemap.workspace = true
+raw-window-handle.workspace = true
 rayon.workspace = true
 regex-automata = "0.4.6"
 regex.workspace = true
@@ -237,6 +238,8 @@ warp_managed_secrets.workspace = true
 zap_sync = { path = "../crates/zap_sync" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# 嵌入式 WebView(WKWebView),用于 Web preview pane。仅 macOS 编译。
+wry = "0.56.1"
 block.workspace = true
 cocoa.workspace = true
 core-foundation.workspace = true

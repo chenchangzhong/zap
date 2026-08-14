@@ -3304,6 +3304,7 @@ impl PaneGroup {
             | IPaneType::GetStarted
             | IPaneType::SshServer
             | IPaneType::Sftp
+            | IPaneType::Browser
             | IPaneType::DeferredPlaceholder => TypedPane::Other,
             #[cfg(test)]
             IPaneType::Dummy => TypedPane::Other,

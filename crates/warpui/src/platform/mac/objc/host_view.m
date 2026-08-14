@@ -5,6 +5,7 @@
 void warp_view_did_change_backing_properties(WarpHostView *, BOOL);
 void warp_view_set_frame_size(WarpHostView *, NSSize, BOOL);
 void warp_update_layer(WarpHostView *);
+BOOL warp_overlay_hit_test(WarpHostView *, CGFloat, CGFloat);
 BOOL warp_handle_view_event(WarpHostView *, NSEvent *, BOOL);
 BOOL warp_handle_first_mouse_event(WarpHostView *, NSEvent *);
 void warp_handle_insert_text(WarpHostView *, id);
@@ -35,7 +36,6 @@ void warp_marked_text_cleared(WarpHostView *);
 @end
 
 @implementation WarpHostView {
-    // The windowState is managed on the Rust side.
     // Note Rust expects this name even though we are not a window.
     void *windowState;
 
@@ -64,6 +64,9 @@ void warp_marked_text_cleared(WarpHostView *);
     // new in-progress text) in the same keystroke. Without this, the trailing
     // unmarkText in keyDownImpl would clobber that new marked text.
     BOOL imeTouchedMarkedTextDuringInterpret;
+    // backing layer so that overlay UI can draw above any embedded webview.
+    MetalRenderView *_metalRenderView;
+    WebViewContainerView *_webViewContainer;
 }
 
 - (BOOL)acceptsFirstResponder {
@@ -155,8 +158,12 @@ void warp_marked_text_cleared(WarpHostView *);
     asyncCallback = shouldAsync;
 }
 - (void)setPresentsWithTransaction:(BOOL)presentsWithTransaction {
-    CAMetalLayer *layer = (CAMetalLayer *)self.layer;
+    CAMetalLayer *layer = (CAMetalLayer *)self.metalRenderView.layer;
     layer.presentsWithTransaction = presentsWithTransaction;
+}
+- (void)setNeedsDisplay:(BOOL)flag {
+    [super setNeedsDisplay:flag];
+    [self.metalRenderView.layer setNeedsDisplay];
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -222,6 +229,13 @@ void warp_marked_text_cleared(WarpHostView *);
 - (void)mouseDown:(NSEvent *)event {
     if (self.readyForWarp) {
         BOOL eventHandled = warp_handle_view_event(self, event, NO);
+        // 点击被 Warp UI 处理(地址栏、按钮等)时,把 first responder 切回
+        // 自身。Warp 的文本输入与输入法(中文组合)都经本视图的
+        // NSTextInputClient 处理;不切换的话,first responder 停留在嵌入的
+        // webview 上,地址栏无法进行输入法组合。
+        if (eventHandled && self.window.firstResponder != self) {
+            [self.window makeFirstResponder:self];
+        }
         if (self->titlebarDragEnabled && !eventHandled && [self mouseInTitleBar:event]) {
             // If Warp doesn't do anything with the event, indicated by returning `false`, and
             // if the drag starts in the titlebar, begin dragging the window
@@ -269,20 +283,16 @@ void warp_marked_text_cleared(WarpHostView *);
 - (void)dealloc {
     [markedText release];
     [textToInsert release];
+    [_metalRenderView release];
+    [_webViewContainer release];
     [metalDevice release];
     [super dealloc];
 }
 
 - (CALayer *)makeBackingLayer {
-    CAMetalLayer *layer = [CAMetalLayer layer];
-    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    layer.device = metalDevice;
-    layer.allowsNextDrawableTimeout = NO;
-    layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
-    layer.needsDisplayOnBoundsChange = YES;
-    layer.presentsWithTransaction = NO;
-    layer.delegate = self;
+    CALayer *layer = [CALayer layer];
     layer.opaque = NO;
+    layer.needsDisplayOnBoundsChange = YES;
     return layer;
 }
 
@@ -306,6 +316,16 @@ void warp_marked_text_cleared(WarpHostView *);
     self.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.wantsLayer = YES;
     self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
+
+    self.webViewContainer = [[WebViewContainerView alloc] initWithFrame:self.bounds];
+    self.webViewContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [self addSubview:self.webViewContainer];
+
+    self.metalRenderView = [[MetalRenderView alloc] initWithFrame:self.bounds
+                                                      metalDevice:metalDevice];
+    self.metalRenderView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [self addSubview:self.metalRenderView];
+    self.metalRenderView.layer.delegate = self;
     return self;
 }
 
@@ -363,6 +383,13 @@ void warp_marked_text_cleared(WarpHostView *);
 
 - (void)closeIMEAsync {
     dispatch_async(dispatch_get_main_queue(), ^{
+      // 只有 WarpHostView 自身是 first responder 时才清理 IME 状态。
+      // 嵌入的 webview(WKWebView)作为 first responder 时,输入上下文属于
+      // webview,此处的 discardMarkedText / unmarkText 会干扰其输入
+      // (例如中文输入法在 webview 里无法继续输入)。
+      if (!self.readyForWarp || self.window.firstResponder != self) {
+        return;
+      }
       NSTextInputContext *inputContext = [self inputContext];
       [inputContext discardMarkedText];
 
@@ -534,3 +561,50 @@ void warp_marked_text_cleared(WarpHostView *);
 }
 
 @end
+@implementation MetalRenderView {
+    id metalDevice;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame metalDevice:(id)device {
+    self = [super initWithFrame:frame];
+    if (self) {
+        metalDevice = [device retain];
+        self.wantsLayer = YES;
+        self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
+    }
+    return self;
+}
+
+- (void)dealloc {
+    [metalDevice release];
+    [super dealloc];
+}
+
+- (BOOL)isFlipped {
+    return YES;
+}
+
+- (CALayer *)makeBackingLayer {
+    CAMetalLayer *layer = [CAMetalLayer layer];
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.device = metalDevice;
+    layer.allowsNextDrawableTimeout = NO;
+    layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    layer.needsDisplayOnBoundsChange = YES;
+    layer.presentsWithTransaction = NO;
+    layer.opaque = NO;
+    return layer;
+}
+
+- (NSView *)hitTest:(NSPoint)point {
+    WarpHostView *host = (WarpHostView *)self.superview;
+    if (!host || !host.readyForWarp) return [super hitTest:point];
+    if (warp_overlay_hit_test(host, point.x, point.y)) return host;
+    return nil;
+}
+
+@end
+
+@implementation WebViewContainerView
+@end
+

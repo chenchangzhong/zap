@@ -420,6 +420,10 @@ pub enum WorkspaceAction {
         full_path: PathBuf,
         line_and_column: Option<LineAndColumnArg>,
     },
+    /// Open a web preview pane(embedded webview) for a localhost URL.
+    OpenBrowserPreview {
+        url: String,
+    },
     OpenNotebook {
         id: SyncId,
     },
@@ -699,6 +703,7 @@ impl WorkspaceAction {
             | OpenNotebook { .. }
             | RunWorkflow { .. }
             | OpenFileInNewTab { .. }
+            | OpenBrowserPreview { .. }
             | RestoreOrNavigateToConversation { .. }
             | NewCodeFile
             | ForkAIConversation { .. }

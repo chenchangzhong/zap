@@ -152,6 +152,10 @@ pub enum LeafContents {
     Sftp {
         node_id: String,
     },
+    /// Web preview pane(嵌入式 webview)。**不持久化** — webview 无法跨重启恢复。
+    Browser {
+        url: String,
+    },
 }
 
 #[cfg(feature = "local_fs")]
@@ -176,6 +180,8 @@ impl LeafContents {
             // Image viewer panes are intentionally not persisted: they render in-session but
             // are not restored after restart.
             LeafContents::Image { .. } => false,
+            // Web preview pane:webview 不可跨重启恢复。
+            LeafContents::Browser { .. } => false,
             // 远端文件代码 pane:远端 buffer 依赖活跃 SSH 连接,`RemoteFileTree`
             // source 不可恢复(`is_restorable() == false`)。若写入持久化会留下
             // 一条 restore 阶段被跳过的孤儿 `Code` 行,导致整个 tab 丢失 ——

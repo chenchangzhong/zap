@@ -267,6 +267,10 @@ pub enum TerminalAction {
     JumpToBookmark(BlockIndex),
     OpenGridLink(GridHighlightedLink),
     OpenRichContentLink(RichContentLink),
+    /// Open a web preview pane for a localhost URL (gated by `FeatureFlag::BrowserPane`).
+    OpenBrowserPreview {
+        url: String,
+    },
     ToggleGridSecret {
         handle: WithinModel<SecretHandle>,
         show_secret: bool,
@@ -528,6 +532,7 @@ impl fmt::Debug for TerminalAction {
             }
             OpenGridLink(_) => f.write_str("OpenGridLink"),
             OpenRichContentLink(_) => f.write_str("OpenRichContentLink"),
+            OpenBrowserPreview { .. } => f.write_str("OpenBrowserPreview"),
             ToggleGridSecret { show_secret, .. } => write!(f, "ToggleGridSecret {show_secret:?}"),
             ToggleRichContentSecret { show_secret, .. } => {
                 write!(f, "ToggleRichContentSecret {show_secret:?}")

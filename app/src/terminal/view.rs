@@ -2210,6 +2210,8 @@ struct TerminalViewMouseStates {
     open_in_warp_tooltip: MouseStateHandle,
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     show_in_file_explorer_tooltip: MouseStateHandle,
+    /// Mouse state for the "Open preview" item in the grid link tooltip.
+    open_browser_preview_tooltip: MouseStateHandle,
     jump_to_bottom_of_block_button: MouseStateHandle,
 
     // Mouse state for the pane header ambient agent indicator tooltip.
@@ -24150,6 +24152,7 @@ impl TypedActionView for TerminalView {
             | SplitUp(_)
             | OpenGridLink(_)
             | OpenRichContentLink(_)
+            | OpenBrowserPreview { .. }
             | ToggleGridSecret { .. }
             | ToggleRichContentSecret { .. }
             | CopyGridSecret(_)
@@ -24572,6 +24575,14 @@ impl TypedActionView for TerminalView {
             }
             OpenGridLink(link) => {
                 self.open_highlighted_link(link, ctx);
+            }
+            OpenBrowserPreview { url } => {
+                if !FeatureFlag::BrowserPane.is_enabled() {
+                    return;
+                }
+                ctx.dispatch_typed_action(&WorkspaceAction::OpenBrowserPreview {
+                    url: url.clone(),
+                });
             }
             OpenRichContentLink(link) => {
                 self.open_rich_content_link(link, ctx);

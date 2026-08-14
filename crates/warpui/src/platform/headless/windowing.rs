@@ -239,6 +239,14 @@ impl platform::Window for Window {
     }
 }
 
+impl raw_window_handle::HasWindowHandle for Window {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        Err(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
 impl platform::WindowContext for Window {
     fn size(&self) -> Vector2F {
         self.bounds.borrow().size()

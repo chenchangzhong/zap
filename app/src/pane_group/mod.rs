@@ -1076,7 +1076,7 @@ impl PaneGroup {
         }
     }
 
-    fn handle_pane_view_event(
+    pub(crate) fn handle_pane_view_event(
         &mut self,
         pane_id: PaneId,
         event: &PaneViewEvent,
@@ -1827,6 +1827,13 @@ impl PaneGroup {
                 // `LeafContents::is_persisted`), so this should be unreachable.
                 Err(anyhow::anyhow!(
                     "Image pane should not have been persisted, as it is not restorable"
+                ))
+            }
+            LeafContents::Browser { .. } => {
+                // Web preview panes are intentionally not persisted (see
+                // `LeafContents::is_persisted`), so this should be unreachable.
+                Err(anyhow::anyhow!(
+                    "Browser pane should not have been persisted, as it is not restorable"
                 ))
             }
             LeafContents::GetStarted => {
@@ -4076,7 +4083,7 @@ impl PaneGroup {
     }
 
     /// Handle a common pane event, such as splitting off another pane.
-    fn handle_pane_event(
+    pub(crate) fn handle_pane_event(
         &mut self,
         pane_id: PaneId,
         event: &PaneEvent,
