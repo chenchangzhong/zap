@@ -2601,32 +2601,22 @@ impl Workspace {
                 &crate::dsh::DshRuntime::handle(ctx),
                 |me, _, event, ctx| match event {
                     crate::dsh::DshRuntimeEvent::Ready { url } => {
-                        // runtime 就绪:若已有打开的 dsh pane(重复打开场景),
-                        // 导航到新 URL;否则打开新 pane。
+                        // 已有 DshPane → set_ready(Loading) 或 navigate(Ready)
                         if me.navigate_existing_dsh_pane(url, ctx) {
                             return;
                         }
-                        let first_use = !crate::dsh::DshRuntime::is_configured();
-                        let window_id = ctx.window_id();
-                        let pane = crate::dsh::DshPane::new(url.clone(), ctx);
+                        // 无 DshPane(跨窗口场景)→ 创建新 tab 并立即就绪,
+                        // 避免留下永远卡 Loading 的幽灵 pane。
+                        let pane = crate::dsh::DshPane::new(ctx);
+                        pane.dsh_view(ctx).update(ctx, |view, ctx| {
+                            view.set_ready(url, ctx);
+                        });
                         let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
                         let new_idx = match new_tab_placement_setting {
                             NewTabPlacement::AfterAllTabs => me.tab_count(),
                             NewTabPlacement::AfterCurrentTab => me.active_tab_index + 1,
                         };
                         me.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
-                        if first_use {
-                            // 首次使用:提示配置模型 API key。
-                            WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
-                                stack.add_persistent_toast(
-                                    DismissibleToast::default(crate::t!(
-                                        "dsh-first-use-configure-model"
-                                    )),
-                                    window_id,
-                                    ctx,
-                                );
-                            });
-                        }
                     }
                     crate::dsh::DshRuntimeEvent::Restarted { url } => {
                         // 崩溃后自动重启完成:导航已有 dsh pane 到新 URL。
@@ -6128,6 +6118,16 @@ impl Workspace {
             }
             menu_items.push(docker_item.into_item());
         }
+        // 7b. DeepSeek
+        if FeatureFlag::DshPane.is_enabled() {
+            menu_items.push(
+                MenuItemFields::new("DeepSeek Harness")
+                    .with_on_select_action(WorkspaceAction::OpenDshPane)
+                    .with_icon(icons::Icon::DeepSeek)
+                    .into_item(),
+            );
+        }
+
 
         // 8. Separator + worktree config entry + new tab config
         if FeatureFlag::TabConfigs.is_enabled() {
@@ -18842,69 +18842,129 @@ impl Workspace {
         crate::uri::web_intent_parser::open_url_on_desktop(url);
     }
 
-    /// 打开 DeepSeek Harness Web UI pane:启动 dsh runtime(若未运行)。
-    /// 就绪后由 `init` 中订阅的 `DshRuntimeEvent::Ready` 打开 BrowserPane。
+    /// 打开 DeepSeek Harness Web UI pane
+    /// - runtime 可用(启动中/就绪)且有 DshPane tab → 聚焦已有 tab
+    /// - 否则 → 创建 Loading tab(若尚无),异步启动/重启 runtime
     fn open_dsh_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        // 读当前 runtime 状态(同步,不借用 self)。
+        let status = crate::dsh::DshRuntime::handle(ctx).read(ctx, |runtime, _| runtime.status());
+
+        // 1. runtime 可用且有 DshPane tab → 聚焦
+        if matches!(
+            status,
+            crate::dsh::DshRuntimeStatus::Starting | crate::dsh::DshRuntimeStatus::Ready
+        ) && self.focus_existing_dsh_pane(ctx)
+        {
+            return;
+        }
+        // 2. 无可用 DshPane tab → 创建 Loading tab(已有 stale pane 时复用,不重复建)
+        if !self.has_dsh_pane(ctx) {
+            let first_use = !crate::dsh::DshRuntime::is_configured();
+            let window_id = ctx.window_id();
+            let pane = crate::dsh::DshPane::new(ctx);
+            let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
+            let new_idx = match new_tab_placement_setting {
+                NewTabPlacement::AfterAllTabs => self.tab_count(),
+                NewTabPlacement::AfterCurrentTab => self.active_tab_index + 1,
+            };
+            self.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
+            if first_use {
+                // 首次使用:提示配置模型 API key。
+                WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
+                    stack.add_persistent_toast(
+                        DismissibleToast::default(crate::t!("dsh-first-use-configure-model")),
+                        window_id,
+                        ctx,
+                    );
+                });
+            }
+        }
+        // 3. 启动/重启 runtime(Starting 返回等就绪;Ready 主动触发就绪;
+        //    Stopped/Failed 重新 begin_start 以支持失败后重试)。
         crate::dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
-            if runtime.status() == crate::dsh::DshRuntimeStatus::Starting {
-                return; // 启动中:就绪事件会打开 pane
-            }
-            if runtime.status() == crate::dsh::DshRuntimeStatus::Ready {
-                // 已就绪:重新触发打开 pane。
-                if let Some(url) = runtime.url().map(str::to_string) {
-                    ctx.emit(crate::dsh::DshRuntimeEvent::Ready { url });
+            match runtime.status() {
+                crate::dsh::DshRuntimeStatus::Starting => return,
+                crate::dsh::DshRuntimeStatus::Ready => {
+                    if let Some(url) = runtime.url().map(str::to_string) {
+                        ctx.emit(crate::dsh::DshRuntimeEvent::Ready { url });
+                    }
+                    return;
                 }
-                return;
+                crate::dsh::DshRuntimeStatus::Stopped | crate::dsh::DshRuntimeStatus::Failed => {}
             }
-            // 标记启动中(复位 stopping/计数,递增代次),防止重复触发。
             let gen = runtime.begin_start();
             ctx.spawn(
                 crate::dsh::DshRuntime::start_future(gen),
                 move |runtime, result, ctx| match result {
                     crate::dsh::DshStartResult::Ready { url, child } => {
-                        // 仅真正收养(未被停止/代次未过期)才通知打开 pane。
                         if runtime.adopt_child(child, url.clone(), gen) {
                             ctx.emit(crate::dsh::DshRuntimeEvent::Ready { url });
                         }
                     }
                     crate::dsh::DshStartResult::Failed { error } => {
-                        // 首次启动失败:仅记录日志(用户看到 pane 未打开),
-                        // 不弹「连续崩溃」toast(文案只适用于崩溃场景)。
                         log::error!("[dsh] start failed: {error}");
                         runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
+                        // emit 失败事件触发既有 toast,避免失败后 Loading pane
+                        // 永久卡 spinner 而无任何用户反馈。
+                        ctx.emit(crate::dsh::DshRuntimeEvent::Failed { error });
                     }
                 },
             );
         });
     }
 
-    /// 若已有打开的 dsh pane,导航到新 URL 并返回 `true`;否则返回 `false`
-    /// (调用方应打开新 pane)。
-    ///
-    /// 用于崩溃重启后恢复:runtime 换了端口,已打开的 dsh webview 还指着
-    /// 旧地址,需要导航到新地址而不是再开一个 pane。按 DshPane 类型精确
-    /// 匹配,不误伤用户手动打开的普通 BrowserPane。
-    fn navigate_existing_dsh_pane(&mut self, url: &str, ctx: &mut ViewContext<Self>) -> bool {
-        let mut navigated = false;
-        for tab in &self.tabs {
-            let pane_group = tab.pane_group.clone();
-            // 遍历该 tab 的所有 DshPane。
-            let dsh_views: Vec<_> = pane_group
-                .as_ref(ctx)
-                .dsh_panes()
-                .map(|pane| pane.browser_view(ctx))
-                .collect();
-            for browser_view in dsh_views {
-                browser_view.update(ctx, |view, ctx| {
-                    view.handle_action(
-                        &crate::browser::BrowserPaneAction::Navigate(url.to_string()),
-                        ctx,
-                    );
-                });
-                navigated = true;
+    /// 是否有 DshPane tab(任意)。
+    fn has_dsh_pane(&self, ctx: &AppContext) -> bool {
+        self.tabs
+            .iter()
+            .any(|tab| tab.pane_group.as_ref(ctx).dsh_panes().next().is_some())
+    }
+
+    /// 聚焦已有 DshPane tab,返回 true 表示找到并切换。
+    fn focus_existing_dsh_pane(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if tab.pane_group.as_ref(ctx).dsh_panes().next().is_some() {
+                // 如有 Loading 态的 DshPane,等待 runtime 就绪即可。
+                self.activate_tab(i, ctx);
+                return true;
             }
         }
-        navigated
+        false
+    }
+
+    /// 导航/就绪已有 DshPane:
+    /// - Loading 态 → set_ready(首次就绪)
+    /// - Ready 态   → navigate 到新 URL(崩溃重启场景)
+    /// 返回 true 表示找到并处理了 DshPane。
+    fn navigate_existing_dsh_pane(&mut self, url: &str, ctx: &mut ViewContext<Self>) -> bool {
+        let mut handled = false;
+        for tab in &self.tabs {
+            let pane_group = tab.pane_group.clone();
+            // collect 成 ViewHandle 避免借用冲突
+            let handles: Vec<_> = pane_group
+                .as_ref(ctx)
+                .dsh_panes()
+                .map(|p| p.dsh_view(ctx))
+                .collect();
+            for dsh_view in handles {
+                if dsh_view.as_ref(ctx).is_loading() {
+                    dsh_view.update(ctx, |view, ctx| {
+                        view.set_ready(url, ctx);
+                    });
+                    handled = true;
+                } else if let Some(bv) = dsh_view.as_ref(ctx).get_browser_view() {
+                    let bv = bv.clone();
+                    bv.update(ctx, |view, ctx| {
+                        view.handle_action(
+                            &crate::browser::BrowserPaneAction::Navigate(url.to_string()),
+                            ctx,
+                        );
+                    });
+                    handled = true;
+                }
+            }
+        }
+        handled
     }
 }
 

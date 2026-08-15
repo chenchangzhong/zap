@@ -48,6 +48,8 @@ pub struct BrowserPaneView {
     /// which destroys the old window's webview. On re-attach the webview is
     /// recreated and the platform-view handler re-registered for the new window.
     needs_recreate: bool,
+    /// 是否渲染地址栏+导航按钮(后退/前进/刷新)。DshPane 等内嵌场景设为 false。
+    show_address_bar: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -74,10 +76,19 @@ pub enum BrowserPaneAction {
 fn is_http_url(input: &str) -> bool {
     Url::parse(input).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
-
 impl BrowserPaneView {
     /// Create a new web preview pane, opening `url` in an embedded webview.
+    /// 默认显示地址栏。
     pub fn new(url: String, ctx: &mut ViewContext<Self>) -> Self {
+        Self::new_with_options(url, true, ctx)
+    }
+
+    /// 创建 webview pane,可控制是否显示地址栏。
+    pub fn new_with_options(
+        url: String,
+        show_address_bar: bool,
+        ctx: &mut ViewContext<Self>,
+    ) -> Self {
         let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new("Browser"));
         let platform_view_id = BrowserWebViewManager::as_ref(ctx).allocate_id();
         let window_id = ctx.window_id();
@@ -111,6 +122,7 @@ impl BrowserPaneView {
             pane_configuration,
             window_id,
             needs_recreate: false,
+            show_address_bar,
         };
 
         ctx.subscribe_to_view(&view.address_bar, Self::handle_address_bar_event);
@@ -183,7 +195,7 @@ impl BrowserPaneView {
     /// - `Closed`:永久关闭,销毁 webview(避免幽灵视图与泄漏)。
     /// - `HiddenForClose`:undo 宽限期,隐藏 webview(保留以便恢复)。
     /// - `Moved`:跨窗口移动,销毁源窗口 webview,待 attach 到新窗口时重建。
-    fn handle_detach(&mut self, detach_type: DetachType, ctx: &mut ViewContext<Self>) {
+    pub(crate) fn handle_detach(&mut self, detach_type: DetachType, ctx: &mut ViewContext<Self>) {
         let manager = BrowserWebViewManager::as_ref(ctx);
         match detach_type {
             DetachType::Closed => manager.destroy(self.model.platform_view_id),
@@ -198,7 +210,7 @@ impl BrowserPaneView {
     /// Pane 附加(首次或恢复):跨窗口移动后在新窗口重建 webview 并重新注册
     /// handler;undo 恢复(HiddenForClose)时重新显示 webview。若 webview 已被
     /// 窗口关闭时的 cleanup 销毁,同样重建。
-    fn handle_attach(&mut self, ctx: &mut ViewContext<Self>) {
+    pub fn handle_attach(&mut self, ctx: &mut ViewContext<Self>) {
         let manager = BrowserWebViewManager::as_ref(ctx);
         let webview_exists = manager.has_webview(self.model.platform_view_id);
         if self.needs_recreate || !webview_exists {
@@ -289,6 +301,7 @@ impl BrowserPaneView {
         }
     }
 }
+
 impl Entity for BrowserPaneView {
     type Event = BrowserPaneEvent;
 }
@@ -356,8 +369,9 @@ impl View for BrowserPaneView {
             .with_cursor(Cursor::PointingHand)
             .finish();
 
-        Flex::column()
-            .with_child(
+        let mut column = Flex::column();
+        if self.show_address_bar {
+            column = column.with_child(
                 Flex::row()
                     .with_spacing(6.)
                     .with_cross_axis_alignment(warpui::elements::CrossAxisAlignment::Center)
@@ -376,7 +390,9 @@ impl View for BrowserPaneView {
                         .finish(),
                     )
                     .finish(),
-            )
+            );
+        }
+        column
             .with_child(
                 Expanded::new(
                     1.0,
