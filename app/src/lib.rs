@@ -1460,16 +1460,13 @@ fn initialize_app(
     }
 
     // 每帧回调:合并 BrowserPane(platform view 定位)与 DshRuntime(崩溃轮询)。
+    // 外层 if(BrowserPane || DshPane)已保证 webview 管理器注册,故直接调用。
     if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
         ctx.on_frame_drawn(|ctx, window_id| {
-            // DshPane 内嵌 webview 同样需要 platform view 定位,故与注册
-            // 条件一致按 BrowserPane || DshPane 门控。
-            if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
-                browser::BrowserWebViewManager::handle(ctx).update(ctx, |manager, ctx| {
-                    manager.drain_pending_platform_views(window_id);
-                    manager.drain_pending_webview_focus(ctx);
-                });
-            }
+            browser::BrowserWebViewManager::handle(ctx).update(ctx, |manager, ctx| {
+                manager.drain_pending_platform_views(window_id);
+                manager.drain_pending_webview_focus(ctx);
+            });
             if FeatureFlag::DshPane.is_enabled() {
                 dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
                     match runtime.poll_child() {

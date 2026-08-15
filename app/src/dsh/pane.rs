@@ -206,6 +206,14 @@ impl DshPaneView {
                 if let BrowserWebViewEvent::UrlChanged(id) = event {
                     if *id == webview_id {
                         view.webview_loaded = true;
+                        // 加载完成且本 pane 仍持焦点时补一次 focus_webview:
+                        // on_focus 只在焦点转移时触发,set_ready(without_focus)
+                        // 期间焦点未转移、on_focus 不会再次触发,若不补,用户
+                        // 加载完成后直接打字会进 Warp 而非页面。焦点已离开本
+                        // pane(用户切走)则不抢,由切回时 on_focus 正常切换。
+                        if ctx.is_self_focused() {
+                            BrowserWebViewManager::as_ref(ctx).focus_webview(webview_id);
+                        }
                         ctx.notify();
                     }
                 }
@@ -378,8 +386,17 @@ impl PaneContent for DshPane {
             .update(ctx, |view, ctx| view.set_focus_handle(focus_handle, ctx));
 
         // 跨窗口移动后重建 webview / undo 恢复时重新显示(Ready 态才有 webview)。
+        // 移动后 webview 重建重载中(spinner 显示)不抢占焦点,与 set_ready 的
+        // without_focus 一致;已加载恢复(HiddenForClose)则正常 attach 带焦点。
         if let Some(bv) = self.dsh_view(ctx).as_ref(ctx).get_browser_view().cloned() {
-            bv.update(ctx, |view, ctx| view.handle_attach(ctx));
+            let webview_loaded = self.dsh_view(ctx).as_ref(ctx).webview_loaded;
+            bv.update(ctx, |view, ctx| {
+                if webview_loaded {
+                    view.handle_attach(ctx);
+                } else {
+                    view.handle_attach_without_focus(ctx);
+                }
+            });
         }
 
         let pane_id = self.id();
