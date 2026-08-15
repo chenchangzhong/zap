@@ -54,14 +54,15 @@ pub struct BrowserWebViewManager {
 
 #[cfg(target_os = "macos")]
 struct WebViewEntry {
-    webview: wry::WebView,
-    /// 所属窗口。drain 按窗口消费上报,跨窗口隐藏需区分归属。
+    /// Box 保证堆分配,地址不受 HashMap rehash 影响。存 raw pointer
+    /// 供 IPC handler 同步调 focus()。
+    webview: Box<wry::WebView>,
     window_id: WindowId,
-    /// 最近一次导航的目标 URL。由 wry navigation handler(内部线程)写入,
-    /// 供后退/前进后同步地址栏。
     current_url: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
-    /// 上次应用的 bounds,用于节流:rect 未变化时不重复调用 `set_bounds`。
     last_bounds: Option<wry::Rect>,
+    /// 与 IPC handler 闭包共享的裸指针。destroy 时先置空再 drop Box,
+    /// 避免销毁后残留的 IPC 回调解引用悬垂指针(use-after-free)。
+    focus_ptr: std::sync::Arc<parking_lot::Mutex<*const wry::WebView>>,
 }
 
 impl BrowserWebViewManager {
@@ -89,14 +90,17 @@ impl BrowserWebViewManager {
         window_id: WindowId,
     ) {
         log::info!("[browser] create webview {id} url={url} rect={rect:?}");
-        // wry 的 child webview 会拦截 performKeyEquivalent(Cmd 快捷键不进
-        // webview),在页面内监听 Cmd+R 触发刷新;同时:当地址栏聚焦时 webview
-        // 失焦,页面活跃元素的焦点应自动释放,避免两处光标共存。
-        // 页面内元素获得焦点(focusin)时经 IPC 上报 Rust,让 Warp 释放地址栏
-        // 的焦点与光标(地址栏与页面各一个光标 = 双光标)。
+        // wry 的 child webview 会拦截 performKeyEquivalent(Cmd 快捷键不
+        // 进 webview),在页面内监听 Cmd+R 触发刷新;同时:当地址栏聚焦时
+        // webview 失焦,页面活跃元素的焦点应自动释放,避免两处光标共存。
+        // 页面内元素获得焦点(focusin)时经 IPC 上报 Rust,让 Warp 释放
+        // 地址栏的焦点与光标(地址栏与页面各一个光标 = 双光标)。
         let init_js = r#"
 document.addEventListener('keydown', (e) => {
-  if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === 'r' || e.key === 'R')) {
+  if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+  // Cmd+R → 页面刷新(wry child webview 的 performKeyEquivalent 返回 NO,
+  // 不触发 KVO 刷新,需 JS 手动处理)。
+  if (e.key === 'r' || e.key === 'R') {
     e.preventDefault();
     location.reload();
   }
@@ -106,10 +110,24 @@ document.addEventListener('focusin', () => {
     window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-focusin');
   }
 });
-// 点击页面任意位置(含空白)也释放地址栏焦点,避免地址栏光标残留。
+// 点击页面任意位置上报 Rust,让 WKWebView 同步成为 first responder。
 document.addEventListener('mousedown', () => {
+  window.focus();
   window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-mousedown');
 });
+// 处理 target=_blank 链接:在当前 webview 导航而非创建新窗口。
+document.addEventListener('click', (e) => {
+  let el = e.target;
+  while (el && el.tagName !== 'A') el = el.parentElement;
+  if (el && el.tagName === 'A' && el.target === '_blank') {
+    e.preventDefault();
+    window.location.href = el.href;
+  }
+});
+// 处理 window.open():在(唯一)当前 webview 导航。
+window.open = function(url) {
+  window.location.href = url;
+};
 setInterval(() => {
   if (!document.hasFocus() && document.activeElement && document.activeElement !== document.body) {
     document.activeElement.blur();
@@ -120,6 +138,12 @@ setInterval(() => {
         let handler_url = current_url.clone();
         let ipc_id = id;
         let url_notify_id = id;
+        // IPC handler 里同步调 makeFirstResponder,不等下一帧。
+        // 用 raw pointer + Box(堆分配,地址不受 HashMap rehash 影响);
+        // focus_ptr 同时存入 WebViewEntry,destroy 时置空防止悬垂。
+        let focus_ptr: std::sync::Arc<parking_lot::Mutex<*const wry::WebView>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::ptr::null()));
+        let holder = focus_ptr.clone();
         match wry::WebViewBuilder::new()
             .with_url(url)
             .with_initialization_script(init_js)
@@ -129,13 +153,18 @@ setInterval(() => {
                 }
             })
             .with_ipc_handler(move |request| {
-                log::debug!("[browser] ipc msg: {}", request.body());
+                let body = request.body();
+                log::debug!("[browser] ipc msg: {}", body);
                 if matches!(
-                    request.body().as_str(),
+                    body.as_str(),
                     "warp:webview-focusin" | "warp:webview-mousedown"
                 ) {
                     log::debug!("[browser] ipc -> PENDING_WEBVIEW_FOCUS_EVENTS id={}", ipc_id);
                     PENDING_WEBVIEW_FOCUS_EVENTS.lock().insert(ipc_id);
+                    let ptr = *holder.lock();
+                    if !ptr.is_null() {
+                        let _ = unsafe { (*ptr).focus() };
+                    }
                 }
             })
             .with_navigation_handler(move |target_url| {
@@ -146,6 +175,8 @@ setInterval(() => {
             .build_as_child(window)
         {
             Ok(webview) => {
+                let webview = Box::new(webview);
+                *focus_ptr.lock() = &*webview as *const wry::WebView;
                 self.webviews.borrow_mut().insert(
                     id,
                     WebViewEntry {
@@ -153,6 +184,7 @@ setInterval(() => {
                         window_id,
                         current_url,
                         last_bounds: None,
+                        focus_ptr,
                     },
                 );
             }
@@ -294,7 +326,11 @@ setInterval(() => {
     /// 销毁 id 对应的 webview(pane 关闭时调用)。
     pub fn destroy(&self, id: u64) {
         #[cfg(target_os = "macos")]
-        self.webviews.borrow_mut().remove(&id);
+        if let Some(entry) = self.webviews.borrow_mut().remove(&id) {
+            // 先置空 IPC handler 共享的裸指针,再 drop Box(webview),
+            // 防止销毁后残留 IPC 回调解引用悬垂指针(use-after-free)。
+            *entry.focus_ptr.lock() = std::ptr::null();
+        }
     }
 
     /// 该 id 的 webview 是否仍存在(窗口关闭 cleanup 后可能已销毁)。

@@ -2,6 +2,7 @@
 #import <AppKit/NSAccessibility.h>
 #import <AppKit/NSAccessibilityConstants.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 
 #import "alert.h"
@@ -574,9 +575,13 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
 /// 这样就避免了 CustomAction 菜单 item 在 context 变化后 isEnabled 
 /// 缓存脏的问题（e.g. CLI_AGENT_RICH_INPUT_OPEN 在菜单未打开时变化，
 /// 导致 performKeyEquivalent: 仍命中旧的菜单绑定）。
+///
+/// 对于 Cmd+C/V/X/A:如果 first responder 是 WKWebView 或其内部
+/// WKContentView,直接在本窗口处理,不经过 Warp 的 key binding 系统和
+/// AppKit 菜单。V/X/A 发送 paste:/cut:/selectAll: 给 first responder;
+/// C 用 evaluateJavaScript 读页面选中文本写系统 NSPasteboard。避免 wry
+/// child webview 的 performKeyEquivalent 返回 NO 后编辑命令被丢弃的问题。
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
-    // We need to bypass the default performKeyEquivalent implementation which, in the case of
-    // having keybinding conflicts with MacOS itself, yields priority to the OS.
     if ([event type] == NSEventTypeKeyDown) {
         // Skip the key-equivalent priority path while the IME has marked text. Arrow keys carry
         // NSEventModifierFlagFunction, so AppKit delivers them here before keyDown:. If we call
@@ -584,6 +589,56 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
         // proceeds to call keyDown: — running interpretKeyEvents a second time for the same event.
         // See #9709.
         if ([(WarpHostView *)self.contentView hasMarkedText]) {
+            return [super performKeyEquivalent:event];
+        }
+
+        // 标准编辑命令:当 first responder 是 WKWebView(或 WKContentView)
+        // 时直接发送,不经过 key binding 系统。
+        id firstResponder = [self firstResponder];
+        BOOL isWKView = [firstResponder isKindOfClass:NSClassFromString(@"WKWebView")]
+            || [firstResponder isKindOfClass:NSClassFromString(@"WKContentView")];
+        if (isWKView) {
+            NSString *chars = [event charactersIgnoringModifiers];
+            NSUInteger mods = [event modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
+            if (mods == NSEventModifierFlagCommand) {
+                if ([chars isEqualToString:@"c"]) {
+                    // Cmd+C 复制:first responder 是外层 WryWebView,对它直接发
+                    // `copy:` 是空操作(AppKit 不转发到真正持有文本选中的内层
+                    // WKContentView),因此用 WebView 公开 API 读选中文本并写
+                    // 系统 NSPasteboard(只写 NSPasteboardTypeString 纯文本)。
+                    WKWebView *webview = (WKWebView *)firstResponder;
+                    // 连按 Cmd+C 时 evaluateJavaScript 回调可能乱序到达:
+                    // generation 只允许最后一次的结果写剪贴板,防止旧选中
+                    // 覆盖新选中。
+                    static NSUInteger s_copyGeneration = 0;
+                    NSUInteger myGeneration = ++s_copyGeneration;
+                    [webview evaluateJavaScript:@"document.getSelection().toString()"
+                              completionHandler:^(id result, NSError *err) {
+                                  if (err != nil) { return; }
+                                  if (![result isKindOfClass:[NSString class]]) { return; }
+                                  NSString *text = (NSString *)result;
+                                  if ([text length] == 0) { return; }
+                                  // 写剪贴板统一放主线程,避免 WebKit 回调线程与
+                                  // NSPasteboard 的线程约束冲突。
+                                  dispatch_async(dispatch_get_main_queue(), ^{
+                                      if (myGeneration != s_copyGeneration) { return; }
+                                      NSPasteboard *pb = [NSPasteboard generalPasteboard];
+                                      [pb declareTypes:@[ NSPasteboardTypeString ] owner:nil];
+                                      [pb setString:text forType:NSPasteboardTypeString];
+                                  });
+                              }];
+                    return YES;
+                } else if ([chars isEqualToString:@"v"]) {
+                    [firstResponder paste:nil];
+                    return YES;
+                } else if ([chars isEqualToString:@"x"]) {
+                    [firstResponder cut:nil];
+                    return YES;
+                } else if ([chars isEqualToString:@"a"]) {
+                    [firstResponder selectAll:nil];
+                    return YES;
+                }
+            }
             return [super performKeyEquivalent:event];
         }
 

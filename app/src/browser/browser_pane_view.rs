@@ -269,6 +269,12 @@ impl BrowserPaneView {
     ) {
         match event {
             BrowserWebViewEvent::PageFocused(id) if *id == self.model.platform_view_id => {
+                // 页面内元素聚焦/点击→直接调 focus_webview 让 WKWebView
+                // 成为 AppKit first responder。ctx.focus_self() 在 pane 已持
+                // 有 Warp 焦点时不触发 on_focus(空操作),会导致 webview 拿不
+                // 到 first responder,进而 Cmd+C/V 等键盘快捷键发错目标。
+                BrowserWebViewManager::as_ref(ctx)
+                    .focus_webview(self.model.platform_view_id);
                 ctx.focus_self();
             }
             BrowserWebViewEvent::UrlChanged(id) if *id == self.model.platform_view_id => {
