@@ -32,6 +32,9 @@ const MAX_RESTARTS: u8 = 3;
 /// 停止时等待优雅退出的时长,超时后 SIGKILL。
 /// 主线程同步阻塞调用(request_stop/Drop),不宜过长。
 const STOP_GRACE: Duration = Duration::from_secs(3);
+/// 崩溃计数重置阈值:距上次成功启动超过该时长后崩溃,视为健康运行期间
+/// 的偶发崩溃,重置连续崩溃计数(避免数月内偶发崩溃累计触发 GiveUp)。
+const CRASH_COUNT_RESET_AFTER: Duration = Duration::from_secs(300);
 
 
 /// 崩溃重启的完整流程(供 ctx.spawn 回调)。
@@ -79,7 +82,6 @@ pub enum PollResult {
 /// DeepSeek Harness runtime 单例。
 ///
 /// 状态与子进程句柄均由主线程(model 消息循环)持有;异步操作通过
-/// `ModelContext::spawn` 在后台执行器上运行,结果回主线程回调。
 pub struct DshRuntime {
     status: DshRuntimeStatus,
     url: Option<String>,
@@ -94,6 +96,9 @@ pub struct DshRuntime {
     /// 携带发起时的代次,代次不匹配(期间又有新启动/停止)则丢弃子进程,
     /// 防止双启动竞态泄漏。
     generation: u64,
+    /// 上次成功收养子进程的时刻。崩溃时若距上次成功启动已超过
+    /// `CRASH_COUNT_RESET_AFTER`,视为健康运行,重置崩溃计数。
+    last_success_at: Option<std::time::Instant>,
 }
 
 impl Default for DshRuntime {
@@ -143,9 +148,6 @@ impl DshRuntime {
         }
     }
 
-}
-
-impl DshRuntime {
     pub fn new() -> Self {
         Self {
             status: DshRuntimeStatus::Stopped,
@@ -154,6 +156,7 @@ impl DshRuntime {
             consecutive_crashes: 0,
             stopping: false,
             generation: 0,
+            last_success_at: None,
         }
     }
 
@@ -435,8 +438,16 @@ impl DshRuntime {
 
     /// 接收启动完成的子进程(回调中调用)。
     ///
-    /// 若代次不匹配(期间又有新启动/停止)或已请求停止,不收养进程,
-    /// 直接优雅终止,避免双启动/无 pane 常驻进程。返回是否真正收养。
+    /// 若已请求停止或代次不匹配(期间又有新启动),不收养进程,直接优雅
+    /// 终止,避免双启动/无 pane 常驻进程。返回是否真正收养。
+    ///
+    /// 状态维护约定:
+    /// - `stopping` 为 true 时,`request_stop` 已把状态置 `Stopped`,这里
+    ///   保持不动;
+    /// - 代次不匹配时,必有更新的 `begin_start`/`begin_restart`(已置
+    ///   `Starting`)或更新的 adopt(已置 `Ready`),这里**不改写状态**,
+    ///   避免把新代次的状态打回 `Stopped`(否则会出现「Stopped + 活子进程」
+    ///   的不一致,并连锁导致下次打开时覆盖句柄泄漏)。
     pub fn adopt_child(&mut self, child: async_process::Child, generation: u64) -> bool {
         if self.stopping || self.generation != generation {
             log::info!(
@@ -445,11 +456,17 @@ impl DshRuntime {
             );
             let mut child = child;
             Self::terminate_child(&mut child);
-            self.set_status(DshRuntimeStatus::Stopped);
             return false;
+        }
+        // 防御:正常情况下本代次不应已有 child(双启动竞态的兜底),
+        // 若存在则先终止,避免句柄覆盖泄漏。
+        if let Some(mut old_child) = self.child.take() {
+            log::warn!("[dsh] adopting child while previous child still alive; terminating old");
+            Self::terminate_child(&mut old_child);
         }
         self.child = Some(child);
         self.stopping = false;
+        self.last_success_at = Some(std::time::Instant::now());
         self.set_status(DshRuntimeStatus::Ready);
         true
     }
@@ -480,7 +497,18 @@ impl DshRuntime {
                 if self.stopping {
                     return PollResult::StoppedByRequest;
                 }
-                self.consecutive_crashes += 1;
+                // 距上次成功启动超过阈值:视为健康运行期间的偶发崩溃,
+                // 重置连续崩溃计数(从 1 重新计)。
+                if self
+                    .last_success_at
+                    .map(|t| t.elapsed() > CRASH_COUNT_RESET_AFTER)
+                    .unwrap_or(false)
+                {
+                    log::info!("[dsh] crash after healthy run; resetting crash count");
+                    self.consecutive_crashes = 1;
+                } else {
+                    self.consecutive_crashes += 1;
+                }
                 log::warn!(
                     "[dsh] process exited unexpectedly (crash #{})",
                     self.consecutive_crashes
@@ -745,6 +773,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
                     if result != PollResult::Running {
                         break;
                     }
+
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 if expected_crash <= MAX_RESTARTS {
@@ -755,6 +784,59 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
                     assert_eq!(runtime.status(), DshRuntimeStatus::Failed);
                 }
             }
+        });
+    }
+
+    /// 健康运行超过阈值后崩溃,重置连续崩溃计数。
+    #[cfg(unix)]
+    #[test]
+    fn crash_after_healthy_run_resets_count() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let mut runtime = DshRuntime::new();
+
+            // 第一次崩溃(计数 1)。
+            let mut cmd = command::r#async::Command::new("sleep");
+            cmd.arg("30");
+            let child = cmd.spawn().expect("spawn sleep");
+            let pid = child.id();
+            let gen = runtime.begin_restart();
+            assert!(runtime.adopt_child(child, gen));
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            for _ in 0..100 {
+                if runtime.poll_child() == PollResult::Crashed {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(runtime.consecutive_crashes, 1);
+
+            // 第二次:adopt 之后把 last_success_at 改到很久以前,模拟健康
+            // 运行超过阈值;崩溃时应重置计数为 1(而非 2)。
+            let mut cmd = command::r#async::Command::new("sleep");
+            cmd.arg("30");
+            let child = cmd.spawn().expect("spawn sleep");
+            let pid = child.id();
+            let gen = runtime.begin_restart();
+            assert!(runtime.adopt_child(child, gen));
+            runtime.last_success_at = Some(
+                std::time::Instant::now() - CRASH_COUNT_RESET_AFTER - Duration::from_secs(1),
+            );
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            for _ in 0..100 {
+                if runtime.poll_child() == PollResult::Crashed {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                runtime.consecutive_crashes, 1,
+                "count should reset after healthy run"
+            );
         });
     }
 

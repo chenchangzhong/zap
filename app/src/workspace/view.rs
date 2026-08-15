@@ -2634,6 +2634,17 @@ impl Workspace {
                     }
                     crate::dsh::DshRuntimeEvent::Failed { error } => {
                         log::error!("[dsh] runtime failed: {error}");
+                        // 提示用户:runtime 已停止,可重新打开。
+                        let window_id = ctx.window_id();
+                        WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
+                            stack.add_persistent_toast(
+                                DismissibleToast::error(crate::t!(
+                                    "dsh-runtime-failed-toast"
+                                )),
+                                window_id,
+                                ctx,
+                            );
+                        });
                     }
                 },
             );

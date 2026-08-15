@@ -1486,6 +1486,8 @@ fn initialize_app(
                                 dsh::DshRestartResult::GiveUp { error } => {
                                     log::error!("[dsh] restart gave up: {error}");
                                     runtime.set_status(dsh::DshRuntimeStatus::Failed);
+                                    // 通知 workspace 展示失败(pane 已停,提示用户)。
+                                    ctx.emit(dsh::DshRuntimeEvent::Failed { error });
                                 }
                             },
                         );
