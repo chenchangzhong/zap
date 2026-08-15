@@ -2300,9 +2300,10 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
     #[cfg(all(debug_assertions, not(windows)))]
     flags.insert(FeatureFlag::ServerFileBrowser);
 
-    // Web preview:dogfood 灰度项,本地 dev(debug 构建)默认启用以便开发验证。
-    // wry 集成目前仅 macOS 实现,故只在该平台 debug 构建默认启用。
-    #[cfg(all(debug_assertions, target_os = "macos"))]
+    // Web preview:全部开放(macOS)。wry 集成目前仅 macOS 实现(见
+    // app/Cargo.toml 的 target.macos 依赖),故只在该平台启用;其余平台
+    // 保持关闭。已从 DOGFOOD 灰度毕业,release 构建同样启用。
+    #[cfg(target_os = "macos")]
     flags.insert(FeatureFlag::BrowserPane);
 
     // Issue #72: HTTP 代理设置页面。不走 channel 判断,所有 channel 含 zap-oss

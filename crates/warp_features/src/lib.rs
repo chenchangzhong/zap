@@ -796,7 +796,6 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::FileGlobV2Warnings,
     FeatureFlag::SummarizationViaMessageReplacement,
     FeatureFlag::LocalComputerUse,
-    FeatureFlag::BrowserPane,
     FeatureFlag::OzPlatformSkills,
     FeatureFlag::AgentViewBlockContext,
     // End manually enabled Code features.
