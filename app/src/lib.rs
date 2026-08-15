@@ -1468,23 +1468,22 @@ fn initialize_app(
             }
             if FeatureFlag::DshPane.is_enabled() {
                 dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
-                    if let Some(crashes) = runtime.poll_child() {
-                        if crashes > 0 {
-                            // 崩溃:调度重启(后台执行器)。
-                            ctx.spawn(
-                                dsh::DshRuntime::restart_future(),
-                                move |runtime, result, _ctx| match result {
-                                    dsh::DshRestartResult::Restarted { url, child } => {
-                                        log::info!("[dsh] restarted at {url}");
-                                        runtime.adopt_child(child);
-                                    }
-                                    dsh::DshRestartResult::GiveUp { error } => {
-                                        log::error!("[dsh] restart gave up: {error}");
-                                        runtime.set_status(dsh::DshRuntimeStatus::Failed);
-                                    }
-                                },
-                            );
-                        }
+                    if runtime.poll_child() == dsh::PollResult::Crashed {
+                        // 崩溃:标记新启动(复位 stopping/计数),调度重启。
+                        runtime.begin_start();
+                        ctx.spawn(
+                            dsh::DshRuntime::restart_future(),
+                            move |runtime, result, _ctx| match result {
+                                dsh::DshRestartResult::Restarted { url, child } => {
+                                    log::info!("[dsh] restarted at {url}");
+                                    runtime.adopt_child(child);
+                                }
+                                dsh::DshRestartResult::GiveUp { error } => {
+                                    log::error!("[dsh] restart gave up: {error}");
+                                    runtime.set_status(dsh::DshRuntimeStatus::Failed);
+                                }
+                            },
+                        );
                     }
                 });
             }

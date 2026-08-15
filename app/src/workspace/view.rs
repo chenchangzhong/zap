@@ -18837,6 +18837,8 @@ impl Workspace {
                 }
                 return;
             }
+            // 标记启动中(复位 stopping/计数),防止重复触发。
+            runtime.begin_start();
             ctx.spawn(
                 crate::dsh::DshRuntime::start_future(),
                 move |runtime, result, ctx| match result {

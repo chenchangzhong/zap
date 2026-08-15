@@ -11,4 +11,6 @@ pub(crate) mod pane;
 pub(crate) mod runtime;
 
 pub use pane::DshPane;
-pub use runtime::{DshRestartResult, DshRuntime, DshRuntimeEvent, DshRuntimeStatus, DshStartResult};
+pub use runtime::{
+    DshRestartResult, DshRuntime, DshRuntimeEvent, DshRuntimeStatus, DshStartResult, PollResult,
+};
