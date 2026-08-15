@@ -2602,6 +2602,8 @@ impl Workspace {
                 |me, _, event, ctx| match event {
                     crate::dsh::DshRuntimeEvent::Ready { url } => {
                         // runtime 就绪:打开 dsh Web UI pane。
+                        let first_use = !crate::dsh::DshRuntime::is_configured();
+                        let window_id = ctx.window_id();
                         let pane = crate::dsh::DshPane::new(url.clone(), ctx);
                         let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
                         let new_idx = match new_tab_placement_setting {
@@ -2609,6 +2611,18 @@ impl Workspace {
                             NewTabPlacement::AfterCurrentTab => me.active_tab_index + 1,
                         };
                         me.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
+                        if first_use {
+                            // 首次使用:提示配置模型 API key。
+                            WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
+                                stack.add_persistent_toast(
+                                    DismissibleToast::default(crate::t!(
+                                        "dsh-first-use-configure-model"
+                                    )),
+                                    window_id,
+                                    ctx,
+                                );
+                            });
+                        }
                     }
                     crate::dsh::DshRuntimeEvent::Failed { error } => {
                         log::error!("[dsh] runtime failed: {error}");

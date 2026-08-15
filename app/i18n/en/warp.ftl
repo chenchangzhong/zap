@@ -1744,6 +1744,7 @@ keybinding-desc-workspace-new-terminal-tab = New Terminal Tab
 keybinding-desc-workspace-new-agent-tab = New Agent Tab
 keybinding-desc-workspace-new-cloud-agent-tab = New Agent Tab
 keybinding-desc-workspace-open-dsh-pane = Open DeepSeek Harness
+dsh-first-use-configure-model = DeepSeek Harness is ready. Configure your model API key in its settings to start.
 new-session-create-new-tab = Create New Tab
 new-session-create-new-window = Create New Window
 new-session-split-pane-down = Split Pane Down

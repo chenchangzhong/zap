@@ -1664,6 +1664,7 @@ keybinding-desc-workspace-new-terminal-tab = 新建终端标签页
 keybinding-desc-workspace-new-agent-tab = 新建 Agent 标签页
 keybinding-desc-workspace-new-cloud-agent-tab = 新建 Agent 标签页
 keybinding-desc-workspace-open-dsh-pane = 打开 DeepSeek Harness
+dsh-first-use-configure-model = DeepSeek Harness 已就绪。请在设置中配置模型 API Key 后开始使用。
 new-session-create-new-tab = 新建标签页
 new-session-create-new-window = 新建窗口
 new-session-split-pane-down = 向下拆分窗格

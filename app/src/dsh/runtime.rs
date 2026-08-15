@@ -108,16 +108,14 @@ impl DshRuntime {
         }
     }
 
-    pub fn status(&self) -> DshRuntimeStatus {
-        self.status
-    }
-
-    pub fn url(&self) -> Option<&str> {
-        self.url.as_deref()
-    }
-
-    pub fn set_status(&mut self, status: DshRuntimeStatus) {
-        self.status = status;
+    /// dsh 是否已配置(settings.yaml 存在即视为已初始化)。
+    ///
+    /// dsh 的设置文档默认在 `<DSH_HOME>/settings.yaml`(见 dsh settings-file
+    /// 插件);首次使用前不存在。用它作为"需要引导"的判据。
+    pub fn is_configured() -> bool {
+        Self::dsh_data_dir()
+            .map(|dir| dir.join("settings.yaml").is_file())
+            .unwrap_or(false)
     }
 
     /// dsh 数据目录:`<data_dir>/dsh`。
@@ -128,6 +126,18 @@ impl DshRuntime {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create dsh data dir {}", dir.display()))?;
         Ok(dir)
+    }
+
+    pub fn status(&self) -> DshRuntimeStatus {
+        self.status
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    pub fn set_status(&mut self, status: DshRuntimeStatus) {
+        self.status = status;
     }
 
     /// 启动 dsh runtime(异步,不借用 self)。
