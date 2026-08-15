@@ -18863,7 +18863,7 @@ impl Workspace {
                 move |runtime, result, ctx| match result {
                     crate::dsh::DshStartResult::Ready { url, child } => {
                         // 仅真正收养(未被停止/代次未过期)才通知打开 pane。
-                        if runtime.adopt_child(child, gen) {
+                        if runtime.adopt_child(child, url.clone(), gen) {
                             ctx.emit(crate::dsh::DshRuntimeEvent::Ready { url });
                         }
                     }

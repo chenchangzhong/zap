@@ -1480,7 +1480,7 @@ fn initialize_app(
                                         log::info!("[dsh] restarted at {url}");
                                         // 仅真正收养(未被停止/代次未过期)才通知
                                         // workspace 导航。
-                                        if runtime.adopt_child(child, gen) {
+                                        if runtime.adopt_child(child, url.clone(), gen) {
                                             ctx.emit(dsh::DshRuntimeEvent::Restarted { url });
                                         }
                                     }

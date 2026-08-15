@@ -448,7 +448,7 @@ impl DshRuntime {
     ///   `Starting`)或更新的 adopt(已置 `Ready`),这里**不改写状态**,
     ///   避免把新代次的状态打回 `Stopped`(否则会出现「Stopped + 活子进程」
     ///   的不一致,并连锁导致下次打开时覆盖句柄泄漏)。
-    pub fn adopt_child(&mut self, child: async_process::Child, generation: u64) -> bool {
+    pub fn adopt_child(&mut self, child: async_process::Child, url: String, generation: u64) -> bool {
         if self.stopping || self.generation != generation {
             log::info!(
                 "[dsh] startup finished after stop/new start (gen {generation} != {}); killing child",
@@ -465,6 +465,7 @@ impl DshRuntime {
             Self::terminate_child(&mut old_child);
         }
         self.child = Some(child);
+        self.url = Some(url);
         self.stopping = false;
         self.last_success_at = Some(std::time::Instant::now());
         self.set_status(DshRuntimeStatus::Ready);
@@ -540,7 +541,7 @@ pub enum DshRuntimeEvent {
     Ready { url: String },
     /// 崩溃后自动重启完成(仅通知已有 pane 导航,不自动开新 pane)。
     Restarted { url: String },
-    /// 启动/重启失败。
+    /// 启动/重启失败,或连续崩溃超过上限放弃重启。
     Failed { error: String },
 }
 
@@ -645,7 +646,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             let mut cmd = command::r#async::Command::new("sleep");
             cmd.arg("30");
             let child = cmd.spawn().expect("spawn sleep");
-            runtime.adopt_child(child, 0);
+            runtime.adopt_child(child, "http://127.0.0.1:1".to_string(), 0);
             assert_eq!(runtime.status(), DshRuntimeStatus::Ready);
 
             // 杀掉进程,下一轮 poll_child 应检测到崩溃(计数 1)。
@@ -676,7 +677,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             cmd.arg("30");
             let child = cmd.spawn().expect("spawn sleep");
             let pid = child.id();
-            runtime.adopt_child(child, 0);
+            runtime.adopt_child(child, "http://127.0.0.1:1".to_string(), 0);
             // 标记停止(不取走 child,模拟"已请求停止但进程还在"的窗口)。
             runtime.stopping = true;
             unsafe {
@@ -708,7 +709,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             cmd.arg("30");
             let child = cmd.spawn().expect("spawn sleep");
             let pid = child.id();
-            runtime.adopt_child(child, 0);
+            runtime.adopt_child(child, "http://127.0.0.1:1".to_string(), 0);
 
             // 不应收养:child 为 None,且子进程被杀。
             assert_eq!(runtime.child.is_none(), true);
@@ -763,7 +764,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
                 let child = cmd.spawn().expect("spawn sleep");
                 let pid = child.id();
                 let gen = runtime.begin_restart();
-                assert!(runtime.adopt_child(child, gen));
+                assert!(runtime.adopt_child(child, "http://127.0.0.1:1".to_string(), gen));
                 unsafe {
                     libc::kill(pid as i32, libc::SIGKILL);
                 }
@@ -801,7 +802,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             let child = cmd.spawn().expect("spawn sleep");
             let pid = child.id();
             let gen = runtime.begin_restart();
-            assert!(runtime.adopt_child(child, gen));
+            assert!(runtime.adopt_child(child, "http://127.0.0.1:1".to_string(), gen));
             unsafe {
                 libc::kill(pid as i32, libc::SIGKILL);
             }
@@ -820,7 +821,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             let child = cmd.spawn().expect("spawn sleep");
             let pid = child.id();
             let gen = runtime.begin_restart();
-            assert!(runtime.adopt_child(child, gen));
+            assert!(runtime.adopt_child(child, "http://127.0.0.1:1".to_string(), gen));
             runtime.last_success_at = Some(
                 std::time::Instant::now() - CRASH_COUNT_RESET_AFTER - Duration::from_secs(1),
             );
