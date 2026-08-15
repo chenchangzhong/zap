@@ -182,6 +182,9 @@ setInterval(() => {
         let holder = focus_ptr.clone();
         match wry::WebViewBuilder::new()
             .with_url(url)
+            // 透明背景:让 WebView 透出下层 WarpUI 画面(深色主题下避免白底)。
+            // 注意:页面自身背景仍需透明(如 body { background: transparent }),否则仍是白底。
+            .with_transparent(true)
             .with_initialization_script(init_js)
             .with_on_page_load_handler(move |event, _url| {
                 if matches!(event, wry::PageLoadEvent::Finished) {
