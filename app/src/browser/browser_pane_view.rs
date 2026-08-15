@@ -209,8 +209,21 @@ impl BrowserPaneView {
 
     /// Pane 附加(首次或恢复):跨窗口移动后在新窗口重建 webview 并重新注册
     /// handler;undo 恢复(HiddenForClose)时重新显示 webview。若 webview 已被
-    /// 窗口关闭时的 cleanup 销毁,同样重建。
+    /// 窗口关闭时的 cleanup 销毁,同样重建。附加完成后把焦点切到 webview。
     pub fn handle_attach(&mut self, ctx: &mut ViewContext<Self>) {
+        self.handle_attach_inner(true, ctx);
+    }
+
+    /// 同 [`Self::handle_attach`],但不抢占 AppKit first responder。
+    ///
+    /// DshPane 等 Loading 场景使用:runtime 就绪时 webview 刚创建、尚未
+    /// 定位且 spinner 仍在显示,此时 focus 会让按键进不可见 webview;webview
+    /// 焦点改由 pane 获得焦点时(on_focus)正常切换。
+    pub(crate) fn handle_attach_without_focus(&mut self, ctx: &mut ViewContext<Self>) {
+        self.handle_attach_inner(false, ctx);
+    }
+
+    fn handle_attach_inner(&mut self, focus: bool, ctx: &mut ViewContext<Self>) {
         let manager = BrowserWebViewManager::as_ref(ctx);
         let webview_exists = manager.has_webview(self.model.platform_view_id);
         if self.needs_recreate || !webview_exists {
@@ -226,7 +239,9 @@ impl BrowserPaneView {
             // 否则 webview 永远收不到 rect 上报,保持 0 尺寸不可见。
             self.register_platform_view_handler(ctx);
         }
-        self.focus_webview(ctx);
+        if focus {
+            self.focus_webview(ctx);
+        }
     }
 
     /// Pane 挂载完成后的收尾:默认焦点在 webview,把 AppKit first responder

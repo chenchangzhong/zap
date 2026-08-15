@@ -1445,8 +1445,10 @@ fn initialize_app(
     ctx.add_singleton_model(CustomSecretRegexUpdater::new);
 
     // Web preview:全局 webview 管理器(platform view 定位在下方合并的
-    // on_frame_drawn 中处理)。
-    if FeatureFlag::BrowserPane.is_enabled() {
+    // on_frame_drawn 中处理)。DshPane 也内嵌 webview 依赖该单例,故
+    // BrowserPane 或 DshPane 任一启用即注册,避免 DshPane 开 BrowserPane
+    // 关时 set_ready 的 as_ref panic。
+    if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
         ctx.add_singleton_model(|_| browser::BrowserWebViewManager::new());
     }
 
@@ -1460,7 +1462,9 @@ fn initialize_app(
     // 每帧回调:合并 BrowserPane(platform view 定位)与 DshRuntime(崩溃轮询)。
     if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
         ctx.on_frame_drawn(|ctx, window_id| {
-            if FeatureFlag::BrowserPane.is_enabled() {
+            // DshPane 内嵌 webview 同样需要 platform view 定位,故与注册
+            // 条件一致按 BrowserPane || DshPane 门控。
+            if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
                 browser::BrowserWebViewManager::handle(ctx).update(ctx, |manager, ctx| {
                     manager.drain_pending_platform_views(window_id);
                     manager.drain_pending_webview_focus(ctx);
@@ -2096,9 +2100,9 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
                 // 供 undo 恢复),但窗口不恢复时 pane 的 Closed detach 不会
                 // 发生,webview 会泄漏;这里兜底清理。undo 恢复时
                 // `BrowserPaneView::handle_attach` 检测到 webview 缺失会重建。
-                // 仅当 BrowserPane 启用时 manager 才注册,未启用时 as_ref
-                // 会 panic,故此处按同一 flag 门控。
-                if FeatureFlag::BrowserPane.is_enabled() {
+                // manager 在 BrowserPane || DshPane 任一启用时注册,故按
+                // 同一条件门控(未启用时 as_ref 会 panic)。
+                if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
                     browser::BrowserWebViewManager::as_ref(ctx).cleanup_window(window_id);
                 }
             }

@@ -192,7 +192,9 @@ impl DshPaneView {
         let browser_view = ctx.add_typed_action_view(|ctx| {
             BrowserPaneView::new_with_options(url.to_string(), false, ctx)
         });
-        browser_view.update(ctx, |view, ctx| view.handle_attach(ctx));
+        // 不抢占焦点:Loading 显示期间 webview 不可见,键盘焦点改由 pane
+        // 聚焦时(on_focus)正常切换,避免按键进不可见 webview。
+        browser_view.update(ctx, |view, ctx| view.handle_attach_without_focus(ctx));
         let webview_id = browser_view.as_ref(ctx).model().platform_view_id;
         self.load_started_at = Some(Instant::now());
         self.webview_loaded = false;
@@ -397,6 +399,15 @@ impl PaneContent for DshPane {
             bv.update(ctx, |view, ctx| view.handle_detach(detach_type, ctx));
         }
         ctx.unsubscribe_to_view(&self.view);
+        if matches!(detach_type, DetachType::Moved) {
+            // Moved 会销毁 webview,重 attach 时以同 id 重建并重新加载页面:
+            // 重置加载时钟与完成标志,否则旧的 load_started_at 起点接近
+            // WEBVIEW_LOAD_TIMEOUT 时,新加载刚开始就被兜底判超时、提前白屏。
+            self.dsh_view(ctx).update(ctx, |view, _ctx| {
+                view.load_started_at = Some(Instant::now());
+                view.webview_loaded = false;
+            });
+        }
         if matches!(detach_type, DetachType::Closed | DetachType::HiddenForClose) {
             log::info!("[dsh] DshPane detached; requesting runtime stop");
             DshRuntime::handle(ctx).update(ctx, |runtime, _ctx| {
