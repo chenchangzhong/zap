@@ -29,6 +29,8 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// 崩溃自动重启最大次数(连续崩溃超过则放弃)。
 const MAX_RESTARTS: u8 = 3;
+/// 停止时等待优雅退出的时长,超时后 SIGKILL。
+const STOP_GRACE: Duration = Duration::from_secs(5);
 
 
 /// 崩溃重启的完整流程(供 ctx.spawn 回调)。
@@ -96,18 +98,45 @@ impl Default for DshRuntime {
 
 impl Drop for DshRuntime {
     fn drop(&mut self) {
-        // 进程退出兜底:杀掉 dsh 子进程,避免残留。
-        // Drop 中不能 await,用同步 kill + try_wait 轮询回收。
+        // 进程退出兜底:优雅终止 dsh 子进程,避免残留。
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            for _ in 0..100 {
-                if child.try_status().ok().flatten().is_some() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            Self::terminate_child(&mut child);
         }
     }
+}
+
+impl DshRuntime {
+    /// 终止子进程:优先 SIGTERM 优雅退出,超时后 SIGKILL。
+    ///
+    /// 同步执行(主线程可安全调用);`kill` 是同步的,退出状态交给
+    /// async-process 的 reap 线程回收。
+    fn terminate_child(child: &mut async_process::Child) {
+        // 1. SIGTERM 优雅退出(Unix)。
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        }
+        // 2. 等待优雅退出,超时后 SIGKILL。
+        let deadline = std::time::Instant::now() + STOP_GRACE;
+        loop {
+            if child.try_status().ok().flatten().is_some() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        // 短轮询回收,避免 zombie。
+        for _ in 0..100 {
+            if child.try_status().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
 }
 
 impl DshRuntime {
@@ -121,14 +150,28 @@ impl DshRuntime {
         }
     }
 
-    /// dsh 是否已配置(settings.yaml 存在即视为已初始化)。
+    /// dsh 是否已配置(settings.yaml 存在,或 storages 里有会话数据)。
     ///
     /// dsh 的设置文档默认在 `<DSH_HOME>/settings.yaml`(见 dsh settings-file
-    /// 插件);首次使用前不存在。用它作为"需要引导"的判据。
+    /// 插件);模型配置/会话历史写入 storages/。两者皆无 = 全新安装,
+    /// 需要引导用户配置模型 API key。
     pub fn is_configured() -> bool {
-        Self::dsh_data_dir()
-            .map(|dir| dir.join("settings.yaml").is_file())
-            .unwrap_or(false)
+        let Ok(dir) = Self::dsh_data_dir() else {
+            return false;
+        };
+        if dir.join("settings.yaml").is_file() {
+            return true;
+        }
+        // storages 里除初始 workspace.json 外还有内容(会话/配置痕迹)。
+        let storages = dir.join("storages");
+        std::fs::read_dir(&storages).is_ok_and(|mut entries| {
+            entries.any(|entry| {
+                entry
+                    .as_ref()
+                    .map(|e| e.file_name() != "workspace.json")
+                    .unwrap_or(false)
+            })
+        })
     }
 
     /// dsh 数据目录:`<data_dir>/dsh`。
@@ -375,8 +418,7 @@ impl DshRuntime {
         if self.stopping {
             log::info!("[dsh] startup finished after stop request; killing child");
             let mut child = child;
-            let _ = child.kill();
-            let _ = child.try_status();
+            Self::terminate_child(&mut child);
             self.set_status(DshRuntimeStatus::Stopped);
             return;
         }
@@ -387,18 +429,11 @@ impl DshRuntime {
     }
 
     /// 主动停止 runtime(面板关闭/退出时)。同步执行,可在主线程直接调用:
-    /// `kill` 是同步的,退出状态交给 async-process 的 reap 线程回收。
+    /// SIGTERM 优雅退出,超时后 SIGKILL。
     pub fn request_stop(&mut self) {
         self.stopping = true;
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            // 短轮询回收(与 Drop 一致),避免 zombie。
-            for _ in 0..100 {
-                if child.try_status().ok().flatten().is_some() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            Self::terminate_child(&mut child);
         }
         self.set_status(DshRuntimeStatus::Stopped);
         self.url = None;
@@ -449,6 +484,8 @@ impl DshRuntime {
 pub enum DshRuntimeEvent {
     /// runtime 就绪,`url` 为 dsh Web UI 地址。
     Ready { url: String },
+    /// 崩溃后自动重启完成(仅通知已有 pane 导航,不自动开新 pane)。
+    Restarted { url: String },
     /// 启动/重启失败。
     Failed { error: String },
 }

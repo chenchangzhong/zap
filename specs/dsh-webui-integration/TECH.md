@@ -21,6 +21,21 @@
 - `crates/node_runtime`:`install_npm` / `find_working_node_binary` / `node_installation_dir`,已入 workspace **零使用点**(天然落点)。
 - dsh 官方分发:`npx @deepseek-ai/dsh web`(需 Node ≥22);另有单文件 exe 打包先例(Python SDK 用,无需 Node)。
 
+## 调研结论(步骤 1 落地,2026-08-15 实测)
+
+| 项 | 结论 | 来源 |
+|---|---|---|
+| `dsh web --port 0` | **支持**,OS 分配空闲端口(实测 63815/61085 等) | `dsh web --help` + 实测 |
+| `--host` | 可绑,默认 127.0.0.1(无鉴权,仅本机) | `dsh web --help` |
+| DSH_HOME 环境变量 | **生效**:`profiles/`(配置)+ `storages/`(数据,600 权限) | 实测 |
+| 就绪判据 | **无 stdout banner**(输出缓冲),用**端口监听 + HTTP 200** | 实测 |
+| 优雅退出 | SIGTERM 进程树干净退出,无残留 | 实测 |
+| npm 包入口 | `@deepseek-ai/dsh` 的 CLI 入口是 `node_modules/@deepseek-ai/dsh/lib/bin.js`(非 apps/cli/dist) | 实测 |
+| npm install 落盘 | npm 11 下 `--prefix` 不落盘 node_modules,需**在目标目录内执行** | 实测 |
+| Node 要求 | engines `^22.19 \|\| >=24`(实测系统 v24.13.0 可用) | 包 engines |
+| 版本锁定 | `0.1.0-rc.6`(npx 最新,源码 rc.5) | npx 实测 |
+
+
 ## 验收标准
 
 1. 冷启动(无 Node、无 dsh):命令触发 → 自动装 Node + dsh → 面板可交互,总耗时 ≤60s(含安装;已安装 ≤5s)。

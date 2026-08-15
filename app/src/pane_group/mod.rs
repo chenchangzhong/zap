@@ -1,3 +1,4 @@
+use crate::browser::BrowserPane;
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::{AIAgentHarness, AIConversation, AIConversationId};
 use crate::ai::agent_conversations_model::{
@@ -2053,6 +2054,11 @@ impl PaneGroup {
             .values()
             .filter_map(|contents| contents.as_any().downcast_ref::<T>())
     }
+    /// 迭代本 pane group 中的所有 BrowserPane。
+    pub fn browser_panes(&self) -> impl Iterator<Item = &'_ BrowserPane> {
+        self.panes_of::<BrowserPane>()
+    }
+
 
     /// Checks if any TerminalView within this pane group matches the given ID.
     pub fn contains_terminal_view(&self, terminal_view_id: EntityId, ctx: &AppContext) -> bool {

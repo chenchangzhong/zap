@@ -18,7 +18,7 @@ pub struct DshPane {
 }
 
 impl DshPane {
-    /// Create a new dsh pane, opening `url` in an embedded webview.
+    /// 新建 dsh pane,在嵌入式 webview 中打开 `url`。
     pub fn new<V: warpui::View>(url: String, ctx: &mut ViewContext<V>) -> Self {
         Self {
             inner: BrowserPane::new(url, ctx),

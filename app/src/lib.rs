@@ -1473,10 +1473,13 @@ fn initialize_app(
                         runtime.begin_start();
                         ctx.spawn(
                             dsh::DshRuntime::restart_future(),
-                            move |runtime, result, _ctx| match result {
+                            move |runtime, result, ctx| match result {
                                 dsh::DshRestartResult::Restarted { url, child } => {
                                     log::info!("[dsh] restarted at {url}");
                                     runtime.adopt_child(child);
+                                    // 通知 workspace:已有 dsh pane 导航到新 URL
+                                    // (崩溃恢复;不自动开新 pane)。
+                                    ctx.emit(dsh::DshRuntimeEvent::Restarted { url });
                                 }
                                 dsh::DshRestartResult::GiveUp { error } => {
                                     log::error!("[dsh] restart gave up: {error}");

@@ -3,5 +3,5 @@
 mod browser_pane_view;
 mod browser_web_view;
 
-pub use browser_pane_view::{BrowserPane, BrowserPaneView};
+pub use browser_pane_view::{BrowserPane, BrowserPaneAction, BrowserPaneView};
 pub use browser_web_view::BrowserWebViewManager;
