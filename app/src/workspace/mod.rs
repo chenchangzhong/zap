@@ -649,6 +649,14 @@ pub fn init(app: &mut AppContext) {
             id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED) & !id!("Workspace_PaneDragging"),
         ),
         EditableBinding::new(
+            "workspace:open_dsh_pane",
+            BindingDescription::new(crate::t!("keybinding-desc-workspace-open-dsh-pane")),
+            WorkspaceAction::OpenDshPane,
+        )
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
+        .with_context_predicate(id!("Workspace") & !id!("Workspace_PaneDragging"))
+        .with_enabled(|| FeatureFlag::DshPane.is_enabled()),
+        EditableBinding::new(
             "workspace:toggle_left_panel",
             BindingDescription::new(crate::t!("keybinding-desc-workspace-toggle-left-panel")),
             WorkspaceAction::ToggleLeftPanel,

@@ -1743,6 +1743,7 @@ keybinding-desc-workspace-new-tab = Create new tab
 keybinding-desc-workspace-new-terminal-tab = New Terminal Tab
 keybinding-desc-workspace-new-agent-tab = New Agent Tab
 keybinding-desc-workspace-new-cloud-agent-tab = New Agent Tab
+keybinding-desc-workspace-open-dsh-pane = Open DeepSeek Harness
 new-session-create-new-tab = Create New Tab
 new-session-create-new-window = Create New Window
 new-session-split-pane-down = Split Pane Down

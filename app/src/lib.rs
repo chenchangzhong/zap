@@ -13,8 +13,9 @@ mod app_state;
 mod auth;
 mod autoupdate;
 mod banner;
-mod browser;
 mod changelog_model;
+mod browser;
+mod dsh;
 mod chip_configurator;
 mod cloud_object;
 mod code;
@@ -1455,6 +1456,33 @@ fn initialize_app(
         });
     }
 
+    // DeepSeek Harness runtime:管理 dsh 子进程,驱动崩溃重启轮询。
+    if FeatureFlag::DshPane.is_enabled() {
+        ctx.add_singleton_model(|_| dsh::DshRuntime::new());
+        ctx.on_frame_drawn(|ctx, _window_id| {
+            dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
+                if let Some(crashes) = runtime.poll_child() {
+                    if crashes > 0 {
+                        // 崩溃:调度重启(后台执行器)。
+                        ctx.spawn(
+                            dsh::DshRuntime::restart_future(),
+                            move |runtime, result, _ctx| match result {
+                                dsh::DshRestartResult::Restarted { url, child } => {
+                                    log::info!("[dsh] restarted at {url}");
+                                    runtime.adopt_child(child);
+                                }
+                                dsh::DshRestartResult::GiveUp { error } => {
+                                    log::error!("[dsh] restart gave up: {error}");
+                                    runtime.set_status(dsh::DshRuntimeStatus::Failed);
+                                }
+                            },
+                        );
+                    }
+                }
+            });
+        });
+    }
+
     // Register initial keybindings prior to creating menus
     ai::init(ctx);
     app_services::init(ctx);
@@ -2305,6 +2333,10 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
     // 保持关闭。已从 DOGFOOD 灰度毕业,release 构建同样启用。
     #[cfg(target_os = "macos")]
     flags.insert(FeatureFlag::BrowserPane);
+    // DeepSeek Harness webview 集成:与 BrowserPane 同策略,仅 macOS 启用
+    // (wry webview 基建目前仅 macOS 实现)。开发期默认开启便于联调。
+    #[cfg(target_os = "macos")]
+    flags.insert(FeatureFlag::DshPane);
 
     // Issue #72: HTTP 代理设置页面。不走 channel 判断,所有 channel 含 zap-oss
     // 默认启用,作为企业 VPN / 公司代理场景的基本能力。

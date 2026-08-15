@@ -752,6 +752,9 @@ pub enum FeatureFlag {
     /// Shows an omp model selector dropdown in the CLI agent toolbar
     /// when an OhMyPi agent session is active.
     OmpModelSelector,
+    /// Enables the embedded DeepSeek Harness web UI pane (dsh webview integration).
+    DshPane,
+
 
 }
 

@@ -2596,6 +2596,27 @@ impl Workspace {
             }
         });
 
+        if FeatureFlag::DshPane.is_enabled() {
+            ctx.subscribe_to_model(
+                &crate::dsh::DshRuntime::handle(ctx),
+                |me, _, event, ctx| match event {
+                    crate::dsh::DshRuntimeEvent::Ready { url } => {
+                        // runtime 就绪:打开 dsh Web UI pane。
+                        let pane = crate::browser::BrowserPane::new(url.clone(), ctx);
+                        let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
+                        let new_idx = match new_tab_placement_setting {
+                            NewTabPlacement::AfterAllTabs => me.tab_count(),
+                            NewTabPlacement::AfterCurrentTab => me.active_tab_index + 1,
+                        };
+                        me.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
+                    }
+                    crate::dsh::DshRuntimeEvent::Failed { error } => {
+                        log::error!("[dsh] runtime failed: {error}");
+                    }
+                },
+            );
+        }
+
         ctx.subscribe_to_model(
             &BlocklistAIHistoryModel::handle(ctx),
             Self::handle_history_model_event,
@@ -18787,6 +18808,36 @@ impl Workspace {
         // Open the URL on desktop. This does nothing if the app isn't installed.
         crate::uri::web_intent_parser::open_url_on_desktop(url);
     }
+
+    /// 打开 DeepSeek Harness Web UI pane:启动 dsh runtime(若未运行)。
+    /// 就绪后由 `init` 中订阅的 `DshRuntimeEvent::Ready` 打开 BrowserPane。
+    fn open_dsh_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        crate::dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
+            if runtime.status() == crate::dsh::DshRuntimeStatus::Starting {
+                return; // 启动中:就绪事件会打开 pane
+            }
+            if runtime.status() == crate::dsh::DshRuntimeStatus::Ready {
+                // 已就绪:重新触发打开 pane。
+                if let Some(url) = runtime.url().map(str::to_string) {
+                    ctx.emit(crate::dsh::DshRuntimeEvent::Ready { url });
+                }
+                return;
+            }
+            ctx.spawn(
+                crate::dsh::DshRuntime::start_future(),
+                move |runtime, result, ctx| match result {
+                    crate::dsh::DshStartResult::Ready { url, child } => {
+                        runtime.adopt_child(child);
+                        ctx.emit(crate::dsh::DshRuntimeEvent::Ready { url });
+                    }
+                    crate::dsh::DshStartResult::Failed { error } => {
+                        runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
+                        ctx.emit(crate::dsh::DshRuntimeEvent::Failed { error });
+                    }
+                },
+            );
+        });
+    }
 }
 
 impl Entity for Workspace {
@@ -18811,6 +18862,9 @@ impl TypedActionView for Workspace {
             _ => ActionAccessibilityContent::from_debug(),
         }
     }
+
+
+
 
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         use WorkspaceAction::*;
@@ -19947,6 +20001,12 @@ impl TypedActionView for Workspace {
                     NewTabPlacement::AfterCurrentTab => self.active_tab_index + 1,
                 };
                 self.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
+            }
+            OpenDshPane => {
+                if !FeatureFlag::DshPane.is_enabled() {
+                    return;
+                }
+                self.open_dsh_pane(ctx);
             }
             TabHoverWidthStart { width } => {
                 // Store the fixed width value for the tab to maintain consistent size during hover
