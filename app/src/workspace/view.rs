@@ -18868,8 +18868,10 @@ impl Workspace {
                         }
                     }
                     crate::dsh::DshStartResult::Failed { error } => {
+                        // 首次启动失败:仅记录日志(用户看到 pane 未打开),
+                        // 不弹「连续崩溃」toast(文案只适用于崩溃场景)。
+                        log::error!("[dsh] start failed: {error}");
                         runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
-                        ctx.emit(crate::dsh::DshRuntimeEvent::Failed { error });
                     }
                 },
             );

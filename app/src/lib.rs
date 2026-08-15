@@ -1468,29 +1468,39 @@ fn initialize_app(
             }
             if FeatureFlag::DshPane.is_enabled() {
                 dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
-                    if runtime.poll_child() == dsh::PollResult::Crashed {
-                        // 崩溃:标记重启(保留崩溃计数,使 MAX_RESTARTS 上限可达),
-                        // 调度重启。
-                        let gen = runtime.begin_restart();
-                        ctx.spawn(
-                            dsh::DshRuntime::restart_future(gen),
-                            move |runtime, result, ctx| match result {
-                                dsh::DshRestartResult::Restarted { url, child } => {
-                                    log::info!("[dsh] restarted at {url}");
-                                    // 仅真正收养(未被停止/代次未过期)才通知
-                                    // workspace 导航。
-                                    if runtime.adopt_child(child, gen) {
-                                        ctx.emit(dsh::DshRuntimeEvent::Restarted { url });
+                    match runtime.poll_child() {
+                        dsh::PollResult::Crashed => {
+                            // 崩溃:标记重启(保留崩溃计数,使 MAX_RESTARTS 上限可达),
+                            // 调度重启。
+                            let gen = runtime.begin_restart();
+                            ctx.spawn(
+                                dsh::DshRuntime::restart_future(gen),
+                                move |runtime, result, ctx| match result {
+                                    dsh::DshRestartResult::Restarted { url, child } => {
+                                        log::info!("[dsh] restarted at {url}");
+                                        // 仅真正收养(未被停止/代次未过期)才通知
+                                        // workspace 导航。
+                                        if runtime.adopt_child(child, gen) {
+                                            ctx.emit(dsh::DshRuntimeEvent::Restarted { url });
+                                        }
                                     }
-                                }
-                                dsh::DshRestartResult::GiveUp { error } => {
-                                    log::error!("[dsh] restart gave up: {error}");
-                                    runtime.set_status(dsh::DshRuntimeStatus::Failed);
-                                    // 通知 workspace 展示失败(pane 已停,提示用户)。
-                                    ctx.emit(dsh::DshRuntimeEvent::Failed { error });
-                                }
-                            },
-                        );
+                                    dsh::DshRestartResult::GiveUp { error } => {
+                                        log::error!("[dsh] restart gave up: {error}");
+                                        runtime.set_status(dsh::DshRuntimeStatus::Failed);
+                                        // 通知 workspace 展示失败(pane 已停,提示用户)。
+                                        ctx.emit(dsh::DshRuntimeEvent::Failed { error });
+                                    }
+                                },
+                            );
+                        }
+                        dsh::PollResult::GiveUp => {
+                            // 连续崩溃超过上限:放弃重启,通知用户。
+                            log::error!("[dsh] gave up after repeated crashes");
+                            ctx.emit(dsh::DshRuntimeEvent::Failed {
+                                error: "repeated crashes".to_string(),
+                            });
+                        }
+                        _ => {}
                     }
                 });
             }
