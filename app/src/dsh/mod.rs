@@ -7,6 +7,8 @@
 //!
 //! 入口:WorkspaceAction::OpenDshPane → DshRuntime 启动 → 就绪后打开 BrowserPane。
 
+pub(crate) mod pane;
 pub(crate) mod runtime;
 
+pub use pane::DshPane;
 pub use runtime::{DshRestartResult, DshRuntime, DshRuntimeEvent, DshRuntimeStatus, DshStartResult};

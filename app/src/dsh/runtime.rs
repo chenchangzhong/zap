@@ -297,12 +297,19 @@ impl DshRuntime {
         self.set_status(DshRuntimeStatus::Ready);
     }
 
-    /// 主动停止 runtime(面板关闭/退出时)。
-    pub async fn stop(&mut self) {
+    /// 主动停止 runtime(面板关闭/退出时)。同步执行,可在主线程直接调用:
+    /// `kill` 是同步的,退出状态交给 async-process 的 reap 线程回收。
+    pub fn request_stop(&mut self) {
         self.stopping = true;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
-            let _ = child.status().await;
+            // 短轮询回收(与 Drop 一致),避免 zombie。
+            for _ in 0..100 {
+                if child.try_status().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         self.set_status(DshRuntimeStatus::Stopped);
         self.url = None;
@@ -393,6 +400,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         assert!(DSH_VERSION.starts_with("0.1.0"));
         assert!(DSH_VERSION.contains('-') || DSH_VERSION.split('.').count() == 3);
     }
+
     /// 端到端冒烟:真实启动 dsh runtime(需网络安装 dsh,首次较慢)。
     /// 验证:启动成功、URL 可访问、子进程可停止。
     #[test]
@@ -413,6 +421,66 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
                 }
                 DshStartResult::Failed { error } => panic!("start failed: {error}"),
             }
+        });
+    }
+
+    /// 生命周期:启动 → 同步 kill + 轮询回收,进程退出。
+    #[test]
+    #[ignore = "requires network + npm install, run manually"]
+    fn lifecycle_start_stop() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let result = DshRuntime::start_future().await;
+            let (url, mut child) = match result {
+                DshStartResult::Ready { url, child } => (url, child),
+                DshStartResult::Failed { error } => panic!("start failed: {error}"),
+            };
+            assert!(url.starts_with("http://127.0.0.1:"));
+
+            // 同步 kill + 轮询回收(模拟 request_stop 的核心路径)。
+            let pid = child.id();
+            let _ = child.kill();
+            for _ in 0..200 {
+                if child.try_status().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // 确认进程已退出。
+            assert!(
+                child.try_status().ok().flatten().is_some(),
+                "process {pid} still alive after kill"
+            );
+        });
+    }
+
+    /// 崩溃检测:poll_child 在进程退出后返回崩溃计数。
+    #[test]
+    fn poll_child_detects_exit() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let mut runtime = DshRuntime::new();
+            // 用 sleep 进程模拟 dsh 子进程。
+            let mut cmd = command::r#async::Command::new("sleep");
+            cmd.arg("30");
+            let child = cmd.spawn().expect("spawn sleep");
+            runtime.adopt_child(child);
+            assert_eq!(runtime.status(), DshRuntimeStatus::Ready);
+
+            // 杀掉进程,下一轮 poll_child 应检测到崩溃(计数 1)。
+            let pid = runtime.child.as_mut().unwrap().id();
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            // 等进程真正退出。
+            for _ in 0..100 {
+                if runtime.poll_child().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(runtime.consecutive_crashes, 1);
+            assert_eq!(runtime.status(), DshRuntimeStatus::Stopped);
         });
     }
 }

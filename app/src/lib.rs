@@ -1843,6 +1843,12 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
             PersistenceWriter::handle(ctx).update(ctx, |writer, _ctx| {
                 writer.terminate();
             });
+            // DeepSeek Harness:退出前停止 dsh 子进程,避免残留。
+            if FeatureFlag::DshPane.is_enabled() {
+                dsh::DshRuntime::handle(ctx).update(ctx, |runtime, _ctx| {
+                    runtime.request_stop();
+                });
+            }
 
             // We want to tear down the terminal server before relaunching for
             // autoupdate, to ensure we're not running any extra Zap processes

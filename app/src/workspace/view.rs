@@ -2602,7 +2602,7 @@ impl Workspace {
                 |me, _, event, ctx| match event {
                     crate::dsh::DshRuntimeEvent::Ready { url } => {
                         // runtime 就绪:打开 dsh Web UI pane。
-                        let pane = crate::browser::BrowserPane::new(url.clone(), ctx);
+                        let pane = crate::dsh::DshPane::new(url.clone(), ctx);
                         let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
                         let new_idx = match new_tab_placement_setting {
                             NewTabPlacement::AfterAllTabs => me.tab_count(),
