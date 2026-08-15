@@ -21,8 +21,10 @@ cfg_if::cfg_if! {
 }
 
 /// The pinned Node.js version to install.
+/// v22.20.0:dsh(DeepSeek Harness)要求 Node >= 22.19(engines ^22.19 || >=24),
+/// 而旧固定版本 v22.12.0 不满足。
 #[cfg(feature = "local_fs")]
-const NODE_VERSION: &str = "v22.12.0";
+const NODE_VERSION: &str = "v22.20.0";
 
 /// Minimum supported Node.js version for system-installed Node.
 #[cfg(feature = "local_fs")]

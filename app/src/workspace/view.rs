@@ -18845,14 +18845,16 @@ impl Workspace {
                 }
                 return;
             }
-            // 标记启动中(复位 stopping/计数),防止重复触发。
-            runtime.begin_start();
+            // 标记启动中(复位 stopping/计数,递增代次),防止重复触发。
+            let gen = runtime.begin_start();
             ctx.spawn(
-                crate::dsh::DshRuntime::start_future(),
+                crate::dsh::DshRuntime::start_future(gen),
                 move |runtime, result, ctx| match result {
                     crate::dsh::DshStartResult::Ready { url, child } => {
-                        runtime.adopt_child(child);
-                        ctx.emit(crate::dsh::DshRuntimeEvent::Ready { url });
+                        // 仅真正收养(未被停止/代次未过期)才通知打开 pane。
+                        if runtime.adopt_child(child, gen) {
+                            ctx.emit(crate::dsh::DshRuntimeEvent::Ready { url });
+                        }
                     }
                     crate::dsh::DshStartResult::Failed { error } => {
                         runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
@@ -18863,36 +18865,30 @@ impl Workspace {
         });
     }
 
-    /// 若已有打开的 dsh pane(URL 为 127.0.0.1 的 BrowserPane),导航到新 URL
-    /// 并返回 `true`;否则返回 `false`(调用方应打开新 pane)。
+    /// 若已有打开的 dsh pane,导航到新 URL 并返回 `true`;否则返回 `false`
+    /// (调用方应打开新 pane)。
     ///
-    /// 用于崩溃重启后恢复:runtime 换了端口,已打开的 webview 还指着旧地址,
-    /// 需要导航到新地址而不是再开一个 pane。
+    /// 用于崩溃重启后恢复:runtime 换了端口,已打开的 dsh webview 还指着
+    /// 旧地址,需要导航到新地址而不是再开一个 pane。按 DshPane 类型精确
+    /// 匹配,不误伤用户手动打开的普通 BrowserPane。
     fn navigate_existing_dsh_pane(&mut self, url: &str, ctx: &mut ViewContext<Self>) -> bool {
         let mut navigated = false;
         for tab in &self.tabs {
             let pane_group = tab.pane_group.clone();
-            // 遍历该 tab 的所有 BrowserPane,找 dsh 的(URL 是 127.0.0.1)。
-            let browser_views: Vec<_> = pane_group
+            // 遍历该 tab 的所有 DshPane。
+            let dsh_views: Vec<_> = pane_group
                 .as_ref(ctx)
-                .browser_panes()
+                .dsh_panes()
                 .map(|pane| pane.browser_view(ctx))
                 .collect();
-            for browser_view in browser_views {
-                let is_dsh = browser_view
-                    .as_ref(ctx)
-                    .model()
-                    .url
-                    .starts_with("http://127.0.0.1:");
-                if is_dsh {
-                    browser_view.update(ctx, |view, ctx| {
-                        view.handle_action(
-                            &crate::browser::BrowserPaneAction::Navigate(url.to_string()),
-                            ctx,
-                        );
-                    });
-                    navigated = true;
-                }
+            for browser_view in dsh_views {
+                browser_view.update(ctx, |view, ctx| {
+                    view.handle_action(
+                        &crate::browser::BrowserPaneAction::Navigate(url.to_string()),
+                        ctx,
+                    );
+                });
+                navigated = true;
             }
         }
         navigated

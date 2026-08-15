@@ -1,4 +1,5 @@
 use crate::browser::BrowserPane;
+use crate::dsh::DshPane;
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::{AIAgentHarness, AIConversation, AIConversationId};
 use crate::ai::agent_conversations_model::{
@@ -2054,9 +2055,15 @@ impl PaneGroup {
             .values()
             .filter_map(|contents| contents.as_any().downcast_ref::<T>())
     }
+
     /// 迭代本 pane group 中的所有 BrowserPane。
     pub fn browser_panes(&self) -> impl Iterator<Item = &'_ BrowserPane> {
         self.panes_of::<BrowserPane>()
+    }
+
+    /// 迭代本 pane group 中的所有 DshPane(dsh Web UI pane)。
+    pub fn dsh_panes(&self) -> impl Iterator<Item = &'_ DshPane> {
+        self.panes_of::<DshPane>()
     }
 
 

@@ -1469,17 +1469,19 @@ fn initialize_app(
             if FeatureFlag::DshPane.is_enabled() {
                 dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
                     if runtime.poll_child() == dsh::PollResult::Crashed {
-                        // 崩溃:标记新启动(复位 stopping/计数),调度重启。
-                        runtime.begin_start();
+                        // 崩溃:标记重启(保留崩溃计数,使 MAX_RESTARTS 上限可达),
+                        // 调度重启。
+                        let gen = runtime.begin_restart();
                         ctx.spawn(
-                            dsh::DshRuntime::restart_future(),
+                            dsh::DshRuntime::restart_future(gen),
                             move |runtime, result, ctx| match result {
                                 dsh::DshRestartResult::Restarted { url, child } => {
                                     log::info!("[dsh] restarted at {url}");
-                                    runtime.adopt_child(child);
-                                    // 通知 workspace:已有 dsh pane 导航到新 URL
-                                    // (崩溃恢复;不自动开新 pane)。
-                                    ctx.emit(dsh::DshRuntimeEvent::Restarted { url });
+                                    // 仅真正收养(未被停止/代次未过期)才通知
+                                    // workspace 导航。
+                                    if runtime.adopt_child(child, gen) {
+                                        ctx.emit(dsh::DshRuntimeEvent::Restarted { url });
+                                    }
                                 }
                                 dsh::DshRestartResult::GiveUp { error } => {
                                     log::error!("[dsh] restart gave up: {error}");

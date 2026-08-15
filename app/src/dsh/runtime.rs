@@ -30,7 +30,8 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// 崩溃自动重启最大次数(连续崩溃超过则放弃)。
 const MAX_RESTARTS: u8 = 3;
 /// 停止时等待优雅退出的时长,超时后 SIGKILL。
-const STOP_GRACE: Duration = Duration::from_secs(5);
+/// 主线程同步阻塞调用(request_stop/Drop),不宜过长。
+const STOP_GRACE: Duration = Duration::from_secs(3);
 
 
 /// 崩溃重启的完整流程(供 ctx.spawn 回调)。
@@ -84,10 +85,15 @@ pub struct DshRuntime {
     url: Option<String>,
     /// dsh web 子进程句柄。`None` 表示未运行。
     child: Option<async_process::Child>,
-    /// 连续崩溃次数(重启成功后清零)。
+    /// 连续崩溃次数(仅在用户主动启动时清零;崩溃重启序列内保持,
+    /// 使 MAX_RESTARTS 上限可达,避免无限重启)。
     consecutive_crashes: u8,
     /// 是否已请求停止(崩溃自动重启与主动停止竞争时优先停止)。
     stopping: bool,
+    /// 启动代次:每次 `begin_start`/`begin_restart` 递增。异步启动完成回调
+    /// 携带发起时的代次,代次不匹配(期间又有新启动/停止)则丢弃子进程,
+    /// 防止双启动竞态泄漏。
+    generation: u64,
 }
 
 impl Default for DshRuntime {
@@ -147,6 +153,7 @@ impl DshRuntime {
             child: None,
             consecutive_crashes: 0,
             stopping: false,
+            generation: 0,
         }
     }
 
@@ -174,6 +181,22 @@ impl DshRuntime {
         })
     }
 
+    /// 启动 dsh runtime(异步,不借用 self)。
+    ///
+    /// `generation` 是 `begin_start`/`begin_restart` 返回的代次;完成回调
+    /// 用它调用 `adopt_child`,代次不匹配时丢弃子进程。
+    pub async fn start_future(generation: u64) -> DshStartResult {
+        match Self::start_inner().await {
+            Ok((child, url)) => DshStartResult::Ready { url, child },
+            Err(err) => {
+                log::error!("[dsh] start failed: {err:#}");
+                DshStartResult::Failed {
+                    error: format!("{err:#}"),
+                }
+            }
+        }
+    }
+
     /// dsh 数据目录:`<data_dir>/dsh`。
     ///
     /// 存放 DSH_HOME(profiles/storages)与 dsh npm 安装缓存,不污染用户目录。
@@ -196,21 +219,6 @@ impl DshRuntime {
         self.status = status;
     }
 
-    /// 启动 dsh runtime(异步,不借用 self)。
-    ///
-    /// 调用方用 `ctx.spawn(Self::start_future(), callback)` 驱动;回调中把
-    /// 返回的子进程句柄交给 runtime(`adopt_child`)。
-    pub async fn start_future() -> DshStartResult {
-        match Self::start_inner().await {
-            Ok((child, url)) => DshStartResult::Ready { url, child },
-            Err(err) => {
-                log::error!("[dsh] start failed: {err:#}");
-                DshStartResult::Failed {
-                    error: format!("{err:#}"),
-                }
-            }
-        }
-    }
 
     async fn start_inner() -> Result<(async_process::Child, String)> {
         // 1. 定位/安装 Node。
@@ -272,7 +280,7 @@ impl DshRuntime {
         Ok((child, url))
     }
 
-    /// 检查 node 版本是否满足 dsh 要求(>= 22.19)。
+    /// 检查 node 版本是否满足 dsh 要求(engines: `^22.19 || >=24`)。
     async fn node_satisfies_min_version(node: &Path) -> bool {
         let mut cmd = Command::new(node);
         cmd.arg("--version");
@@ -290,7 +298,8 @@ impl DshRuntime {
             .filter_map(|p| p.parse().ok())
             .collect();
         match parts.as_slice() {
-            [major, minor] => (*major, *minor) >= (22, 19),
+            // ^22.19.0:22.19 <= v < 23;或 v >= 24。
+            [major, minor] => (*major, *minor) >= (22, 19) && *major < 23 || *major >= 24,
             _ => false,
         }
     }
@@ -400,32 +409,49 @@ impl DshRuntime {
         None
     }
 
-    /// 标记一次新启动开始(由主线程在 spawn 前调用)。
+    /// 标记一次用户主动启动开始(由主线程在 spawn 前调用)。
     ///
-    /// 复位停止标记与崩溃计数,并把状态置为 `Starting`,使后续
-    /// `open_dsh_pane` 不会重复触发启动(双启动保护)。
-    pub fn begin_start(&mut self) {
+    /// 复位停止标记与崩溃计数(新会话重新计数),递增启动代次,并把状态
+    /// 置为 `Starting`,使后续 `open_dsh_pane` 不会重复触发启动。
+    /// 返回本次启动的代次,供异步启动回调校验。
+    pub fn begin_start(&mut self) -> u64 {
         self.stopping = false;
         self.consecutive_crashes = 0;
+        self.generation += 1;
         self.set_status(DshRuntimeStatus::Starting);
+        self.generation
+    }
+
+    /// 标记一次崩溃自动重启开始(由 lib.rs 在 spawn restart 前调用)。
+    ///
+    /// 只递增代次并置位 `Starting`;**不复位崩溃计数**(连续崩溃序列内
+    /// 保持递增,使 MAX_RESTARTS 上限可达),也**不复位 stopping**
+    /// (崩溃路径 stopping 必为 false;保持原值避免覆盖用户刚发的停止请求)。
+    pub fn begin_restart(&mut self) -> u64 {
+        self.generation += 1;
+        self.set_status(DshRuntimeStatus::Starting);
+        self.generation
     }
 
     /// 接收启动完成的子进程(回调中调用)。
     ///
-    /// 若此时已请求停止(如启动/重启期间关闭了 pane),不收养进程,
-    /// 直接杀掉,避免无 pane 的常驻进程。
-    pub fn adopt_child(&mut self, child: async_process::Child) {
-        if self.stopping {
-            log::info!("[dsh] startup finished after stop request; killing child");
+    /// 若代次不匹配(期间又有新启动/停止)或已请求停止,不收养进程,
+    /// 直接优雅终止,避免双启动/无 pane 常驻进程。返回是否真正收养。
+    pub fn adopt_child(&mut self, child: async_process::Child, generation: u64) -> bool {
+        if self.stopping || self.generation != generation {
+            log::info!(
+                "[dsh] startup finished after stop/new start (gen {generation} != {}); killing child",
+                self.generation
+            );
             let mut child = child;
             Self::terminate_child(&mut child);
             self.set_status(DshRuntimeStatus::Stopped);
-            return;
+            return false;
         }
         self.child = Some(child);
         self.stopping = false;
-        self.consecutive_crashes = 0;
         self.set_status(DshRuntimeStatus::Ready);
+        true
     }
 
     /// 主动停止 runtime(面板关闭/退出时)。同步执行,可在主线程直接调用:
@@ -471,8 +497,8 @@ impl DshRuntime {
     }
 
     /// 崩溃后重启(由外部在 `poll_child` 返回 `Crashed` 后调度,`'static` future)。
-    pub async fn restart_future() -> DshRestartResult {
-        match Self::start_future().await {
+    pub async fn restart_future(generation: u64) -> DshRestartResult {
+        match Self::start_future(generation).await {
             DshStartResult::Ready { url, child } => DshRestartResult::Restarted { url, child },
             DshStartResult::Failed { error } => DshRestartResult::GiveUp { error },
         }
@@ -534,7 +560,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
     fn smoke_start_stop() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let result = DshRuntime::start_future().await;
+            let result = DshRuntime::start_future(0).await;
             match result {
                 DshStartResult::Ready { url, mut child } => {
                     // URL 可达。
@@ -556,7 +582,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
     fn lifecycle_start_stop() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let result = DshRuntime::start_future().await;
+            let result = DshRuntime::start_future(0).await;
             let (url, mut child) = match result {
                 DshStartResult::Ready { url, child } => (url, child),
                 DshStartResult::Failed { error } => panic!("start failed: {error}"),
@@ -591,7 +617,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             let mut cmd = command::r#async::Command::new("sleep");
             cmd.arg("30");
             let child = cmd.spawn().expect("spawn sleep");
-            runtime.adopt_child(child);
+            runtime.adopt_child(child, 0);
             assert_eq!(runtime.status(), DshRuntimeStatus::Ready);
 
             // 杀掉进程,下一轮 poll_child 应检测到崩溃(计数 1)。
@@ -622,7 +648,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             cmd.arg("30");
             let child = cmd.spawn().expect("spawn sleep");
             let pid = child.id();
-            runtime.adopt_child(child);
+            runtime.adopt_child(child, 0);
             // 标记停止(不取走 child,模拟"已请求停止但进程还在"的窗口)。
             runtime.stopping = true;
             unsafe {
@@ -654,7 +680,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             cmd.arg("30");
             let child = cmd.spawn().expect("spawn sleep");
             let pid = child.id();
-            runtime.adopt_child(child);
+            runtime.adopt_child(child, 0);
 
             // 不应收养:child 为 None,且子进程被杀。
             assert_eq!(runtime.child.is_none(), true);
@@ -687,12 +713,51 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         let mut runtime = DshRuntime::new();
         runtime.request_stop();
         runtime.consecutive_crashes = 2;
-        runtime.begin_start();
+        let gen = runtime.begin_start();
         assert_eq!(runtime.status(), DshRuntimeStatus::Starting);
         assert_eq!(runtime.consecutive_crashes, 0);
-        // stopping 是私有字段,通过行为验证:begin_start 后再 adopt_child
-        // 应正常收养。
+        // stopping 复位:begin_start 后再 adopt_child 应正常收养。
+        assert!(!runtime.stopping);
+        assert!(gen > 0);
     }
+
+    /// 连续崩溃超过 MAX_RESTARTS 后 poll_child 返回 GiveUp(计数序列不清零)。
+    #[cfg(unix)]
+    #[test]
+    fn poll_child_gives_up_after_max_restarts() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let mut runtime = DshRuntime::new();
+            // 模拟连续崩溃:每次 spawn sleep → adopt → SIGKILL → poll。
+            for expected_crash in 1..=MAX_RESTARTS + 1 {
+                let mut cmd = command::r#async::Command::new("sleep");
+                cmd.arg("30");
+                let child = cmd.spawn().expect("spawn sleep");
+                let pid = child.id();
+                let gen = runtime.begin_restart();
+                assert!(runtime.adopt_child(child, gen));
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+                let mut result = PollResult::Running;
+                for _ in 0..100 {
+                    result = runtime.poll_child();
+                    if result != PollResult::Running {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if expected_crash <= MAX_RESTARTS {
+                    assert_eq!(result, PollResult::Crashed, "crash #{expected_crash}");
+                    assert_eq!(runtime.consecutive_crashes, expected_crash);
+                } else {
+                    assert_eq!(result, PollResult::GiveUp, "should give up");
+                    assert_eq!(runtime.status(), DshRuntimeStatus::Failed);
+                }
+            }
+        });
+    }
+
     /// 崩溃重启完整链路:启动 → kill 子进程 → poll_child 检测 →
     /// restart_future 重启 → 新 URL 可达。
     #[test]
@@ -701,7 +766,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
             // 1. 启动。
-            let (url1, mut child) = match DshRuntime::start_future().await {
+            let (url1, mut child) = match DshRuntime::start_future(0).await {
                 DshStartResult::Ready { url, child } => (url, child),
                 DshStartResult::Failed { error } => panic!("start failed: {error}"),
             };
@@ -729,7 +794,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             );
 
             // 4. 重启(等价 lib.rs 的 restart_future 调度)。
-            let (url2, mut child2) = match DshRuntime::restart_future().await {
+            let (url2, mut child2) = match DshRuntime::restart_future(0).await {
                 DshRestartResult::Restarted { url, child } => (url, child),
                 DshRestartResult::GiveUp { error } => panic!("restart gave up: {error}"),
             };

@@ -7,12 +7,12 @@
 //!   不持有 runtime 引用,避免恢复竞态)。
 
 use crate::app_state::LeafContents;
-use crate::browser::BrowserPane;
+use crate::browser::{BrowserPane, BrowserPaneView};
 use crate::dsh::DshRuntime;
 use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::pane_group::pane::{DetachType, PaneContent, ShareableLink, ShareableLinkError};
 use crate::pane_group::{PaneConfiguration, PaneGroup, PaneId};
-use warpui::{AppContext, Entity, ModelHandle, SingletonEntity, ViewContext};
+use warpui::{AppContext, Entity, ModelHandle, SingletonEntity, ViewContext, ViewHandle};
 pub struct DshPane {
     inner: BrowserPane,
 }
@@ -23,6 +23,11 @@ impl DshPane {
         Self {
             inner: BrowserPane::new(url, ctx),
         }
+    }
+
+    /// 访问内部 BrowserPane 视图(导航/状态查询用)。
+    pub fn browser_view(&self, ctx: &AppContext) -> ViewHandle<BrowserPaneView> {
+        self.inner.browser_view(ctx)
     }
 }
 
