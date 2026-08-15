@@ -493,4 +493,55 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             assert_eq!(runtime.status(), DshRuntimeStatus::Stopped);
         });
     }
+    /// 崩溃重启完整链路:启动 → kill 子进程 → poll_child 检测 →
+    /// restart_future 重启 → 新 URL 可达。
+    #[test]
+    #[ignore = "requires network + npm install, run manually"]
+    fn crash_restart_cycle() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            // 1. 启动。
+            let (url1, mut child) = match DshRuntime::start_future().await {
+                DshStartResult::Ready { url, child } => (url, child),
+                DshStartResult::Failed { error } => panic!("start failed: {error}"),
+            };
+            let client = http_client::Client::new();
+            assert!(
+                client.get(&url1).send().await.unwrap().status().is_success(),
+                "first start not reachable"
+            );
+
+            // 2. 模拟崩溃:SIGKILL 子进程。
+            let pid = child.id();
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            // 3. 等退出(等价 poll_child 检测)。
+            for _ in 0..100 {
+                if child.try_status().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                child.try_status().ok().flatten().is_some(),
+                "process {pid} did not exit after SIGKILL"
+            );
+
+            // 4. 重启(等价 lib.rs 的 restart_future 调度)。
+            let (url2, mut child2) = match DshRuntime::restart_future().await {
+                DshRestartResult::Restarted { url, child } => (url, child),
+                DshRestartResult::GiveUp { error } => panic!("restart gave up: {error}"),
+            };
+            assert_ne!(url1, url2, "restart should pick a new port");
+            assert!(
+                client.get(&url2).send().await.unwrap().status().is_success(),
+                "restarted runtime not reachable"
+            );
+
+            // 5. 清理。
+            let _ = child2.kill();
+            let _ = child2.status().await;
+        });
+    }
 }
