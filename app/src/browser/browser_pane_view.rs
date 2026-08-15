@@ -208,6 +208,11 @@ impl BrowserPaneView {
             self.register_platform_view_handler(ctx);
         } else {
             manager.set_visible(self.model.platform_view_id, true);
+            // 重建场景后重新注册 platform-view handler:首次创建发生在
+            // `new()` 中,此时 pane 可能尚未挂载到窗口,handler 注册可能
+            // 失败(platform_window 尚不可用);attach 时幂等重注册兜底,
+            // 否则 webview 永远收不到 rect 上报,保持 0 尺寸不可见。
+            self.register_platform_view_handler(ctx);
         }
         self.focus_webview(ctx);
     }
@@ -306,7 +311,6 @@ impl View for BrowserPaneView {
                 .blur_webview_page(self.model.platform_view_id);
         }
     }
-
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);

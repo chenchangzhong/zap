@@ -1444,42 +1444,50 @@ fn initialize_app(
 
     ctx.add_singleton_model(CustomSecretRegexUpdater::new);
 
-    // Web preview:全局 webview 管理器。每帧消费 platform-view 上报
-    // (渲染线程写入的暂存队列),把 webview 定位到场景声明的 rect。
+    // Web preview:全局 webview 管理器(platform view 定位在下方合并的
+    // on_frame_drawn 中处理)。
     if FeatureFlag::BrowserPane.is_enabled() {
         ctx.add_singleton_model(|_| browser::BrowserWebViewManager::new());
-        ctx.on_frame_drawn(|ctx, window_id| {
-            browser::BrowserWebViewManager::handle(ctx).update(ctx, |manager, ctx| {
-                manager.drain_pending_platform_views(window_id);
-                manager.drain_pending_webview_focus(ctx);
-            });
-        });
     }
 
     // DeepSeek Harness runtime:管理 dsh 子进程,驱动崩溃重启轮询。
+    // 注意:on_frame_drawn 是覆盖式单回调,必须与 BrowserPane 的合并,
+    // 否则后注册的会覆盖先注册的(导致 webview 收不到 rect 上报)。
     if FeatureFlag::DshPane.is_enabled() {
         ctx.add_singleton_model(|_| dsh::DshRuntime::new());
-        ctx.on_frame_drawn(|ctx, _window_id| {
-            dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
-                if let Some(crashes) = runtime.poll_child() {
-                    if crashes > 0 {
-                        // 崩溃:调度重启(后台执行器)。
-                        ctx.spawn(
-                            dsh::DshRuntime::restart_future(),
-                            move |runtime, result, _ctx| match result {
-                                dsh::DshRestartResult::Restarted { url, child } => {
-                                    log::info!("[dsh] restarted at {url}");
-                                    runtime.adopt_child(child);
-                                }
-                                dsh::DshRestartResult::GiveUp { error } => {
-                                    log::error!("[dsh] restart gave up: {error}");
-                                    runtime.set_status(dsh::DshRuntimeStatus::Failed);
-                                }
-                            },
-                        );
+    }
+
+    // 每帧回调:合并 BrowserPane(platform view 定位)与 DshRuntime(崩溃轮询)。
+    if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
+        ctx.on_frame_drawn(|ctx, window_id| {
+            if FeatureFlag::BrowserPane.is_enabled() {
+                browser::BrowserWebViewManager::handle(ctx).update(ctx, |manager, ctx| {
+                    manager.drain_pending_platform_views(window_id);
+                    manager.drain_pending_webview_focus(ctx);
+                });
+            }
+            if FeatureFlag::DshPane.is_enabled() {
+                dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
+                    if let Some(crashes) = runtime.poll_child() {
+                        if crashes > 0 {
+                            // 崩溃:调度重启(后台执行器)。
+                            ctx.spawn(
+                                dsh::DshRuntime::restart_future(),
+                                move |runtime, result, _ctx| match result {
+                                    dsh::DshRestartResult::Restarted { url, child } => {
+                                        log::info!("[dsh] restarted at {url}");
+                                        runtime.adopt_child(child);
+                                    }
+                                    dsh::DshRestartResult::GiveUp { error } => {
+                                        log::error!("[dsh] restart gave up: {error}");
+                                        runtime.set_status(dsh::DshRuntimeStatus::Failed);
+                                    }
+                                },
+                            );
+                        }
                     }
-                }
-            });
+                });
+            }
         });
     }
 

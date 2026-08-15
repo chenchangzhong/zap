@@ -96,6 +96,19 @@ impl BrowserWebViewManager {
         // 页面内元素获得焦点(focusin)时经 IPC 上报 Rust,让 Warp 释放
         // 地址栏的焦点与光标(地址栏与页面各一个光标 = 双光标)。
         let init_js = r#"
+// JS 错误/警告转发到 Rust 日志(诊断用)。
+window.addEventListener('error', (e) => {
+  window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-js-error:' + (e.message || 'unknown'));
+});
+window.addEventListener('unhandledrejection', (e) => {
+  window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-js-error:unhandledrejection:' + String(e.reason).slice(0, 200));
+});
+const __origLog = console.error;
+console.error = function(...args) {
+  window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-js-error:console:' + args.map(String).join(' ').slice(0, 300));
+  __origLog.apply(console, args);
+};
+
 document.addEventListener('keydown', (e) => {
   if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
   // Cmd+R → 页面刷新(wry child webview 的 performKeyEquivalent 返回 NO,
@@ -155,6 +168,11 @@ setInterval(() => {
             .with_ipc_handler(move |request| {
                 let body = request.body();
                 log::debug!("[browser] ipc msg: {}", body);
+                if body.starts_with("warp:webview-js-error:") {
+                    // 页面 JS 错误(诊断):转发到日志。
+                    log::warn!("[browser] webview {ipc_id} JS error: {}", &body["warp:webview-js-error:".len()..]);
+                    return;
+                }
                 if matches!(
                     body.as_str(),
                     "warp:webview-focusin" | "warp:webview-mousedown"
@@ -322,6 +340,7 @@ setInterval(() => {
             }
         }
     }
+
 
     /// 销毁 id 对应的 webview(pane 关闭时调用)。
     pub fn destroy(&self, id: u64) {
