@@ -46,9 +46,13 @@ impl PaneContent for DshPane {
     }
 
     fn detach(&self, group: &PaneGroup, detach_type: DetachType, ctx: &mut ViewContext<PaneGroup>) {
+        log::info!("[dsh] DshPane::detach: {detach_type:?}");
         self.inner.detach(group, detach_type, ctx);
-        if matches!(detach_type, DetachType::Closed) {
-            // 关闭 dsh pane:同步停止 runtime(启动/停止对称)。
+        // 关闭 tab 走 HiddenForClose(可 undo 恢复),完全销毁走 Closed:
+        // 两者都停止 runtime。undo 恢复时 DshPane 重建、webview 指向旧 URL,
+        // 用户重新执行 OpenDshPane 会重启 runtime 并导航(恢复体验可接受)。
+        if matches!(detach_type, DetachType::Closed | DetachType::HiddenForClose) {
+            log::info!("[dsh] DshPane detached; requesting runtime stop");
             DshRuntime::handle(ctx).update(ctx, |runtime, _ctx| {
                 runtime.request_stop();
             });

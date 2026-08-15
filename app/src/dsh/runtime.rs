@@ -475,6 +475,7 @@ impl DshRuntime {
     /// 主动停止 runtime(面板关闭/退出时)。同步执行,可在主线程直接调用:
     /// SIGTERM 优雅退出,超时后 SIGKILL。
     pub fn request_stop(&mut self) {
+        log::info!("[dsh] request_stop: child={}", self.child.is_some());
         self.stopping = true;
         if let Some(mut child) = self.child.take() {
             Self::terminate_child(&mut child);
@@ -483,8 +484,6 @@ impl DshRuntime {
         self.url = None;
         self.consecutive_crashes = 0;
     }
-
-    /// 轮询子进程是否退出(由 app 的 on_frame_drawn 驱动)。
     ///
     /// 返回 [`PollResult`]:崩溃时置状态为 `Stopped`(等待重启调度),
     /// 超过上限置 `Failed` 并返回 [`PollResult::GiveUp`]。
