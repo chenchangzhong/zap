@@ -141,8 +141,31 @@ document.addEventListener('click', (e) => {
 window.open = function(url) {
   window.location.href = url;
 };
+// 失焦时记录并 blur 页面输入框(防与 Warp 地址栏光标共存的双光标)。
+// 记录元素供重新聚焦时(__restoreFocused)恢复:WKWebView 失焦再聚焦不会自动
+// 恢复页面 activeElement,不恢复则切走再切回 tab 时输入框焦点丢失。
+window.__lastFocused = null;
+window.__restoreFocused = function() {
+  var el = window.__lastFocused;
+  if (!el || !el.isConnected) { window.__lastFocused = null; return; }
+  var attempts = 0;
+  var tryFocus = function() {
+    // makeFirstResponder 后页面 hasFocus 需等 AppKit 事件循环才变 true,
+    // 故轮询等待,有限次避免死循环。
+    if (el.isConnected && document.hasFocus()) {
+      el.focus();
+      window.__lastFocused = null;
+    } else if (el.isConnected && attempts++ < 20) {
+      setTimeout(tryFocus, 30);
+    } else {
+      window.__lastFocused = null;
+    }
+  };
+  tryFocus();
+};
 setInterval(() => {
   if (!document.hasFocus() && document.activeElement && document.activeElement !== document.body) {
+    window.__lastFocused = document.activeElement;
     document.activeElement.blur();
   }
 }, 100);
@@ -320,6 +343,11 @@ setInterval(() => {
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             let _ = entry.webview.focus();
+            // 恢复之前被 setInterval blur 的页面输入框焦点(WKWebView 失焦再
+            // 聚焦不会自动恢复页面 activeElement)。
+            let _ = entry
+                .webview
+                .evaluate_script("window.__restoreFocused && window.__restoreFocused();");
         }
     }
 
