@@ -9953,7 +9953,9 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         let Some(tab_data) = self.tabs.get(index) else {
-            debug_assert!(false, "Tried to remove a tab with an invalid index");
+            // 无效 index(如对已关闭的 tab 重复 CloseTab):优雅返回,不 panic。
+            // 重复关闭是用户可触发的正常场景,不该用 debug_assert 崩溃。
+            log::warn!("Tried to remove a tab with an invalid index: {index}");
             return false;
         };
         let removed_tab_had_terminal_panes = tab_data.pane_group.as_ref(ctx).has_terminal_panes();
@@ -18846,6 +18848,7 @@ impl Workspace {
     /// - runtime 可用(启动中/就绪)且有 DshPane tab → 聚焦已有 tab
     /// - 否则 → 创建 Loading tab(若尚无),异步启动/重启 runtime
     fn open_dsh_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
         // 读当前 runtime 状态(同步,不借用 self)。
         let status = crate::dsh::DshRuntime::handle(ctx).read(ctx, |runtime, _| runtime.status());
 
@@ -18860,7 +18863,6 @@ impl Workspace {
         // 2. 无可用 DshPane tab → 创建 Loading tab(已有 stale pane 时复用,不重复建)
         if !self.has_dsh_pane(ctx) {
             let first_use = !crate::dsh::DshRuntime::is_configured();
-            let window_id = ctx.window_id();
             let pane = crate::dsh::DshPane::new(ctx);
             let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
             let new_idx = match new_tab_placement_setting {
@@ -18891,6 +18893,25 @@ impl Workspace {
                     return;
                 }
                 crate::dsh::DshRuntimeStatus::Stopped | crate::dsh::DshRuntimeStatus::Failed => {}
+            }
+            // 注入最近打开的 Zap 项目目录作 dsh 工作目录(DSH_CWD),
+            // 使会话 cwd 跟随 Zap 项目(workspace 归组)。
+            let dir = crate::projects::ProjectManagementModel::handle(ctx).read(ctx, |model, _| {
+                model
+                    .all_projects()
+                    .filter(|p| p.last_opened_ts.is_some())
+                    .max_by_key(|p| p.last_opened_ts.unwrap())
+                    .map(|p| std::path::PathBuf::from(&p.path))
+            })
+            .or_else(|| {
+                // 无最近打开项目:fallback 到活动终端 cwd(更"当前"的工作目录)。
+                crate::workspace::ActiveSession::handle(ctx).read(ctx, |active, _| {
+                    active.path_if_local(window_id).map(std::path::PathBuf::from)
+                })
+            });
+            if let Some(dir) = dir {
+                log::info!("[dsh] workspace dir set to {}", dir.display());
+                crate::dsh::runtime::set_workspace_dir(dir);
             }
             let gen = runtime.begin_start();
             ctx.spawn(

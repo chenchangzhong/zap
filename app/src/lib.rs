@@ -1457,6 +1457,8 @@ fn initialize_app(
     // 否则后注册的会覆盖先注册的(导致 webview 收不到 rect 上报)。
     if FeatureFlag::DshPane.is_enabled() {
         ctx.add_singleton_model(|_| dsh::DshRuntime::new());
+        // 独立桥服务:起 WS server + 握手,事件经每帧 drain 分发。
+        ctx.add_singleton_model(|_| dsh::bridge::BridgeServer::new());
     }
 
     // 每帧回调:合并 BrowserPane(platform view 定位)与 DshRuntime(崩溃轮询)。
@@ -1468,7 +1470,13 @@ fn initialize_app(
                 manager.drain_pending_webview_focus(ctx);
             });
             if FeatureFlag::DshPane.is_enabled() {
+                // 桥事件(连接/断开)每帧 drain 分发。
+                dsh::bridge::BridgeServer::handle(ctx).update(ctx, |bridge, ctx| {
+                    bridge.drain_events(ctx);
+                });
                 dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
+                    // 阶段3:提取活动终端最近命令(受隐私开关,节流)。
+                    dsh::runtime::update_terminal_context_from_active(ctx, window_id);
                     match runtime.poll_child() {
                         dsh::PollResult::Crashed => {
                             // 崩溃:标记重启(保留崩溃计数,使 MAX_RESTARTS 上限可达),

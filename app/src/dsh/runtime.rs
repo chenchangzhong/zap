@@ -13,11 +13,16 @@
 //! 平台:macOS 先行(webview 基建仅 macOS 有实现),其他平台编译为空壳。
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use command::r#async::Command;
-use warpui::{Entity, SingletonEntity};
+use parking_lot::Mutex;
+use warpui::{Entity, ModelContext, SingletonEntity, WindowId};
+
+use super::bridge;
 
 /// dsh npm 包名。
 const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh";
@@ -35,6 +40,114 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 /// 崩溃计数重置阈值:距上次成功启动超过该时长后崩溃,视为健康运行期间
 /// 的偶发崩溃,重置连续崩溃计数(避免数月内偶发崩溃累计触发 GiveUp)。
 const CRASH_COUNT_RESET_AFTER: Duration = Duration::from_secs(300);
+
+/// 当前 Zap 项目目录(注入 dsh 作 `DSH_CWD`,使会话工作目录跟随 Zap 项目)。
+/// 由 `open_dsh_pane` 在启动 dsh 时更新;`start_inner`(异步关联函数)读取。
+static WORKSPACE_DIR: LazyLock<Mutex<Option<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// 设置 dsh 工作目录(最近打开的 Zap 项目目录)。
+pub(crate) fn set_workspace_dir(path: PathBuf) {
+    *WORKSPACE_DIR.lock() = Some(path);
+}
+
+/// 读取 dsh 工作目录;未设置时为 `None`(不注入 `DSH_CWD`,用 dsh 默认)。
+pub(crate) fn workspace_dir() -> Option<PathBuf> {
+    WORKSPACE_DIR.lock().clone()
+}
+
+/// 注入给 dsh 的终端上下文最大命令数。
+const TERMINAL_CONTEXT_MAX: usize = 20;
+/// 终端上下文刷新节流间隔。
+const TERMINAL_CONTEXT_REFRESH: Duration = Duration::from_secs(1);
+
+/// 最近注入的活动终端命令(供桥 `zap.terminal_context` 读取)。
+static TERMINAL_CONTEXT: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// 隐私开关:默认关闭(不暴露终端命令给 agent);需显式开启。
+static TERMINAL_CONTEXT_ENABLED: AtomicBool = AtomicBool::new(false);
+/// 上次刷新时刻(节流)。
+static TERMINAL_CONTEXT_LAST_REFRESH: LazyLock<Mutex<Instant>> =
+    LazyLock::new(|| Mutex::new(Instant::now() - TERMINAL_CONTEXT_REFRESH));
+
+/// 设置终端上下文注入开关(隐私),并持久化到 dsh 设置文件。默认关闭。
+pub(crate) fn set_terminal_context_enabled(enabled: bool) {
+    TERMINAL_CONTEXT_ENABLED.store(enabled, Ordering::Relaxed);
+    if let Ok(path) = dsh_settings_path() {
+        let value = serde_json::json!({ "terminal_context_enabled": enabled });
+        let _ = std::fs::write(path, serde_json::to_string_pretty(&value).unwrap_or_default());
+    }
+}
+
+/// 从 dsh 设置文件加载隐私开关(启动时调用,初始化 atomic)。
+pub(crate) fn init_terminal_context_enabled_from_disk() {
+    TERMINAL_CONTEXT_ENABLED.store(terminal_context_enabled_from_disk(), Ordering::Relaxed);
+}
+
+/// 从 dsh 设置文件实时读取隐私开关值。
+fn terminal_context_enabled_from_disk() -> bool {
+    dsh_settings_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| v.get("terminal_context_enabled").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+}
+
+/// dsh 设置文件路径(隐私开关持久化)。正规 settings 框架 UI 后续接入。
+fn dsh_settings_path() -> Result<PathBuf> {
+    Ok(DshRuntime::dsh_data_dir()?.join("dsh_settings.json"))
+}
+
+/// 主线程每帧提取活动终端最近命令到暂存(节流 1s)。隐私关闭时跳过更新。
+pub(crate) fn update_terminal_context_from_active(
+    ctx: &mut ModelContext<DshRuntime>,
+    window_id: WindowId,
+) {
+    // 从文件实时刷新隐私开关:用户运行中改 dsh_settings.json 后 1s 内生效
+    // (仅启动时缓存会导致改文件不生效)。
+    TERMINAL_CONTEXT_ENABLED.store(terminal_context_enabled_from_disk(), Ordering::Relaxed);
+    if !TERMINAL_CONTEXT_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = Instant::now();
+    if now.duration_since(*TERMINAL_CONTEXT_LAST_REFRESH.lock()) < TERMINAL_CONTEXT_REFRESH {
+        return;
+    }
+    *TERMINAL_CONTEXT_LAST_REFRESH.lock() = now;
+
+    let session_id =
+        crate::workspace::ActiveSession::handle(ctx).read(ctx, |a, _| a.session(window_id).map(|s| s.id()));
+    let commands = match session_id {
+        Some(id) => crate::terminal::History::handle(ctx).read(ctx, |h, _| {
+            let cmds = h.commands(id);
+            log::info!(
+                "[dsh] terminal ctx: session {id:?}, history commands = {:?}",
+                cmds.as_ref().map(|c| c.len())
+            );
+            cmds.map(|cmds| {
+                cmds.iter()
+                    .rev()
+                    .take(TERMINAL_CONTEXT_MAX)
+                    .map(|e| e.command.clone())
+                    .collect()
+            })
+        }),
+        None => {
+            log::info!("[dsh] terminal ctx: no active session for window {window_id:?}");
+            None
+        }
+    };
+    *TERMINAL_CONTEXT.lock() = commands.unwrap_or_default();
+}
+
+/// 读取注入的终端上下文(隐私关闭时为空)。
+pub(crate) fn terminal_context() -> Vec<String> {
+    if TERMINAL_CONTEXT_ENABLED.load(Ordering::Relaxed) {
+        TERMINAL_CONTEXT.lock().clone()
+    } else {
+        Vec::new()
+    }
+}
 
 
 /// 崩溃重启的完整流程(供 ctx.spawn 回调)。
@@ -149,6 +262,7 @@ impl DshRuntime {
     }
 
     pub fn new() -> Self {
+        init_terminal_context_enabled_from_disk();
         Self {
             status: DshRuntimeStatus::Stopped,
             url: None,
@@ -256,15 +370,34 @@ impl DshRuntime {
         // 2. 定位/安装 dsh。
         let dsh_cli = Self::ensure_dsh_installed(&node).await?;
 
-        // 3. 启动 `dsh web --port 0`。
+        // 3. 启动 `dsh web --port 0`(带桥插件注入)。
         let dsh_home = Self::dsh_data_dir()?;
         let mut cmd = Command::new(&node);
+        // command crate 默认 stdout/stderr = null;dsh web 对 null/socket 无效
+        // stdout 会启动即退出(exit 1)。重定向到文件(正常可写目标),顺带留日志。
+        let dsh_web_log = std::fs::File::create(dsh_home.join("dsh-web.log"))?;
+        cmd.stdout(std::process::Stdio::from(dsh_web_log.try_clone()?));
+        cmd.stderr(std::process::Stdio::from(dsh_web_log));
         cmd.arg(&dsh_cli)
             .arg("web")
             .arg("--port")
             .arg("0")
-            .env("DSH_HOME", &dsh_home)
-            .env("ZAP_BRIDGE_ADDRESS", ""); // 预留:插件桥地址(第二阶段)
+            .env("DSH_HOME", &dsh_home);
+        // 桥插件注入:写 profile patch 层(cordis.patch.yml),dsh web 启动时应用。
+        if let Some((port, token)) = bridge::bridge_info() {
+            cmd.env("ZAP_BRIDGE_ADDRESS", format!("ws://127.0.0.1:{port}"));
+            Self::write_bridge_config(&dsh_home, port, &token)?;
+            log::info!("[dsh] bridge plugin injected via cordis.patch.yml (port {port})");
+        }
+        // dsh 会话工作目录 = Zap 当前项目目录。dsh 的 workspaceRoot 取
+        // process.cwd(),故设子进程 cwd(默认 agent preset standard 不读
+        // DSH_CWD,仅 minimal 用;设 current_dir 两者皆正确)。
+        if let Some(dir) = workspace_dir().filter(|d| d.is_dir()) {
+            cmd.current_dir(&dir);
+            // minimal preset 兼容(standard 忽略)。
+            cmd.env("DSH_CWD", &dir);
+            log::info!("[dsh] workspace cwd set to {}", dir.display());
+        }
         let mut child = cmd.spawn().context("Failed to spawn dsh web")?;
 
         // 4. 就绪探测:等端口出现 + HTTP 200。失败时显式清理子进程,
@@ -366,6 +499,43 @@ impl DshRuntime {
         Ok(cli_js)
     }
 
+    /// 生成 cordis.yml(注入 zap-bridge 插件),返回 patch 文件路径。
+    ///
+    /// 插件文件(`<dsh_home>/zap-bridge.ts`)尚未就绪时返回 `None`(降级:
+    /// 不带 `--patch` 启动,避免 dsh 指向缺失文件)。
+    fn write_bridge_config(dsh_home: &Path, port: u16, token: &str) -> Result<()> {
+        let plugin_ts = dsh_home.join("zap-bridge.ts");
+        // 总是尝试从 bundled 源码覆盖提取:dev 下保证插件更新传播到 DSH_HOME;
+        // 发布时 manifest 源码路径不可用 → 复用已提取文件。
+        let src =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/bundled/dsh/zap-bridge.ts");
+        match std::fs::read(&src) {
+            Ok(contents) => {
+                std::fs::write(&plugin_ts, contents)?;
+                log::info!("[dsh] extracted zap-bridge.ts to {}", plugin_ts.display());
+            }
+            Err(_) if !plugin_ts.is_file() => {
+                log::warn!(
+                    "[dsh] zap-bridge.ts missing, starting dsh without bridge plugin"
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                // 源码不可用但已有提取文件:复用(发布场景)。
+            }
+        }
+        // rc.6 的 `web --patch` 无效(unknown option);插件经 profile 用户
+        // patch 层 `profiles/web/cordis.patch.yml` 注入(dsh web 启动时应用)。
+        let patch_dir = dsh_home.join("profiles").join("web");
+        std::fs::create_dir_all(&patch_dir)?;
+        let content = format!(
+            "- insert:\n    - id: zap-bridge\n      name: '{}'\n      config:\n        bridgeAddress: 'ws://127.0.0.1:{port}'\n        token: '{}'\n",
+            plugin_ts.display(),
+            token
+        );
+        std::fs::write(patch_dir.join("cordis.patch.yml"), content)?;
+        Ok(())
+    }
 
     /// 轮询探测 dsh web 就绪(端口监听 + HTTP 200),返回 URL。
     async fn wait_until_ready(child: &async_process::Child) -> Result<String> {
@@ -579,6 +749,63 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
     fn version_constant_is_parseable() {
         assert!(DSH_VERSION.starts_with("0.1.0"));
         assert!(DSH_VERSION.contains('-') || DSH_VERSION.split('.').count() == 3);
+    }
+
+    /// 生成 cordis.patch.yml:内容含 id/桥地址/token/插件绝对路径。
+    #[test]
+    fn write_bridge_config_generates_patch() {
+        let dir = std::env::temp_dir().join(format!("dsh-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zap-bridge.ts"), "// zap-bridge").unwrap();
+
+        DshRuntime::write_bridge_config(&dir, 54321, "t0k3n").unwrap();
+        let patch = dir.join("profiles").join("web").join("cordis.patch.yml");
+        let content = std::fs::read_to_string(&patch).unwrap();
+        assert!(content.contains("id: zap-bridge"));
+        assert!(content.contains("bridgeAddress: 'ws://127.0.0.1:54321'"));
+        assert!(content.contains("token: 't0k3n'"));
+        assert!(content.contains(&format!("name: '{}'", dir.join("zap-bridge.ts").display())));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// set_workspace_dir / workspace_dir 存取与缺省。
+    #[test]
+    fn workspace_dir_set_and_get() {
+        *WORKSPACE_DIR.lock() = None;
+        assert!(workspace_dir().is_none(), "default should be None");
+        set_workspace_dir(PathBuf::from("/tmp/zap-foo"));
+        assert_eq!(workspace_dir(), Some(PathBuf::from("/tmp/zap-foo")));
+    }
+
+    /// 终端上下文隐私开关:关闭时返回空,开启后返回暂存命令。
+    #[test]
+    fn terminal_context_privacy_gate() {
+        TERMINAL_CONTEXT_ENABLED.store(false, Ordering::Relaxed);
+        *TERMINAL_CONTEXT.lock() = vec!["ls".to_string(), "cd src".to_string()];
+        assert!(terminal_context().is_empty(), "privacy off => empty");
+
+        TERMINAL_CONTEXT_ENABLED.store(true, Ordering::Relaxed);
+        assert_eq!(
+            terminal_context(),
+            vec!["ls".to_string(), "cd src".to_string()],
+            "privacy on => returns staged commands"
+        );
+
+        // 复位默认。
+        TERMINAL_CONTEXT_ENABLED.store(false, Ordering::Relaxed);
+    }
+    #[test]
+    fn write_bridge_config_extracts_source() {
+        let dir = std::env::temp_dir().join(format!("dsh-cfg-src-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // dsh_home 无插件文件 → 从源码提取。
+        DshRuntime::write_bridge_config(&dir, 54322, "t0k3n2").unwrap();
+        assert!(dir.join("zap-bridge.ts").is_file(), "plugin extracted to dsh_home");
+        let patch = dir.join("profiles").join("web").join("cordis.patch.yml");
+        let content = std::fs::read_to_string(&patch).unwrap();
+        assert!(content.contains(&format!("name: '{}'", dir.join("zap-bridge.ts").display())));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 端到端冒烟:真实启动 dsh runtime(需网络安装 dsh,首次较慢)。

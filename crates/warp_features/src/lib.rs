@@ -823,6 +823,8 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::CloudRunners,
     FeatureFlag::McpJsonTreeView,
     FeatureFlag::BoxDrawingGlyphs,
+    // DeepSeek Harness 集成(dsh webview):阶段 0-3 已实现,dev 启用。
+    FeatureFlag::DshPane,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Zap).
