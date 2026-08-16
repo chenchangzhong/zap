@@ -18892,6 +18892,18 @@ impl Workspace {
                 }
                 crate::dsh::DshRuntimeStatus::Stopped | crate::dsh::DshRuntimeStatus::Failed => {}
             }
+            // 注入最近打开的 Zap 项目目录作 dsh 工作目录(DSH_CWD),
+            // 使会话 cwd 跟随 Zap 项目(workspace 归组)。
+            let dir = crate::projects::ProjectManagementModel::handle(ctx).read(ctx, |model, _| {
+                model
+                    .all_projects()
+                    .filter(|p| p.last_opened_ts.is_some())
+                    .max_by_key(|p| p.last_opened_ts.unwrap())
+                    .map(|p| std::path::PathBuf::from(&p.path))
+            });
+            if let Some(dir) = dir {
+                crate::dsh::runtime::set_workspace_dir(dir);
+            }
             let gen = runtime.begin_start();
             ctx.spawn(
                 crate::dsh::DshRuntime::start_future(gen),

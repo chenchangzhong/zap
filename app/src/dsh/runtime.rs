@@ -13,10 +13,12 @@
 //! 平台:macOS 先行(webview 基建仅 macOS 有实现),其他平台编译为空壳。
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use command::r#async::Command;
+use parking_lot::Mutex;
 use warpui::{Entity, SingletonEntity};
 
 use super::bridge;
@@ -37,6 +39,21 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 /// 崩溃计数重置阈值:距上次成功启动超过该时长后崩溃,视为健康运行期间
 /// 的偶发崩溃,重置连续崩溃计数(避免数月内偶发崩溃累计触发 GiveUp)。
 const CRASH_COUNT_RESET_AFTER: Duration = Duration::from_secs(300);
+
+/// 当前 Zap 项目目录(注入 dsh 作 `DSH_CWD`,使会话工作目录跟随 Zap 项目)。
+/// 由 `open_dsh_pane` 在启动 dsh 时更新;`start_inner`(异步关联函数)读取。
+static WORKSPACE_DIR: LazyLock<Mutex<Option<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// 设置 dsh 工作目录(最近打开的 Zap 项目目录)。
+pub(crate) fn set_workspace_dir(path: PathBuf) {
+    *WORKSPACE_DIR.lock() = Some(path);
+}
+
+/// 读取 dsh 工作目录;未设置时为 `None`(不注入 `DSH_CWD`,用 dsh 默认)。
+fn workspace_dir() -> Option<PathBuf> {
+    WORKSPACE_DIR.lock().clone()
+}
 
 
 /// 崩溃重启的完整流程(供 ctx.spawn 回调)。
@@ -273,6 +290,15 @@ impl DshRuntime {
                 cmd.arg("--patch").arg(&patch);
                 log::info!("[dsh] bridge plugin injected via {:?} (port {port})", patch);
             }
+        }
+        // dsh 会话工作目录 = Zap 当前项目目录。dsh 的 workspaceRoot 取
+        // process.cwd(),故设子进程 cwd(默认 agent preset standard 不读
+        // DSH_CWD,仅 minimal 用;设 current_dir 两者皆正确)。
+        if let Some(dir) = workspace_dir().filter(|d| d.is_dir()) {
+            cmd.current_dir(&dir);
+            // minimal preset 兼容(standard 忽略)。
+            cmd.env("DSH_CWD", &dir);
+            log::info!("[dsh] workspace cwd set to {}", dir.display());
         }
         let mut child = cmd.spawn().context("Failed to spawn dsh web")?;
 
@@ -643,7 +669,14 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 插件文件缺失时从 bundled 源码提取到 DSH_HOME,并生成 cordis.yml。
+    /// set_workspace_dir / workspace_dir 存取与缺省。
+    #[test]
+    fn workspace_dir_set_and_get() {
+        *WORKSPACE_DIR.lock() = None;
+        assert!(workspace_dir().is_none(), "default should be None");
+        set_workspace_dir(PathBuf::from("/tmp/zap-foo"));
+        assert_eq!(workspace_dir(), Some(PathBuf::from("/tmp/zap-foo")));
+    }
     #[test]
     fn write_bridge_config_extracts_source() {
         let dir = std::env::temp_dir().join(format!("dsh-cfg-src-{}", std::process::id()));
