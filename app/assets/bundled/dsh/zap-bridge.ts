@@ -54,25 +54,25 @@ function extractTools(ctx: unknown): ToolsLike | undefined {
 }
 
 /// 手动构造一个工具定义(JSON Schema 格式,等价 defineTool 的转换结果)。
-function zapTool(name: string, description: string, method: string): unknown {
+function zapTool(
+  name: string,
+  description: string,
+  method: string,
+  parameters: unknown,
+): unknown {
   return {
     name,
     description,
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'Path relative to the project root.' },
-      },
-      required: ['path'],
-    },
+    parameters,
     output: {
       schema: { type: 'string' },
       render: (_args: unknown, value: unknown) => [
-        { type: 'text', text: JSON.stringify(value) },
+        { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) },
       ],
     },
     async execute(args: unknown) {
-      return rpc(method, args)
+      // output.schema 要求 string;桥返回对象,JSON 序列化后返回。
+      return JSON.stringify(await rpc(method, args))
     },
   }
 }
@@ -86,11 +86,11 @@ function zapToolNoArgs(name: string, description: string, method: string): unkno
     output: {
       schema: { type: 'string' },
       render: (_args: unknown, value: unknown) => [
-        { type: 'text', text: JSON.stringify(value) },
+        { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) },
       ],
     },
     async execute(args: unknown) {
-      return rpc(method, args)
+      return JSON.stringify(await rpc(method, args))
     },
   }
 }
@@ -102,12 +102,28 @@ function registerTools(ctx: unknown): void {
     console.error('[zap-bridge] tools service unavailable')
     return
   }
+  const pathParam = {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'Path relative to the project root.' },
+    },
+    required: ['path'],
+  }
+  const patternParam = {
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: 'Filename substring to search.' },
+    },
+    required: ['pattern'],
+  }
+
   tools.register(
     zapTool(
       'zap_list_files',
       'List entries (files and directories) in the current Zap project. ' +
         'Paths are relative to the project root; use empty string for the root.',
       'zap.list_files',
+      pathParam,
     ),
   )
   tools.register(
@@ -115,6 +131,15 @@ function registerTools(ctx: unknown): void {
       'zap_read_file',
       'Read a file in the current Zap project as UTF-8 text.',
       'zap.read_file',
+      pathParam,
+    ),
+  )
+  tools.register(
+    zapTool(
+      'zap_search',
+      'Search for files in the current Zap project by filename substring.',
+      'zap.search',
+      patternParam,
     ),
   )
   tools.register(
@@ -126,7 +151,7 @@ function registerTools(ctx: unknown): void {
     ),
   )
   console.log(
-    '[zap-bridge] registered zap_list_files, zap_read_file, zap_terminal_context',
+    '[zap-bridge] registered zap_list_files, zap_read_file, zap_search, zap_terminal_context',
   )
 }
 
