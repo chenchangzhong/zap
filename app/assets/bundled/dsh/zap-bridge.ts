@@ -1,20 +1,36 @@
-// zap-bridge:Zap ⇄ dsh 桥插件(阶段 0)。
+// zap-bridge:Zap ⇄ dsh 桥插件。
 //
-// 零 npm 依赖:仅用 Node 原生 `WebSocket` + `fetch`(Node >= 22.19)。
-// 流程:握手(`bridge/hello`,携带 token + 协议版本 + 能力)→ 保持连接 →
-// 断线指数退避重连 + 重新握手。
+// 零 npm 依赖:不用 `import`(插件文件位于 DSH_HOME,Node 无法解析外部包),
+// 仅用 Node 原生 `WebSocket` 与 `ctx.tools.register`(运行时注入)。工具定义
+// 以 JSON Schema 格式手动构造(等价 `defineTool` 转换结果)。
 //
-// 配置经 cordis.yml 的 `config:` 注入(`bridgeAddress` + `token`),由
-// Zap 侧 runtime 启动 dsh 时生成。发布形态:随 Zap 打包(bundled asset),
-// 运行时提取到 DSH_HOME,`--patch` 指向该文件。
+// 职责:
+// - 握手(`bridge/hello`,token + 协议版本 + 能力)→ 保持连接 → 断线指数退避重连
+// - 注册 `zap_*` 工具,`execute` 经桥(WS JSON-RPC)调用 Zap 的文件能力
+// - `rpc` 请求-响应映射(id → resolve)
+//
+// 配置经 cordis.yml `config:` 注入(`bridgeAddress` + `token`),由 Zap 侧
+// runtime 启动 dsh 时生成。
 
 export const name = 'zap-bridge'
+/// 声明依赖 tools 服务(框架保证就绪后才加载本插件)。
+export const inject = ['tools']
 
 const PROTOCOL_VERSION = 1
 const DSH_VERSION = '0.1.0-rc.6'
-/// 重连初始退避(ms)与上限。
 const INITIAL_BACKOFF_MS = 1000
 const MAX_BACKOFF_MS = 30000
+/// 工具 rpc 起始 id(握手占用 id=1,避免冲突)。
+const RPC_ID_START = 100
+
+let ws: WebSocket | null = null
+let nextRpcId = RPC_ID_START
+const pending = new Map<number, (v: unknown) => void>()
+
+/// 工具注册所需的最小 tools 接口(避免依赖完整 ctx 类型推断)。
+interface ToolsLike {
+  register(d: unknown): () => void
+}
 
 export function apply(ctx: unknown, config: unknown): void {
   const c = config as { bridgeAddress?: string; token?: string }
@@ -25,18 +41,91 @@ export function apply(ctx: unknown, config: unknown): void {
     return
   }
   connect(address, token)
+  registerTools(ctx)
+}
+
+/// 从 ctx 提取 tools 服务(运行时守卫,避免内联断言)。
+function extractTools(ctx: unknown): ToolsLike | undefined {
+  if (ctx && typeof ctx === 'object' && 'tools' in ctx) {
+    // 'tools' in ctx 已守卫存在性;cast 到最小接口。
+    return (ctx as { tools: ToolsLike }).tools
+  }
+  return undefined
+}
+
+/// 手动构造一个工具定义(JSON Schema 格式,等价 defineTool 的转换结果)。
+function zapTool(name: string, description: string, method: string): unknown {
+  return {
+    name,
+    description,
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Path relative to the project root.' },
+      },
+      required: ['path'],
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, value: unknown) => [
+        { type: 'text', text: JSON.stringify(value) },
+      ],
+    },
+    async execute(args: unknown) {
+      return rpc(method, args)
+    },
+  }
+}
+
+/// 注册 Zap 文件能力工具(execute 经桥调用 Zap)。
+function registerTools(ctx: unknown): void {
+  const tools = extractTools(ctx)
+  if (!tools) {
+    console.error('[zap-bridge] tools service unavailable')
+    return
+  }
+  tools.register(
+    zapTool(
+      'zap_list_files',
+      'List entries (files and directories) in the current Zap project. ' +
+        'Paths are relative to the project root; use empty string for the root.',
+      'zap.list_files',
+    ),
+  )
+  tools.register(
+    zapTool(
+      'zap_read_file',
+      'Read a file in the current Zap project as UTF-8 text.',
+      'zap.read_file',
+    ),
+  )
+  console.log('[zap-bridge] registered zap_list_files, zap_read_file')
+}
+
+/// 经桥发起一次 JSON-RPC 请求并等待响应。
+function rpc(method: string, params: unknown): Promise<unknown> {
+  const { promise, resolve } = Promise.withResolvers<unknown>()
+  const sock = ws
+  if (!sock || sock.readyState !== WebSocket.OPEN) {
+    resolve({ error: 'zap bridge not connected' })
+    return promise
+  }
+  const id = nextRpcId++
+  pending.set(id, resolve)
+  sock.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+  return promise
 }
 
 /// 建立一条 WS 连接;断线自动指数退避重连。
 function connect(address: string, token: string): void {
-  const ws = new WebSocket(address)
+  const sock = new WebSocket(address)
+  ws = sock
   let handshaken = false
   let backoff = INITIAL_BACKOFF_MS
 
-  ws.onopen = () => {
+  sock.onopen = () => {
     backoff = INITIAL_BACKOFF_MS
-    // 握手:token + 协议版本 + 能力清单。
-    ws.send(
+    sock.send(
       JSON.stringify({
         jsonrpc: '2.0',
         id: 1,
@@ -45,48 +134,52 @@ function connect(address: string, token: string): void {
           token,
           protocolVersion: PROTOCOL_VERSION,
           dshVersion: DSH_VERSION,
-          capabilities: [],
+          capabilities: ['files.list', 'files.read'],
         },
       }),
     )
   }
 
-  ws.onmessage = (event) => {
+  sock.onmessage = (event) => {
     const text = typeof event.data === 'string' ? event.data : ''
     if (!text) return
     try {
-      const msg = JSON.parse(text) as {
-        id?: number
-        result?: { protocolVersion?: number; zapVersion?: string }
-        error?: unknown
-      }
+      const msg = JSON.parse(text) as { id?: number; result?: unknown; error?: unknown }
       if (msg.id === 1 && msg.result) {
         handshaken = true
-        console.log(
-          '[zap-bridge] handshake ok (zap ' +
-            (msg.result.zapVersion ?? '?') +
-            ', protocol ' +
-            (msg.result.protocolVersion ?? '?') +
-            ')',
-        )
-        // 握手成功:发一次 zap.ping 验证往返。
-        ws.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'zap.ping', params: {} }))
+        console.log('[zap-bridge] handshake ok')
       } else if (msg.error) {
         console.error('[zap-bridge] rpc error:', JSON.stringify(msg.error))
         // 握手失败(token 错 / 版本不匹配):关闭触发重连。
-        ws.close()
+        if (msg.id === 1) {
+          sock.close()
+        } else if (msg.id !== undefined && pending.has(msg.id)) {
+          const resolve = pending.get(msg.id)
+          pending.delete(msg.id)
+          resolve?.({ error: msg.error })
+        }
+      } else if (msg.id !== undefined && pending.has(msg.id)) {
+        const resolve = pending.get(msg.id)
+        pending.delete(msg.id)
+        resolve?.(msg.result)
       }
     } catch {
       // 非 JSON 帧:忽略。
     }
   }
 
-  ws.onclose = () => {
+  sock.onclose = () => {
+    ws = null
+    // 拒绝挂起的请求。
+    for (const resolve of pending.values()) {
+      resolve({ error: 'zap bridge disconnected' })
+    }
+    pending.clear()
     console.log('[zap-bridge] connection closed, reconnecting in ' + backoff + 'ms')
     setTimeout(() => connect(address, token), backoff)
     backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)
   }
 
   // onerror 后必随 onclose,统一走重连。
-  ws.onerror = () => {}
+  sock.onerror = () => {}
 }

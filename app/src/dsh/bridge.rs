@@ -12,6 +12,7 @@
 //! 生成,供 `runtime.rs` 写 cordis.yml 注入 dsh。
 
 use parking_lot::Mutex;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -40,6 +41,15 @@ pub mod code {
     pub const UNAUTHORIZED: i64 = 1001;
     /// 协议版本不匹配。
     pub const PROTOCOL_MISMATCH: i64 = 1002;
+    // ── zap.* 业务错误(1000x) ──
+    /// 路径不是目录。
+    pub const NOT_A_DIR: i64 = 10010;
+    /// 读目录失败。
+    pub const READ_DIR: i64 = 10011;
+    /// 读文件失败。
+    pub const READ_FILE: i64 = 10012;
+    /// 路径非法(绝对路径 / 逃逸项目根 / 解析失败)。
+    pub const PATH_INVALID: i64 = 10013;
 }
 
 /// 桥对外状态。
@@ -271,6 +281,52 @@ async fn handle_connection(stream: tokio::net::TcpStream, token: Arc<str>) {
             }
         };
 
+        // zap.* 文件能力:异步 IO(读文件系统),独立于同步 handle_message。
+        // 需已握手;根为当前 Zap 项目目录。
+        if handshaken {
+            if let Some((zap_method, zap_params, zap_id)) = parse_rpc_head(&text) {
+                if zap_method.starts_with("zap.") {
+                    let result = match super::runtime::workspace_dir() {
+                        Some(root) => handle_zap_method(&zap_method, &zap_params, &root),
+                        None => Err(RpcError {
+                            code: code::INVALID_REQUEST,
+                            message: "no Zap workspace (project) set".into(),
+                            id: Some(zap_id.clone()),
+                        }),
+                    };
+                    match result {
+                        Ok(value) => {
+                            let resp = json!({ "jsonrpc": "2.0", "id": zap_id, "result": value });
+                            if ws
+                                .send(async_tungstenite::tungstenite::Message::Text(
+                                    resp.to_string(),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(id) = &err.id {
+                                let resp = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": { "code": err.code, "message": err.message },
+                                });
+                                let _ = ws
+                                    .send(async_tungstenite::tungstenite::Message::Text(
+                                        resp.to_string(),
+                                    ))
+                                    .await;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
         match handle_message(&token, handshaken, &text) {
             Ok(outcome) => {
                 for event in outcome.events {
@@ -464,6 +520,110 @@ fn handle_hello(token: &str, params: &Value) -> Result<MessageOutcome, RpcError>
             capabilities,
         }],
     })
+}
+
+/// 轻量提取 JSON-RPC 消息头(method / params / id),供 zap.* 异步分流。
+fn parse_rpc_head(raw: &str) -> Option<(String, Value, Value)> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    let obj = v.as_object()?;
+    let method = obj.get("method")?.as_str()?.to_string();
+    let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
+    let id = obj.get("id").cloned().unwrap_or(Value::Null);
+    Some((method, params, id))
+}
+
+/// 分发 zap.* 文件能力方法(同步 IO,根为当前 Zap 项目目录)。
+fn handle_zap_method(method: &str, params: &Value, root: &Path) -> Result<Value, RpcError> {
+    match method {
+        "zap.list_files" => zap_list_files(params, root),
+        "zap.read_file" => zap_read_file(params, root),
+        _ => Err(RpcError {
+            code: code::METHOD_NOT_FOUND,
+            message: format!("unknown method {method}"),
+            id: None,
+        }),
+    }
+}
+
+/// 校验相对路径在项目根内,返回规范化后的路径。
+///
+/// 拒绝绝对路径与 `..` 逃逸;再经 `canonicalize` 防符号链接逃逸到根外。
+fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, RpcError> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() || rel.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err(RpcError {
+            code: code::PATH_INVALID,
+            message: format!("path must be relative and inside project root: {rel}"),
+            id: None,
+        });
+    }
+    let canon_root = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf());
+    let canon = root.join(rel_path).canonicalize().map_err(|err| RpcError {
+        code: code::PATH_INVALID,
+        message: format!("resolve {rel}: {err}"),
+        id: None,
+    })?;
+    if !canon.starts_with(&canon_root) {
+        return Err(RpcError {
+            code: code::PATH_INVALID,
+            message: format!("path escapes project root: {rel}"),
+            id: None,
+        });
+    }
+    Ok(canon)
+}
+
+/// `zap.list_files`:列出相对项目根目录的条目(名字 + 类型)。
+fn zap_list_files(params: &Value, root: &Path) -> Result<Value, RpcError> {
+    let rel = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+    let dir = resolve_in_root(root, rel)?;
+    if !dir.is_dir() {
+        return Err(RpcError {
+            code: code::NOT_A_DIR,
+            message: format!("not a directory: {rel}"),
+            id: None,
+        });
+    }
+    let entries = std::fs::read_dir(&dir).map_err(|err| RpcError {
+        code: code::READ_DIR,
+        message: format!("read dir {rel}: {err}"),
+        id: None,
+    })?;
+    let mut list: Vec<Value> = entries
+        .flatten()
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = match entry.file_type() {
+                Ok(t) if t.is_dir() => "dir",
+                Ok(t) if t.is_symlink() => "symlink",
+                _ => "file",
+            };
+            json!({ "name": name, "kind": kind })
+        })
+        .collect();
+    list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(json!({ "path": rel, "entries": list }))
+}
+
+/// `zap.read_file`:读取相对项目根的文件内容(UTF-8)。
+fn zap_read_file(params: &Value, root: &Path) -> Result<Value, RpcError> {
+    let rel = params
+        .get("path")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| RpcError {
+            code: code::INVALID_PARAMS,
+            message: "missing path".into(),
+            id: None,
+        })?;
+    let path = resolve_in_root(root, rel)?;
+    let content = std::fs::read_to_string(&path).map_err(|err| RpcError {
+        code: code::READ_FILE,
+        message: format!("read {rel}: {err}"),
+        id: None,
+    })?;
+    Ok(json!({ "path": rel, "content": content }))
 }
 
 /// 单条消息处理结果。

@@ -140,3 +140,104 @@ fn handshake_as_notification_no_response() {
     assert!(outcome.response.is_none(), "notification must not get a response");
     assert_eq!(outcome.events.len(), 1);
 }
+
+/// zap.list_files:列目录条目,排序且区分 dir/file。
+#[test]
+fn zap_list_files_lists_entries() {
+    let dir = std::env::temp_dir().join(format!("zap-list-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("a.txt"), "hi").unwrap();
+
+    let out = handle_zap_method("zap.list_files", &json!({ "path": "" }), &dir).unwrap();
+    let entries = out["entries"].as_array().expect("entries");
+    let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["a.txt", "sub"], "sorted dir/file listing");
+    assert_eq!(entries[0]["kind"], "file");
+    assert_eq!(entries[1]["kind"], "dir");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.list_files:相对子目录路径。
+#[test]
+fn zap_list_files_relative_subdir() {
+    let dir = std::env::temp_dir().join(format!("zap-list-sub-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub").join("inner.txt"), "x").unwrap();
+
+    let out = handle_zap_method("zap.list_files", &json!({ "path": "sub" }), &dir).unwrap();
+    let entries = out["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["name"], "inner.txt");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.list_files:路径非目录 → NOT_A_DIR。
+#[test]
+fn zap_list_files_not_a_dir() {
+    let dir = std::env::temp_dir().join(format!("zap-list-err-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("f.txt"), "x").unwrap();
+
+    let err = handle_zap_method("zap.list_files", &json!({ "path": "f.txt" }), &dir)
+        .unwrap_err();
+    assert_eq!(err.code, code::NOT_A_DIR);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.read_file:读取文件内容。
+#[test]
+fn zap_read_file_reads_content() {
+    let dir = std::env::temp_dir().join(format!("zap-read-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "hello zap").unwrap();
+
+    let out = handle_zap_method("zap.read_file", &json!({ "path": "a.txt" }), &dir).unwrap();
+    assert_eq!(out["content"], "hello zap");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.read_file:缺 path → INVALID_PARAMS。
+#[test]
+fn zap_read_file_missing_path() {
+    let dir = std::env::temp_dir().join(format!("zap-read-err-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let err = handle_zap_method("zap.read_file", &json!({}), &dir).unwrap_err();
+    assert_eq!(err.code, code::INVALID_PARAMS);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.*:未知方法 → METHOD_NOT_FOUND。
+#[test]
+fn zap_unknown_method() {
+    let dir = std::env::temp_dir().join(format!("zap-unk-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = handle_zap_method("zap.nope", &json!({}), &dir).unwrap_err();
+    assert_eq!(err.code, code::METHOD_NOT_FOUND);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.* 路径穿越防护:拒绝 `..` 逃逸与绝对路径。
+#[test]
+fn zap_path_traversal_rejected() {
+    let dir = std::env::temp_dir().join(format!("zap-traversal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // ".." 逃逸。
+    let err = handle_zap_method("zap.read_file", &json!({ "path": "../secret" }), &dir)
+        .unwrap_err();
+    assert_eq!(err.code, code::PATH_INVALID);
+    // 绝对路径。
+    let err = handle_zap_method("zap.list_files", &json!({ "path": "/etc" }), &dir).unwrap_err();
+    assert_eq!(err.code, code::PATH_INVALID);
+    // 嵌套 ".."。
+    let err = handle_zap_method("zap.read_file", &json!({ "path": "a/../../x" }), &dir)
+        .unwrap_err();
+    assert_eq!(err.code, code::PATH_INVALID);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -51,7 +51,7 @@ pub(crate) fn set_workspace_dir(path: PathBuf) {
 }
 
 /// 读取 dsh 工作目录;未设置时为 `None`(不注入 `DSH_CWD`,用 dsh 默认)。
-fn workspace_dir() -> Option<PathBuf> {
+pub(crate) fn workspace_dir() -> Option<PathBuf> {
     WORKSPACE_DIR.lock().clone()
 }
 
