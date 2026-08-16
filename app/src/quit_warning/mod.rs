@@ -8,6 +8,7 @@ use warpui::{
 
 use crate::{
     code::editor_management::{CodeEditorStatus, CodeEditorSummary},
+    dsh::{DshPane, DshRuntime, DshRuntimeStatus},
     pane_group::{CodePane, PaneGroup, PaneId, TerminalPane},
     report_if_error, send_telemetry_from_app_ctx,
     server::telemetry::CloseTarget,
@@ -200,6 +201,48 @@ impl QuitScope<'_> {
             Self::EditorTab { .. } => CloseTarget::EditorTab,
         }
     }
+
+    /// 作用域内是否存在 dsh pane 且 dsh runtime 正在运行。
+    ///
+    /// dsh runtime 是全局单例子进程,关闭作用域内的 dsh tab/pane 会触发
+    /// `request_stop` 中断 WebUI/agent 会话,与终端的长运行命令同等对待:
+    /// 计入需确认的"运行进程",使关闭确认弹窗与终端 tab 行为一致。
+    fn dsh_running(&self, ctx: &AppContext) -> bool {
+        let has_dsh_pane = match self {
+            Self::Pane {
+                pane_group,
+                pane_id,
+                ..
+            } => pane_group.downcast_pane_by_id::<DshPane>(*pane_id).is_some(),
+            Self::Tabs(tabs) => tabs
+                .iter()
+                .filter_map(|tab| tab.upgrade(ctx))
+                .any(|pane_group| pane_group.as_ref(ctx).dsh_panes().next().is_some()),
+            Self::Window(window_id) => ctx
+                .views_of_type::<PaneGroup>(*window_id)
+                .map(|views| {
+                    views
+                        .into_iter()
+                        .any(|view| view.as_ref(ctx).dsh_panes().next().is_some())
+                })
+                .unwrap_or_default(),
+            Self::App => ctx.window_ids().any(|window_id| {
+                ctx.views_of_type::<PaneGroup>(window_id)
+                    .map(|views| {
+                        views
+                            .into_iter()
+                            .any(|view| view.as_ref(ctx).dsh_panes().next().is_some())
+                    })
+                    .unwrap_or_default()
+            }),
+            Self::EditorTab { .. } => false,
+        };
+        has_dsh_pane
+            && matches!(
+                DshRuntime::handle(ctx).read(ctx, |runtime, _| runtime.status()),
+                DshRuntimeStatus::Starting | DshRuntimeStatus::Ready
+            )
+    }
 }
 
 impl UnsavedStateSummary<'static> {
@@ -260,9 +303,14 @@ impl<'a> UnsavedStateSummary<'a> {
 
         let num_shared_sessions = scope.shared_sessions(ctx);
 
+        // dsh runtime 运行中(关掉会中断 WebUI/agent 会话)计为 1 个运行进程,
+        // 使关闭确认弹窗与终端 tab 的长运行命令行为一致。
+        let dsh_running = scope.dsh_running(ctx);
+
         UnsavedStateSummary {
             scope,
-            total_long_running_commands: sessions_summary.long_running_cmds.len(),
+            total_long_running_commands: sessions_summary.long_running_cmds.len()
+                + usize::from(dsh_running),
             windows_with_long_running_commands: sessions_summary.windows_running().len(),
             tabs_with_long_running_commands: sessions_summary.tabs_running().len(),
             terminal_sessions: sessions,
