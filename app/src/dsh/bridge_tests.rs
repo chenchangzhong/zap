@@ -241,3 +241,53 @@ fn zap_path_traversal_rejected() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// zap.list_files 尊重 .gitignore(与 Zap 文件树语义一致)。
+#[test]
+fn zap_list_files_respects_gitignore() {
+    let dir = std::env::temp_dir().join(format!("zap-ig-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join(".gitignore"), "node_modules/\n").unwrap();
+    std::fs::write(dir.join("src").join("main.rs"), "fn main() {}").unwrap();
+
+    let out = handle_zap_method("zap.list_files", &json!({ "path": "" }), &dir).unwrap();
+    let names: Vec<&str> = out["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        !names.contains(&"node_modules"),
+        "gitignored entry must be filtered: {names:?}"
+    );
+    assert!(names.contains(&"src"), "non-ignored dir listed: {names:?}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.search:按文件名子串匹配,返回相对项目根的路径。
+#[test]
+fn zap_search_matches_filenames() {
+    let dir = std::env::temp_dir().join(format!("zap-search-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src").join("foo_utils.rs"), "x").unwrap();
+    std::fs::write(dir.join("src").join("bar.rs"), "x").unwrap();
+    std::fs::write(dir.join("README.md"), "x").unwrap();
+
+    let out = handle_zap_method("zap.search", &json!({ "pattern": "foo" }), &dir).unwrap();
+    let matches: Vec<&str> = out["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(matches, vec!["src/foo_utils.rs"]);
+
+    // 无匹配。
+    let out = handle_zap_method("zap.search", &json!({ "pattern": "zzz" }), &dir).unwrap();
+    assert!(out["matches"].as_array().unwrap().is_empty());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

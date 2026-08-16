@@ -17,6 +17,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
+use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use warpui::{Entity, ModelContext, SingletonEntity};
@@ -29,6 +30,8 @@ const ZAP_CAPABILITIES: &[&str] = &[];
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// token 字符数。
 const TOKEN_LEN: usize = 32;
+/// `zap.read_file` 最大读入字节(防超大文件吃内存)。
+const MAX_READ_BYTES: u64 = 10 * 1024 * 1024;
 
 /// JSON-RPC 2.0 错误码 + 桥应用错误码。
 pub mod code {
@@ -50,6 +53,8 @@ pub mod code {
     pub const READ_FILE: i64 = 10012;
     /// 路径非法(绝对路径 / 逃逸项目根 / 解析失败)。
     pub const PATH_INVALID: i64 = 10013;
+    /// 文件超过读取上限。
+    pub const FILE_TOO_LARGE: i64 = 10014;
 }
 
 /// 桥对外状态。
@@ -537,6 +542,7 @@ fn handle_zap_method(method: &str, params: &Value, root: &Path) -> Result<Value,
     match method {
         "zap.list_files" => zap_list_files(params, root),
         "zap.read_file" => zap_read_file(params, root),
+        "zap.search" => zap_search(params, root),
         _ => Err(RpcError {
             code: code::METHOD_NOT_FOUND,
             message: format!("unknown method {method}"),
@@ -591,8 +597,14 @@ fn zap_list_files(params: &Value, root: &Path) -> Result<Value, RpcError> {
         message: format!("read dir {rel}: {err}"),
         id: None,
     })?;
+    // gitignore 过滤(目录 .gitignore + 全局):与 Zap 文件树语义一致。
+    let gitignores = repo_metadata::gitignores_for_directory(&dir);
     let mut list: Vec<Value> = entries
         .flatten()
+        .filter(|entry| {
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            !repo_metadata::matches_gitignores(&entry.path(), is_dir, &gitignores, true)
+        })
         .map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             let kind = match entry.file_type() {
@@ -618,12 +630,64 @@ fn zap_read_file(params: &Value, root: &Path) -> Result<Value, RpcError> {
             id: None,
         })?;
     let path = resolve_in_root(root, rel)?;
+    let len = std::fs::metadata(&path).map_err(|err| RpcError {
+        code: code::READ_FILE,
+        message: format!("stat {rel}: {err}"),
+        id: None,
+    })?.len();
+    if len > MAX_READ_BYTES {
+        return Err(RpcError {
+            code: code::FILE_TOO_LARGE,
+            message: format!("file too large ({len} bytes, max {MAX_READ_BYTES}): {rel}"),
+            id: None,
+        });
+    }
     let content = std::fs::read_to_string(&path).map_err(|err| RpcError {
         code: code::READ_FILE,
         message: format!("read {rel}: {err}"),
         id: None,
     })?;
     Ok(json!({ "path": rel, "content": content }))
+}
+
+/// `zap.search`:按文件名子串搜索项目内文件(gitignore 感知,WalkBuilder)。
+/// 结果上限 `limit`(默认 100,最多 1000)。
+fn zap_search(params: &Value, root: &Path) -> Result<Value, RpcError> {
+    let pattern = params
+        .get("pattern")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| RpcError {
+            code: code::INVALID_PARAMS,
+            message: "missing pattern".into(),
+            id: None,
+        })?;
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.as_u64())
+        .unwrap_or(100)
+        .min(1000) as usize;
+
+    let mut matches: Vec<Value> = Vec::new();
+    let walker = WalkBuilder::new(root).hidden(true).build();
+    for entry in walker.flatten() {
+        if matches.len() >= limit {
+            break;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.contains(pattern) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            matches.push(json!({ "path": rel }));
+        }
+    }
+    Ok(json!({ "pattern": pattern, "matches": matches }))
 }
 
 /// 单条消息处理结果。
