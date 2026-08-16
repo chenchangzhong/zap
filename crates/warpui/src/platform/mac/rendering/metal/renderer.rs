@@ -18,7 +18,7 @@ use objc2_metal::{
     MTLRenderPipelineState, MTLResourceOptions, MTLScissorRect, MTLSize, MTLStoreAction,
     MTLTexture, MTLTextureDescriptor, MTLViewport,
 };
-use objc2_quartz_core::CAMetalDrawable;
+use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use pathfinder_color::{ColorF, ColorU};
 use pathfinder_geometry::rect::{RectF, RectI};
 use pathfinder_geometry::vector::{vec2f, Vector2F};
@@ -1195,6 +1195,49 @@ impl super::super::Renderer for Renderer {
         if let (Some(frame), Some(callback)) = (captured, capture_callback) {
             callback(frame);
         }
+    }
+
+    fn render_background(&mut self, layer: &CAMetalLayer, color: ColorU) {
+        // The background layer renders a solid color by clearing the drawable
+        // to `color` — no draw calls needed. It composites over the desktop
+        // with the same alpha blending as the main renderer, so the full-window
+        // (and any transparent-webview) background matches the Metal UI.
+        //
+        // nextDrawable can be nil when the layer has a zero drawable size
+        // (e.g. the webview is freshly created or hidden); skip the frame
+        // rather than panic — the render loop retries next frame.
+        let Some(drawable) = layer.nextDrawable() else {
+            return;
+        };
+        let buffer = self
+            .command_queue
+            .commandBuffer()
+            .expect("command queue should always vend a command buffer");
+        let descriptor = MTLRenderPassDescriptor::new();
+
+        // SAFETY: index 0 is always a valid color attachment slot for a CAMetalLayer's drawable.
+        let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+        color_attachment.setTexture(Some(&drawable.texture()));
+        color_attachment.setLoadAction(MTLLoadAction::Clear);
+        color_attachment.setStoreAction(MTLStoreAction::Store);
+        // CAMetalLayer 的内容按 premultiplied alpha 合成,与主渲染器输出一致
+        // (主渲染器经 blend 把 rgb×α 写入 drawable)。直写 clear color 必须
+        // 同样预乘:否则窗口背景透明度 < 100 时 RGB 未乘 α,背景层会比其他
+        // tab 更亮、更实。α = 255 时 rgb×α ≡ rgb,默认配置下无差异。
+        let alpha = f64::from(color.a) / 255.;
+        color_attachment.setClearColor(MTLClearColor {
+            red: f64::from(color.r) / 255. * alpha,
+            green: f64::from(color.g) / 255. * alpha,
+            blue: f64::from(color.b) / 255. * alpha,
+            alpha,
+        });
+
+        let encoder = buffer
+            .renderCommandEncoderWithDescriptor(&descriptor)
+            .expect("command buffer should always vend a render command encoder");
+        encoder.endEncoding();
+        buffer.presentDrawable(ProtocolObject::from_ref(&*drawable));
+        buffer.commit();
     }
 
     fn resize(&mut self, _window: &WindowState) {

@@ -67,6 +67,7 @@ void warp_marked_text_cleared(WarpHostView *);
     // backing layer so that overlay UI can draw above any embedded webview.
     MetalRenderView *_metalRenderView;
     WebViewContainerView *_webViewContainer;
+    MetalBackgroundView *_metalBackgroundView;
 }
 
 - (BOOL)acceptsFirstResponder {
@@ -285,6 +286,7 @@ void warp_marked_text_cleared(WarpHostView *);
     [textToInsert release];
     [_metalRenderView release];
     [_webViewContainer release];
+    [_metalBackgroundView release];
     [metalDevice release];
     [super dealloc];
 }
@@ -320,6 +322,15 @@ void warp_marked_text_cleared(WarpHostView *);
     self.webViewContainer = [[WebViewContainerView alloc] initWithFrame:self.bounds];
     self.webViewContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [self addSubview:self.webViewContainer];
+
+    // Background layer is the full-window background surface, placed as the
+    // first subview of the webview container so it sits below any embedded
+    // webview. The render loop clears it (full-window) with the workspace
+    // background color; a transparent webview above it then shows this same
+    // color instead of the desktop, matching the Metal-drawn UI.
+    self.metalBackgroundView = [[MetalBackgroundView alloc] initWithFrame:NSZeroRect
+                                                              metalDevice:metalDevice];
+    [self.webViewContainer addSubview:self.metalBackgroundView];
 
     self.metalRenderView = [[MetalRenderView alloc] initWithFrame:self.bounds
                                                       metalDevice:metalDevice];
@@ -606,5 +617,49 @@ void warp_marked_text_cleared(WarpHostView *);
 @end
 
 @implementation WebViewContainerView
+@end
+
+@implementation MetalBackgroundView {
+    id metalDevice;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame metalDevice:(id)device {
+    self = [super initWithFrame:frame];
+    if (self) {
+        metalDevice = [device retain];
+        self.wantsLayer = YES;
+        self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
+    }
+    return self;
+}
+
+- (void)dealloc {
+    [metalDevice release];
+    [super dealloc];
+}
+
+// 与 WebViewContainerView 保持一致(非 flipped,底部原点):背景层 frame 由
+// 渲染循环设为父容器的 bounds(铺满全窗),坐标系需与 webview 容器一致,否则
+// y 方向会上下翻转、背景层错位。
+- (BOOL)isFlipped {
+    return NO;
+}
+
+- (CALayer *)makeBackingLayer {
+    CAMetalLayer *layer = [CAMetalLayer layer];
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.device = metalDevice;
+    layer.allowsNextDrawableTimeout = NO;
+    layer.presentsWithTransaction = NO;
+    layer.opaque = NO;
+    return layer;
+}
+
+// Never intercept events; the background layer only paints behind the webview
+// and must let hit testing reach the webview above it.
+- (NSView *)hitTest:(NSPoint)point {
+    return nil;
+}
+
 @end
 

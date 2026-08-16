@@ -123,7 +123,6 @@ use super::hoa_onboarding::{
     mark_hoa_onboarding_completed, HoaOnboardingFlow, HoaOnboardingFlowEvent, HoaOnboardingStep,
 };
 use super::lightbox_view::{LightboxParams, LightboxView, LightboxViewEvent};
-use super::util;
 use super::WorkspaceRegistry;
 use crate::ai::execution_profiles::editor::ExecutionProfileEditorManager;
 use crate::ai::execution_profiles::profiles::{AIExecutionProfilesModel, ClientProfileId};
@@ -21020,9 +21019,7 @@ impl View for Workspace {
             // Hide the vertical tab rail for simplified WASM views (notebooks, shared sessions, etc.)
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), true);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
-            Container::new(outer_column.finish())
-                .with_background(util::get_terminal_background_fill(self.window_id, app))
-                .finish()
+            outer_column.finish()
         } else {
             let mut outer_column = Flex::column();
             if tab_bar_mode == ShowTabBar::Stacked {
@@ -21031,9 +21028,10 @@ impl View for Workspace {
             let content = self.render_banner_and_active_tab(app, appearance);
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
-            Container::new(outer_column.finish())
-                .with_background(util::get_terminal_background_fill(self.window_id, app))
-                .finish()
+            // workspace 主背景(render 末尾的 Stack)已用 surface_2/背景图垫遍
+            // 整窗,这里不再重复垫半透明背景,否则半透明窗口下标签栏/头部
+            // 会因两层 alpha 叠加而变深(同 APP-4328 先例)。
+            outer_column.finish()
         };
         let mut stack = Stack::new();
 
@@ -21878,6 +21876,16 @@ impl View for Workspace {
             .background_opacity
             .effective_opacity(self.window_id, app);
 
+        // 背景层与 workspace 背景使用同一主题色(surface_2)+ 窗口背景透明度,
+        // 半透明窗口下 webview 空洞区域与 Metal 绘制区域视觉一致。有背景图时
+        // 背景层只能按单色近似,无法 1:1 反映背景图。
+        let background_color = match theme.surface_2().with_opacity(background_opacity) {
+            Fill::Solid(color) => color,
+            Fill::VerticalGradient(gradient) => gradient.get_most_opaque(),
+            Fill::HorizontalGradient(gradient) => gradient.get_most_opaque(),
+        };
+        app.windows().set_window_background_color(self.window_id, background_color);
+
         if let Some(img) = theme.background_image() {
             let opacity_ratio = background_opacity as f32 / 100.;
             stack.add_child(
@@ -21893,11 +21901,11 @@ impl View for Workspace {
             );
             stack.add_child(workspace.finish());
         } else {
-            stack.add_child(
-                workspace
-                    .with_background(theme.surface_2().with_opacity(background_opacity))
-                    .finish(),
-            );
+            // 窗口背景已由原生背景层(MetalBackgroundView,见 set_window_background_color)
+            // 以同一 surface_2 + 窗口透明度铺满整窗承担。这里不再重复铺 surface_2,
+            // 否则半透明窗口下每区域都被两层同色背景叠加而过深(各 tab 背景来源也不
+            // 一致)。workspace 仅承载 UI,底色由原生层提供。
+            stack.add_child(workspace.finish());
         }
 
         let input_position_id = self
