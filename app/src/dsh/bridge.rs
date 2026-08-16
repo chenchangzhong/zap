@@ -156,17 +156,25 @@ impl BridgeServer {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let port = std_listener.local_addr()?.port();
         std_listener.set_nonblocking(true)?;
-        let listener = tokio::net::TcpListener::from_std(std_listener)?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_io()
             .enable_time()
             .build()?;
-        // token 在 accept 前由 new() 传入;这里 listener 先跑,握手用
-        // runtime.rs 集成的 token。为解耦,accept loop 内不校验 token
-        // (token 校验在 handle_message 由连接线程执行)。
-        runtime.spawn(accept_loop(listener, token));
+        // `TcpListener::from_std` 需要 tokio reactor,而 `BridgeServer::new()`
+        // 在 app 主线程(非 tokio runtime 上下文)调用,故转 tokio listener
+        // 必须在独立 runtime 内执行(否则 panic "no reactor running")。
+        runtime.spawn(async move {
+            let listener = match tokio::net::TcpListener::from_std(std_listener) {
+                Ok(listener) => listener,
+                Err(err) => {
+                    log::error!("[dsh-bridge] from_std failed: {err:#}");
+                    return;
+                }
+            };
+            accept_loop(listener, token).await;
+        });
         Ok((runtime, port))
     }
 
