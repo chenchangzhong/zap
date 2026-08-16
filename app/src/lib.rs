@@ -1457,7 +1457,8 @@ fn initialize_app(
     // 否则后注册的会覆盖先注册的(导致 webview 收不到 rect 上报)。
     if FeatureFlag::DshPane.is_enabled() {
         ctx.add_singleton_model(|_| dsh::DshRuntime::new());
-        // 独立桥服务:起 WS server + 握手,事件经每帧 drain 分发。
+        // 独立桥服务:懒创建,首次打开 dsh pane 时随 runtime 启动,事件经
+        // 每帧 drain 分发。
         ctx.add_singleton_model(|_| dsh::bridge::BridgeServer::new());
     }
 
@@ -1483,7 +1484,7 @@ fn initialize_app(
                             // 调度重启。
                             let gen = runtime.begin_restart();
                             ctx.spawn(
-                                dsh::DshRuntime::restart_future(gen),
+                                dsh::DshRuntime::restart_future(),
                                 move |runtime, result, ctx| match result {
                                     dsh::DshRestartResult::Restarted { url, child } => {
                                         log::info!("[dsh] restarted at {url}");

@@ -430,6 +430,11 @@ impl PaneContent for DshPane {
             DshRuntime::handle(ctx).update(ctx, |runtime, _ctx| {
                 runtime.request_stop();
             });
+            // 桥随 runtime 启停:停掉 listener 并清空 BRIDGE_INFO,避免旧 token
+            // 的桥在 dsh 停止后仍被同机进程调用。
+            crate::dsh::bridge::BridgeServer::handle(ctx).update(ctx, |bridge, _ctx| {
+                bridge.stop();
+            });
         }
     }
 

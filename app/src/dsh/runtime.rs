@@ -69,15 +69,6 @@ static TERMINAL_CONTEXT_ENABLED: AtomicBool = AtomicBool::new(false);
 static TERMINAL_CONTEXT_LAST_REFRESH: LazyLock<Mutex<Instant>> =
     LazyLock::new(|| Mutex::new(Instant::now() - TERMINAL_CONTEXT_REFRESH));
 
-/// 设置终端上下文注入开关(隐私),并持久化到 dsh 设置文件。默认关闭。
-pub(crate) fn set_terminal_context_enabled(enabled: bool) {
-    TERMINAL_CONTEXT_ENABLED.store(enabled, Ordering::Relaxed);
-    if let Ok(path) = dsh_settings_path() {
-        let value = serde_json::json!({ "terminal_context_enabled": enabled });
-        let _ = std::fs::write(path, serde_json::to_string_pretty(&value).unwrap_or_default());
-    }
-}
-
 /// 从 dsh 设置文件加载隐私开关(启动时调用,初始化 atomic)。
 pub(crate) fn init_terminal_context_enabled_from_disk() {
     TERMINAL_CONTEXT_ENABLED.store(terminal_context_enabled_from_disk(), Ordering::Relaxed);
@@ -120,7 +111,7 @@ pub(crate) fn update_terminal_context_from_active(
     let commands = match session_id {
         Some(id) => crate::terminal::History::handle(ctx).read(ctx, |h, _| {
             let cmds = h.commands(id);
-            log::info!(
+            log::debug!(
                 "[dsh] terminal ctx: session {id:?}, history commands = {:?}",
                 cmds.as_ref().map(|c| c.len())
             );
@@ -133,7 +124,7 @@ pub(crate) fn update_terminal_context_from_active(
             })
         }),
         None => {
-            log::info!("[dsh] terminal ctx: no active session for window {window_id:?}");
+            log::debug!("[dsh] terminal ctx: no active session for window {window_id:?}");
             None
         }
     };
@@ -300,9 +291,9 @@ impl DshRuntime {
 
     /// 启动 dsh runtime(异步,不借用 self)。
     ///
-    /// `generation` 是 `begin_start`/`begin_restart` 返回的代次;完成回调
-    /// 用它调用 `adopt_child`,代次不匹配时丢弃子进程。
-    pub async fn start_future(generation: u64) -> DshStartResult {
+    /// 代次校验不在本函数内:调用方持 `begin_start`/`begin_restart` 返回的
+    /// 代次,完成回调里传给 `adopt_child` 做代次比对,代次不匹配时丢弃子进程。
+    pub async fn start_future() -> DshStartResult {
         match Self::start_inner().await {
             Ok((child, url)) => DshStartResult::Ready { url, child },
             Err(err) => {
@@ -504,26 +495,13 @@ impl DshRuntime {
     /// 插件文件(`<dsh_home>/zap-bridge.ts`)尚未就绪时返回 `None`(降级:
     /// 不带 `--patch` 启动,避免 dsh 指向缺失文件)。
     fn write_bridge_config(dsh_home: &Path, port: u16, token: &str) -> Result<()> {
+        // 编译期嵌入插件源码,而非运行时读 manifest 路径(该路径打包后用户机
+        // 上不存在,会导致发布场景静默缺失插件)。include_str 保证每次构建把
+        // 最新插件写进 DSH_HOME。
+        const PLUGIN_SOURCE: &str = include_str!("../../assets/bundled/dsh/zap-bridge.ts");
         let plugin_ts = dsh_home.join("zap-bridge.ts");
-        // 总是尝试从 bundled 源码覆盖提取:dev 下保证插件更新传播到 DSH_HOME;
-        // 发布时 manifest 源码路径不可用 → 复用已提取文件。
-        let src =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/bundled/dsh/zap-bridge.ts");
-        match std::fs::read(&src) {
-            Ok(contents) => {
-                std::fs::write(&plugin_ts, contents)?;
-                log::info!("[dsh] extracted zap-bridge.ts to {}", plugin_ts.display());
-            }
-            Err(_) if !plugin_ts.is_file() => {
-                log::warn!(
-                    "[dsh] zap-bridge.ts missing, starting dsh without bridge plugin"
-                );
-                return Ok(());
-            }
-            Err(_) => {
-                // 源码不可用但已有提取文件:复用(发布场景)。
-            }
-        }
+        std::fs::write(&plugin_ts, PLUGIN_SOURCE)?;
+        log::info!("[dsh] extracted zap-bridge.ts to {}", plugin_ts.display());
         // rc.6 的 `web --patch` 无效(unknown option);插件经 profile 用户
         // patch 层 `profiles/web/cordis.patch.yml` 注入(dsh web 启动时应用)。
         let patch_dir = dsh_home.join("profiles").join("web");
@@ -695,8 +673,8 @@ impl DshRuntime {
     }
 
     /// 崩溃后重启(由外部在 `poll_child` 返回 `Crashed` 后调度,`'static` future)。
-    pub async fn restart_future(generation: u64) -> DshRestartResult {
-        match Self::start_future(generation).await {
+    pub async fn restart_future() -> DshRestartResult {
+        match Self::start_future().await {
             DshStartResult::Ready { url, child } => DshRestartResult::Restarted { url, child },
             DshStartResult::Failed { error } => DshRestartResult::GiveUp { error },
         }
@@ -815,7 +793,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
     fn smoke_start_stop() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let result = DshRuntime::start_future(0).await;
+            let result = DshRuntime::start_future().await;
             match result {
                 DshStartResult::Ready { url, mut child } => {
                     // URL 可达。
@@ -837,7 +815,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
     fn lifecycle_start_stop() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let result = DshRuntime::start_future(0).await;
+            let result = DshRuntime::start_future().await;
             let (url, mut child) = match result {
                 DshStartResult::Ready { url, child } => (url, child),
                 DshStartResult::Failed { error } => panic!("start failed: {error}"),
@@ -1075,7 +1053,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
             // 1. 启动。
-            let (url1, mut child) = match DshRuntime::start_future(0).await {
+            let (url1, mut child) = match DshRuntime::start_future().await {
                 DshStartResult::Ready { url, child } => (url, child),
                 DshStartResult::Failed { error } => panic!("start failed: {error}"),
             };
@@ -1103,7 +1081,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
             );
 
             // 4. 重启(等价 lib.rs 的 restart_future 调度)。
-            let (url2, mut child2) = match DshRuntime::restart_future(0).await {
+            let (url2, mut child2) = match DshRuntime::restart_future().await {
                 DshRestartResult::Restarted { url, child } => (url, child),
                 DshRestartResult::GiveUp { error } => panic!("restart gave up: {error}"),
             };

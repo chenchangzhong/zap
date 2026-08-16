@@ -1,5 +1,22 @@
 use super::*;
+use futures_util::StreamExt as _;
 use serde_json::json;
+
+/// 读一条 WS 响应帧并解析为 JSON。泛型避免命名具体流类型(connect_async
+/// 返回 `WebSocketStream<ClientStream<TcpStream>>`,路径易随版本变动)。
+async fn read_ws_resp<S>(ws: &mut S) -> Value
+where
+    S: futures_util::Stream<
+            Item = Result<
+                async_tungstenite::tungstenite::Message,
+                async_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    let msg = ws.next().await.unwrap().unwrap();
+    let text = msg.into_text().unwrap();
+    serde_json::from_str(&text).unwrap()
+}
 
 fn hello_req(id: Option<Value>, token: &str, protocol: Option<u32>) -> String {
     let mut obj = serde_json::Map::new();
@@ -294,6 +311,89 @@ fn zap_list_files_respects_ancestor_gitignore() {
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 连接循环路由级测试:真实拉起 accept_loop + handle_connection,经 WS 客户端
+/// 走完整消息路由(握手 → zap.ping / zap.terminal_context → 未知方法),验证
+/// fast path 与 handle_message 的分发。防止「握手后 zap.ping 被 fast path
+/// 劫持返回 METHOD_NOT_FOUND」「握手后错误误关连接」这类纯函数单测漏网的
+/// 集成缺陷。
+#[test]
+fn connection_loop_routes_zap_methods() {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = std_listener.local_addr().unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+    let token: Arc<str> = Arc::from("route-test-token");
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // 服务端:与真实桥一致地起 accept loop。
+    rt.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+        accept_loop(listener, token).await;
+    });
+
+    rt.block_on(async {
+        let (mut ws, _) = async_tungstenite::tokio::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        use async_tungstenite::tungstenite::Message;
+        use futures_util::{SinkExt as _, StreamExt as _};
+
+        // 1. 握手成功(返回 protocolVersion + zap 能力)。
+        ws.send(Message::Text(hello_req(Some(json!(1)), "route-test-token", Some(1)).into()))
+            .await
+            .unwrap();
+        let resp = read_ws_resp(&mut ws).await;
+        assert_eq!(resp["id"], json!(1));
+        assert_eq!(resp["result"]["protocolVersion"], json!(PROTOCOL_VERSION));
+        assert_eq!(
+            resp["result"]["capabilities"],
+            json!(ZAP_CAPABILITIES),
+            "握手应宣告实际能力清单"
+        );
+
+        // 2. 握手后 zap.ping → ok:true(核心回归:此前被 fast path 劫持为 -32601)。
+        ws.send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":2,"method":"zap.ping"}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let resp = read_ws_resp(&mut ws).await;
+        assert_eq!(resp["id"], json!(2));
+        assert_eq!(resp["result"], json!({ "ok": true }), "zap.ping must route through");
+
+        // 3. 握手后 zap.terminal_context → 返回 commands(隐私默认关 → 空数组)。
+        ws.send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":3,"method":"zap.terminal_context"}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let resp = read_ws_resp(&mut ws).await;
+        assert_eq!(resp["id"], json!(3));
+        assert!(
+            resp["result"]["commands"].is_array(),
+            "terminal_context should return commands array"
+        );
+
+        // 4. 握手后未知方法 → 错误响应,且连接保持(不误报 HandshakeFailed/关闭)。
+        ws.send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":50,"method":"foo.bar"}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let resp = read_ws_resp(&mut ws).await;
+        assert_eq!(resp["id"], json!(50));
+        assert_eq!(resp["error"]["code"], code::METHOD_NOT_FOUND);
+
+        // 连接仍存活:再 ping 一次应成功。
+        ws.send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":4,"method":"zap.ping"}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let resp = read_ws_resp(&mut ws).await;
+        assert_eq!(resp["result"], json!({ "ok": true }), "connection must survive an error");
+    });
 }
 
 /// zap.search:按文件名子串匹配,返回相对项目根的路径。

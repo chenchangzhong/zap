@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use futures_util::{SinkExt as _, StreamExt as _};
+use futures_util::StreamExt as _;
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -24,8 +24,14 @@ use warpui::{Entity, ModelContext, SingletonEntity};
 
 /// 协议版本(递增;不匹配时握手明确报错)。
 const PROTOCOL_VERSION: u32 = 1;
-/// Zap 提供的能力清单(阶段 1+ 填充:get_workspace/list_files/... )。
-const ZAP_CAPABILITIES: &[&str] = &[];
+/// Zap 提供的能力清单(握手响应返回,dsh 据此决定注册哪些 `zap_*` 工具)。
+/// 与 `handle_zap_method` / `handle_message` 实际实现的方法一致。
+const ZAP_CAPABILITIES: &[&str] = &[
+    "files.list",
+    "files.read",
+    "files.search",
+    "terminal.context",
+];
 /// 握手超时:连接后未在此时长内完成握手即关闭(防半开连接)。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// token 字符数。
@@ -101,8 +107,11 @@ pub(crate) fn bridge_info() -> Option<(u16, String)> {
     BRIDGE_INFO.lock().clone()
 }
 
-/// Zap 侧桥服务单例。生命周期随 app(`SingletonEntity`);面板关闭时停止
-/// dsh runtime,桥 listener 由 `Drop` 关停(见 `runtime.rs` 集成)。
+/// Zap 侧桥服务单例。生命周期挂到 DshRuntime 启停:懒启动,首次打开 dsh
+/// pane 时由 `open_dsh_pane` 调用 [`BridgeServer::start`] 拉起 listener;
+/// dsh 停止时由 pane detach 调用 [`BridgeServer::stop`] 关停并清空
+/// `BRIDGE_INFO`,避免旧 token 的桥在 dsh 停止后仍被同机进程调用。桥关闭
+/// 时 listener 由 `Drop` 兜底关停。
 pub struct BridgeServer {
     runtime: Option<tokio::runtime::Runtime>,
     port: u16,
@@ -122,32 +131,55 @@ impl Drop for BridgeServer {
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_background();
         }
+        *BRIDGE_INFO.lock() = None;
     }
 }
 
 impl BridgeServer {
+    /// 懒创建:不启动 listener。首次打开 dsh pane 时由 `start()` 拉起。
     pub fn new() -> Self {
+        Self {
+            runtime: None,
+            port: 0,
+            token: Arc::from(""),
+            state: BridgeState::Down,
+        }
+    }
+
+    /// 启动桥(幂等):已运行则保持;否则新建 listener 与随机 token,并把
+    /// (port, token) 写入 `BRIDGE_INFO` 供 `start_inner` 注入 dsh。
+    pub fn start(&mut self) {
+        if self.runtime.is_some() {
+            return;
+        }
         let token: Arc<str> = Arc::from(generate_token());
         let (runtime, port) = match Self::spawn_listener(token.clone()) {
             Ok(rt) => rt,
             Err(err) => {
                 log::error!("[dsh-bridge] failed to start: {err:#}");
-                return Self {
-                    runtime: None,
-                    port: 0,
-                    token: Arc::from(""),
-                    state: BridgeState::Down,
-                };
+                self.state = BridgeState::Down;
+                return;
             }
         };
         *BRIDGE_INFO.lock() = Some((port, token.to_string()));
         push_event(BridgeEvent::Listening { port });
-        Self {
-            runtime: Some(runtime),
-            port,
-            token,
-            state: BridgeState::Listening,
+        self.runtime = Some(runtime);
+        self.port = port;
+        self.token = token;
+        self.state = BridgeState::Listening;
+    }
+
+    /// 停止桥:关停 listener runtime、清空 `BRIDGE_INFO` 与待处理事件,状态
+    /// 置 `Down`。幂等;停止后调用 `start()` 可重新拉起(带新 token)。
+    pub fn stop(&mut self) {
+        if let Some(rt) = self.runtime.take() {
+            rt.shutdown_background();
         }
+        PENDING_EVENTS.lock().clear();
+        *BRIDGE_INFO.lock() = None;
+        self.port = 0;
+        self.token = Arc::from("");
+        self.state = BridgeState::Down;
     }
 
     /// 同步 bind 随机端口(得 `port` 供 cordis.yml),在独立 tokio runtime
@@ -294,19 +326,42 @@ async fn handle_connection(stream: tokio::net::TcpStream, token: Arc<str>) {
             }
         };
 
-        // zap.* 文件能力:异步 IO(读文件系统),独立于同步 handle_message。
-        // 需已握手;根为当前 Zap 项目目录。
+        // zap.* 文件能力方法:需已握手,根为当前 Zap 项目目录;同步文件 IO
+        // 移入 spawn_blocking,避免阻塞单 worker runtime(大仓库搜索 / 慢
+        // IO 会冻结 accept 循环与其它连接)。zap.ping / zap.terminal_context
+        // 不需项目根,回落 handle_message 统一分发。
         if handshaken {
             if let Some((zap_method, zap_params, zap_id)) = parse_rpc_head(&text) {
-                if zap_method.starts_with("zap.") {
-                    let result = match super::runtime::workspace_dir() {
-                        Some(root) => handle_zap_method(&zap_method, &zap_params, &root),
-                        None => Err(RpcError {
-                            code: code::INVALID_REQUEST,
-                            message: "no Zap workspace (project) set".into(),
-                            id: Some(zap_id.clone()),
-                        }),
-                    };
+                if matches!(
+                    zap_method.as_str(),
+                    "zap.list_files" | "zap.read_file" | "zap.search"
+                ) {
+                    // 通知(无 id):文件方法只读无副作用,无需执行;且 JSON-RPC
+                    // 规定通知不得有响应,跳过避免发 `id: null` 的垃圾帧。
+                    if zap_id.is_null() {
+                        continue;
+                    }
+                    let result: Result<Value, RpcError> =
+                        match super::runtime::workspace_dir() {
+                            Some(root) => {
+                                let method = zap_method.clone();
+                                let params = zap_params.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    handle_zap_method(&method, &params, &root)
+                                })
+                                .await
+                                .unwrap_or_else(|join_err| Err(RpcError {
+                                    code: code::INTERNAL_ERROR,
+                                    message: format!("file op panicked: {join_err}"),
+                                    id: Some(zap_id.clone()),
+                                }))
+                            }
+                            None => Err(RpcError {
+                                code: code::INVALID_REQUEST,
+                                message: "no Zap workspace (project) set".into(),
+                                id: Some(zap_id.clone()),
+                            }),
+                        };
                     match result {
                         Ok(value) => {
                             let resp = json!({ "jsonrpc": "2.0", "id": zap_id, "result": value });
@@ -360,7 +415,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, token: Arc<str>) {
                 }
             }
             Err(err) => {
-                // 发错误响应(若有 id),并关闭连接。
+                // 发错误响应(若有 id)。
                 if let Some(id) = &err.id {
                     let resp = json!({
                         "jsonrpc": "2.0",
@@ -371,11 +426,16 @@ async fn handle_connection(stream: tokio::net::TcpStream, token: Arc<str>) {
                         .send(async_tungstenite::tungstenite::Message::Text(resp.to_string()))
                         .await;
                 }
-                push_event(BridgeEvent::HandshakeFailed {
-                    reason: err.message,
-                });
-                failed = true;
-                break;
+                // 仅未握手阶段的错误(畸形请求 / token 错 / 版本不匹配)才判定
+                // 握手失败并关闭;已握手长连接上的普通 JSON-RPC 错误只回 error
+                // 响应,连接保持(避免一条坏消息杀死健康连接)。
+                if !handshaken {
+                    push_event(BridgeEvent::HandshakeFailed {
+                        reason: err.message,
+                    });
+                    failed = true;
+                    break;
+                }
             }
         }
     }
@@ -441,6 +501,22 @@ fn handle_message(
             } else {
                 Ok(MessageOutcome {
                     response: Some(json!({ "ok": true })),
+                    events: Vec::new(),
+                })
+            }
+        }
+        // 不需项目根:不经过 fast path(handle_connection 只拦截文件方法),
+        // 在 handle_message 统一处理,避免错误依赖 workspace_dir 已设置。
+        "zap.terminal_context" => {
+            if !handshaken {
+                Err(RpcError {
+                    code: code::UNAUTHORIZED,
+                    message: "not authenticated (send bridge/hello first)".into(),
+                    id: None,
+                })
+            } else {
+                zap_terminal_context().map(|result| MessageOutcome {
+                    response: Some(result),
                     events: Vec::new(),
                 })
             }
@@ -547,12 +623,13 @@ fn parse_rpc_head(raw: &str) -> Option<(String, Value, Value)> {
 }
 
 /// 分发 zap.* 文件能力方法(同步 IO,根为当前 Zap 项目目录)。
+/// 仅在 fast path 内被 spawn_blocking 调用,只接收需要项目根的文件方法;
+/// `zap.terminal_context` 不依赖根,经 handle_message 分发。
 fn handle_zap_method(method: &str, params: &Value, root: &Path) -> Result<Value, RpcError> {
     match method {
         "zap.list_files" => zap_list_files(params, root),
         "zap.read_file" => zap_read_file(params, root),
         "zap.search" => zap_search(params, root),
-        "zap.terminal_context" => zap_terminal_context(),
         _ => Err(RpcError {
             code: code::METHOD_NOT_FOUND,
             message: format!("unknown method {method}"),
@@ -666,6 +743,15 @@ fn zap_read_file(params: &Value, root: &Path) -> Result<Value, RpcError> {
             id: None,
         })?;
     let path = resolve_in_root(root, rel)?;
+    // 仅普通文件可读:目录/FIFO/设备等 metadata.len() 可能为 0,绕过大小
+    // 上限;FIFO 的 read_to_string 还会永久阻塞。先判 is_file 拒绝非普通文件。
+    if !path.is_file() {
+        return Err(RpcError {
+            code: code::READ_FILE,
+            message: format!("not a regular file: {rel}"),
+            id: None,
+        });
+    }
     let len = std::fs::metadata(&path).map_err(|err| RpcError {
         code: code::READ_FILE,
         message: format!("stat {rel}: {err}"),

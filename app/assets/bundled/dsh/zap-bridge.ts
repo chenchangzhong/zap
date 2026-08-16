@@ -26,6 +26,16 @@ const RPC_ID_START = 100
 let ws: WebSocket | null = null
 let nextRpcId = RPC_ID_START
 const pending = new Map<number, (v: unknown) => void>()
+/// 定时器句柄类型(浏览器与 Node 的 setTimeout 返回类型不同)。
+type TimerHandle = ReturnType<typeof setTimeout>
+/// 重连定时器句柄(卸载时清理)。
+let reconnectTimer: TimerHandle | null = null
+/// 连续握手失败次数(超限后放弃自动重连,避免 token/协议永久不匹配时
+/// 无限循环刷日志)。
+let handshakeFailures = 0
+/// 已卸载(dispose/`ctx.effect` 清理)标记:onclose 据此不再调度重连。
+let disposed = false
+const MAX_HANDSHAKE_FAILURES = 5
 
 /// 工具注册所需的最小 tools 接口(避免依赖完整 ctx 类型推断)。
 interface ToolsLike {
@@ -40,6 +50,13 @@ export function apply(ctx: unknown, config: unknown): void {
     console.error('[zap-bridge] missing bridgeAddress/token in config:', JSON.stringify(config))
     return
   }
+  // 卸载/HMR 时清理:关 socket + 清重连定时器,避免旧实例残留连接与僵尸
+  // 重连链(配置变更触发 HMR 时旧实例会继续反复握手)。
+  const effect = (ctx as { effect?: (fn: () => void) => void }).effect
+  effect?.(() => cleanup())
+  // 新配置实例 = 重新尝试的意图:重置握手失败计数(HMR 复用模块状态时,
+  // 否则 token 修复后 handshakeFailures 卡在 MAX 永不重连)。
+  handshakeFailures = 0
   connect(address, token)
   registerTools(ctx)
 }
@@ -169,11 +186,40 @@ function rpc(method: string, params: unknown): Promise<unknown> {
   return promise
 }
 
-/// 建立一条 WS 连接;断线自动指数退避重连。
+/// 清理连接与重连定时器(插件卸载/`ctx.effect` 时调用)。
+function cleanup(): void {
+  disposed = true
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  if (ws) {
+    // 先置空 onclose,避免 close() 再触发重连。
+    ws.onclose = null
+    ws.close()
+    ws = null
+  }
+  for (const resolve of pending.values()) {
+    resolve({ error: 'zap bridge unloaded' })
+  }
+  pending.clear()
+}
+
+/// 调度一次重连(记录句柄供卸载时清理)。
+function scheduleReconnect(address: string, token: string, backoff: number): void {
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    connect(address, token)
+  }, backoff)
+}
+
+/// 建立一条 WS 连接;断线自动指数退避重连(握手永久失败或已卸载则停止)。
 function connect(address: string, token: string): void {
+  // 新连接尝试:清除卸载标记(保留 handshakeFailures,使失败计数在未成功
+  // 前跨重连累积;握手成功时归零)。
+  disposed = false
   const sock = new WebSocket(address)
   ws = sock
-  let handshaken = false
   let backoff = INITIAL_BACKOFF_MS
 
   sock.onopen = () => {
@@ -199,12 +245,21 @@ function connect(address: string, token: string): void {
     try {
       const msg = JSON.parse(text) as { id?: number; result?: unknown; error?: unknown }
       if (msg.id === 1 && msg.result) {
-        handshaken = true
+        // 握手成功:重置失败计数,之后可再次重试。
+        handshakeFailures = 0
         console.log('[zap-bridge] handshake ok')
       } else if (msg.error) {
         console.error('[zap-bridge] rpc error:', JSON.stringify(msg.error))
-        // 握手失败(token 错 / 版本不匹配):关闭触发重连。
+        // 握手失败(token 错 / 版本不匹配):计次;超限后不再重连,避免
+        // token/协议永久不匹配时无限循环刷日志。
         if (msg.id === 1) {
+          handshakeFailures++
+          if (handshakeFailures >= MAX_HANDSHAKE_FAILURES) {
+            console.error(
+              '[zap-bridge] handshake failed ' + handshakeFailures +
+                ' times; giving up auto-reconnect (permanent failure)',
+            )
+          }
           sock.close()
         } else if (msg.id !== undefined && pending.has(msg.id)) {
           const resolve = pending.get(msg.id)
@@ -228,8 +283,13 @@ function connect(address: string, token: string): void {
       resolve({ error: 'zap bridge disconnected' })
     }
     pending.clear()
+    // 已卸载或握手永久失败:不再自动重连。
+    if (disposed || handshakeFailures >= MAX_HANDSHAKE_FAILURES) {
+      console.log('[zap-bridge] connection closed (disposed or permanent failure; no reconnect)')
+      return
+    }
     console.log('[zap-bridge] connection closed, reconnecting in ' + backoff + 'ms')
-    setTimeout(() => connect(address, token), backoff)
+    scheduleReconnect(address, token, backoff)
     backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)
   }
 

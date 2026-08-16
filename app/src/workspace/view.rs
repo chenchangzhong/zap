@@ -18913,9 +18913,14 @@ impl Workspace {
                 log::info!("[dsh] workspace dir set to {}", dir.display());
                 crate::dsh::runtime::set_workspace_dir(dir);
             }
+            // 桥随 runtime 启停:启动前先拉起桥 listener(幂等),使
+            // start_inner 能读到 (port, token) 注入 dsh 插件。
+            crate::dsh::bridge::BridgeServer::handle(ctx).update(ctx, |bridge, _ctx| {
+                bridge.start();
+            });
             let gen = runtime.begin_start();
             ctx.spawn(
-                crate::dsh::DshRuntime::start_future(gen),
+                crate::dsh::DshRuntime::start_future(),
                 move |runtime, result, ctx| match result {
                     crate::dsh::DshStartResult::Ready { url, child } => {
                         if runtime.adopt_child(child, url.clone(), gen) {
