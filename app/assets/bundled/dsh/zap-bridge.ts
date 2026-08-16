@@ -77,6 +77,24 @@ function zapTool(name: string, description: string, method: string): unknown {
   }
 }
 
+/// 手动构造一个无参数工具定义(JSON Schema 格式)。
+function zapToolNoArgs(name: string, description: string, method: string): unknown {
+  return {
+    name,
+    description,
+    parameters: { type: 'object', properties: {} },
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, value: unknown) => [
+        { type: 'text', text: JSON.stringify(value) },
+      ],
+    },
+    async execute(args: unknown) {
+      return rpc(method, args)
+    },
+  }
+}
+
 /// 注册 Zap 文件能力工具(execute 经桥调用 Zap)。
 function registerTools(ctx: unknown): void {
   const tools = extractTools(ctx)
@@ -99,7 +117,17 @@ function registerTools(ctx: unknown): void {
       'zap.read_file',
     ),
   )
-  console.log('[zap-bridge] registered zap_list_files, zap_read_file')
+  tools.register(
+    zapToolNoArgs(
+      'zap_terminal_context',
+      'Return recent commands from the current Zap terminal. ' +
+        'Only available when the Zap "terminal context" privacy setting is enabled.',
+      'zap.terminal_context',
+    ),
+  )
+  console.log(
+    '[zap-bridge] registered zap_list_files, zap_read_file, zap_terminal_context',
+  )
 }
 
 /// 经桥发起一次 JSON-RPC 请求并等待响应。

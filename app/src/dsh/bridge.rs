@@ -543,6 +543,7 @@ fn handle_zap_method(method: &str, params: &Value, root: &Path) -> Result<Value,
         "zap.list_files" => zap_list_files(params, root),
         "zap.read_file" => zap_read_file(params, root),
         "zap.search" => zap_search(params, root),
+        "zap.terminal_context" => zap_terminal_context(),
         _ => Err(RpcError {
             code: code::METHOD_NOT_FOUND,
             message: format!("unknown method {method}"),
@@ -688,6 +689,12 @@ fn zap_search(params: &Value, root: &Path) -> Result<Value, RpcError> {
         }
     }
     Ok(json!({ "pattern": pattern, "matches": matches }))
+}
+
+/// `zap.terminal_context`:返回当前活动终端的最近命令(隐私关闭时为空)。
+fn zap_terminal_context() -> Result<Value, RpcError> {
+    let commands = super::runtime::terminal_context();
+    Ok(json!({ "commands": commands }))
 }
 
 /// 单条消息处理结果。

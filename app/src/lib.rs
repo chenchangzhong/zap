@@ -1478,6 +1478,8 @@ fn initialize_app(
                     bridge.drain_events(ctx);
                 });
                 dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
+                    // 阶段3:提取活动终端最近命令(受隐私开关,节流)。
+                    dsh::runtime::update_terminal_context_from_active(ctx, window_id);
                     match runtime.poll_child() {
                         dsh::PollResult::Crashed => {
                             // 崩溃:标记重启(保留崩溃计数,使 MAX_RESTARTS 上限可达),

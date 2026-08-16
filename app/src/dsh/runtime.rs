@@ -13,13 +13,14 @@
 //! 平台:macOS 先行(webview 基建仅 macOS 有实现),其他平台编译为空壳。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use command::r#async::Command;
 use parking_lot::Mutex;
-use warpui::{Entity, SingletonEntity};
+use warpui::{Entity, ModelContext, SingletonEntity, WindowId};
 
 use super::bridge;
 
@@ -53,6 +54,64 @@ pub(crate) fn set_workspace_dir(path: PathBuf) {
 /// 读取 dsh 工作目录;未设置时为 `None`(不注入 `DSH_CWD`,用 dsh 默认)。
 pub(crate) fn workspace_dir() -> Option<PathBuf> {
     WORKSPACE_DIR.lock().clone()
+}
+
+/// 注入给 dsh 的终端上下文最大命令数。
+const TERMINAL_CONTEXT_MAX: usize = 20;
+/// 终端上下文刷新节流间隔。
+const TERMINAL_CONTEXT_REFRESH: Duration = Duration::from_secs(1);
+
+/// 最近注入的活动终端命令(供桥 `zap.terminal_context` 读取)。
+static TERMINAL_CONTEXT: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// 隐私开关:默认关闭(不暴露终端命令给 agent);需显式开启。
+static TERMINAL_CONTEXT_ENABLED: AtomicBool = AtomicBool::new(false);
+/// 上次刷新时刻(节流)。
+static TERMINAL_CONTEXT_LAST_REFRESH: LazyLock<Mutex<Instant>> =
+    LazyLock::new(|| Mutex::new(Instant::now() - TERMINAL_CONTEXT_REFRESH));
+
+/// 设置终端上下文注入开关(隐私)。默认关闭。
+pub(crate) fn set_terminal_context_enabled(enabled: bool) {
+    TERMINAL_CONTEXT_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// 主线程每帧提取活动终端最近命令到暂存(节流 1s)。隐私关闭时跳过更新。
+pub(crate) fn update_terminal_context_from_active(
+    ctx: &mut ModelContext<DshRuntime>,
+    window_id: WindowId,
+) {
+    if !TERMINAL_CONTEXT_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = Instant::now();
+    if now.duration_since(*TERMINAL_CONTEXT_LAST_REFRESH.lock()) < TERMINAL_CONTEXT_REFRESH {
+        return;
+    }
+    *TERMINAL_CONTEXT_LAST_REFRESH.lock() = now;
+
+    let session_id =
+        crate::workspace::ActiveSession::handle(ctx).read(ctx, |a, _| a.session(window_id).map(|s| s.id()));
+    let commands = match session_id {
+        Some(id) => crate::terminal::History::handle(ctx).read(ctx, |h, _| {
+            h.commands(id).map(|cmds| {
+                cmds.iter()
+                    .rev()
+                    .take(TERMINAL_CONTEXT_MAX)
+                    .map(|e| e.command.clone())
+                    .collect()
+            })
+        }),
+        None => None,
+    };
+    *TERMINAL_CONTEXT.lock() = commands.unwrap_or_default();
+}
+
+/// 读取注入的终端上下文(隐私关闭时为空)。
+pub(crate) fn terminal_context() -> Vec<String> {
+    if TERMINAL_CONTEXT_ENABLED.load(Ordering::Relaxed) {
+        TERMINAL_CONTEXT.lock().clone()
+    } else {
+        Vec::new()
+    }
 }
 
 
@@ -676,6 +735,24 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         assert!(workspace_dir().is_none(), "default should be None");
         set_workspace_dir(PathBuf::from("/tmp/zap-foo"));
         assert_eq!(workspace_dir(), Some(PathBuf::from("/tmp/zap-foo")));
+    }
+
+    /// 终端上下文隐私开关:关闭时返回空,开启后返回暂存命令。
+    #[test]
+    fn terminal_context_privacy_gate() {
+        TERMINAL_CONTEXT_ENABLED.store(false, Ordering::Relaxed);
+        *TERMINAL_CONTEXT.lock() = vec!["ls".to_string(), "cd src".to_string()];
+        assert!(terminal_context().is_empty(), "privacy off => empty");
+
+        set_terminal_context_enabled(true);
+        assert_eq!(
+            terminal_context(),
+            vec!["ls".to_string(), "cd src".to_string()],
+            "privacy on => returns staged commands"
+        );
+
+        // 复位默认。
+        set_terminal_context_enabled(false);
     }
     #[test]
     fn write_bridge_config_extracts_source() {
