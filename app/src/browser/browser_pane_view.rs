@@ -73,8 +73,8 @@ pub enum BrowserPaneAction {
     Close,
 }
 
-fn is_http_url(input: &str) -> bool {
-    Url::parse(input).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+fn is_navigation_url(input: &str) -> bool {
+    Url::parse(input).is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "about" | "data"))
 }
 impl BrowserPaneView {
     /// Create a new web preview pane, opening `url` in an embedded webview.
@@ -95,7 +95,7 @@ impl BrowserPaneView {
 
         let address_bar = ctx.add_typed_action_view(|ctx| {
             let mut input = SubmittableTextInput::new(ctx)
-                .validate_on_submit(is_http_url)
+                .validate_on_submit(is_navigation_url)
                 .with_border(false)
                 .with_on_focus_callback({
                     let id = platform_view_id;

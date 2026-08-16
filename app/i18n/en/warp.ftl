@@ -1744,6 +1744,7 @@ keybinding-desc-workspace-new-terminal-tab = New Terminal Tab
 keybinding-desc-workspace-new-agent-tab = New Agent Tab
 keybinding-desc-workspace-new-cloud-agent-tab = New Agent Tab
 keybinding-desc-workspace-open-dsh-pane = Open DeepSeek Harness
+keybinding-desc-workspace-open-blank-web-preview = Open Blank Web Preview
 dsh-first-use-configure-model = DeepSeek Harness is ready. Configure your model API key in its settings to start.
 dsh-runtime-failed-toast = DeepSeek Harness stopped after repeated crashes. Reopen it from the command palette to start again.
 new-session-create-new-tab = Create New Tab
