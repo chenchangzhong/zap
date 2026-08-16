@@ -80,13 +80,17 @@ pub(crate) fn set_terminal_context_enabled(enabled: bool) {
 
 /// 从 dsh 设置文件加载隐私开关(启动时调用,初始化 atomic)。
 pub(crate) fn init_terminal_context_enabled_from_disk() {
-    let enabled = dsh_settings_path()
+    TERMINAL_CONTEXT_ENABLED.store(terminal_context_enabled_from_disk(), Ordering::Relaxed);
+}
+
+/// 从 dsh 设置文件实时读取隐私开关值。
+fn terminal_context_enabled_from_disk() -> bool {
+    dsh_settings_path()
         .ok()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|v| v.get("terminal_context_enabled").and_then(|b| b.as_bool()))
-        .unwrap_or(false);
-    TERMINAL_CONTEXT_ENABLED.store(enabled, Ordering::Relaxed);
+        .unwrap_or(false)
 }
 
 /// dsh 设置文件路径(隐私开关持久化)。正规 settings 框架 UI 后续接入。
@@ -99,6 +103,9 @@ pub(crate) fn update_terminal_context_from_active(
     ctx: &mut ModelContext<DshRuntime>,
     window_id: WindowId,
 ) {
+    // 从文件实时刷新隐私开关:用户运行中改 dsh_settings.json 后 1s 内生效
+    // (仅启动时缓存会导致改文件不生效)。
+    TERMINAL_CONTEXT_ENABLED.store(terminal_context_enabled_from_disk(), Ordering::Relaxed);
     if !TERMINAL_CONTEXT_ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -112,7 +119,12 @@ pub(crate) fn update_terminal_context_from_active(
         crate::workspace::ActiveSession::handle(ctx).read(ctx, |a, _| a.session(window_id).map(|s| s.id()));
     let commands = match session_id {
         Some(id) => crate::terminal::History::handle(ctx).read(ctx, |h, _| {
-            h.commands(id).map(|cmds| {
+            let cmds = h.commands(id);
+            log::info!(
+                "[dsh] terminal ctx: session {id:?}, history commands = {:?}",
+                cmds.as_ref().map(|c| c.len())
+            );
+            cmds.map(|cmds| {
                 cmds.iter()
                     .rev()
                     .take(TERMINAL_CONTEXT_MAX)
@@ -120,7 +132,10 @@ pub(crate) fn update_terminal_context_from_active(
                     .collect()
             })
         }),
-        None => None,
+        None => {
+            log::info!("[dsh] terminal ctx: no active session for window {window_id:?}");
+            None
+        }
     };
     *TERMINAL_CONTEXT.lock() = commands.unwrap_or_default();
 }
@@ -770,7 +785,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         *TERMINAL_CONTEXT.lock() = vec!["ls".to_string(), "cd src".to_string()];
         assert!(terminal_context().is_empty(), "privacy off => empty");
 
-        set_terminal_context_enabled(true);
+        TERMINAL_CONTEXT_ENABLED.store(true, Ordering::Relaxed);
         assert_eq!(
             terminal_context(),
             vec!["ls".to_string(), "cd src".to_string()],
@@ -778,7 +793,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         );
 
         // 复位默认。
-        set_terminal_context_enabled(false);
+        TERMINAL_CONTEXT_ENABLED.store(false, Ordering::Relaxed);
     }
     #[test]
     fn write_bridge_config_extracts_source() {
