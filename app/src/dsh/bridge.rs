@@ -321,18 +321,19 @@ async fn handle_connection(stream: tokio::net::TcpStream, token: Arc<str>) {
                             }
                         }
                         Err(err) => {
-                            if let Some(id) = &err.id {
-                                let resp = json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "error": { "code": err.code, "message": err.message },
-                                });
-                                let _ = ws
-                                    .send(async_tungstenite::tungstenite::Message::Text(
-                                        resp.to_string(),
-                                    ))
-                                    .await;
-                            }
+                            // 始终用请求 id 发错误响应:handle_zap_method 内部
+                            // 错误 id 可能为 None,否则 dsh 侧 rpc promise 永不
+                            // resolve,工具调用卡住(真实验收发现)。
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": zap_id,
+                                "error": { "code": err.code, "message": err.message },
+                            });
+                            let _ = ws
+                                .send(async_tungstenite::tungstenite::Message::Text(
+                                    resp.to_string(),
+                                ))
+                                .await;
                         }
                     }
                     continue;
