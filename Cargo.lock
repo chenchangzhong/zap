@@ -15348,6 +15348,7 @@ dependencies = [
  "async-recursion",
  "async-stream",
  "async-trait",
+ "async-tungstenite",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-sts",

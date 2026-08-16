@@ -7,6 +7,7 @@
 //!
 //! 入口:WorkspaceAction::OpenDshPane → DshRuntime 启动 → 就绪后打开 BrowserPane。
 
+pub(crate) mod bridge;
 pub(crate) mod pane;
 pub(crate) mod runtime;
 

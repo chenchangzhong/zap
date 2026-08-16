@@ -19,6 +19,8 @@ use anyhow::{bail, Context, Result};
 use command::r#async::Command;
 use warpui::{Entity, SingletonEntity};
 
+use super::bridge;
+
 /// dsh npm 包名。
 const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh";
 /// 锁定的 dsh 版本(preview 阶段必须 pin,防止上游破坏性变更)。
@@ -256,15 +258,22 @@ impl DshRuntime {
         // 2. 定位/安装 dsh。
         let dsh_cli = Self::ensure_dsh_installed(&node).await?;
 
-        // 3. 启动 `dsh web --port 0`。
+        // 3. 启动 `dsh web --port 0`(带桥插件注入)。
         let dsh_home = Self::dsh_data_dir()?;
         let mut cmd = Command::new(&node);
         cmd.arg(&dsh_cli)
             .arg("web")
             .arg("--port")
             .arg("0")
-            .env("DSH_HOME", &dsh_home)
-            .env("ZAP_BRIDGE_ADDRESS", ""); // 预留:插件桥地址(第二阶段)
+            .env("DSH_HOME", &dsh_home);
+        // 桥插件注入:桥就绪 + 插件文件就绪时生成 cordis.yml 并 --patch。
+        if let Some((port, token)) = bridge::bridge_info() {
+            cmd.env("ZAP_BRIDGE_ADDRESS", format!("ws://127.0.0.1:{port}"));
+            if let Some(patch) = Self::write_bridge_config(&dsh_home, port, &token)? {
+                cmd.arg("--patch").arg(&patch);
+                log::info!("[dsh] bridge plugin injected via {:?} (port {port})", patch);
+            }
+        }
         let mut child = cmd.spawn().context("Failed to spawn dsh web")?;
 
         // 4. 就绪探测:等端口出现 + HTTP 200。失败时显式清理子进程,
@@ -366,6 +375,40 @@ impl DshRuntime {
         Ok(cli_js)
     }
 
+    /// 生成 cordis.yml(注入 zap-bridge 插件),返回 patch 文件路径。
+    ///
+    /// 插件文件(`<dsh_home>/zap-bridge.ts`)尚未就绪时返回 `None`(降级:
+    /// 不带 `--patch` 启动,避免 dsh 指向缺失文件)。
+    fn write_bridge_config(dsh_home: &Path, port: u16, token: &str) -> Result<Option<PathBuf>> {
+        let plugin_ts = dsh_home.join("zap-bridge.ts");
+        // 总是尝试从 bundled 源码覆盖提取:dev 下保证插件更新传播到 DSH_HOME;
+        // 发布时 manifest 源码路径不可用 → 复用已提取文件。
+        let src =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/bundled/dsh/zap-bridge.ts");
+        match std::fs::read(&src) {
+            Ok(contents) => {
+                std::fs::write(&plugin_ts, contents)?;
+                log::info!("[dsh] extracted zap-bridge.ts to {}", plugin_ts.display());
+            }
+            Err(_) if !plugin_ts.is_file() => {
+                log::warn!(
+                    "[dsh] zap-bridge.ts source and installed both missing, starting dsh without bridge plugin"
+                );
+                return Ok(None);
+            }
+            Err(_) => {
+                // 源码不可用但已有提取文件:复用(发布场景)。
+            }
+        }
+        let content = format!(
+            "- insert:\n    - id: zap-bridge\n      name: '{}'\n      config:\n        bridgeAddress: 'ws://127.0.0.1:{port}'\n        token: '{}'\n",
+            plugin_ts.display(),
+            token
+        );
+        let path = dsh_home.join("cordis.yml");
+        std::fs::write(&path, content)?;
+        Ok(Some(path))
+    }
 
     /// 轮询探测 dsh web 就绪(端口监听 + HTTP 200),返回 URL。
     async fn wait_until_ready(child: &async_process::Child) -> Result<String> {
@@ -579,6 +622,40 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
     fn version_constant_is_parseable() {
         assert!(DSH_VERSION.starts_with("0.1.0"));
         assert!(DSH_VERSION.contains('-') || DSH_VERSION.split('.').count() == 3);
+    }
+
+    /// 生成 cordis.yml:内容含 id/桥地址/token/插件绝对路径。
+    #[test]
+    fn write_bridge_config_generates_patch() {
+        let dir = std::env::temp_dir().join(format!("dsh-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zap-bridge.ts"), "// zap-bridge").unwrap();
+
+        let path = DshRuntime::write_bridge_config(&dir, 54321, "t0k3n")
+            .unwrap()
+            .expect("patch file should be generated");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("id: zap-bridge"));
+        assert!(content.contains("bridgeAddress: 'ws://127.0.0.1:54321'"));
+        assert!(content.contains("token: 't0k3n'"));
+        assert!(content.contains(&format!("name: '{}'", dir.join("zap-bridge.ts").display())));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 插件文件缺失时从 bundled 源码提取到 DSH_HOME,并生成 cordis.yml。
+    #[test]
+    fn write_bridge_config_extracts_source() {
+        let dir = std::env::temp_dir().join(format!("dsh-cfg-src-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // dsh_home 无插件文件 → 从源码提取。
+        let path = DshRuntime::write_bridge_config(&dir, 54322, "t0k3n2")
+            .unwrap()
+            .expect("patch should be generated after extraction");
+        assert!(dir.join("zap-bridge.ts").is_file(), "plugin extracted to dsh_home");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(&format!("name: '{}'", dir.join("zap-bridge.ts").display())));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 端到端冒烟:真实启动 dsh runtime(需网络安装 dsh,首次较慢)。
