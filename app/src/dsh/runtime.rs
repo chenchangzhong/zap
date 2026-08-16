@@ -69,9 +69,29 @@ static TERMINAL_CONTEXT_ENABLED: AtomicBool = AtomicBool::new(false);
 static TERMINAL_CONTEXT_LAST_REFRESH: LazyLock<Mutex<Instant>> =
     LazyLock::new(|| Mutex::new(Instant::now() - TERMINAL_CONTEXT_REFRESH));
 
-/// 设置终端上下文注入开关(隐私)。默认关闭。
+/// 设置终端上下文注入开关(隐私),并持久化到 dsh 设置文件。默认关闭。
 pub(crate) fn set_terminal_context_enabled(enabled: bool) {
     TERMINAL_CONTEXT_ENABLED.store(enabled, Ordering::Relaxed);
+    if let Ok(path) = dsh_settings_path() {
+        let value = serde_json::json!({ "terminal_context_enabled": enabled });
+        let _ = std::fs::write(path, serde_json::to_string_pretty(&value).unwrap_or_default());
+    }
+}
+
+/// 从 dsh 设置文件加载隐私开关(启动时调用,初始化 atomic)。
+pub(crate) fn init_terminal_context_enabled_from_disk() {
+    let enabled = dsh_settings_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| v.get("terminal_context_enabled").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
+    TERMINAL_CONTEXT_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// dsh 设置文件路径(隐私开关持久化)。正规 settings 框架 UI 后续接入。
+fn dsh_settings_path() -> Result<PathBuf> {
+    Ok(DshRuntime::dsh_data_dir()?.join("dsh_settings.json"))
 }
 
 /// 主线程每帧提取活动终端最近命令到暂存(节流 1s)。隐私关闭时跳过更新。
@@ -227,6 +247,7 @@ impl DshRuntime {
     }
 
     pub fn new() -> Self {
+        init_terminal_context_enabled_from_disk();
         Self {
             status: DshRuntimeStatus::Stopped,
             url: None,
