@@ -590,6 +590,31 @@ fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, RpcError> {
     Ok(canon)
 }
 
+/// 收集从 `root` 到 `dir` 的 gitignore 链(祖先规则传递)+ 全局。
+///
+/// gitignore 规则祖先生效:根 `.gitignore` 的 `/target` 应影响其所有子目录。
+/// 单层实现(`gitignores_for_directory`)不会加载祖先规则,导致进入被忽略
+/// 目录时内容仍列出(与 Zap 文件树不一致)。
+fn gitignores_up_to_root(dir: &Path, root: &Path) -> Vec<ignore::gitignore::Gitignore> {
+    let mut gitignores = Vec::new();
+    let mut current = Some(dir);
+    while let Some(d) = current {
+        let gi = d.join(".gitignore");
+        if gi.is_file() {
+            gitignores.push(ignore::gitignore::Gitignore::new(gi).0);
+        }
+        if d == root {
+            break;
+        }
+        current = d.parent();
+    }
+    let (global, _) = ignore::gitignore::Gitignore::global();
+    if !global.is_empty() {
+        gitignores.push(global);
+    }
+    gitignores
+}
+
 /// `zap.list_files`:列出相对项目根目录的条目(名字 + 类型)。
 fn zap_list_files(params: &Value, root: &Path) -> Result<Value, RpcError> {
     let rel = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
@@ -606,8 +631,9 @@ fn zap_list_files(params: &Value, root: &Path) -> Result<Value, RpcError> {
         message: format!("read dir {rel}: {err}"),
         id: None,
     })?;
-    // gitignore 过滤(目录 .gitignore + 全局):与 Zap 文件树语义一致。
-    let gitignores = repo_metadata::gitignores_for_directory(&dir);
+    // gitignore 过滤(祖先链 + 全局):gitignore 规则祖先传递(根 .gitignore
+    // 的 /target 应影响其子目录),与 Zap 文件树语义一致。
+    let gitignores = gitignores_up_to_root(&dir, root);
     let mut list: Vec<Value> = entries
         .flatten()
         .filter(|entry| {

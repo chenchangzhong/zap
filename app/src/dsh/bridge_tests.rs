@@ -267,6 +267,35 @@ fn zap_list_files_respects_gitignore() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// gitignore 规则祖先传递:根 /target 应影响其子目录内容(进入 target 也过滤)。
+#[test]
+fn zap_list_files_respects_ancestor_gitignore() {
+    let dir = std::env::temp_dir().join(format!("zap-ig-anc-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("target").join("debug")).unwrap();
+    std::fs::write(dir.join("target").join("x.o"), "x").unwrap();
+    std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+
+    // 根目录:target/ 被过滤。
+    let out = handle_zap_method("zap.list_files", &json!({ "path": "" }), &dir).unwrap();
+    let names: Vec<&str> = out["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert!(!names.contains(&"target"), "root-level target filtered: {names:?}");
+
+    // 进入 target:祖先规则(target/)应过滤其内容。
+    let out = handle_zap_method("zap.list_files", &json!({ "path": "target" }), &dir).unwrap();
+    let entries = out["entries"].as_array().unwrap();
+    assert!(
+        entries.is_empty(),
+        "target content should be filtered by ancestor rule: {entries:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// zap.search:按文件名子串匹配,返回相对项目根的路径。
 #[test]
 fn zap_search_matches_filenames() {
