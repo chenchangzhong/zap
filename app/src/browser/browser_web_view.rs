@@ -44,6 +44,13 @@ pub(crate) static PENDING_WEBVIEW_URL_CHANGED: std::sync::LazyLock<
     Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
+/// 可安全交给系统默认浏览器/应用打开的 URL scheme。`javascript:` 等伪协议
+/// 一律过滤,防止把脚本串传给 NSWorkspace。
+fn is_externally_openable(url: &str) -> bool {
+    url::Url::parse(url)
+        .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "mailto" | "tel"))
+}
+
 /// 全局单例:管理所有 webview 的 create / navigate / set_bounds / destroy。
 pub struct BrowserWebViewManager {
     #[cfg(target_os = "macos")]
@@ -128,18 +135,30 @@ document.addEventListener('mousedown', () => {
   window.focus();
   window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-mousedown');
 });
-// 处理 target=_blank 链接:在当前 webview 导航而非创建新窗口。
+// 点击链接:一律用系统默认浏览器打开,不在 webview 内导航。
+// 锚点(#...)与 javascript: 伪协议链接不拦截。兼容 HTML 与 SVG <a>。
 document.addEventListener('click', (e) => {
+  if (e.button !== 0 && e.button !== 1) return;
   let el = e.target;
   while (el && el.tagName !== 'A') el = el.parentElement;
-  if (el && el.tagName === 'A' && el.target === '_blank') {
-    e.preventDefault();
-    window.location.href = el.href;
+  if (!el || el.tagName !== 'A') return;
+  const rawHref = el.getAttribute('href');
+  if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('javascript:')) return;
+  e.preventDefault();
+  // HTML <a> 的 href 是字符串;SVG <a> 的是 SVGAnimatedString,需用
+  // baseURI 重新解析。解析失败(非法 URL)则吞掉点击,不导航不外部打开。
+  let target;
+  try {
+    target = typeof el.href === 'string' ? el.href : new URL(rawHref, document.baseURI).href;
+  } catch {
+    return;
   }
+  window.webkit?.messageHandlers?.ipc?.postMessage('warp:open-external:' + target);
 });
-// 处理 window.open():在(唯一)当前 webview 导航。
+// window.open():同样交给系统默认浏览器,不创建新窗口也不在当前 webview 导航。
 window.open = function(url) {
-  window.location.href = url;
+  window.webkit?.messageHandlers?.ipc?.postMessage('warp:open-external:' + url);
+  return null;
 };
 // 失焦时记录并 blur 页面输入框(防与 Warp 地址栏光标共存的双光标)。
 // 记录元素供重新聚焦时(__restoreFocused)恢复:WKWebView 失焦再聚焦不会自动
@@ -185,7 +204,7 @@ setInterval(() => {
             // 透明背景:让 WebView 透出下层 WarpUI 画面(深色主题下避免白底)。
             // 注意:页面自身背景仍需透明(如 body { background: transparent }),否则仍是白底。
             .with_transparent(true)
-            .with_initialization_script(init_js)
+            .with_initialization_script_for_main_only(init_js, false)
             .with_on_page_load_handler(move |event, _url| {
                 if matches!(event, wry::PageLoadEvent::Finished) {
                     PENDING_WEBVIEW_URL_CHANGED.lock().insert(url_notify_id);
@@ -197,6 +216,20 @@ setInterval(() => {
                 if body.starts_with("warp:webview-js-error:") {
                     // 页面 JS 错误(诊断):转发到日志。
                     log::warn!("[browser] webview {ipc_id} JS error: {}", &body["warp:webview-js-error:".len()..]);
+                    return;
+                }
+                if let Some(url) = body.strip_prefix("warp:open-external:") {
+                    // 页面链接点击:立即用系统默认浏览器打开。不能经每帧
+                    // drain——点击发生在 WKWebView 内不产生 Warp 渲染帧,
+                    // 帧回调不触发会把打开延迟到下次重绘(表现为切到浏览器
+                    // 后才打开)。IPC handler 在主线程,直接同步调用平台
+                    // open_url(NSWorkspace)。
+                    if is_externally_openable(url) {
+                        log::info!("[browser] webview {ipc_id} open external: {url}");
+                        warpui::platform::mac::Window::open_url(url);
+                    } else {
+                        log::warn!("[browser] webview {ipc_id} skip non-openable url: {url}");
+                    }
                     return;
                 }
                 if matches!(
@@ -456,6 +489,7 @@ setInterval(() => {
         }
     }
     /// 消费暂存的页面 focusin 事件与 URL 变更事件,经 model emit 分发。
+    /// (外部打开请求在 IPC handler 内同步处理,不经此处。)
     pub fn drain_pending_webview_focus(&self, ctx: &mut ModelContext<Self>) {
         let focus_events: Vec<BrowserWebViewEvent> = PENDING_WEBVIEW_FOCUS_EVENTS
             .lock()
