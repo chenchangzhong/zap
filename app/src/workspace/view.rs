@@ -2621,6 +2621,21 @@ impl Workspace {
                         // 崩溃后自动重启完成:导航已有 dsh pane 到新 URL。
                         me.navigate_existing_dsh_pane(url, ctx);
                     }
+                    crate::dsh::DshRuntimeEvent::Updating { version } => {
+                        // 检测到 dsh 新版本,提醒用户正在更新(更新完成后
+                        // Ready 事件会照常导航到 Web UI)。
+                        let window_id = ctx.window_id();
+                        WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
+                            stack.add_persistent_toast(
+                                DismissibleToast::default(crate::t!(
+                                    "dsh-updating-toast",
+                                    version = version.as_str()
+                                )),
+                                window_id,
+                                ctx,
+                            );
+                        });
+                    }
                     crate::dsh::DshRuntimeEvent::Failed { error } => {
                         log::error!("[dsh] runtime failed: {error}");
                         // 提示用户:runtime 已停止,可重新打开。
@@ -18918,21 +18933,33 @@ impl Workspace {
                 bridge.start();
             });
             let gen = runtime.begin_start();
+            // 启动前检查 dsh 新版本:有更新则先提醒用户(Updating 事件),
+            // 并把目标版本传给 start_future 完成安装更新。
             ctx.spawn(
-                crate::dsh::DshRuntime::start_future(),
-                move |runtime, result, ctx| match result {
-                    crate::dsh::DshStartResult::Ready { url, child } => {
-                        if runtime.adopt_child(child, url.clone(), gen) {
-                            ctx.emit(crate::dsh::DshRuntimeEvent::Ready { url });
-                        }
+                crate::dsh::DshRuntime::check_update_future(),
+                move |runtime, update, ctx| {
+                    if let Some(version) = &update {
+                        ctx.emit(crate::dsh::DshRuntimeEvent::Updating {
+                            version: version.clone(),
+                        });
                     }
-                    crate::dsh::DshStartResult::Failed { error } => {
-                        log::error!("[dsh] start failed: {error}");
-                        runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
-                        // emit 失败事件触发既有 toast,避免失败后 Loading pane
-                        // 永久卡 spinner 而无任何用户反馈。
-                        ctx.emit(crate::dsh::DshRuntimeEvent::Failed { error });
-                    }
+                    ctx.spawn(
+                        crate::dsh::DshRuntime::start_future(update),
+                        move |runtime, result, ctx| match result {
+                            crate::dsh::DshStartResult::Ready { url, child } => {
+                                if runtime.adopt_child(child, url.clone(), gen) {
+                                    ctx.emit(crate::dsh::DshRuntimeEvent::Ready { url });
+                                }
+                            }
+                            crate::dsh::DshStartResult::Failed { error } => {
+                                log::error!("[dsh] start failed: {error}");
+                                runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
+                                // emit 失败事件触发既有 toast,避免失败后 Loading pane
+                                // 永久卡 spinner 而无任何用户反馈。
+                                ctx.emit(crate::dsh::DshRuntimeEvent::Failed { error });
+                            }
+                        },
+                    );
                 },
             );
         });

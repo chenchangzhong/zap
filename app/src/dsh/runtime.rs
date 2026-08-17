@@ -291,10 +291,14 @@ impl DshRuntime {
 
     /// 启动 dsh runtime(异步,不借用 self)。
     ///
+    /// `target` 为检测到的最新版本(经 [`check_update_future`] 得到):
+    /// - `Some(v)`:强制安装/更新到版本 v
+    /// - `None`:用已安装版本(`version.txt`),未安装时用 `DSH_VERSION`
+    ///
     /// 代次校验不在本函数内:调用方持 `begin_start`/`begin_restart` 返回的
     /// 代次,完成回调里传给 `adopt_child` 做代次比对,代次不匹配时丢弃子进程。
-    pub async fn start_future() -> DshStartResult {
-        match Self::start_inner().await {
+    pub async fn start_future(target: Option<String>) -> DshStartResult {
+        match Self::start_inner(target).await {
             Ok((child, url)) => DshStartResult::Ready { url, child },
             Err(err) => {
                 log::error!("[dsh] start failed: {err:#}");
@@ -305,14 +309,104 @@ impl DshRuntime {
         }
     }
 
-    /// dsh 数据目录:`<data_dir>/dsh`。
+    /// 查询 npm registry 上 `@deepseek-ai/dsh` 的最新版本号。
+    ///
+    /// 失败(网络不可达 / 响应异常 / 超时)返回 `None`,调用方按"无更新"
+    /// 处理,不阻塞启动。reqwest 默认无总超时,故用 `tokio::time::timeout`
+    /// 兜底,避免网络黑洞时启动永久卡 Loading。
+    async fn query_latest_version() -> Option<String> {
+        const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+        let client = http_client::Client::new();
+        let url = format!("https://registry.npmjs.org/{DSH_NPM_PACKAGE}/latest");
+        let result = tokio::time::timeout(CHECK_TIMEOUT, async {
+            let resp = client.get(&url).send().await.ok()?;
+            if !resp.status().is_success() {
+                log::warn!("[dsh] version check failed: HTTP {}", resp.status());
+                return None;
+            }
+            let body: serde_json::Value = resp.json().await.ok()?;
+            body.get("version").and_then(|v| v.as_str()).map(str::to_string)
+        })
+        .await;
+        match result {
+            Ok(version) => version,
+            Err(_) => {
+                log::warn!("[dsh] version check timed out after {CHECK_TIMEOUT:?}");
+                None
+            }
+        }
+    }
+
+    /// 启动前检查 dsh 是否有新版本。
+    ///
+    /// 返回 `Some(latest)` 当 registry 最新版与当前已安装版本(`version.txt`,
+    /// 未安装视为 `DSH_VERSION`)不一致;一致或查询失败返回 `None`。
+    /// 供启动流程在 spawn `start_future` 前调用,以决定是否提醒用户更新。
+    pub async fn check_update_future() -> Option<String> {
+        let latest = Self::query_latest_version().await?;
+        let installed = Self::dsh_data_dir()
+            .ok()
+            .map(|dir| dir.join("dsh-install").join("version.txt"))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let installed = if installed.is_empty() {
+            DSH_VERSION.to_string()
+        } else {
+            installed
+        };
+        if latest != installed {
+            log::info!("[dsh] update available: {installed} -> {latest}");
+            Some(latest)
+        } else {
+            None
+        }
+    }
+
+    /// dsh 数据目录:`~/.dsh`。
     ///
     /// 存放 DSH_HOME(profiles/storages)与 dsh npm 安装缓存,不污染用户目录。
+    /// 首次使用时把旧位置 `~/.zap/dsh` 的数据一次性迁移过来。
     pub fn dsh_data_dir() -> Result<PathBuf> {
-        let dir = warp_core::paths::data_dir().join("dsh");
+        let home = dirs::home_dir()
+            .with_context(|| "Failed to resolve home dir for dsh data dir")?;
+        let dir = home.join(".dsh");
+        Self::migrate_legacy_data_dir(&dir);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create dsh data dir {}", dir.display()))?;
         Ok(dir)
+    }
+
+    /// 一次性迁移旧数据目录 `~/.zap/dsh` → `~/.dsh`。
+    ///
+    /// 仅当新目录不存在且旧目录存在时执行;`rename` 失败(dsh 正在运行持有
+    /// 句柄等)不阻塞,打日志后继续用新目录重建。
+    fn migrate_legacy_data_dir(new_dir: &Path) {
+        let Some(home) = dirs::home_dir() else { return };
+        let legacy = home.join(".zap").join("dsh");
+        if !legacy.is_dir() || new_dir.exists() {
+            return;
+        }
+        if let Some(parent) = new_dir.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        match std::fs::rename(&legacy, new_dir) {
+            Ok(()) => {
+                log::info!(
+                    "[dsh] migrated data dir {} -> {}",
+                    legacy.display(),
+                    new_dir.display()
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "[dsh] migrate data dir {} -> {} failed: {err}",
+                    legacy.display(),
+                    new_dir.display()
+                );
+            }
+        }
     }
 
     pub fn status(&self) -> DshRuntimeStatus {
@@ -328,7 +422,7 @@ impl DshRuntime {
     }
 
 
-    async fn start_inner() -> Result<(async_process::Child, String)> {
+    async fn start_inner(target: Option<String>) -> Result<(async_process::Child, String)> {
         // 1. 定位/安装 Node。
         let path_env = std::env::var("PATH").unwrap_or_default();
         let mut node = match node_runtime::find_working_node_binary(Some(&path_env)).await {
@@ -359,7 +453,7 @@ impl DshRuntime {
         }
 
         // 2. 定位/安装 dsh。
-        let dsh_cli = Self::ensure_dsh_installed(&node).await?;
+        let dsh_cli = Self::ensure_dsh_installed(&node, target.as_deref()).await?;
 
         // 3. 启动 `dsh web --port 0`(带桥插件注入)。
         let dsh_home = Self::dsh_data_dir()?;
@@ -432,7 +526,11 @@ impl DshRuntime {
     }
 
     /// 确保 dsh 已安装,返回 CLI 入口 JS 路径。
-    async fn ensure_dsh_installed(node: &Path) -> Result<PathBuf> {
+    ///
+    /// `target` 指定要安装的版本:
+    /// - `Some(v)`:安装/更新到版本 v(启动前检测到新版本时传入)
+    /// - `None`:沿用已安装版本(`version.txt`),未安装时用 `DSH_VERSION`
+    async fn ensure_dsh_installed(node: &Path, target: Option<&str>) -> Result<PathBuf> {
         let data_dir = Self::dsh_data_dir()?;
         let dsh_dir = data_dir.join("dsh-install");
         let cli_js = dsh_dir
@@ -442,15 +540,25 @@ impl DshRuntime {
             .join("lib")
             .join("bin.js");
 
+        // 期望版本:target 优先;否则用已装版本;都没有则用编译期锁定版本。
+        let want = match target {
+            Some(v) => v.to_string(),
+            None => std::fs::read_to_string(dsh_dir.join("version.txt"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DSH_VERSION.to_string()),
+        };
+
         // 已安装且版本匹配则复用。
         if cli_js.is_file() {
             let installed =
                 std::fs::read_to_string(dsh_dir.join("version.txt")).unwrap_or_default();
-            if installed.trim() == DSH_VERSION {
+            if installed.trim() == want {
                 return Ok(cli_js);
             }
             log::info!(
-                "[dsh] version mismatch (installed {:?}, want {DSH_VERSION}), reinstalling",
+                "[dsh] version mismatch (installed {:?}, want {want}), reinstalling",
                 installed.trim()
             );
             let _ = std::fs::remove_dir_all(&dsh_dir);
@@ -464,14 +572,14 @@ impl DshRuntime {
             node_runtime::npm_binary_path().unwrap_or_else(|_| PathBuf::from("npm"))
         };
 
-        log::info!("[dsh] installing {DSH_NPM_PACKAGE}@{DSH_VERSION}...");
+        log::info!("[dsh] installing {DSH_NPM_PACKAGE}@{want}...");
         // 注意:不用 `--prefix`(npm 11 下不落盘 node_modules),改为
         // 在目标目录内执行 npm install。
         let mut cmd = Command::new(&npm);
         cmd.current_dir(&dsh_dir)
             .arg("install")
             .arg("--no-save")
-            .arg(format!("{DSH_NPM_PACKAGE}@{DSH_VERSION}"));
+            .arg(format!("{DSH_NPM_PACKAGE}@{want}"));
         let output = cmd
             .output()
             .await
@@ -483,7 +591,7 @@ impl DshRuntime {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        std::fs::write(dsh_dir.join("version.txt"), DSH_VERSION)?;
+        std::fs::write(dsh_dir.join("version.txt"), &want)?;
         if !cli_js.is_file() {
             bail!("dsh installed but entry not found at {}", cli_js.display());
         }
@@ -673,8 +781,10 @@ impl DshRuntime {
     }
 
     /// 崩溃后重启(由外部在 `poll_child` 返回 `Crashed` 后调度,`'static` future)。
+    ///
+    /// 崩溃重启不触发版本检查/更新(仅用户主动打开时更新),沿用已装版本。
     pub async fn restart_future() -> DshRestartResult {
-        match Self::start_future().await {
+        match Self::start_future(None).await {
             DshStartResult::Ready { url, child } => DshRestartResult::Restarted { url, child },
             DshStartResult::Failed { error } => DshRestartResult::GiveUp { error },
         }
@@ -686,6 +796,8 @@ impl DshRuntime {
 pub enum DshRuntimeEvent {
     /// runtime 就绪,`url` 为 dsh Web UI 地址。
     Ready { url: String },
+    /// 检测到 dsh 新版本,正在更新(提醒用户后自动继续启动)。
+    Updating { version: String },
     /// 崩溃后自动重启完成(仅通知已有 pane 导航,不自动开新 pane)。
     Restarted { url: String },
     /// 启动/重启失败,或连续崩溃超过上限放弃重启。
@@ -793,7 +905,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
     fn smoke_start_stop() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let result = DshRuntime::start_future().await;
+            let result = DshRuntime::start_future(None).await;
             match result {
                 DshStartResult::Ready { url, mut child } => {
                     // URL 可达。
@@ -815,7 +927,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
     fn lifecycle_start_stop() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let result = DshRuntime::start_future().await;
+            let result = DshRuntime::start_future(None).await;
             let (url, mut child) = match result {
                 DshStartResult::Ready { url, child } => (url, child),
                 DshStartResult::Failed { error } => panic!("start failed: {error}"),
@@ -1053,7 +1165,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
             // 1. 启动。
-            let (url1, mut child) = match DshRuntime::start_future().await {
+            let (url1, mut child) = match DshRuntime::start_future(None).await {
                 DshStartResult::Ready { url, child } => (url, child),
                 DshStartResult::Failed { error } => panic!("start failed: {error}"),
             };
