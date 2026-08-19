@@ -22,10 +22,12 @@ use serde_json::{json, Value};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
+use crate::notifications::item::NotificationCategory;
+
 /// 协议版本(递增;不匹配时握手明确报错)。
 const PROTOCOL_VERSION: u32 = 1;
 /// Zap 提供的能力清单(阶段 1+ 填充:get_workspace/list_files/... )。
-const ZAP_CAPABILITIES: &[&str] = &[];
+const ZAP_CAPABILITIES: &[&str] = &["notify"];
 /// 握手超时:连接后未在此时长内完成握手即关闭(防半开连接)。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// token 字符数。
@@ -80,6 +82,12 @@ pub enum BridgeEvent {
     Disconnected,
     /// 握手失败(原因:token 无效 / 版本不匹配 / 超时)。
     HandshakeFailed { reason: String },
+    /// dsh 插件请求发送通知(任务完成/出错/需确认)。
+    Notify {
+        title: String,
+        body: String,
+        category: NotificationCategory,
+    },
 }
 
 /// 待主线程消费的事件(独立 tokio runtime 线程写入,主线程每帧 drain)。
@@ -199,6 +207,7 @@ impl BridgeServer {
                 BridgeEvent::Disconnected => self.state = BridgeState::Listening,
                 BridgeEvent::HandshakeFailed { .. } => self.state = BridgeState::HandshakeFailed,
                 BridgeEvent::Listening { .. } => {}
+                BridgeEvent::Notify { .. } => {}
             }
             ctx.emit(event);
         }
@@ -553,6 +562,7 @@ fn handle_zap_method(method: &str, params: &Value, root: &Path) -> Result<Value,
         "zap.read_file" => zap_read_file(params, root),
         "zap.search" => zap_search(params, root),
         "zap.terminal_context" => zap_terminal_context(),
+        "zap.notify" => zap_notify(params),
         _ => Err(RpcError {
             code: code::METHOD_NOT_FOUND,
             message: format!("unknown method {method}"),
@@ -730,6 +740,48 @@ fn zap_search(params: &Value, root: &Path) -> Result<Value, RpcError> {
 fn zap_terminal_context() -> Result<Value, RpcError> {
     let commands = super::runtime::terminal_context();
     Ok(json!({ "commands": commands }))
+}
+
+/// `zap.notify`:请求发送通知(任务完成/出错/需确认)。
+fn zap_notify(params: &Value) -> Result<Value, RpcError> {
+    let p = params.as_object().ok_or_else(|| RpcError {
+        code: code::INVALID_PARAMS,
+        message: "params must be an object".into(),
+        id: None,
+    })?;
+
+    let title = p.get("title").and_then(|t| t.as_str()).unwrap_or("");
+    if title.is_empty() {
+        return Err(RpcError {
+            code: code::INVALID_PARAMS,
+            message: "title is required and must be non-empty".into(),
+            id: None,
+        });
+    }
+
+    let body = p
+        .get("body")
+        .and_then(|b| b.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let category_str = p
+        .get("category")
+        .and_then(|c| c.as_str())
+        .unwrap_or("info");
+    let category = match category_str {
+        "error" => NotificationCategory::Error,
+        "confirm" => NotificationCategory::Request,
+        _ => NotificationCategory::Complete,
+    };
+
+    push_event(BridgeEvent::Notify {
+        title: title.to_string(),
+        body,
+        category,
+    });
+
+    Ok(json!({ "ok": true }))
 }
 
 /// 单条消息处理结果。

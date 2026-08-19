@@ -2638,6 +2638,42 @@ impl Workspace {
                     }
                 },
             );
+
+            // 订阅桥事件:处理 dsh 插件通知请求。
+            // 假设:DSH 只有一个 pane,取其 view id 作为通知 origin。
+            ctx.subscribe_to_model(
+                &crate::dsh::bridge::BridgeServer::handle(ctx),
+                |me, _, event, ctx| match event {
+                    crate::dsh::bridge::BridgeEvent::Notify {
+                        ref title,
+                        ref body,
+                        category,
+                    } => {
+                        if me.has_dsh_pane(ctx) {
+                            let dsh_view_id = me
+                                .tabs
+                                .iter()
+                                .find_map(|tab| {
+                                    tab.pane_group.as_ref(ctx).dsh_panes().next().map(|p| {
+                                        use crate::pane_group::pane::PaneContent;
+                                        p.id().creation_order_id()
+                                    })
+                                })
+                                .unwrap_or_else(EntityId::new);
+                            NotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                                model.add_dsh_notification(
+                                    title.clone(),
+                                    body.clone(),
+                                    *category,
+                                    dsh_view_id,
+                                    ctx,
+                                );
+                            });
+                        }
+                    }
+                    _ => {}
+                },
+            );
         }
 
         ctx.subscribe_to_model(

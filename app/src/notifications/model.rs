@@ -417,6 +417,43 @@ impl NotificationsModel {
         self.notifications.push(item);
         ctx.emit(NotificationsEvent::NotificationAdded { id });
     }
+
+    /// 添加 DSH 插件通知(任务完成/出错/需确认)。
+    pub fn add_dsh_notification(
+        &mut self,
+        title: String,
+        message: String,
+        category: NotificationCategory,
+        origin_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !*AISettings::as_ref(ctx).show_agent_notifications {
+            return;
+        }
+
+        let item = NotificationItem::new(
+            title,
+            message,
+            category,
+            NotificationSourceAgent::Dsh,
+            NotificationOrigin::DshSession(origin_id),
+            false, // is_visible: 初始不可见，用户看到时标记已读
+            origin_id,
+            vec![], // artifacts: DSH 不是终端 agent，无此上下文
+            None,   // branch: 同上
+        );
+
+        send_telemetry_from_ctx!(
+            TelemetryEvent::AgentNotificationShown {
+                agent_variant: NotificationSourceAgent::Dsh.into(),
+            },
+            ctx
+        );
+
+        let id = item.id;
+        self.notifications.push(item);
+        ctx.emit(NotificationsEvent::NotificationAdded { id });
+    }
 }
 
 #[derive(Clone, Debug)]

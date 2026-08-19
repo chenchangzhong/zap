@@ -320,3 +320,96 @@ fn zap_search_matches_filenames() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// 注意:以下测试操作全局 PENDING_EVENTS,依赖 nextest(每测试独立进程)。
+// 若改用 cargo test(多线程同进程),需加 #[serial] 或改验证返回值。
+
+/// zap.notify:正常调用 → 返回 ok,产生 Notify 事件。
+#[test]
+fn zap_notify_ok() {
+    let dir = std::env::temp_dir().join(format!("zap-notify-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 清空全局事件缓冲。
+    PENDING_EVENTS.lock().clear();
+
+    let out = handle_zap_method(
+        "zap.notify",
+        &json!({ "title": "Task done", "body": "Completed successfully" }),
+        &dir,
+    )
+    .unwrap();
+    assert_eq!(out, json!({ "ok": true }));
+
+    // 验证事件已入队。
+    let events = PENDING_EVENTS.lock().clone();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        BridgeEvent::Notify { title, body, category } => {
+            assert_eq!(title, "Task done");
+            assert_eq!(body, "Completed successfully");
+            assert_eq!(*category, NotificationCategory::Complete);
+        }
+        other => panic!("expected Notify event, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.notify:title 为空 → INVALID_PARAMS。
+#[test]
+fn zap_notify_empty_title_rejected() {
+    let dir = std::env::temp_dir().join(format!("zap-notify-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let err = handle_zap_method("zap.notify", &json!({ "title": "" }), &dir).unwrap_err();
+    assert_eq!(err.code, code::INVALID_PARAMS);
+    assert!(err.message.contains("title"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.notify:category 映射: "error" → Error, "confirm" → Request。
+#[test]
+fn zap_notify_category_mapping() {
+    let dir = std::env::temp_dir().join(format!("zap-notify-cat-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    PENDING_EVENTS.lock().clear();
+
+    // error
+    handle_zap_method(
+        "zap.notify",
+        &json!({ "title": "Error", "category": "error" }),
+        &dir,
+    )
+    .unwrap();
+    let events = PENDING_EVENTS.lock().clone();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        BridgeEvent::Notify { category, .. } => {
+            assert_eq!(*category, NotificationCategory::Error);
+        }
+        other => panic!("expected Notify, got {other:?}"),
+    }
+
+    PENDING_EVENTS.lock().clear();
+
+    // confirm
+    handle_zap_method(
+        "zap.notify",
+        &json!({ "title": "Confirm", "category": "confirm" }),
+        &dir,
+    )
+    .unwrap();
+    let events = PENDING_EVENTS.lock().clone();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        BridgeEvent::Notify { category, .. } => {
+            assert_eq!(*category, NotificationCategory::Request);
+        }
+        other => panic!("expected Notify, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
