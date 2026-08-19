@@ -421,6 +421,9 @@ fn render_agent_avatar(
             agent: cli,
             status: Some(status),
         },
+        NotificationSourceAgent::Dsh => IconWithStatusVariant::Dsh {
+            status: Some(status),
+        },
     };
     render_icon_with_status(
         variant,

@@ -465,6 +465,8 @@ pub enum NotificationAgentVariant {
     Oz,
     /// A CLI agent (e.g., Claude Code, Gemini CLI, etc.).
     CLIAgent(CLIAgentType),
+    /// DSH plugin.
+    Dsh,
 }
 
 impl From<crate::notifications::NotificationSourceAgent> for NotificationAgentVariant {
@@ -474,6 +476,7 @@ impl From<crate::notifications::NotificationSourceAgent> for NotificationAgentVa
             crate::notifications::NotificationSourceAgent::CLI(cli_agent) => {
                 Self::CLIAgent(cli_agent.into())
             }
+            crate::notifications::NotificationSourceAgent::Dsh => Self::Dsh,
         }
     }
 }

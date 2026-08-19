@@ -43,12 +43,13 @@ impl NotificationFilter {
 }
 
 /// 通知发出方。`Oz` 是 Zap 自家本地 BYOP agent;`CLI(...)` 是第三方 CLI agent
-/// (Claude Code / Codex / Antigravity 等)。
+/// (Claude Code / Codex / Antigravity 等);`Dsh` 是 DSH 插件。
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum NotificationSourceAgent {
     Oz,
     CLI(CLIAgent),
+    Dsh,
 }
 
 /// 标识这条通知所属的对话或会话。
@@ -60,6 +61,8 @@ pub enum NotificationOrigin {
     Conversation(AIConversationId),
     /// CLI session 按 terminal view id 区分(每个 pane 至多一个 CLI agent session)。
     CLISession(EntityId),
+    /// DSH session，用 webview EntityId 标识。
+    DshSession(EntityId),
 }
 
 #[derive(Debug, Clone)]
