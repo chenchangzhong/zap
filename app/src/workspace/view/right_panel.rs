@@ -1137,6 +1137,7 @@ impl RightPanelView {
                 diff_state_model_clone,
                 code_review_comment_batch,
                 Some(terminal_view),
+                false,
                 ctx,
             )
         });

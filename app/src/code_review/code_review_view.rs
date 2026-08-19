@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     mem,
     ops::Range,
@@ -154,6 +155,7 @@ use warpui::{
     ModelHandle, WeakViewHandle,
 };
 
+use crate::code::diff_layout::DiffLayout;
 use crate::code::footer::CodeFooterView;
 use crate::settings::AISettings;
 use crate::ui_components::{
@@ -387,6 +389,15 @@ pub enum CodeReviewAction {
     OpenCreatePrDialog,
     ViewPr(String),
     PublishBranch,
+    ToggleDiffLayout,
+}
+
+/// Holds the two editor views for side-by-side diff rendering.
+pub struct SideBySideEditorState {
+    pub baseline_editor: ViewHandle<LocalCodeEditorView>,
+    pub modified_editor: ViewHandle<LocalCodeEditorView>,
+    /// Prevents infinite scroll sync loop between the two editors.
+    pub syncing: Rc<Cell<bool>>,
 }
 
 pub struct FileState {
@@ -400,6 +411,10 @@ pub struct FileState {
     discard_button: ViewHandle<ActionButton>,
     add_context_button: ViewHandle<ActionButton>,
     copy_path_button: ViewHandle<ActionButton>,
+    /// Side-by-side editors, created lazily when diff_layout is SideBySide.
+    pub side_by_side_state: Option<SideBySideEditorState>,
+    /// Baseline content (HEAD) for this file, used by side-by-side editor creation.
+    pub content_at_head: Option<String>,
 }
 
 pub(crate) struct LoadedState {
@@ -765,6 +780,12 @@ pub struct CodeReviewView {
     code_review_footer: Option<ViewHandle<CodeFooterView>>,
     /// Active git-operation dialog overlay (commit / push / publish), if open.
     git_dialog: Option<ViewHandle<GitDialog>>,
+    /// Whether this view was opened from a DSH (DeepSeek Harness) webview pane.
+    is_dsh: bool,
+    /// Current diff layout mode (inline or side-by-side).
+    diff_layout: DiffLayout,
+    /// Saved layout before maximize, restored on un-maximize.
+    diff_layout_before_maximize: Option<DiffLayout>,
 }
 
 impl CodeReviewView {
@@ -1001,6 +1022,7 @@ impl CodeReviewView {
         diff_state_model: ModelHandle<DiffStateModel>,
         comment_batch_model: Option<ModelHandle<ReviewCommentBatch>>,
         terminal_view: Option<WeakViewHandle<TerminalView>>,
+        is_dsh: bool,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         // TODO(asweet): Migrate subscription and event handling of diff_state_model to RepositoryState
@@ -1237,6 +1259,9 @@ impl CodeReviewView {
             is_open: false,
             code_review_footer: None,
             git_dialog: None,
+            is_dsh,
+            diff_layout: DiffLayout::Inline,
+            diff_layout_before_maximize: None,
         };
         view.set_active_repo_comment_model(comment_batch_model, ctx);
         if has_repo {
@@ -2563,7 +2588,9 @@ impl CodeReviewView {
             }
             DiffState::NotInRepository => {
                 if let Some(repo) = self.active_repo.as_mut() {
-                    if repo.repo_path.as_os_str().is_empty() {
+                    // DSH 场景:repo_path 来自 workspace_dir(非空),即使非 git 也
+                    // 非空,应显示"非 git 仓库"文案而非停留在加载中。
+                    if repo.repo_path.as_os_str().is_empty() || self.is_dsh {
                         repo.state = CodeReviewViewState::NoRepoFound;
                     } else {
                         log::info!(
@@ -2799,6 +2826,8 @@ impl CodeReviewView {
                 discard_button,
                 add_context_button,
                 copy_path_button,
+                side_by_side_state: None, // Created lazily in render_file_content when diff_layout is SideBySide
+                content_at_head: file.content_at_head.clone(),
                 sidebar_mouse_state: MouseStateHandle::default(),
                 header_mouse_state: MouseStateHandle::default(),
             })
@@ -5345,6 +5374,8 @@ impl CodeReviewView {
                 .finish(),
                 theme,
             )
+        } else if self.diff_layout.is_side_by_side() {
+            self.render_side_by_side_content(file, appearance)
         } else if let Some(editor_state) = file.editor_state.as_ref() {
             Hoverable::new(editor_state.editor_mouse_state.clone(), |_| {
                 Container::new(ChildView::new(&editor_state.editor).finish())
@@ -5376,6 +5407,290 @@ impl CodeReviewView {
                 theme,
             )
         }
+    }
+
+    /// Renders side-by-side diff with two editor panes.
+    fn render_side_by_side_content(
+        &self,
+        file: &FileState,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+
+        let Some(side_by_side) = &file.side_by_side_state else {
+            return Self::styled_file_content_container(
+                Text::new(
+                    "Loading side-by-side view...",
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size(),
+                )
+                .with_color(theme.sub_text_color(theme.background()).into())
+                .finish(),
+                theme,
+            );
+        };
+
+        let vertical_separator = ConstrainedBox::new(
+            Rect::new()
+                .with_background(theme.outline())
+                .finish(),
+        )
+        .with_width(1.)
+        .finish();
+
+        let left_pane = Container::new(
+            ChildView::new(&side_by_side.baseline_editor).finish(),
+        )
+        .with_corner_radius(CornerRadius::with_bottom(Radius::Pixels(8.)))
+        .with_background(theme.background())
+        .with_border(
+            Border::new(1.)
+                .with_sides(false, true, true, false)
+                .with_border_fill(theme.surface_3()),
+        )
+        .finish();
+
+        let right_pane = Container::new(
+            ChildView::new(&side_by_side.modified_editor).finish(),
+        )
+        .with_corner_radius(CornerRadius::with_bottom(Radius::Pixels(8.)))
+        .with_background(theme.background())
+        .with_border(
+            Border::new(1.)
+                .with_sides(false, false, true, true)
+                .with_border_fill(theme.surface_3()),
+        )
+        .finish();
+
+        Flex::row()
+            .with_child(Shrinkable::new(1., left_pane).finish())
+            .with_child(vertical_separator)
+            .with_child(Shrinkable::new(1., right_pane).finish())
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .finish()
+    }
+
+    /// Creates side-by-side editors for all expanded files.
+    fn create_side_by_side_editors_for_expanded_files(&mut self, ctx: &mut ViewContext<Self>) {
+        // Collect file paths that need side-by-side editors first,
+        // then create them to avoid borrow conflicts.
+        let paths_to_create: Vec<PathBuf> = {
+            let Some(repo) = self.active_repo.as_ref() else {
+                return;
+            };
+            let CodeReviewViewState::Loaded(state) = &repo.state else {
+                return;
+            };
+            state.file_states.iter()
+                .filter(|(_, f)| f.is_expanded && f.side_by_side_state.is_none() && !f.file_diff.is_binary)
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+
+        for path in paths_to_create {
+            // Create the editor pair (needs &self)
+            let editor_pair = {
+                let Some(repo) = self.active_repo.as_ref() else {
+                    break;
+                };
+                let CodeReviewViewState::Loaded(state) = &repo.state else {
+                    break;
+                };
+                let Some(file) = state.file_states.get(&path) else {
+                    continue;
+                };
+                self.create_side_by_side_editors(file, ctx)
+            };
+
+            // Now store it and set up scroll sync (needs &mut self)
+            if let Some(pair) = editor_pair {
+                // Subscribe baseline editor's ViewportUpdated → sync scroll to modified editor
+                let baseline_code_editor = pair.baseline_editor.as_ref(ctx).editor().clone();
+                let modified_handle = pair.modified_editor.clone();
+                let syncing = pair.syncing.clone();
+                ctx.subscribe_to_view(&baseline_code_editor, move |_this, editor, event, ctx| {
+                    if matches!(event, CodeEditorEvent::ViewportUpdated) && !syncing.get() {
+                        syncing.set(true);
+                        Self::sync_scroll_to_target(&editor, &modified_handle, ctx);
+                        syncing.set(false);
+                    }
+                });
+
+                if let Some(repo) = self.active_repo.as_mut() {
+                    if let CodeReviewViewState::Loaded(state) = &mut repo.state {
+                        if let Some(file) = state.file_states.get_mut(&path) {
+                            file.side_by_side_state = Some(pair);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Syncs scroll position from source editor to target editor proportionally.
+    /// Called when source editor's viewport is updated.
+    fn sync_scroll_to_target(
+        source: &ViewHandle<CodeEditorView>,
+        target: &ViewHandle<LocalCodeEditorView>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Read source scroll position
+        let source_view = source.as_ref(ctx);
+        let source_model = source_view.model.as_ref(ctx);
+        let source_render_handle = source_model.render_state().clone();
+        let source_render = source_render_handle.as_ref(ctx);
+        let source_vp = source_render.viewport();
+        let source_scroll_top = source_vp.scroll_top().as_f32();
+        let source_height = source_render.height().as_f32();
+        let source_viewport_h = source_vp.height().as_f32();
+
+        // Scrollable range = content height - viewport height
+        let source_scrollable = (source_height - source_viewport_h).max(0.0);
+        if source_scrollable <= 0.0 {
+            return;
+        }
+
+        // Compute scroll ratio (0.0 = top, 1.0 = bottom)
+        let ratio = (source_scroll_top / source_scrollable).clamp(0.0, 1.0);
+
+        // Apply proportional scroll to target via model update
+        let target_local = target.as_ref(ctx);
+        let target_code_editor = target_local.editor();
+        let target_code_ref = target_code_editor.as_ref(ctx);
+        let target_model_handle = target_code_ref.model.clone();
+
+        target_model_handle.update(ctx, |model, ctx| {
+            let render_state_handle = model.render_state().clone();
+            render_state_handle.update(ctx, |render_state, ctx| {
+                let target_height = render_state.height().as_f32();
+                let target_viewport_h = render_state.viewport().height().as_f32();
+                let target_scrollable = (target_height - target_viewport_h).max(0.0);
+                if target_scrollable > 0.0 {
+                    let target_scroll = Pixels::new(target_scrollable * ratio);
+                    let current = render_state.viewport().scroll_top();
+                    let delta = target_scroll - current;
+                    render_state.scroll(delta, ctx);
+                }
+            });
+        });
+    }
+
+    /// Reconstructs new file content from old content + diff hunks.
+    /// Used for deleted files where the new content isn't available on disk.
+    fn reconstruct_new_content(old_content: &str, hunks: &[DiffHunk]) -> String {
+        let old_lines: Vec<&str> = old_content.lines().collect();
+        let mut result = Vec::new();
+        let mut old_idx = 0;
+        for hunk in hunks {
+            let hunk_start = hunk.old_start_line.saturating_sub(1);
+            while old_idx < hunk_start && old_idx < old_lines.len() {
+                result.push(old_lines[old_idx]);
+                old_idx += 1;
+            }
+            for line in &hunk.lines {
+                match line.line_type {
+                    DiffLineType::Context => {
+                        result.push(line.text.as_str());
+                        old_idx += 1;
+                    }
+                    DiffLineType::Delete => {
+                        old_idx += 1;
+                    }
+                    DiffLineType::Add => {
+                        result.push(line.text.as_str());
+                    }
+                    DiffLineType::HunkHeader => {}
+                }
+            }
+        }
+        while old_idx < old_lines.len() {
+            result.push(old_lines[old_idx]);
+            old_idx += 1;
+        }
+        result.join("\n")
+    }
+
+    /// Creates the two editor views for side-by-side diff rendering.
+    fn create_side_by_side_editors(
+        &self,
+        file: &FileState,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<SideBySideEditorState> {
+        let repo_path = self.repo_path()?;
+
+        if file.file_diff.is_binary {
+            return None;
+        }
+
+        let old_content = file.content_at_head.as_deref().unwrap_or("");
+        let new_content = if matches!(file.file_diff.status, GitFileStatus::Deleted) {
+            Self::reconstruct_new_content(old_content, &file.file_diff.hunks)
+        } else {
+            let full_path = repo_path.join(&file.file_diff.file_path);
+            std::fs::read_to_string(&full_path).unwrap_or_else(|_| {
+                Self::reconstruct_new_content(old_content, &file.file_diff.hunks)
+            })
+        };
+
+        // Create baseline (left) editor
+        let baseline_editor = ctx.add_typed_action_view(|ctx| {
+            CodeEditorView::new(
+                None,
+                None,
+                CodeEditorRenderOptions::new(VerticalExpansionBehavior::InfiniteHeight)
+                    .lazy_layout()
+                    .line_height_override(CODE_REVIEW_EDITOR_LINE_HEIGHT_RATIO),
+                ctx,
+            )
+            .with_comment_button()
+            .with_collapsible_diffs(false)
+            .disable_diff_indicator_expansion_on_hover()
+            .with_gutter_hover_target(GutterHoverTarget::Line)
+            .disable_find_and_replace()
+        });
+
+        let full_file_path = repo_path.join(&file.file_diff.file_path);
+        baseline_editor.update(ctx, |editor, ctx| {
+            editor.set_language_with_path(&full_file_path, ctx);
+            editor.reset(InitialBufferState::plain_text(old_content), ctx);
+        });
+
+        let baseline_local = ctx.add_typed_action_view(|ctx| {
+            LocalCodeEditorView::new(baseline_editor, None, false, None, ctx)
+        });
+
+        // Create modified (right) editor
+        let modified_editor = ctx.add_typed_action_view(|ctx| {
+            CodeEditorView::new(
+                None,
+                None,
+                CodeEditorRenderOptions::new(VerticalExpansionBehavior::InfiniteHeight)
+                    .lazy_layout()
+                    .line_height_override(CODE_REVIEW_EDITOR_LINE_HEIGHT_RATIO),
+                ctx,
+            )
+            .with_comment_button()
+            .with_collapsible_diffs(false)
+            .disable_diff_indicator_expansion_on_hover()
+            .with_gutter_hover_target(GutterHoverTarget::Line)
+            .disable_find_and_replace()
+        });
+
+        modified_editor.update(ctx, |editor, ctx| {
+            editor.set_language_with_path(&full_file_path, ctx);
+            editor.reset(InitialBufferState::plain_text(&new_content), ctx);
+            editor.set_base(old_content, true, ctx);
+        });
+
+        let modified_local = ctx.add_typed_action_view(|ctx| {
+            LocalCodeEditorView::new(modified_editor, None, false, None, ctx)
+        });
+
+        Some(SideBySideEditorState {
+            baseline_editor: baseline_local,
+            modified_editor: modified_local,
+            syncing: Rc::new(Cell::new(false)),
+        })
     }
 
     fn revert_hunk_toast_id(&self, ctx: &mut ViewContext<Self>) -> String {
@@ -7218,6 +7533,11 @@ impl TypedActionView for CodeReviewView {
                     was_expanded
                 };
 
+                // When switching to SideBySide, create editors for the newly expanded file
+                if self.diff_layout.is_side_by_side() && !was_expanded {
+                    self.create_side_by_side_editors_for_expanded_files(ctx);
+                }
+
                 self.viewported_list_state
                     .invalidate_height_for_index(*file_index);
 
@@ -7242,6 +7562,20 @@ impl TypedActionView for CodeReviewView {
                     .as_ref()
                     .is_some_and(|h| h.is_maximized(ctx));
 
+                if is_currently_maximized {
+                    // Restoring: revert to saved layout
+                    if let Some(saved) = self.diff_layout_before_maximize.take() {
+                        self.diff_layout = saved;
+                    }
+                } else {
+                    // Maximizing: save current layout, switch to side-by-side
+                    if !self.diff_layout.is_side_by_side() {
+                        self.diff_layout_before_maximize = Some(self.diff_layout);
+                        self.diff_layout = DiffLayout::SideBySide;
+                        self.create_side_by_side_editors_for_expanded_files(ctx);
+                    }
+                }
+
                 let state_change = if is_currently_maximized {
                     PaneStateChange::Minimized
                 } else {
@@ -7254,6 +7588,18 @@ impl TypedActionView for CodeReviewView {
                 );
 
                 ctx.emit(CodeReviewViewEvent::Pane(PaneEvent::ToggleMaximized));
+            }
+
+            CodeReviewAction::ToggleDiffLayout => {
+                self.diff_layout = match self.diff_layout {
+                    DiffLayout::Inline => DiffLayout::SideBySide,
+                    DiffLayout::SideBySide => DiffLayout::Inline,
+                };
+                // When switching to SideBySide, create editors for expanded files
+                if self.diff_layout.is_side_by_side() {
+                    self.create_side_by_side_editors_for_expanded_files(ctx);
+                }
+                ctx.notify();
             }
             CodeReviewAction::SaveAllFiles { paths } => {
                 self.save_files(paths, ctx);

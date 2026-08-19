@@ -7,6 +7,7 @@ use warpui::elements::DropTargetData;
 use warpui::AppContext;
 
 pub mod buffer_location;
+pub mod diff_layout;
 pub mod diff_viewer;
 pub mod editor;
 pub mod editor_management;

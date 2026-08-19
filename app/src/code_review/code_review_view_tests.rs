@@ -254,6 +254,7 @@ impl TestContext {
                 diff_state_model,
                 code_review_comment_batch,
                 None,
+                false,
                 ctx,
             )
         });
@@ -303,6 +304,8 @@ fn create_loaded_state_with_editors(
                 discard_button,
                 add_context_button,
                 copy_path_button,
+                side_by_side_state: None,
+                content_at_head: None,
             };
             (file_path, state)
         })
