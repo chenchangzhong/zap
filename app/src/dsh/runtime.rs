@@ -24,10 +24,8 @@ use warpui::{Entity, ModelContext, SingletonEntity, WindowId};
 
 use super::bridge;
 
-/// dsh npm 包名。
+/// dsh npm 包名。版本动态取 registry latest，不再硬编码。
 const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh";
-/// 锁定的 dsh 版本(preview 阶段必须 pin,防止上游破坏性变更)。
-const DSH_VERSION: &str = "0.1.0-rc.6";
 /// 就绪探测超时(含首次安装)。
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// 就绪探测间隔。
@@ -340,7 +338,7 @@ impl DshRuntime {
     /// 启动前检查 dsh 是否有新版本。
     ///
     /// 返回 `Some(latest)` 当 registry 最新版与当前已安装版本(`version.txt`,
-    /// 未安装视为 `DSH_VERSION`)不一致;一致或查询失败返回 `None`。
+    /// 未安装视为需安装)不一致;一致或查询失败返回 `None`。
     /// 供启动流程在 spawn `start_future` 前调用,以决定是否提醒用户更新。
     pub async fn check_update_future() -> Option<String> {
         let latest = Self::query_latest_version().await?;
@@ -351,11 +349,10 @@ impl DshRuntime {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let installed = if installed.is_empty() {
-            DSH_VERSION.to_string()
-        } else {
-            installed
-        };
+        if installed.is_empty() {
+            log::info!("[dsh] no installed version, will install {latest}");
+            return Some(latest);
+        }
         if latest != installed {
             log::info!("[dsh] update available: {installed} -> {latest}");
             Some(latest)
@@ -527,7 +524,8 @@ impl DshRuntime {
     ///
     /// `target` 指定要安装的版本:
     /// - `Some(v)`:安装/更新到版本 v(启动前检测到新版本时传入)
-    /// - `None`:沿用已安装版本(`version.txt`),未安装时用 `DSH_VERSION`
+    /// - `None`:沿用已安装版本(`version.txt`),未安装时联网取 latest 安装;
+    ///   无网则 `bail`，上层 `start_future` 转 `Failed`，workspace 弹失败提示。
     async fn ensure_dsh_installed(node: &Path, target: Option<&str>) -> Result<PathBuf> {
         let data_dir = Self::dsh_data_dir()?;
         let dsh_dir = data_dir.join("dsh-install");
@@ -538,14 +536,22 @@ impl DshRuntime {
             .join("lib")
             .join("bin.js");
 
-        // 期望版本:target 优先;否则用已装版本;都没有则用编译期锁定版本。
+        // 期望版本:target 优先;否则已装版本;都没有则联网取 latest，无网失败。
         let want = match target {
             Some(v) => v.to_string(),
-            None => std::fs::read_to_string(dsh_dir.join("version.txt"))
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DSH_VERSION.to_string()),
+            None => {
+                let installed = std::fs::read_to_string(dsh_dir.join("version.txt"))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                if let Some(v) = installed {
+                    v
+                } else {
+                    Self::query_latest_version()
+                        .await
+                        .context("no installed dsh and failed to fetch latest version (offline?)")?
+                }
+            }
         };
 
         // 已安装且版本匹配则复用。
@@ -823,12 +829,7 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         assert_eq!(port_str, "63815");
     }
 
-    /// 版本常量必须与 npm 包一致(安装路径依赖它)。
-    #[test]
-    fn version_constant_is_parseable() {
-        assert!(DSH_VERSION.starts_with("0.1.0"));
-        assert!(DSH_VERSION.contains('-') || DSH_VERSION.split('.').count() == 3);
-    }
+    /// 已移除硬编码版本常量；启动时动态取 latest，无网且未安装则失败。
 
     /// set_workspace_dir / workspace_dir 存取与缺省。
     #[test]
