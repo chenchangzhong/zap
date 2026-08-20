@@ -27,6 +27,8 @@ pub enum BridgeEvent {
     },
     /// dsh 侧切换了当前项目目录(通知类,无回复)。
     SwitchProject { path: PathBuf },
+    /// dsh 侧请求在 Zap 打开文件浏览器到指定项目目录。
+    OpenFileExplorer { path: PathBuf },
     /// runtime 就绪,`url` 为 dsh Web UI 地址。
     Ready { url: String },
     /// 检测到 dsh 新版本,正在更新。
@@ -62,8 +64,6 @@ pub fn drain_events(ctx: &mut ModelContext<super::DshRuntime>) {
 }
 
 /// 处理浏览器端插件经 webview IPC 发来的 zap.* 消息。
-/// payload 格式: `"method\nid\nparams_json"`(由 zap-bridge-client.js 构造)。
-/// 返回事件供调用方立即 drain(确保 IPC 事件即时生效，不依赖下一帧绘制)。
 pub(crate) fn handle_zap_ipc(payload: &str) -> Option<BridgeEvent> {
     let mut parts = payload.splitn(3, '\n');
     let method = parts.next()?;
@@ -72,30 +72,42 @@ pub(crate) fn handle_zap_ipc(payload: &str) -> Option<BridgeEvent> {
     let params: Value =
         serde_json::from_str(params_json).unwrap_or(Value::Object(Default::default()));
 
-    match method {
-        "zap.switch_project" => {
-            let path = params.get("path").and_then(|p| p.as_str()).map(PathBuf::from)?;
-            // 路径校验:canonicalize + 存在性 + 目录检查。
-            let canonical = match path.canonicalize() {
-                Ok(p) => p,
-                Err(e) => {
-                    log::warn!("[dsh-bridge] IPC switch_project canonicalize failed: {e}");
-                    return None;
-                }
-            };
-            if !canonical.is_dir() {
-                log::warn!(
-                    "[dsh-bridge] IPC switch_project path is not a directory: {}",
-                    canonical.display()
-                );
+    fn canonical_dir(raw: &str, method: &str) -> Option<PathBuf> {
+        let path = PathBuf::from(raw);
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[dsh-bridge] IPC {method} canonicalize failed: {e}");
                 return None;
             }
+        };
+        if !canonical.is_dir() {
+            log::warn!(
+                "[dsh-bridge] IPC {method} path is not a directory: {}",
+                canonical.display()
+            );
+            return None;
+        }
+        Some(canonical)
+    }
+
+    match method {
+        "zap.switch_project" => {
+            let raw = params.get("path")?.as_str()?;
+            let canonical = canonical_dir(raw, "switch_project")?;
+            log::info!("[dsh-bridge] IPC SwitchProject path={}", canonical.display());
+            super::runtime::set_workspace_dir(canonical.clone());
+            Some(push_event(BridgeEvent::SwitchProject { path: canonical }))
+        }
+        "zap.open_file_explorer" => {
+            let raw = params.get("path")?.as_str()?;
+            let canonical = canonical_dir(raw, "open_file_explorer")?;
             log::info!(
-                "[dsh-bridge] IPC SwitchProject path={}",
+                "[dsh-bridge] IPC OpenFileExplorer path={}",
                 canonical.display()
             );
             super::runtime::set_workspace_dir(canonical.clone());
-            Some(push_event(BridgeEvent::SwitchProject { path: canonical }))
+            Some(push_event(BridgeEvent::OpenFileExplorer { path: canonical }))
         }
         "zap.notify" => {
             let title = params

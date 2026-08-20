@@ -2959,17 +2959,23 @@ impl Workspace {
                 });
             },
         );
-        // dsh 切项目时同步 badge 数据源。仅当 DshPane flag 开启时订阅
+        // dsh 切项目/打开文件浏览器。仅当 DshPane flag 开启时订阅
         // (DshRuntime singleton 由 lib.rs 在 flag 开启时注册;测试环境 flag
         // 关闭,避免未注册 singleton panic)。
         if FeatureFlag::DshPane.is_enabled() {
             ctx.subscribe_to_model(
                 &crate::dsh::DshRuntime::handle(ctx),
-                |me, _, event, ctx| {
-                    log::info!("[dsh-badge] DshRuntime event received: {:?}", event);
-                    if let crate::dsh::bridge::BridgeEvent::SwitchProject { path } = event {
+                |me, _, event, ctx| match event {
+                    crate::dsh::bridge::BridgeEvent::SwitchProject { path } => {
                         log::info!("[dsh-badge] SwitchProject path={}, has_dsh={}", path.display(), me.has_dsh_pane(ctx));
                         me.handle_dsh_switch_project(path.clone(), ctx);
+                    }
+                    crate::dsh::bridge::BridgeEvent::OpenFileExplorer { path } => {
+                        log::info!("[dsh-file-explorer] OpenFileExplorer path={}, has_dsh={}", path.display(), me.has_dsh_pane(ctx));
+                        me.handle_dsh_open_file_explorer(path.clone(), ctx);
+                    }
+                    _ => {
+                        log::debug!("[dsh] unhandled BridgeEvent: {:?}", event);
                     }
                 },
             );
@@ -12524,11 +12530,33 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         let pane_group_id = pane_group.id();
-        let terminal_cwds: Vec<(EntityId, String)> = pane_group
+        let mut terminal_cwds: Vec<(EntityId, String)> = pane_group
             .as_ref(ctx)
             .terminal_view_working_directories(ctx)
             .filter_map(|(id, cwd)| cwd.map(|c| (id, c)))
             .collect();
+        // dsh pane 非 terminal，但其 workspace_dir 需驱动文件浏览器。
+        // 以 pane_group_id 作稳定合成 id，避免 EntityId::new() 每帧新建
+        // 导致 WorkingDirectoriesModel 抖动；按仓库根去重避免同库双根
+        // 覆盖终端映射(下游会 canonicalize+get_root_for_path 归一)。
+        if FeatureFlag::DshPane.is_enabled() && pane_group.as_ref(ctx).dsh_panes().next().is_some() {
+            if let Some(dir) = crate::dsh::runtime::workspace_dir() {
+                let dir_str = dir.to_string_lossy().to_string();
+                let dsh_root = repo_metadata::repositories::DetectedRepositories::as_ref(ctx)
+                    .get_root_for_path(&dir)
+                    .unwrap_or_else(|| dir.clone());
+                let already_contains = terminal_cwds.iter().any(|(_, s)| {
+                    let p = std::path::PathBuf::from(s);
+                    let r = repo_metadata::repositories::DetectedRepositories::as_ref(ctx)
+                        .get_root_for_path(&p)
+                        .unwrap_or(p);
+                    r == dsh_root
+                });
+                if !already_contains {
+                    terminal_cwds.push((pane_group_id, dir_str));
+                }
+            }
+        }
         let code_local_paths: Vec<(EntityId, String)> = pane_group
             .as_ref(ctx)
             .code_view_local_paths(ctx)
@@ -19060,10 +19088,24 @@ impl Workspace {
                 },
             );
         });
-        // 初始化 dsh 项目的 git status 订阅（首次打开时没有 SwitchProject 事件触发）。
-        // 仅在有 DshPane 时才订阅，避免无 pane 时创建无用的 git watcher。
+        // 初始化 dsh 项目的 git status 订阅与文件浏览器（首次打开时无 SwitchProject）。
+        // 仅在有 DshPane 时才订阅，避免无 pane 时创建无用 watcher。
         if self.has_dsh_pane(ctx) {
             self.update_dsh_git_status_subscription(ctx);
+            // 文件浏览器跟随 dsh workspace_dir（首次打开即显示当前项目）。
+            if let Some(pane_group) = self
+                .tabs
+                .iter()
+                .find_map(|tab| {
+                    if tab.pane_group.as_ref(ctx).dsh_panes().next().is_some() {
+                        Some(tab.pane_group.clone())
+                    } else {
+                        None
+                    }
+                })
+            {
+                self.refresh_working_directories_for_pane_group(&pane_group, ctx);
+            }
         }
     }
 
@@ -19081,7 +19123,50 @@ impl Workspace {
         // 仅在有 DshPane 时才订阅，避免 pane 已关闭时创建无用的 git watcher。
         if self.has_dsh_pane(ctx) {
             self.update_dsh_git_status_subscription(ctx);
+            // 同步文件浏览器:注入 workspace_dir 到 WorkingDirectoriesModel。
+            if let Some(pane_group) = self
+                .tabs
+                .iter()
+                .find_map(|tab| {
+                    if tab.pane_group.as_ref(ctx).dsh_panes().next().is_some() {
+                        Some(tab.pane_group.clone())
+                    } else {
+                        None
+                    }
+                })
+            {
+                self.refresh_working_directories_for_pane_group(&pane_group, ctx);
+            }
         }
+    }
+
+    /// dsh 侧边栏项目行触发"打开文件浏览器"→ 同步选中目录并打开左侧文件树。
+    fn handle_dsh_open_file_explorer(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        crate::dsh::runtime::set_workspace_dir(path.clone());
+        if !self.has_dsh_pane(ctx) {
+            log::info!("[dsh-file-explorer] no DshPane, workspace_dir set for next pane path={}", path.display());
+            return;
+        }
+        log::info!("[dsh-file-explorer] handle path={}", path.display());
+        self.update_dsh_git_status_subscription(ctx);
+        if let Some(pane_group) = self
+            .tabs
+            .iter()
+            .find_map(|tab| {
+                if tab.pane_group.as_ref(ctx).dsh_panes().next().is_some() {
+                    Some(tab.pane_group.clone())
+                } else {
+                    None
+                }
+            })
+        {
+            self.refresh_working_directories_for_pane_group(&pane_group, ctx);
+        }
+        self.open_left_panel(ctx);
+        self.left_panel_view.update(ctx, |lp, ctx| {
+            lp.handle_action_with_force_open(&LeftPanelAction::ProjectExplorer, true, ctx);
+        });
+        ctx.notify();
     }
 
     /// 清除 dsh git status 订阅与右侧面板状态：解绑旧 handle 订阅（防止
