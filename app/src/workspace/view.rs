@@ -19148,8 +19148,6 @@ impl Workspace {
                             crate::code_review::git_status_update::GitRepoStatusEvent::MetadataChanged
                         ) {
                             ctx.notify();
-                            #[cfg(target_os = "macos")]
-                            warpui::platform::mac::Window::request_redraw_all_windows();
                         }
                     });
                     self.dsh_git_status = Some(handle);

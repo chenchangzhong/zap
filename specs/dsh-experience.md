@@ -6,13 +6,13 @@
 
 - dsh 独立 web pane（webview），内多项目随意切，`sessions/workspaces` 快照权威 `cwd`。
 - Zap 侧单 pane 窗口，`Workspace.dsh_git_status: Option<ModelHandle<GitRepoStatusModel>>` 自持数据源，不依赖 terminal。
-- 已去 `local_fs` 门控（`RightPanelView/dsh_repo` 全量开放），`crates/warpui` 合成探针为另案边界。
+- 已去 `local_fs` 门控（`RightPanelView/dsh_repo` 全量开放），`crates/warpui` 合成 B 探已定点 `notify→present` 自动。
 
 ## 2. 通信（IPC-only，WebSocket 已删）
 
 - 客户端：`@zap/zap-bridge-client`（目录 `@zap/`，`package.json name zap-bridge-client` 无 scope，`cordis.patch.yml name: '@zap/zap-bridge-client'` 包名、`require.resolve('<name>/package.json')`）。
 - `window.__ModuleLoader__.load({id:"@zap/zap-bridge-client", inject:["sessions","workspaces"]})`，`subscribe reportCurrentPath -> currentWorkspacePath(cwd) -> zapRpc('zap.switch_project')`，`lastReportedPath` 去重，`pendingRequests Map`。
-- Rust：`browser_web_view.rs` `DSH_WEBVIEW_IDS` 白名单，`body.strip_prefix("zap:")` 验 id -> `handle_zap_ipc(payload method\nid\nparams_json)`，`canonicalize+is_dir` 校验 -> `set_workspace_dir` -> `push_event(SwitchProject)` -> `request_redraw_all_windows()`。
+- Rust：`browser_web_view.rs` `DSH_WEBVIEW_IDS` 白名单，`body.strip_prefix("zap:")` 验 id -> `handle_zap_ipc(payload method\nid\nparams_json)`，`canonicalize+is_dir` 校验 -> `set_workspace_dir` -> `push_event(SwitchProject)` -> `request_redraw_all_windows()`（首跳排帧，push 需触发 drain）。
 - `bridge.rs` `PENDING_EVENTS LazyLock<Mutex<Vec<BridgeEvent>>> {Notify,SwitchProject,Ready,Updating,Restarted,Failed}`，`lib.rs on_frame_drawn drain_events -> ModelContext::emit`，`has_pending_events` fallback `window.request_redraw()`。
 - `runtime.rs install_client_plugin(dsh_home)` 写 `node_modules/@zap/zap-bridge-client/{index.js,client.js,package.json}` + `profiles/web/cordis.patch.yml`。
 - 坑：`name: '.../index.js'` 文件路径 `require.resolve FAIL` 静默不入表；`id` 必须 `@zap/zap-bridge-client`；`evaluate_script_on` wry borrow 闪退 -> 静写 cordis。
@@ -21,10 +21,10 @@
 ## 3. badge 实时刷新
 
 - 基线 `render_right_panel_button:16148` 原只读 `active_session_view.current_diff_line_changes`，dsh 无 terminal -> None。
-- 本改：`Workspace.dsh_git_status` + `update_dsh_git_status_subscription`，`GitStatusUpdateModel::subscribe(&dir)` + `canonicalize(repo_path)==dir` 防父 repo 残留，`subscribe ok -> refresh_metadata`（缓存命中补刷）-> `subscribe_to_model MetadataChanged -> ctx.notify + request_redraw_all_windows`。
+- 本改：`Workspace.dsh_git_status` + `update_dsh_git_status_subscription`，`GitStatusUpdateModel::subscribe(&dir)` + `canonicalize(repo_path)==dir` 防父 repo 残留，`subscribe ok -> refresh_metadata`（缓存命中补刷）-> `subscribe_to_model MetadataChanged -> ctx.notify`（`notify` 即 `present`，B 已去冗余 `request_redraw`）。
 - 判定：`is_dsh_active = active_tab_pane_group().dsh_panes().next().is_some()` pane-group 级（分栏 dsh+terminal 焦点 terminal 也跟 dsh），`dsh_line_changes.filter>0` 独占，不 `or(tv)`（防非 git 串 terminal 数）。
-- 订阅生命周期：`clear_dsh_git_status` helper `take old -> unsubscribe_to_model(&old) -> set_dsh_repo(None)`，`repo_matches` 前 `take` 去重（缓存同 handle 多次 subscribe 累加，多次 notify/request_redraw）。
-- `on_frame_drawn` 首帧 `request_redraw_all_windows` 被 drain 消耗，第二帧 `MetadataChanged notify` 再 `request_redraw` 需补，否则空档 `notify != present`，hover 才 `CATransaction` 提交。终端靠 `TerminalViewStateChanged` 心跳掩盖，dsh 空闲暴露。
+- 订阅生命周期：`clear_dsh_git_status` helper `take old -> unsubscribe_to_model(&old) -> set_dsh_repo(None)`，`repo_matches` 前 `take` 去重（缓存同 handle 多次 subscribe 累加，多次 notify）。
+- 初：`on_frame_drawn` 首帧 `request_redraw_all_windows` 被 drain 消耗，第二帧 `MetadataChanged notify` 再 `request_redraw` 补，否则空档 `notify != present` hover 才 `CATransaction`。B 后第二跳无需补，`notify`自动`present`。
 - 验证：`zap.log MetadataChanged×4` `subscribe ok 3192` `Set available_branches 4`，切 `zap <-> dsh-plugins(非git) <-> zap` 无 hover 即刷。
 
 ## 4. 面板非 git 提示
@@ -40,7 +40,7 @@
 
 - `ctx.notify()` dirty Workspace 已 render，但 `CAMetalLayer presentDrawable` 未提交，空闲无 `DisplayLink` 便车。
 - 已试全败回滚：`postEvent/JS动画/全量view失效/host_view displayLayer/setNeedsDisplay dispatch_async/browser动画/focus递归/update_windows_called/[self displayIfNeeded]->NSWindow drawRect空+DuringViewResize+Metal` 闪退。
-- 本轮：`ipc后 request_redraw + MetadataChanged后 request_redraw` 二跳闭合，`lib.rs` `on_frame_drawn` `has_pending fallback` 兜底。
+- 本轮初 `ipc后 request_redraw + MetadataChanged后 request_redraw` 二跳，B 根治后 `MetadataChanged` 仅 `notify`，首跳 `request_redraw` 保留以触发 `drain_events`，`has_pending` 兜底可删。
 - `crash_recovery` 原 `user_is_logged_in` 分支注册 `on_frame_drawn`（覆盖式单回调），合并到 `BrowserPane||DshPane` 门控致登录态丢失 -> 改无条件注册单回调，内分支 `if user_is_logged_in { crash_recovery }` + `if BrowserPane||DshPane { webview/dsh }`，`move` 捕获 `user_is_logged_in bool`。
 
 ## 6. 上游与门控
@@ -79,7 +79,7 @@
 | R2 | badge 误串：dsh 非 git 仍 `+N/-N` 另一仓库 | `dsh.or(tv)` fallback 退 terminal | 改 `is_dsh_active` 独占分支（group 级 `dsh_panes().next()`） | 切 `dsh-plugins` 无 badge |
 | R3 | 面板 `Cannot detect`：`get_or_create None` → return 未选 | `set_dsh_repo None` 回退未 `set_selected` | 设 `dsh_repo_path` + `render filter` 放行 + `is_dsh` 跳 `has_active_repos` | 切 zap 面板正常 |
 | R4 | 切非 git 误清用户手选普通 repo | `set_dsh_repo(None)` 无条件 `selected=None` | 仅 `selected==old_dsh` 才清 | 后台失败不误伤 |
-| R5 | badge 不实时：数据通但不上屏，hover 才刷 | `notify != present`，第二帧无 `request_redraw` | `MetadataChanged` 回调 `ctx.notify + request_redraw_all_windows` + `ipc后 request_redraw` 二跳 | 无 hover 即刷 |
+| R5 | badge 不实时：数据通但不上屏，hover 才刷 | `notify != present`，第二帧无 `request_redraw` | **workaround**：`MetadataChanged ctx.notify+request_redraw_all_windows`+`ipc后 request_redraw`二跳通；**B 根治**：`warpui_core ViewContext::notify→pending_effects→notify_view_observers→window_invalidations→flush_effects→update_windows→on_window_invalidated→window.request_redraw`自动，删回调内手工 `request_redraw_all_windows`冗余，仅`ctx.notify`即`present` | 无 hover 即刷 |
 | R6 | 面板点按钮仍 `非git`：`setup_code_review_panel` 无 terminal → `close` | `context_data None -> close_code_review` | 回退 `dsh_repo_path` 建 view，`diff_state None` 不 close | 点按钮面板正常 |
 | R7 | 首次打开 dsh 无 SwitchProject → 无订阅 | `open_dsh_pane` 闭包后未补 | 补 `update_dsh_git_status_subscription` | 首载即有 |
 | R8 | 父 repo 污染：subscribe 返回父仓库 model | `subscribe` 可返回父 git 仓库 | `canonicalize(repo_path)==dir` 校验，不等则 `clear` | 非 git 失败符合预期 |
@@ -91,7 +91,7 @@
 | `postEvent` 合成事件 | 无 | — |
 | JS 动画 / 全量 view 失效 / `host_view displayLayer` / `setNeedsDisplay:YES` / `dispatch_async` / browser 动画 / focus 递归 / `update_windows_called` | 无 | — |
 | `[self displayIfNeeded]` → `NSWindow drawRect 空 + DuringViewResize + Metal` | **闪退**，`python /tmp/revert_inject.py` 收敛 | 不碰 `WarpWindow displayIfNeeded` |
-| 结论 | 全闪退，用户确认 `crates/warpui/**` 不在计划，数据正确为前提，合成另案 | 本轮用 `request_redraw` 二跳+`has_pending` 兜底通 |
+| 结论 | 全闪退，用户确认 `crates/warpui/**` 不在计划，数据正确为前提，合成另案 | 本轮先`request_redraw`二跳+`has_pending`兜底通，B探后确认`notify→present`自动，删workaround，`notify`即`present` |
 
 ### 8.4 通信链路
 
@@ -122,14 +122,18 @@
 - `git checkout -- .` 丢 working tree（无 stash），含 dsh badge 整段，177 行 PLAN 重建
 - Watcher 验证缺口：从未 `touch` 文件看 badge 上屏
 - `zap-bridge.ts` 旧 56/-187 行批改在 topic 外
-- 上层合成 `CAMetalLayer present` 缺口未动，属 `crates/warpui/**`，`notify_windows/displayLink/metal present` 另案探
 
-## 9. 风险与下一步
+## 9. B 探根治
 
-- 合成 `notify->present` 缺口探针 `warpui_core notify_windows/displayLink/metal present` 待另案定 p。
-- `get_or_create_diff_state_model` 恒 Some，不 close 兜底保留。
+- 定点 `warpui_core/src/core/view/context.rs:452 notify→app.pending_effects ViewNotification`→`app.rs:3826 notify_view_observers→window_invalidations`→`3205 update_windows→invalidation_callbacks→platform window.request_redraw()`。`notify`已自动排帧，无需手工。
+- 已删 `MetadataChanged`内`request_redraw_all_windows`冗余；`lib.rs has_pending`兜底可删，或保留无害。
+- 改动：`view.rs` 1行删 + `lib.rs crash_recovery`无条件单回调（`move`捕获`user_is_logged_in`）。
+
+## 10. 风险与下一步
+
+- 合成已根治：`notify`自动`present`，`request_redraw`仅首跳保留，无另案。
 - 下一步：面板多项目历史/通知 `BridgeEvent::Notify` 入 `NotificationsModel` 已通，侧边多 dsh 扩展另案。
 
-## 10. 修订
+## 11. 修订
 
 - 2026-08-20 订阅去重 + 关 pane 不误伤 + badge group 判定 + setup 回退 + 双 notify 去冗 + lib 合并 + 右面板去 local_fs。
