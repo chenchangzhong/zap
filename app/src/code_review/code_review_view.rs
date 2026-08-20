@@ -1365,17 +1365,31 @@ impl CodeReviewView {
             if !self.file_sidebar_expanded {
                 self.open_file_sidebar(ctx);
                 self.update_file_nav_button_tooltip(ctx);
-                ctx.notify();
             }
+
+            // Switch to side-by-side diff layout
+            if !self.diff_layout.is_side_by_side() {
+                self.diff_layout_before_maximize = Some(self.diff_layout);
+                self.diff_layout = DiffLayout::SideBySide;
+                self.create_side_by_side_editors_for_expanded_files(ctx);
+            }
+
+            ctx.notify();
         } else if !is_maximized {
             if let Some(was_expanded) = self.file_sidebar_expanded_before_maximize.take() {
                 // Transitioning to minimized: restore saved sidebar state
                 if self.file_sidebar_expanded != was_expanded {
                     self.file_sidebar_expanded = was_expanded;
                     self.update_file_nav_button_tooltip(ctx);
-                    ctx.notify();
                 }
             }
+
+            // Restore diff layout
+            if let Some(saved) = self.diff_layout_before_maximize.take() {
+                self.diff_layout = saved;
+            }
+
+            ctx.notify();
         }
     }
 
@@ -7575,6 +7589,8 @@ impl TypedActionView for CodeReviewView {
                         self.create_side_by_side_editors_for_expanded_files(ctx);
                     }
                 }
+
+                ctx.notify();
 
                 let state_change = if is_currently_maximized {
                     PaneStateChange::Minimized

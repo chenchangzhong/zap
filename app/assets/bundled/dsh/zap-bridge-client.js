@@ -16,7 +16,7 @@
 // 如 "/Users/zhong/project/dsh-plugins");`workspaceId` 不在 summary 上,故
 // 用 cwd 直接作项目目录,并回退到 workspace 列表按 sessionIds 反查。
 window.__ModuleLoader__.load({
-	id: "zap-bridge-client",
+	id: "@zap/zap-bridge-client",
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;

@@ -455,8 +455,12 @@ impl DshRuntime {
         // 2. 定位/安装 dsh。
         let dsh_cli = Self::ensure_dsh_installed(&node, target.as_deref()).await?;
 
-        // 3. 启动 `dsh web --port 0`(带桥插件注入)。
+        // 3. 启动 `dsh web --port 0`(带客户端插件注入)。
         let dsh_home = Self::dsh_data_dir()?;
+        // 注入 zap-bridge-client 浏览器端插件(经 webview IPC 发项目切换通知)。
+        if let Err(err) = Self::install_client_plugin(&dsh_home) {
+            log::warn!("[dsh] install_client_plugin failed: {err}");
+        }
         let mut cmd = Command::new(&node);
         // command crate 默认 stdout/stderr = null;dsh web 对 null/socket 无效
         // stdout 会启动即退出(exit 1)。重定向到文件(正常可写目标),顺带留日志。
@@ -468,12 +472,6 @@ impl DshRuntime {
             .arg("--port")
             .arg("0")
             .env("DSH_HOME", &dsh_home);
-        // 桥插件注入:写 profile patch 层(cordis.patch.yml),dsh web 启动时应用。
-        if let Some((port, token)) = bridge::bridge_info() {
-            cmd.env("ZAP_BRIDGE_ADDRESS", format!("ws://127.0.0.1:{port}"));
-            Self::write_bridge_config(&dsh_home, port, &token)?;
-            log::info!("[dsh] bridge plugin injected via cordis.patch.yml (port {port})");
-        }
         // dsh 会话工作目录 = Zap 当前项目目录。dsh 的 workspaceRoot 取
         // process.cwd(),故设子进程 cwd(默认 agent preset standard 不读
         // DSH_CWD,仅 minimal 用;设 current_dir 两者皆正确)。
@@ -598,26 +596,30 @@ impl DshRuntime {
         Ok(cli_js)
     }
 
-    /// 生成 cordis.yml(注入 zap-bridge 插件),返回 patch 文件路径。
-    ///
-    /// 插件文件(`<dsh_home>/zap-bridge.ts`)尚未就绪时返回 `None`(降级:
-    /// 不带 `--patch` 启动,避免 dsh 指向缺失文件)。
-    fn write_bridge_config(dsh_home: &Path, port: u16, token: &str) -> Result<()> {
-        // 编译期嵌入插件源码,而非运行时读 manifest 路径(该路径打包后用户机
-        // 上不存在,会导致发布场景静默缺失插件)。include_str 保证每次构建把
-        // 最新插件写进 DSH_HOME。
-        const PLUGIN_SOURCE: &str = include_str!("../../assets/bundled/dsh/zap-bridge.ts");
-        let plugin_ts = dsh_home.join("zap-bridge.ts");
-        std::fs::write(&plugin_ts, PLUGIN_SOURCE)?;
-        log::info!("[dsh] extracted zap-bridge.ts to {}", plugin_ts.display());
-        // rc.6 的 `web --patch` 无效(unknown option);插件经 profile 用户
-        // patch 层 `profiles/web/cordis.patch.yml` 注入(dsh web 启动时应用)。
+    /// 注入 zap-bridge-client 浏览器端插件到 dsh 并注册 cordis patch。
+    /// 客户端插件经 webview IPC 发项目切换通知给 Zap。
+    fn install_client_plugin(dsh_home: &Path) -> Result<()> {
+        // 1. 写入客户端插件文件到 DSH_HOME/node_modules。
+        let node_modules = dsh_home.join("node_modules").join("@zap").join("zap-bridge-client");
+        std::fs::create_dir_all(&node_modules)?;
+        const CLIENT_INDEX: &str = include_str!("../../assets/bundled/dsh/zap-bridge-client-index.js");
+        const CLIENT_JS: &str = include_str!("../../assets/bundled/dsh/zap-bridge-client.js");
+        const CLIENT_PKG: &str = include_str!("../../assets/bundled/dsh/zap-bridge-client-package.json");
+        std::fs::write(node_modules.join("index.js"), CLIENT_INDEX)?;
+        std::fs::write(node_modules.join("client.js"), CLIENT_JS)?;
+        std::fs::write(node_modules.join("package.json"), CLIENT_PKG)?;
+        log::info!("[dsh] installed zap-bridge-client to {}", node_modules.display());
+        // 2. 写入 cordis.patch.yml 注册客户端插件(dsh web 启动时加载)。
         let patch_dir = dsh_home.join("profiles").join("web");
         std::fs::create_dir_all(&patch_dir)?;
+        // patch 行 name 必须是包名:client-modules 用
+        // `require.resolve('<name>/package.json')` 解析 client 声明,
+        // 文件路径无法解析会导致 entry 静默不入表、客户端插件永不加载。
         let content = format!(
-            "- insert:\n    - id: zap-bridge\n      name: '{}'\n      config:\n        bridgeAddress: 'ws://127.0.0.1:{port}'\n        token: '{}'\n",
-            plugin_ts.display(),
-            token
+            "- insert:
+    - id: zap-bridge-client
+      name: '@zap/zap-bridge-client'
+"
         );
         std::fs::write(patch_dir.join("cordis.patch.yml"), content)?;
         Ok(())
@@ -791,21 +793,8 @@ impl DshRuntime {
     }
 }
 
-/// DshRuntime 对外事件。
-#[derive(Debug, Clone)]
-pub enum DshRuntimeEvent {
-    /// runtime 就绪,`url` 为 dsh Web UI 地址。
-    Ready { url: String },
-    /// 检测到 dsh 新版本,正在更新(提醒用户后自动继续启动)。
-    Updating { version: String },
-    /// 崩溃后自动重启完成(仅通知已有 pane 导航,不自动开新 pane)。
-    Restarted { url: String },
-    /// 启动/重启失败,或连续崩溃超过上限放弃重启。
-    Failed { error: String },
-}
-
 impl Entity for DshRuntime {
-    type Event = DshRuntimeEvent;
+    type Event = super::bridge::BridgeEvent;
 }
 
 impl SingletonEntity for DshRuntime {}
@@ -841,24 +830,6 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         assert!(DSH_VERSION.contains('-') || DSH_VERSION.split('.').count() == 3);
     }
 
-    /// 生成 cordis.patch.yml:内容含 id/桥地址/token/插件绝对路径。
-    #[test]
-    fn write_bridge_config_generates_patch() {
-        let dir = std::env::temp_dir().join(format!("dsh-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("zap-bridge.ts"), "// zap-bridge").unwrap();
-
-        DshRuntime::write_bridge_config(&dir, 54321, "t0k3n").unwrap();
-        let patch = dir.join("profiles").join("web").join("cordis.patch.yml");
-        let content = std::fs::read_to_string(&patch).unwrap();
-        assert!(content.contains("id: zap-bridge"));
-        assert!(content.contains("bridgeAddress: 'ws://127.0.0.1:54321'"));
-        assert!(content.contains("token: 't0k3n'"));
-        assert!(content.contains(&format!("name: '{}'", dir.join("zap-bridge.ts").display())));
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// set_workspace_dir / workspace_dir 存取与缺省。
     #[test]
     fn workspace_dir_set_and_get() {
@@ -885,19 +856,6 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
         // 复位默认。
         TERMINAL_CONTEXT_ENABLED.store(false, Ordering::Relaxed);
     }
-    #[test]
-    fn write_bridge_config_extracts_source() {
-        let dir = std::env::temp_dir().join(format!("dsh-cfg-src-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // dsh_home 无插件文件 → 从源码提取。
-        DshRuntime::write_bridge_config(&dir, 54322, "t0k3n2").unwrap();
-        assert!(dir.join("zap-bridge.ts").is_file(), "plugin extracted to dsh_home");
-        let patch = dir.join("profiles").join("web").join("cordis.patch.yml");
-        let content = std::fs::read_to_string(&patch).unwrap();
-        assert!(content.contains(&format!("name: '{}'", dir.join("zap-bridge.ts").display())));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// 端到端冒烟:真实启动 dsh runtime(需网络安装 dsh,首次较慢)。
     /// 验证:启动成功、URL 可访问、子进程可停止。
     #[test]

@@ -326,17 +326,15 @@ pub struct RightPanelView {
     resizable_state_handle: ResizableStateHandle,
     close_button_mouse_state: MouseStateHandle,
     file_navigation_button_mouse_state: MouseStateHandle,
-    #[cfg(feature = "local_fs")]
     open_repository_button: ViewHandle<ActionButton>,
     pub active_pane_group: Option<ViewHandle<PaneGroup>>,
-    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     working_directories_model: ModelHandle<WorkingDirectoriesModel>,
     maximize_button: ViewHandle<ActionButton>,
     code_review_state: Option<CodeReviewState>,
-    #[cfg(feature = "local_fs")]
     code_review_session_env: Option<CodeReviewSessionEnv>,
     is_agent_management_view_open: bool,
     panel_position: super::PanelPosition,
+    dsh_repo_path: Option<PathBuf>,
 }
 
 impl RightPanelView {
@@ -368,12 +366,7 @@ impl RightPanelView {
                 resizable_state_handle(600.0)
             }
         };
-
-        let code_review_state = if cfg!(feature = "local_fs") {
-            Some(CodeReviewState::new(ctx))
-        } else {
-            None
-        };
+        let code_review_state = Some(CodeReviewState::new(ctx));
 
         ctx.subscribe_to_model(&working_directories_model, move |me, _, event, ctx| {
             me.handle_working_directories_event(event, ctx)
@@ -409,7 +402,6 @@ impl RightPanelView {
             button
         });
 
-        #[cfg(feature = "local_fs")]
         let open_repository_button = ctx.add_typed_action_view(|_| {
             ActionButton::new(
                 crate::t!("workspace-right-panel-open-repository"),
@@ -425,16 +417,15 @@ impl RightPanelView {
             resizable_state_handle,
             close_button_mouse_state: Default::default(),
             file_navigation_button_mouse_state: Default::default(),
-            #[cfg(feature = "local_fs")]
             open_repository_button,
             active_pane_group: None,
             working_directories_model,
             maximize_button,
             code_review_state,
-            #[cfg(feature = "local_fs")]
             code_review_session_env: None,
             is_agent_management_view_open: false,
             panel_position: super::PanelPosition::Right,
+            dsh_repo_path: None,
         }
     }
 
@@ -461,6 +452,10 @@ impl RightPanelView {
     ) {
         self.code_review_session_env = Some(CodeReviewSessionEnv { is_remote, is_wsl });
         ctx.notify();
+    }
+
+    pub fn dsh_repo_path(&self) -> Option<&PathBuf> {
+        self.dsh_repo_path.as_ref()
     }
 
     pub fn selected_repo_path(&self) -> Option<&PathBuf> {
@@ -601,13 +596,46 @@ impl RightPanelView {
         ctx.notify();
     }
 
-    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
-    /// Will only update repo_path if one is not already set
+    pub fn set_dsh_repo(&mut self, repo: Option<PathBuf>, ctx: &mut ViewContext<Self>) {
+        let old = self.dsh_repo_path.clone();
+        self.dsh_repo_path = repo.clone();
+        match repo {
+            Some(repo_path) => {
+                if let Some(o) = old { if o != repo_path { if let Some(pg) = &self.active_pane_group { self.close_code_review_view(pg.id(), &o, ctx); } } }
+                if let Some(s) = &mut self.code_review_state { s.set_selected_repo(repo_path.clone(), ctx); }
+                let m = self.working_directories_model.update(ctx, |mm, ctx| mm.get_or_create_diff_state_model(repo_path.clone(), ctx));
+                let Some(m) = m else { ctx.notify(); return; };
+                if self.active_pane_group.is_none() { ctx.notify(); return; }
+                self.open_code_review(Some(repo_path), m, None, true, ctx);
+            }
+            None => {
+                // 仅当当前选中的 repo 就是刚清除的 dsh repo（old）时才关闭并清空，
+                // 避免后台订阅失败误伤用户手动选中的普通仓库。
+                let selected = self
+                    .code_review_state
+                    .as_ref()
+                    .and_then(|s| s.selected_repo_path.clone());
+                if let Some(selected) = selected {
+                    if old.as_ref() == Some(&selected) {
+                        if let Some(pg) = &self.active_pane_group {
+                            self.close_code_review_view(pg.id(), &selected, ctx);
+                        }
+                        if let Some(s) = &mut self.code_review_state {
+                            s.selected_repo_path = None;
+                        }
+                    }
+                }
+                ctx.notify();
+            }
+        }
+    }
+
     pub fn open_code_review(
         &mut self,
         repo_path: Option<PathBuf>,
         diff_state_model: ModelHandle<DiffStateModel>,
-        terminal_view: WeakViewHandle<TerminalView>,
+        terminal_view: Option<WeakViewHandle<TerminalView>>,
+        is_dsh: bool,
         ctx: &mut ViewContext<Self>,
     ) {
         let Some(repo_dropdown_state) = &mut self.code_review_state else {
@@ -619,17 +647,18 @@ impl RightPanelView {
         };
         let pane_group_id = active_pane_group.id();
 
-        if repo_dropdown_state.selected_repo_path.is_none() {
+        if is_dsh || repo_dropdown_state.selected_repo_path.is_none() {
             repo_dropdown_state.set_selected_repo(repo_path.clone(), ctx);
         }
-        // Check if we already have a cached CodeReviewView
         let working_directories_model = self.working_directories_model.clone();
         let existing_view = working_directories_model
             .as_ref(ctx)
             .get_code_review_view(pane_group_id, repo_path);
         if let Some(view) = existing_view {
             view.update(ctx, |view, ctx| {
-                view.set_terminal_view(terminal_view);
+                if let Some(tv) = &terminal_view {
+                    view.set_terminal_view(tv.clone());
+                }
                 view.on_open(Some(repo_path.clone()), ctx);
             });
             self.recompute_terminal_availability(ctx);
@@ -638,6 +667,7 @@ impl RightPanelView {
             diff_state_model.clone(),
             pane_group_id,
             terminal_view.clone(),
+            is_dsh,
             ctx,
         ) {
             view.update(ctx, |view, ctx| {
@@ -781,8 +811,7 @@ impl RightPanelView {
         let selected_repo_path = state
             .selected_repo_path
             .as_ref()
-            .filter(|repo_path| state.available_repos.contains(repo_path));
-
+            .filter(|repo_path| state.available_repos.contains(repo_path) || Some(*repo_path) == self.dsh_repo_path.as_ref());
         let Some(selected_repo_path) = selected_repo_path else {
             let simple_header = self.render_simple_header(close_button);
 
@@ -1111,20 +1140,20 @@ impl RightPanelView {
         repo_path: &Path,
         diff_state_model: ModelHandle<DiffStateModel>,
         pane_group_id: EntityId,
-        terminal_view: WeakViewHandle<TerminalView>,
+        terminal_view: Option<WeakViewHandle<TerminalView>>,
+        is_dsh: bool,
         ctx: &mut ViewContext<Self>,
     ) -> Option<ViewHandle<CodeReviewView>> {
-        // Early check: if pane group has no active repositories, don't create a view
-        let has_active_repos = self
-            .working_directories_model
-            .as_ref(ctx)
-            .most_recent_repositories_for_pane_group(pane_group_id)
-            .is_some_and(|repos| repos.count() > 0);
-
-        if !has_active_repos {
-            return None;
+        if !is_dsh {
+            let has_active_repos = self
+                .working_directories_model
+                .as_ref(ctx)
+                .most_recent_repositories_for_pane_group(pane_group_id)
+                .is_some_and(|repos| repos.count() > 0);
+            if !has_active_repos {
+                return None;
+            }
         }
-
         let diff_state_model_clone = diff_state_model.clone();
         let code_review_comment_batch =
             self.working_directories_model
@@ -1136,8 +1165,8 @@ impl RightPanelView {
                 Some(repo_path.to_path_buf()),
                 diff_state_model_clone,
                 code_review_comment_batch,
-                Some(terminal_view),
-                false,
+                terminal_view.clone(),
+                is_dsh,
                 ctx,
             )
         });
@@ -1625,7 +1654,8 @@ impl RightPanelView {
                         repo_path,
                         diff_state_model,
                         pane_group_id,
-                        terminal_view.downgrade(),
+                        Some(terminal_view.downgrade()),
+                        false,
                         ctx,
                     ) {
                         if is_panel_open {

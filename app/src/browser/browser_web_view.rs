@@ -29,6 +29,12 @@ pub(crate) static PENDING_WEBVIEW_FOCUS_EVENTS: std::sync::LazyLock<
     Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
+/// DSH 插件 webview ID 集合。只有在此集合中的 webview 才允许发送 `zap:` IPC 消息。
+/// 由 DshPane 创建 webview 时注册,webview 销毁时移除。
+pub(crate) static DSH_WEBVIEW_IDS: std::sync::LazyLock<
+    Mutex<std::collections::HashSet<u64>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
 /// webview 相关事件,经 singleton model 分发给各 BrowserPane。
 #[derive(Debug, Clone)]
 pub enum BrowserWebViewEvent {
@@ -84,6 +90,16 @@ impl BrowserWebViewManager {
     /// 分配一个唯一的 platform-view id,供新 webview 使用。
     pub fn allocate_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// 注册 webview ID 为 DSH 插件,允许发送 `zap:` IPC 消息。
+    pub fn register_dsh_webview(id: u64) {
+        DSH_WEBVIEW_IDS.lock().insert(id);
+    }
+
+    /// 注销 DSH webview ID。
+    pub fn unregister_dsh_webview(id: u64) {
+        DSH_WEBVIEW_IDS.lock().remove(&id);
     }
 
     /// 在 `window` 的 contentView 内创建 id 对应的 webview,初始位置 `rect`。
@@ -229,6 +245,20 @@ setInterval(() => {
                         warpui::platform::mac::Window::open_url(url);
                     } else {
                         log::warn!("[browser] webview {ipc_id} skip non-openable url: {url}");
+                    }
+                    return;
+                }
+                // dsh 插件 IPC:zap.switch_project 等通知。
+                // 仅允许已注册的 DSH webview 发送 zap: 消息。
+                if let Some(payload) = body.strip_prefix("zap:") {
+                    if DSH_WEBVIEW_IDS.lock().contains(&ipc_id) {
+                        crate::dsh::bridge::handle_zap_ipc(payload);
+                        // 推送事件后强制重绘，确保 on_frame_drawn → drain_events 执行。
+                        // IPC 在事件循环空闲期到达时，on_frame_drawn 不会自然触发。
+                        #[cfg(target_os = "macos")]
+                        warpui::platform::mac::Window::request_redraw_all_windows();
+                    } else {
+                        log::warn!("[browser] webview {ipc_id} rejected zap: IPC (not a DSH pane)");
                     }
                     return;
                 }
@@ -384,6 +414,14 @@ setInterval(() => {
             let _ = entry
                 .webview
                 .evaluate_script("window.__restoreFocused && window.__restoreFocused();");
+        }
+    }
+
+    /// 在指定 webview 中执行 JavaScript。
+    pub fn evaluate_script_on(&self, id: u64, script: &str) {
+        #[cfg(target_os = "macos")]
+        if let Some(entry) = self.webviews.borrow().get(&id) {
+            let _ = entry.webview.evaluate_script(script);
         }
     }
 

@@ -910,6 +910,21 @@ impl Window {
         }
     }
 
+    pub fn request_redraw_all_windows() {
+        // 供 webview IPC 等无 AppContext 的主线程路径触发重绘，
+        // 确保 on_frame_drawn → drain_pending_* 得以执行。
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let windows = NSApplication::sharedApplication(mtm).windows();
+        for i in 0..windows.count() {
+            let window = windows.objectAtIndex(i);
+            unsafe {
+                if is_warp_window(&window).as_bool() {
+                    let _: () = msg_send![&*window, setNeedsDisplayAsync];
+                }
+            }
+        }
+    }
+
     pub fn show_window_and_focus_app(window_id: WindowId, bring_to_front: bool) {
         // SAFETY: `find_window_with_id` / `show_window_and_focus_app` are FFI calls.
         unsafe {

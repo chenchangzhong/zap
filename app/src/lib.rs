@@ -1360,12 +1360,8 @@ fn initialize_app(
             send_telemetry_from_app_ctx!(event, ctx);
         });
 
-        #[cfg(enable_crash_recovery)]
-        ctx.on_frame_drawn(|ctx, window_id| {
-            crash_recovery::CrashRecovery::handle(ctx).update(ctx, |crash_recovery, ctx| {
-                crash_recovery.on_frame_drawn(window_id, ctx);
-            });
-        })
+        // crash_recovery 的 on_frame_drawn 合并到后方统一的 on_frame_drawn 单回调中(见下方合并段)，
+        // 此处不再单独注册，避免覆盖式单回调被后注册覆盖导致丢失。
     } else {
         // If the app was opened while logged out, record an event for measuring new users.
         // This is sent immediately in case they quit the app on the signup screen.
@@ -1457,24 +1453,25 @@ fn initialize_app(
     // 否则后注册的会覆盖先注册的(导致 webview 收不到 rect 上报)。
     if FeatureFlag::DshPane.is_enabled() {
         ctx.add_singleton_model(|_| dsh::DshRuntime::new());
-        // 独立桥服务:懒创建,首次打开 dsh pane 时随 runtime 启动,事件经
-        // 每帧 drain 分发。
-        ctx.add_singleton_model(|_| dsh::bridge::BridgeServer::new());
     }
 
-    // 每帧回调:合并 BrowserPane(platform view 定位)与 DshRuntime(崩溃轮询)。
-    // 外层 if(BrowserPane || DshPane)已保证 webview 管理器注册,故直接调用。
-    if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
-        ctx.on_frame_drawn(|ctx, window_id| {
+    // 每帧回调:合并 crash_recovery + BrowserPane(platform view 定位) + DshRuntime(崩溃轮询/IPC drain)。
+    // on_frame_drawn 是覆盖式单回调(核心层 Some(Box::new))，所有每帧工作必须合并在同一注册内，
+    // 无条件注册一次，内部分支按 flag 守卫（避免 crash_recovery 被 BrowserPane/DshPane 门控误伤丢失登录态）。
+    ctx.on_frame_drawn(move |ctx, window_id| {
+        // crash_recovery 仅在登录用户下执行(对齐原 `if user_is_logged_in` 分支)。
+        if user_is_logged_in {
+            #[cfg(enable_crash_recovery)]
+            crash_recovery::CrashRecovery::handle(ctx).update(ctx, |crash_recovery, ctx| {
+                crash_recovery.on_frame_drawn(window_id, ctx);
+            });
+        }
+        if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
             browser::BrowserWebViewManager::handle(ctx).update(ctx, |manager, ctx| {
                 manager.drain_pending_platform_views(window_id);
                 manager.drain_pending_webview_focus(ctx);
             });
             if FeatureFlag::DshPane.is_enabled() {
-                // 桥事件(连接/断开)每帧 drain 分发。
-                dsh::bridge::BridgeServer::handle(ctx).update(ctx, |bridge, ctx| {
-                    bridge.drain_events(ctx);
-                });
                 dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
                     // 阶段3:提取活动终端最近命令(受隐私开关,节流)。
                     dsh::runtime::update_terminal_context_from_active(ctx, window_id);
@@ -1491,14 +1488,14 @@ fn initialize_app(
                                         // 仅真正收养(未被停止/代次未过期)才通知
                                         // workspace 导航。
                                         if runtime.adopt_child(child, url.clone(), gen) {
-                                            ctx.emit(dsh::DshRuntimeEvent::Restarted { url });
+                                            ctx.emit(dsh::bridge::BridgeEvent::Restarted { url });
                                         }
                                     }
                                     dsh::DshRestartResult::GiveUp { error } => {
                                         log::error!("[dsh] restart gave up: {error}");
                                         runtime.set_status(dsh::DshRuntimeStatus::Failed);
                                         // 通知 workspace 展示失败(pane 已停,提示用户)。
-                                        ctx.emit(dsh::DshRuntimeEvent::Failed { error });
+                                        ctx.emit(dsh::bridge::BridgeEvent::Failed { error });
                                     }
                                 },
                             );
@@ -1506,16 +1503,30 @@ fn initialize_app(
                         dsh::PollResult::GiveUp => {
                             // 连续崩溃超过上限:放弃重启,通知用户。
                             log::error!("[dsh] gave up after repeated crashes");
-                            ctx.emit(dsh::DshRuntimeEvent::Failed {
+                            ctx.emit(dsh::bridge::BridgeEvent::Failed {
                                 error: "repeated crashes".to_string(),
                             });
                         }
                         _ => {}
                     }
                 });
+                // 消费 IPC 推入的待处理事件(SwitchProject, Notify 等)。
+                dsh::DshRuntime::handle(ctx).update(ctx, |_runtime, ctx| {
+                    dsh::bridge::drain_events(ctx);
+                });
+                // Fallback: drain_events 在 on_frame_drawn 中运行，但 push_event 可能在
+                // 事件循环空闲期调用（此时 on_frame_drawn 不触发）。检测到残余事件时
+                // 强制重绘所有窗口，确保 drain_events 在下一帧执行。
+                if dsh::bridge::has_pending_events() {
+                    for wid in ctx.window_ids() {
+                        if let Some(window) = ctx.windows().platform_window(wid) {
+                            window.request_redraw();
+                        }
+                    }
+                }
             }
-        });
-    }
+        }
+    });
 
     // Register initial keybindings prior to creating menus
     ai::init(ctx);

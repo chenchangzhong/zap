@@ -146,6 +146,8 @@ pub struct DshPaneView {
     webview_loaded: bool,
     /// webview 开始加载的时刻(超时兜底,加载事件丢失时强制切换)。
     load_started_at: Option<Instant>,
+    /// DSH webview ID,用于 drop 时注销。
+    webview_id: Option<u64>,
 }
 
 impl DshPaneView {
@@ -158,6 +160,7 @@ impl DshPaneView {
             current_url: String::new(),
             webview_loaded: false,
             load_started_at: None,
+            webview_id: None,
         }
     }
 
@@ -196,6 +199,9 @@ impl DshPaneView {
         // 聚焦时(on_focus)正常切换,避免按键进不可见 webview。
         browser_view.update(ctx, |view, ctx| view.handle_attach_without_focus(ctx));
         let webview_id = browser_view.as_ref(ctx).model().platform_view_id;
+        // 注册为 DSH webview,允许发送 zap: IPC 消息。
+        crate::browser::BrowserWebViewManager::register_dsh_webview(webview_id);
+        self.webview_id = Some(webview_id);
         self.load_started_at = Some(Instant::now());
         self.webview_loaded = false;
         // 订阅 webview 加载完成(UrlChanged):完成后才从 spinner 切到 webview,
@@ -227,6 +233,15 @@ impl DshPaneView {
 
 impl Entity for DshPaneView {
     type Event = ();
+}
+
+impl Drop for DshPaneView {
+    fn drop(&mut self) {
+        // 注销 DSH webview ID,避免 IPC handler 仍接受已销毁 webview 的消息。
+        if let Some(id) = self.webview_id {
+            crate::browser::BrowserWebViewManager::unregister_dsh_webview(id);
+        }
+    }
 }
 
 impl View for DshPaneView {
@@ -429,11 +444,6 @@ impl PaneContent for DshPane {
             log::info!("[dsh] DshPane detached; requesting runtime stop");
             DshRuntime::handle(ctx).update(ctx, |runtime, _ctx| {
                 runtime.request_stop();
-            });
-            // 桥随 runtime 启停:停掉 listener 并清空 BRIDGE_INFO,避免旧 token
-            // 的桥在 dsh 停止后仍被同机进程调用。
-            crate::dsh::bridge::BridgeServer::handle(ctx).update(ctx, |bridge, _ctx| {
-                bridge.stop();
             });
         }
     }

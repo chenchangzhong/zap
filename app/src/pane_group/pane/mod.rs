@@ -454,6 +454,10 @@ impl PaneId {
         matches!(self.0.pane_type, IPaneType::CodeDiff)
     }
 
+    pub fn is_dsh_pane(&self) -> bool {
+        matches!(self.0.pane_type, IPaneType::DeepSeek)
+    }
+
     pub fn is_environment_management_pane(&self) -> bool {
         // Zap Wave 7-3:ambient-agent UI 子系统物理删,任意 pane 都不是
         // environment management pane。调用者为渐进式清理保留、返回 false。
