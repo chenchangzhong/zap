@@ -119,6 +119,7 @@ impl BrowserWebViewManager {
         // 页面内元素获得焦点(focusin)时经 IPC 上报 Rust,让 Warp 释放
         // 地址栏的焦点与光标(地址栏与页面各一个光标 = 双光标)。
         let init_js = r#"
+window.__ZAP_BRIDGE__ = true;
 // JS 错误/警告转发到 Rust 日志(诊断用)。
 window.addEventListener('error', (e) => {
   window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-js-error:' + (e.message || 'unknown'));

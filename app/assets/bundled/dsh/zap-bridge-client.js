@@ -287,6 +287,10 @@ window.__ModuleLoader__.load({
 		}
 
 		function apply(ctx) {
+			// 非 Zap 环境:不注册任何能力,直接退出。
+			if (!window.__ZAP_BRIDGE__) {
+				return;
+			}
 			const sessions = ctx.get("sessions");
 			const workspaces = ctx.get("workspaces");
 			if (!sessions || !workspaces) {
