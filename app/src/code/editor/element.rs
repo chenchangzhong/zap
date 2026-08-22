@@ -1333,15 +1333,17 @@ impl<V: EditorView> Element for EditorWrapper<V> {
         let size_buffer = self.size_buffer();
         let wrapper_size = self.size().unwrap_or_default();
 
-        // Pre-pass: Draw full-width overlay rects for diff highlighting.
-        // Drawing before the inner editor and gutter elements so they appear behind text.
-        // Clip to the wrapper bounds so overlays don't bleed outside the element
-        // (important for Lens mode where LineDecoration ranges may exceed the visible range).
-        let overlay_clip = RectF::new(origin, wrapper_size);
+        // Pre-pass: Draw overlay rects for diff highlighting in the content area only.
+        // Clip to content area (right of gutter) to prevent background bleeding into gutter.
+        let content_origin = origin + vec2f(size_buffer.x(), 0.);
+        let content_width = wrapper_size.x() - size_buffer.x();
+        let overlay_clip = RectF::new(
+            content_origin,
+            vec2f(content_width, wrapper_size.y()),
+        );
         ctx.scene
             .start_layer(ClipBounds::BoundedByActiveLayerAnd(overlay_clip));
 
-        // Added/replaced lines: one rect per LineDecoration range.
         {
             let model = self.model().as_ref(app);
             let content = model.content();
@@ -1357,16 +1359,16 @@ impl<V: EditorView> Element for EditorWrapper<V> {
                 let end_y = content.y_offset_at_line(decoration.end);
                 ctx.scene
                     .draw_rect_without_hit_recording(RectF::new(
-                        origin + vec2f(0., (start_y - y_adjustment).as_f32()),
-                        vec2f(wrapper_size.x(), (end_y - start_y).as_f32()),
+                        content_origin + vec2f(0., (start_y - y_adjustment).as_f32()),
+                        vec2f(content_width, (end_y - start_y).as_f32()),
                     ))
                     .with_background(decoration.overlay);
             }
         }
 
-        self.paint_removed_line_overlays(origin, wrapper_size, ctx);
-
         ctx.scene.stop_layer();
+
+        self.paint_removed_line_overlays(origin, wrapper_size, ctx);
 
         self.editor.paint(origin + size_buffer, ctx, app);
 

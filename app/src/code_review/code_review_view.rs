@@ -25,7 +25,11 @@ use crate::code_review::context::{
 use crate::{
     ai::agent::CurrentHead,
     code::editor::view::CodeEditorRenderOptions,
-    code::editor::{CommentEditor, CommentEditorEvent, EditorCommentsModel, EditorReviewComment},
+    code::editor::{
+        add_inline_overlay_color, add_overlay_color, remove_inline_overlay_color,
+        remove_overlay_color, CommentEditor, CommentEditorEvent, EditorCommentsModel,
+        EditorReviewComment,
+    },
     code_review::{comments::ReviewCommentBatch, DiffSetScope},
 };
 use crate::{
@@ -57,6 +61,9 @@ use crate::{
         },
     },
 };
+use warp_editor::content::diff::compute_spacers;
+use warpui::color::ColorU;
+use warp_core::ui::theme::Fill;
 
 #[cfg(feature = "local_fs")]
 use crate::code_review::telemetry_event::DiffSetContextScope;
@@ -191,7 +198,10 @@ use crate::code::ShowCommentEditorProvider;
 use crate::code_review::comments::CommentId;
 use crate::ui_components::render_file_search_row::{render_file_search_row, FileSearchRowOptions};
 use crate::workspace::view::right_panel::{ReviewDestination, ReviewSubmissionResult};
-use warp_editor::model::CoreEditorModel;
+use warp_editor::{
+    model::CoreEditorModel,
+    render::model::{Decoration, LineDecoration},
+};
 #[cfg(not(target_family = "wasm"))]
 use warp_editor::render::model::AutoScrollMode;
 use warp_editor::{
@@ -785,9 +795,24 @@ pub struct CodeReviewView {
     /// Current diff layout mode (inline or side-by-side).
     diff_layout: DiffLayout,
     /// Saved layout before maximize, restored on un-maximize.
-    diff_layout_before_maximize: Option<DiffLayout>,
+     diff_layout_before_maximize: Option<DiffLayout>,
+    /// Index of the currently selected file in side-by-side mode.
+    active_file_index: Option<usize>,
 }
 
+
+
+    /// Compute spacer blocks for one side of the split diff (Zed approach).
+    ///
+    /// Spacers are empty `TemporaryBlock`s inserted at specific line positions to pad
+    /// whichever side is shorter in a hunk pair, keeping the two sides vertically aligned.
+    ///
+    /// Algorithm:
+    /// - Walk the hunk's lines in parallel.
+    /// - Context lines: advance both sides together (0 spacers needed).
+    /// - Lines only on left (Delete): if right has no current line, insert spacer on right.
+    /// - Lines only on right (Add): if left has no current line, insert spacer on left.
+    /// - `insert_before` = target editor's current line number (0-indexed).
 impl CodeReviewView {
     pub fn repo_path(&self) -> Option<&PathBuf> {
         self.active_repo.as_ref().map(|repo| &repo.repo_path)
@@ -1262,6 +1287,7 @@ impl CodeReviewView {
             is_dsh,
             diff_layout: DiffLayout::Inline,
             diff_layout_before_maximize: None,
+            active_file_index: None,
         };
         view.set_active_repo_comment_model(comment_batch_model, ctx);
         if has_repo {
@@ -1560,6 +1586,11 @@ impl CodeReviewView {
         self.diff_state_model.update(ctx, |model, ctx| {
             model.set_diff_mode(mode, false, ctx);
         });
+        // Keep a valid active file in side-by-side mode so the view stays non-blank
+        // after a mode change.
+        if self.diff_layout.is_side_by_side() && self.active_file_index.is_none() {
+            self.active_file_index = self.first_expanded_file_index();
+        }
     }
 
     fn handle_find_event(
@@ -2870,7 +2901,75 @@ impl CodeReviewView {
             return Empty::new().finish();
         };
 
+        // Zed approach: in side-by-side mode, render only the active file (header + content).
+        if self.diff_layout.is_side_by_side() && self.effective_active_index() != Some(index) {
+            log::info!(
+                "render_diff_at_index: skipping file {} (active={:?}, effective={:?})",
+                index,
+                self.active_file_index,
+                self.effective_active_index()
+            );
+            return Empty::new().finish();
+        }
+
         self.render_file_diff(file_state, index, scroll_offset, appearance, app)
+    }
+
+    /// The active file index, falling back to the first expanded file in side-by-side mode.
+    /// Guarantees the view never goes blank when `active_file_index` is momentarily None.
+    fn effective_active_index(&self) -> Option<usize> {
+        self.active_file_index
+            .or_else(|| self.first_expanded_file_index())
+    }
+
+    /// The first expanded file's index, falling back to the first file.
+    /// Used to pick a default active file when entering side-by-side mode.
+    fn first_expanded_file_index(&self) -> Option<usize> {
+        let Some(repo) = self.active_repo.as_ref() else {
+            return None;
+        };
+        let CodeReviewViewState::Loaded(state) = &repo.state else {
+            return None;
+        };
+        let mut first = None;
+        for (i, (_, file)) in state.file_states.iter().enumerate() {
+            if first.is_none() {
+                first = Some(i);
+            }
+            if file.is_expanded {
+                return Some(i);
+            }
+        }
+        log::info!(
+            "first_expanded_file_index: {} files, returning {:?}",
+            state.file_states.len(),
+            first
+        );
+        first
+    }
+
+    /// The next expanded file at or after `index` (wrapping), falling back to the
+    /// first expanded file, then the first file. Used when collapsing the active
+    /// file in side-by-side mode so the view never goes blank.
+    fn next_expanded_file_index(state: &LoadedState, index: usize) -> Option<usize> {
+        let len = state.file_states.len();
+        if len == 0 {
+            return None;
+        }
+        // Prefer an expanded file after `index`.
+        for i in (index + 1)..len {
+            if state.file_states[i].is_expanded {
+                return Some(i);
+            }
+        }
+        // Otherwise any expanded file from the start.
+        for (i, (_, file)) in state.file_states.iter().enumerate() {
+            if file.is_expanded {
+                return Some(i);
+            }
+        }
+        // No expanded files at all — fall back to the first file.
+        Some(0)
     }
 
     fn should_auto_expand_file(&self, file: &FileDiff) -> bool {
@@ -4712,20 +4811,25 @@ impl CodeReviewView {
         let mut column = Flex::column()
             .with_main_axis_alignment(MainAxisAlignment::Start)
             .with_cross_axis_alignment(CrossAxisAlignment::Start);
-
+        let active_file_index = self.effective_active_index();
         for (file_index, file_state) in state.file_states.values().enumerate() {
+            let is_active = active_file_index == Some(file_index);
             let file_row = self.render_file_sidebar_row(file_state, appearance);
             column.add_child(
-                Hoverable::new(file_state.sidebar_mouse_state.clone(), |mouse_state| {
+                Hoverable::new(file_state.sidebar_mouse_state.clone(), move |mouse_state| {
                     let mut container = Container::new(Shrinkable::new(1., file_row).finish())
                         .with_vertical_padding(5.)
                         .with_horizontal_padding(8.)
                         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
 
-                    if mouse_state.is_hovered() {
+                    if is_active {
+                        container = container.with_background(Fill::Solid(
+                            ColorU::new(51, 102, 255, 40),
+                        ));
+                    } else if mouse_state.is_hovered() {
                         container = container.with_background(warp_core::ui::theme::Fill::Solid(
                             internal_colors::neutral_3(appearance.theme()),
-                        ))
+                        ));
                     }
                     container.finish()
                 })
@@ -4956,7 +5060,7 @@ impl CodeReviewView {
                 Empty::new().finish()
             } else {
                 let header = SavePosition::new(
-                    self.render_file_header(file, appearance, app),
+                    self.render_file_header(file, file_index, appearance, app),
                     &self.file_diff_header_position(file_index),
                 )
                 .finish();
@@ -4969,10 +5073,15 @@ impl CodeReviewView {
             };
 
         let mut content = Flex::column().with_child(file_header);
-
         let mut stack = Stack::new().with_constrain_absolute_children();
         // Only show file content if expanded.
-        if file.is_expanded {
+        // In side-by-side mode, the active file always shows content; non-active files are
+        // skipped entirely in `render_diff_at_index`. In inline mode, show all expanded files.
+        let show_content = file.is_expanded
+            && (!self.diff_layout.is_side_by_side()
+                || self.effective_active_index() == Some(file_index));
+
+        if show_content {
             stack.add_child(
                 SavePosition::new(
                     Container::new(self.render_file_content(file, appearance))
@@ -4998,7 +5107,7 @@ impl CodeReviewView {
                 .finish(),
             );
             if is_item_being_scrolled && !is_first_item_with_no_scroll {
-                let sticky_file_header = self.render_file_header(file, appearance, app);
+                let sticky_file_header = self.render_file_header(file, file_index, appearance, app);
                 stack.add_positioned_child(
                     sticky_file_header,
                     // We effectively make this an absolutely positioned header.
@@ -5023,6 +5132,7 @@ impl CodeReviewView {
     fn render_file_header(
         &self,
         file: &FileState,
+        file_index: usize,
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
@@ -5188,11 +5298,15 @@ impl CodeReviewView {
             CornerRadius::with_all(Radius::Pixels(8.))
         };
 
+        let is_selected = self.effective_active_index() == Some(file_index);
         let inner_header = Hoverable::new(file.header_mouse_state.clone(), |mouse_state| {
-            let header_bg = if mouse_state.is_hovered() {
-                neutral_3(appearance.theme())
+            let header_bg: Fill = if is_selected {
+                // Selected file: use surface_2 to stand out
+                theme.surface_2()
+            } else if mouse_state.is_hovered() {
+                Fill::Solid(neutral_3(appearance.theme()))
             } else {
-                neutral_2(appearance.theme())
+                Fill::Solid(neutral_2(appearance.theme()))
             };
             Container::new(
                 Clipped::new(
@@ -5484,7 +5598,8 @@ impl CodeReviewView {
             .finish()
     }
 
-    /// Creates side-by-side editors for all expanded files.
+    /// Creates side-by-side editors for the active file (Zed approach: only the file
+    /// currently shown in side-by-side mode gets an editor pair).
     fn create_side_by_side_editors_for_expanded_files(&mut self, ctx: &mut ViewContext<Self>) {
         // Collect file paths that need side-by-side editors first,
         // then create them to avoid borrow conflicts.
@@ -5495,13 +5610,37 @@ impl CodeReviewView {
             let CodeReviewViewState::Loaded(state) = &repo.state else {
                 return;
             };
-            state.file_states.iter()
-                .filter(|(_, f)| f.is_expanded && f.side_by_side_state.is_none() && !f.file_diff.is_binary)
-                .map(|(path, _)| path.clone())
-                .collect()
+            let Some(active_index) = self.effective_active_index() else {
+                return;
+            };
+            let Some((path, file)) = state.file_states.get_index(active_index) else {
+                return;
+            };
+            log::info!(
+                "create_editors: active={} is_expanded={} had_editors={} is_binary={}",
+                active_index,
+                file.is_expanded,
+                file.side_by_side_state.is_some(),
+                file.file_diff.is_binary
+            );
+            // Always (re)create the active file's editor pair so its git-diff decorations are
+            // (re)applied every time we enter/switch in side-by-side mode.
+            if file.is_expanded && !file.file_diff.is_binary {
+                vec![path.clone()]
+            } else {
+                Vec::new()
+            }
         };
 
         for path in paths_to_create {
+            // Clear any stale editor pair so create_side_by_side_editors re-applies decorations.
+            if let Some(repo) = self.active_repo.as_mut() {
+                if let CodeReviewViewState::Loaded(state) = &mut repo.state {
+                    if let Some(file) = state.file_states.get_mut(&path) {
+                        file.side_by_side_state = None;
+                    }
+                }
+            }
             // Create the editor pair (needs &self)
             let editor_pair = {
                 let Some(repo) = self.active_repo.as_ref() else {
@@ -5624,7 +5763,57 @@ impl CodeReviewView {
         result.join("\n")
     }
 
-    /// Creates the two editor views for side-by-side diff rendering.
+
+    /// Compute the starting char offset of each line (0-indexed) within `content`.
+    /// The last entry is the offset past the final line (used as a sentinel).
+    fn line_start_offsets(content: &str) -> Vec<CharOffset> {
+        let mut offsets = Vec::new();
+        let mut current = CharOffset::zero();
+        offsets.push(current);
+        for line in content.split_inclusive('\n') {
+            current += CharOffset::from(line.chars().count());
+            offsets.push(current);
+        }
+        offsets
+    }
+
+    /// Character-level diff for a pair of modified lines (Zed's `word_diff_ranges`).
+    /// Returns (deletions on the old side, insertions on the new side) as text decorations
+    /// positioned by char offset within their respective buffers.
+    fn compute_inline_decorations(
+        old_line: &str,
+        new_line: &str,
+        old_line_start: CharOffset,
+        new_line_start: CharOffset,
+        appearance: &Appearance,
+    ) -> (Vec<Decoration>, Vec<Decoration>) {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+
+        let (old_ranges, new_ranges) =
+            warp_editor::content::diff::word_diff_ranges(old_line, new_line);
+
+        for range in old_ranges {
+            // Byte ranges are relative to the line text; convert to buffer char offsets.
+            let start = old_line_start + CharOffset::from(old_line[..range.start].chars().count());
+            let end = old_line_start + CharOffset::from(old_line[..range.end].chars().count());
+            left.push(
+                Decoration::new(start, end)
+                    .with_background(remove_inline_overlay_color(appearance).into()),
+            );
+        }
+        for range in new_ranges {
+            let start = new_line_start + CharOffset::from(new_line[..range.start].chars().count());
+            let end = new_line_start + CharOffset::from(new_line[..range.end].chars().count());
+            right.push(
+                Decoration::new(start, end)
+                    .with_background(add_inline_overlay_color(appearance).into()),
+            );
+        }
+
+        (left, right)
+    }
+
     fn create_side_by_side_editors(
         &self,
         file: &FileState,
@@ -5646,7 +5835,62 @@ impl CodeReviewView {
             })
         };
 
-        // Create baseline (left) editor
+        let appearance = Appearance::as_ref(ctx);
+
+        // Compute decorations from the BufferDiff line mapping (Zed approach): imara_diff on
+        // old vs new content. Left editor (old): red for changed old rows. Right editor (new):
+        // green for changed new rows. Character-level word diffs for equal-line-count (modification)
+        // hunks.
+        let mut left_decorations = Vec::new();
+        let mut right_decorations = Vec::new();
+        let mut left_text_decorations = Vec::new();
+        let mut right_text_decorations = Vec::new();
+
+        let diff_hunks =
+            warp_editor::content::diff::diff_lines(old_content, &new_content);
+
+        for hunk in diff_hunks.iter() {
+            // Line backgrounds (SplitSide colors): left = old rows (deleted/red),
+            // right = new rows (added/green).
+            for row in hunk.old_rows.clone() {
+                left_decorations.push(LineDecoration::new(
+                    LineCount::from(row),
+                    LineCount::from(row + 1),
+                    remove_overlay_color(appearance).into(),
+                ));
+            }
+            for row in hunk.new_rows.clone() {
+                right_decorations.push(LineDecoration::new(
+                    LineCount::from(row),
+                    LineCount::from(row + 1),
+                    add_overlay_color(appearance).into(),
+                ));
+            }
+
+            // Character-level word diffs (byte ranges relative to whole text → CharOffset).
+            for r in &hunk.old_word_diffs {
+                let start = CharOffset::from(old_content[..r.start].chars().count());
+                let end = CharOffset::from(old_content[..r.end].chars().count());
+                left_text_decorations.push(
+                    Decoration::new(start, end)
+                        .with_background(remove_inline_overlay_color(appearance).into()),
+                );
+            }
+            for r in &hunk.new_word_diffs {
+                let start = CharOffset::from(new_content[..r.start].chars().count());
+                let end = CharOffset::from(new_content[..r.end].chars().count());
+                right_text_decorations.push(
+                    Decoration::new(start, end)
+                        .with_background(add_inline_overlay_color(appearance).into()),
+                );
+            }
+        }
+
+        // Compute spacer blocks for each side (Zed spacer-block alignment)
+        let (left_spacers, right_spacers) = compute_spacers(&diff_hunks);
+
+
+        // Create baseline (left) editor — old content with red deletion decorations + left spacers
         let baseline_editor = ctx.add_typed_action_view(|ctx| {
             CodeEditorView::new(
                 None,
@@ -5661,19 +5905,27 @@ impl CodeReviewView {
             .disable_diff_indicator_expansion_on_hover()
             .with_gutter_hover_target(GutterHoverTarget::Line)
             .disable_find_and_replace()
+            .with_can_show_diff_ui(false)
         });
 
         let full_file_path = repo_path.join(&file.file_diff.file_path);
         baseline_editor.update(ctx, |editor, ctx| {
             editor.set_language_with_path(&full_file_path, ctx);
             editor.reset(InitialBufferState::plain_text(old_content), ctx);
+            // Apply red deletion decorations + inline deletions + left spacers — no set_base, no diff engine
+            editor.set_git_diff_decorations(
+                left_decorations,
+                left_text_decorations,
+                left_spacers,
+                ctx,
+            );
         });
 
         let baseline_local = ctx.add_typed_action_view(|ctx| {
             LocalCodeEditorView::new(baseline_editor, None, false, None, ctx)
         });
 
-        // Create modified (right) editor
+        // Create modified (right) editor — new content with green addition decorations + right spacers
         let modified_editor = ctx.add_typed_action_view(|ctx| {
             CodeEditorView::new(
                 None,
@@ -5688,12 +5940,19 @@ impl CodeReviewView {
             .disable_diff_indicator_expansion_on_hover()
             .with_gutter_hover_target(GutterHoverTarget::Line)
             .disable_find_and_replace()
+            .with_can_show_diff_ui(false)
         });
 
         modified_editor.update(ctx, |editor, ctx| {
             editor.set_language_with_path(&full_file_path, ctx);
             editor.reset(InitialBufferState::plain_text(&new_content), ctx);
-            editor.set_base(old_content, true, ctx);
+            // Apply green addition decorations + inline additions + right spacers — no set_base, no diff engine
+            editor.set_git_diff_decorations(
+                right_decorations,
+                right_text_decorations,
+                right_spacers,
+                ctx,
+            );
         });
 
         let modified_local = ctx.add_typed_action_view(|ctx| {
@@ -5706,6 +5965,7 @@ impl CodeReviewView {
             syncing: Rc::new(Cell::new(false)),
         })
     }
+
 
     fn revert_hunk_toast_id(&self, ctx: &mut ViewContext<Self>) -> String {
         format!("diff_removed_{}", ctx.view_id())
@@ -7471,9 +7731,17 @@ impl TypedActionView for CodeReviewView {
 
                     if let CodeReviewViewState::Loaded(state) = &mut repo.state {
                         if let Some(index) = state.file_states.get_index_of(path) {
+                            // Track active file for side-by-side highlight. On collapse,
+                            // switch to the next expanded file so the view never goes blank.
+                            let next_active = if state.file_states[index].is_expanded {
+                                Self::next_expanded_file_index(state, index)
+                            } else {
+                                Some(index)
+                            };
                             let file = &mut state.file_states[index];
                             file.is_expanded = !file.is_expanded;
                             let now_expanded = file.is_expanded;
+                            self.active_file_index = next_active;
                             repo.file_expanded
                                 .insert(file.file_diff.file_path.clone(), now_expanded);
                             (index, now_expanded, file.chevron_button.clone())
@@ -7546,9 +7814,13 @@ impl TypedActionView for CodeReviewView {
                     file.is_expanded = true;
                     was_expanded
                 };
+                // Track the active file index for side-by-side mode
+                self.active_file_index = Some(*file_index);
 
-                // When switching to SideBySide, create editors for the newly expanded file
-                if self.diff_layout.is_side_by_side() && !was_expanded {
+                // Ensure the newly active file has its side-by-side editor pair.
+                // `create_side_by_side_editors_for_expanded_files` internally skips files
+                // that already have editors, so this is safe to call unconditionally.
+                if self.diff_layout.is_side_by_side() {
                     self.create_side_by_side_editors_for_expanded_files(ctx);
                 }
 
@@ -7586,7 +7858,26 @@ impl TypedActionView for CodeReviewView {
                     if !self.diff_layout.is_side_by_side() {
                         self.diff_layout_before_maximize = Some(self.diff_layout);
                         self.diff_layout = DiffLayout::SideBySide;
+                        // Default the active file to the first expanded file (or first file).
+                        if self.active_file_index.is_none() {
+                            let default_active = self.first_expanded_file_index();
+                            log::info!(
+                                "ToggleMaximize: setting default active to {:?} (was None)",
+                                default_active
+                            );
+                            self.active_file_index = default_active;
+                        } else {
+                            log::info!(
+                                "ToggleMaximize: keeping active {:?}",
+                                self.active_file_index
+                            );
+                        }
                         self.create_side_by_side_editors_for_expanded_files(ctx);
+                    } else {
+                        log::info!(
+                            "ToggleMaximize: already side-by-side, active={:?}",
+                            self.active_file_index
+                        );
                     }
                 }
 
@@ -7611,8 +7902,12 @@ impl TypedActionView for CodeReviewView {
                     DiffLayout::Inline => DiffLayout::SideBySide,
                     DiffLayout::SideBySide => DiffLayout::Inline,
                 };
-                // When switching to SideBySide, create editors for expanded files
+                // When switching to SideBySide: default the active file to the first expanded
+                // file (falling back to the first file), then create its editor pair.
                 if self.diff_layout.is_side_by_side() {
+                    if self.active_file_index.is_none() {
+                        self.active_file_index = self.first_expanded_file_index();
+                    }
                     self.create_side_by_side_editors_for_expanded_files(ctx);
                 }
                 ctx.notify();

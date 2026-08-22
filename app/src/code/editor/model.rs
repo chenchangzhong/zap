@@ -16,6 +16,7 @@ use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::theme::Fill;
 use warp_editor::content::anchor::Anchor;
 use warp_editor::content::edit::EditDelta;
+use warp_editor::content::edit::TemporaryBlock;
 use warp_editor::content::find::{SearchConfig, SearchResults};
 use warp_editor::content::selection_model::BufferSelectionModel;
 use warp_editor::content::version::BufferVersion;
@@ -77,7 +78,8 @@ use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
 use super::super::DiffResult;
 use super::comments::{EditorCommentsModel, PendingComment, PendingCommentEvent};
 use super::diff::{
-    add_inline_overlay_color, DiffModel, DiffModelEvent, DiffStatus, RenderableDiffHunk,
+    add_inline_overlay_color, DiffModel, DiffModelEvent, DiffStatus,
+    RenderableDiffHunk,
 };
 use super::line::EditorLineLocation;
 use crate::code_review::comments::{CommentId, CommentOrigin, LineDiffContent};
@@ -308,11 +310,17 @@ pub struct CodeEditorModel {
     syntax_tree: ModelHandle<SyntaxTreeState>,
     comments: ModelHandle<EditorCommentsModel>,
     hidden_lines: ModelHandle<HiddenLinesModel>,
+    interaction_state: InteractionState,
     /// The current state of diff navigation (collapsed, expanded, or focused on a specific hunk)
     diff_navigation_state: DiffNavigationState,
-    interaction_state: InteractionState,
-    /// Only applies to scenarios where current line highlighting is possible.
-    /// For example, current line highlighting will always be disabled during diff navigation.
+    /// When set, decorations/temporary blocks were supplied manually (side-by-side view via
+    /// `set_git_diff_decorations`) and must not be overwritten by the diff engine's
+    /// `refresh_diff_state`.
+    using_manual_git_diff_decorations: bool,
+    /// Side-by-side spacer blocks that couldn't be inserted yet because content is still
+    /// being laid out (async). They are re-applied once the first layout cycle completes
+    /// (`mark_lazy_layout_initialized`), when the content tree has rows to anchor against.
+    pending_side_by_side_blocks: Vec<TemporaryBlock>,
     show_current_line_highlights: bool,
     /// Delay rendering of content updates until a certain trigger.
     delay_rendering: Option<DelayRendering>,
@@ -405,6 +413,8 @@ impl CodeEditorModel {
             comments,
             hidden_lines,
             diff_navigation_state: DiffNavigationState::Collapsed,
+            using_manual_git_diff_decorations: false,
+            pending_side_by_side_blocks: Vec::new(),
             interaction_state: InteractionState::Editable,
             show_current_line_highlights: true,
             delay_rendering: None,
@@ -424,6 +434,15 @@ impl CodeEditorModel {
     fn mark_lazy_layout_initialized(&mut self, ctx: &mut ModelContext<Self>) {
         if self.lazy_layout_enabled {
             self.lazy_layout_initialized = true;
+        }
+        // Re-apply side-by-side spacer blocks now that content has been laid out (the content
+        // tree now has rows to anchor TemporaryBlocks against). Consume them so we only do
+        // this once after the first layout cycle.
+        if !self.pending_side_by_side_blocks.is_empty() {
+            let blocks = std::mem::take(&mut self.pending_side_by_side_blocks);
+            self.render_state.update(ctx, |render_state, _| {
+                render_state.add_temporary_blocks(blocks);
+            });
         }
         self.maybe_bootstrap_syntax_tree(ctx);
     }
@@ -497,6 +516,38 @@ impl CodeEditorModel {
                 diff.compute_diff(content, true, buffer_version, ctx)
             });
         }
+    }
+
+
+    /// Set line decorations directly from git diff hunks, bypassing the diff engine.
+    /// Used by side-by-side view where the diff engine's alignment conflicts with
+    /// git's alignment. These decorations persist across `refresh_diff_state` calls.
+    pub fn set_git_diff_decorations(
+        &mut self,
+        line_decorations: Vec<LineDecoration>,
+        text_decorations: Vec<Decoration>,
+        temporary_blocks: Vec<TemporaryBlock>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        log::info!(
+            "set_git_diff_decorations: {} line, {} text, {} blocks",
+            line_decorations.len(),
+            text_decorations.len(),
+            temporary_blocks.len()
+        );
+        // Prevent the diff engine's refresh_diff_state from overwriting these decorations.
+        self.using_manual_git_diff_decorations = true;
+        // Apply decorations immediately (they are a render overlay, independent of content layout).
+        self.render_state.update(ctx, |render_state, _| {
+            render_state.set_decorations_after_layout(UpdateDecorationAfterLayout::LineAndText {
+                line: line_decorations,
+                text: text_decorations,
+            });
+            // Store spacer blocks only; they are inserted by `mark_lazy_layout_initialized`
+            // once the content tree is laid out. Inserting them here AND re-inserting in
+            // `mark_lazy_layout_initialized` would duplicate/desync spacers.
+            self.pending_side_by_side_blocks = temporary_blocks;
+        });
     }
 
     pub fn positioning(&self, ctx: &AppContext) -> OffsetPositioning {
@@ -1114,6 +1165,11 @@ impl CodeEditorModel {
 
         // If there is no diff navigation, we update the `RenderState` to have no temporary blocks
         // or decorations. Other events can add decorations, e.g. the active cursor line highlight.
+        if self.using_manual_git_diff_decorations {
+            // Side-by-side view supplies its own decorations via `set_git_diff_decorations`;
+            // don't overwrite them with the (empty) diff-engine results.
+            return;
+        }
         self.render_state.update(ctx, |render_state, _| {
             render_state.add_temporary_blocks(all_diffs_removed_lines);
             render_state.set_decorations_after_layout(UpdateDecorationAfterLayout::LineAndText {
@@ -1591,6 +1647,11 @@ impl CodeEditorModel {
 
     /// Update the line highlights for the current cursor positions.
     fn update_cursor_line_highlights(&self, ctx: &mut ModelContext<CodeEditorModel>) {
+        if self.using_manual_git_diff_decorations {
+            // Side-by-side view manages line decorations via `set_git_diff_decorations`;
+            // don't overwrite them with the cursor-line highlight.
+            return;
+        }
         let selection_model = self.selection_model.as_ref(ctx);
 
         let overlay = Appearance::as_ref(ctx).theme().surface_2();

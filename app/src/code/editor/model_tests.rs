@@ -1090,3 +1090,99 @@ fn test_line_at_vertical_offset_returns_none_for_invalid() {
         );
     })
 }
+
+/// Side-by-side left pane sets buffer = old content and base = new content,
+/// which REVERSES the diff engine's Add/Deletion semantics compared to the
+/// single-column view (buffer = new, base = old):
+/// - a pure deletion (old-only line) surfaces as an engine `Add`
+///
+/// The side-by-side view uses `set_git_diff_decorations` which bypasses the
+/// diff engine's alignment. These assertions pin the engine's base/buffer
+/// direction semantics so they cannot silently break if someone flips the pane's
+/// base/buffer direction.
+#[test]
+fn test_side_by_side_left_pane_engine_direction() {
+    App::test((), |mut app| async move {
+        initialize_deps(&mut app);
+
+        // 场景 A:纯删除(旧文件有 b、新文件无)→ 引擎 Add,范围覆盖 buffer 行 1
+        let editor_a = mock_model_with_diff(&mut app, "a\nc", "a\nb\nc", ContentVersion::new());
+        compute_diff_and_expand(&mut app, &editor_a).await;
+        editor_a.update(&mut app, |editor, ctx| {
+            let diff = editor.diff().as_ref(ctx);
+            let appearance = Appearance::as_ref(ctx);
+            let base = diff.base().expect("base set");
+            let mut line_iterator = LineIterator::new(base.lines());
+            let mut saw_add = false;
+            for i in 0..diff.diff_hunk_count() {
+                if let Some(RenderableDiffHunk::Add { line_decoration }) =
+                    diff.renderable_diff_hunk_by_index(i, &mut line_iterator, appearance)
+                {
+                    assert_eq!(
+                        line_decoration.start.as_usize(),
+                        1,
+                        "旧文件删除行应被引擎识别为 Add(覆盖 buffer 行 1)"
+                    );
+                    saw_add = true;
+                }
+            }
+            assert!(saw_add, "左列方向下纯删除行应为引擎 Add");
+        });
+
+        // 场景 B:纯新增(新文件有 b、旧文件无)→ 引擎 Deletion,removed_lines 来自 base(新内容)
+        let editor_b = mock_model_with_diff(&mut app, "a\nb\nc", "a\nc", ContentVersion::new());
+        compute_diff_and_expand(&mut app, &editor_b).await;
+        editor_b.update(&mut app, |editor, ctx| {
+            let diff = editor.diff().as_ref(ctx);
+            let appearance = Appearance::as_ref(ctx);
+            let base = diff.base().expect("base set");
+            let mut line_iterator = LineIterator::new(base.lines());
+            let mut saw_deletion = false;
+            for i in 0..diff.diff_hunk_count() {
+                if let Some(RenderableDiffHunk::Deletion { removed_lines }) =
+                    diff.renderable_diff_hunk_by_index(i, &mut line_iterator, appearance)
+                {
+                    let contents: Vec<String> = removed_lines
+                        .iter()
+                        .map(|b| b.content.trim_end().to_string())
+                        .collect();
+                    assert_eq!(
+                        contents,
+                        vec!["b".to_string()],
+                        "新增行应为引擎 Deletion,removed_lines 内容来自 base(新内容)"
+                    );
+                    saw_deletion = true;
+                }
+            }
+            assert!(saw_deletion, "左列方向下纯新增行应为引擎 Deletion");
+        });
+
+        // 场景 C:修改行(旧 b → 新 x)→ 引擎 Replace,removed_lines 来自 base(新内容 "x")
+        let editor_c = mock_model_with_diff(&mut app, "a\nx\nc", "a\nb\nc", ContentVersion::new());
+        compute_diff_and_expand(&mut app, &editor_c).await;
+        editor_c.update(&mut app, |editor, ctx| {
+            let diff = editor.diff().as_ref(ctx);
+            let appearance = Appearance::as_ref(ctx);
+            let base = diff.base().expect("base set");
+            let mut line_iterator = LineIterator::new(base.lines());
+            let mut saw_replace = false;
+            for i in 0..diff.diff_hunk_count() {
+                if let Some(RenderableDiffHunk::Replace { removed_lines, .. }) =
+                    diff.renderable_diff_hunk_by_index(i, &mut line_iterator, appearance)
+                {
+                    let contents: Vec<String> = removed_lines
+                        .iter()
+                        .map(|b| b.content.trim_end().to_string())
+                        .collect();
+                    assert_eq!(
+                        contents,
+                        vec!["x".to_string()],
+                        "Replace 的 removed_lines 内容应来自 base(新内容),而非 buffer(旧内容)"
+                    );
+                    saw_replace = true;
+                }
+            }
+            assert!(saw_replace, "左列方向下修改行应为引擎 Replace");
+        });
+    })
+}

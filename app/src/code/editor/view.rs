@@ -16,6 +16,7 @@ use crate::code::editor::{
     nav_bar::{NavBar, NavBarBehavior, NavBarEvent},
     scroll::{ScrollPosition, ScrollTrigger, ScrollWheelBehavior},
 };
+use warp_editor::content::edit::TemporaryBlock;
 use crate::code::{
     editor::EditorReviewComment, DiffResult, NoopCommentEditorProvider, ShowCommentEditorProvider,
 };
@@ -57,8 +58,8 @@ use warp_editor::{
             VerticalExpansionBehavior,
         },
         model::{
-            AutoScrollMode, BlockSpacing, Decoration, ExpansionType, LineCount, ParagraphStyles,
-            RichTextStyles, CODE_EDITOR_HIDDEN_SECTION_EXPANSION_LINES,
+            AutoScrollMode, BlockSpacing, Decoration, ExpansionType, LineCount, LineDecoration,
+            ParagraphStyles, RichTextStyles, CODE_EDITOR_HIDDEN_SECTION_EXPANSION_LINES,
         },
     },
     search::{SearchEvent, Searcher, MATCH_FILL, SELECTED_MATCH_FILL},
@@ -546,6 +547,19 @@ impl CodeEditorView {
     pub fn set_base(&self, base: &str, recompute_diff: bool, ctx: &mut ViewContext<Self>) {
         self.model
             .update(ctx, |model, ctx| model.set_base(base, recompute_diff, ctx));
+    }
+
+    /// Set git diff decorations directly (bypasses diff engine). Used by side-by-side view.
+    pub fn set_git_diff_decorations(
+        &self,
+        line_decorations: Vec<LineDecoration>,
+        text_decorations: Vec<Decoration>,
+        temporary_blocks: Vec<TemporaryBlock>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.model.update(ctx, |model, ctx| {
+            model.set_git_diff_decorations(line_decorations, text_decorations, temporary_blocks, ctx);
+        });
     }
 
     pub fn lens_for_line_range(
