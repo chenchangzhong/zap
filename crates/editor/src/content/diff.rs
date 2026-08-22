@@ -363,6 +363,57 @@ pub fn diff_lines(old_text: &str, new_text: &str) -> Vec<LineDiffHunk> {
 ///     the new text where the surviving content begins, which equals the new-side
 ///     row that corresponds to the first surviving row after the deletion.
 ///
+/// 合并连续相同 insert_before 的 spacers 为一个 TemporaryBlock
+///
+/// 优化：将多个连续的 spacer 合并为一个，内容为多行空格（`" \n".repeat(n)`）
+fn merge_consecutive_spacers(spacers: Vec<TemporaryBlock>) -> Vec<TemporaryBlock> {
+    if spacers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut merged = Vec::new();
+    let mut current_group: Vec<TemporaryBlock> = Vec::new();
+
+    for spacer in spacers {
+        if current_group.is_empty()
+            || current_group.last().unwrap().insert_before == spacer.insert_before
+        {
+            // 当前组为空，或者 insert_before 相同，加入当前组
+            current_group.push(spacer);
+        } else {
+            // insert_before 不同，合并当前组并开始新组
+            merged.push(merge_group(&current_group));
+            current_group = vec![spacer];
+        }
+    }
+
+    // 合并最后一组
+    if !current_group.is_empty() {
+        merged.push(merge_group(&current_group));
+    }
+
+    merged
+}
+
+/// 将一组具有相同 insert_before 的 spacers 合并为一个 TemporaryBlock
+fn merge_group(group: &[TemporaryBlock]) -> TemporaryBlock {
+    assert!(!group.is_empty());
+
+    let insert_before = group[0].insert_before;
+    let line_decoration = group[0].line_decoration.clone();
+    let inline_text_decorations = group[0].inline_text_decorations.clone();
+
+    // 合并内容为多行空格
+    let content = " \n".repeat(group.len());
+
+    TemporaryBlock {
+        content,
+        insert_before,
+        line_decoration,
+        inline_text_decorations,
+    }
+}
+
 /// The key insight from Zed: spacers are always placed at the **surviving content
 /// boundary** on the side that needs them — i.e. `old_rows.end` for left-side
 /// spacers, `new_rows.end` for right-side spacers (or equivalently for pure
@@ -376,8 +427,8 @@ pub fn diff_lines(old_text: &str, new_text: &str) -> Vec<LineDiffHunk> {
 pub fn compute_spacers(
     diff_hunks: &[LineDiffHunk],
 ) -> (Vec<TemporaryBlock>, Vec<TemporaryBlock>) {
-    let mut left_spacers = Vec::new();
-    let mut right_spacers = Vec::new();
+    let mut left_spacers: Vec<TemporaryBlock> = Vec::new();
+    let mut right_spacers: Vec<TemporaryBlock> = Vec::new();
 
     // Zed tracks a running `delta` across hunks. Between hunks, content is
     // unchanged so delta stays the same. At each hunk we compute the new delta
@@ -440,12 +491,103 @@ pub fn compute_spacers(
         new_consumed += new_count;
     }
 
+    // 合并连续相同 insert_before 的 spacers
+    let left_spacers = merge_consecutive_spacers(left_spacers);
+    let right_spacers = merge_consecutive_spacers(right_spacers);
+
     (left_spacers, right_spacers)
+}
+
+/// Limit the total number of spacer lines across both sides.
+///
+/// When spacers exceed `max_total_lines`, truncate the list and append a
+/// single placeholder spacer that renders "skipped N lines" as its content.
+/// This prevents creating millions of temporary blocks for very large diffs.
+///
+/// Returns the capped `(left_spacers, right_spacers)` and the total number
+/// of skipped lines (0 if no capping occurred).
+pub fn limit_spacers(
+    mut left_spacers: Vec<TemporaryBlock>,
+    mut right_spacers: Vec<TemporaryBlock>,
+    max_total_lines: usize,
+) -> (Vec<TemporaryBlock>, Vec<TemporaryBlock>, usize) {
+    // Count total spacer lines (merged spacers: content.lines().count()).
+    let count_lines = |spacers: &[TemporaryBlock]| -> usize {
+        spacers
+            .iter()
+            .map(|s| s.content.lines().count().max(1))
+            .sum()
+    };
+
+    let total = count_lines(&left_spacers) + count_lines(&right_spacers);
+    if total <= max_total_lines {
+        return (left_spacers, right_spacers, 0);
+    }
+
+    let mut kept_lines = 0usize;
+    let mut skipped_lines = 0usize;
+
+    // Keep spacers from both sides until we hit the budget.
+    // Interleave by keeping all left first, then right (simpler, and the
+    // visual order doesn't matter for spacers since they're all at different
+    // positions).
+    let mut capped_left = Vec::new();
+    for spacer in &left_spacers {
+        let h = spacer.content.lines().count().max(1);
+        if kept_lines + h <= max_total_lines {
+            capped_left.push(spacer.clone());
+            kept_lines += h;
+        } else {
+            skipped_lines += h;
+        }
+    }
+    left_spacers = capped_left;
+
+    let mut capped_right = Vec::new();
+    for spacer in &right_spacers {
+        let h = spacer.content.lines().count().max(1);
+        if kept_lines + h <= max_total_lines {
+            capped_right.push(spacer.clone());
+            kept_lines += h;
+        } else {
+            skipped_lines += h;
+        }
+    }
+    right_spacers = capped_right;
+
+    // Add a placeholder at the end of the longer side.
+    if skipped_lines > 0 {
+        let placeholder = format!(" ⋯ skipped {skipped_lines} lines ⋯\n");
+        if left_spacers.len() >= right_spacers.len() {
+            left_spacers.push(TemporaryBlock {
+                content: placeholder,
+                insert_before: left_spacers
+                    .last()
+                    .map(|s| s.insert_before)
+                    .unwrap_or_else(LineCount::zero),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            });
+        } else {
+            right_spacers.push(TemporaryBlock {
+                content: placeholder,
+                insert_before: right_spacers
+                    .last()
+                    .map(|s| s.insert_before)
+                    .unwrap_or_else(LineCount::zero),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            });
+        }
+    }
+
+    (left_spacers, right_spacers, skipped_lines)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::edit::TemporaryBlock;
 
     #[test]
     fn word_diff_unchanged_text() {
@@ -591,14 +733,15 @@ mod tests {
         
         let (left_spacers, right_spacers) = compute_spacers(&hunks);
         
-        // LHS should get 2 spacers (for X and Y)
-        assert_eq!(left_spacers.len(), 2);
+        // LHS should get 1 merged spacer (for X and Y)
+        assert_eq!(left_spacers.len(), 1);
         // RHS should get 0 spacers (no deletions)
         assert_eq!(right_spacers.len(), 0);
         
-        // Spacers should be inserted at position 1 (before new content starts)
+        // Spacer should be inserted at position 1 (before new content starts)
         assert_eq!(left_spacers[0].insert_before, LineCount::from(1));
-        assert_eq!(left_spacers[1].insert_before, LineCount::from(1));
+        // Content should be two lines of spaces
+        assert_eq!(left_spacers[0].content, " \n \n");
     }
 
     #[test]
@@ -618,12 +761,13 @@ mod tests {
         
         // LHS should get 0 spacers (no additions)
         assert_eq!(left_spacers.len(), 0);
-        // RHS should get 2 spacers (for deleted b and c)
-        assert_eq!(right_spacers.len(), 2);
+        // RHS should get 1 merged spacer (for deleted b and c)
+        assert_eq!(right_spacers.len(), 1);
         
-        // Spacers should be inserted at position 1 (where surviving content starts)
+        // Spacer should be inserted at position 1 (where surviving content starts)
         assert_eq!(right_spacers[0].insert_before, LineCount::from(1));
-        assert_eq!(right_spacers[1].insert_before, LineCount::from(1));
+        // Content should be two lines of spaces
+        assert_eq!(right_spacers[0].content, " \n \n");
     }
 
     #[test]
@@ -641,13 +785,223 @@ mod tests {
         
         let (left_spacers, right_spacers) = compute_spacers(&hunks);
         
-        // LHS needs 2 spacers (new has 3 rows, old has 1 row)
-        assert_eq!(left_spacers.len(), 2);
+        // LHS needs 1 merged spacer (new has 3 rows, old has 1 row)
+        assert_eq!(left_spacers.len(), 1);
         // RHS needs 0 spacers
         assert_eq!(right_spacers.len(), 0);
         
-        // Spacers inserted at old_rows.end = 2
+        // Spacer inserted at old_rows.end = 2
         assert_eq!(left_spacers[0].insert_before, LineCount::from(2));
-        assert_eq!(left_spacers[1].insert_before, LineCount::from(2));
+        // Content should be two lines of spaces
+        assert_eq!(left_spacers[0].content, " \n \n");
+    }
+
+    #[test]
+    fn test_multiple_temporary_blocks_with_same_insert_before() {
+        // 测试多个具有相同 insert_before 的 TemporaryBlock
+        // 直接调用 merge_consecutive_spacers 验证合并行为
+
+        let blocks = vec![
+            TemporaryBlock {
+                content: " ".to_string(),
+                insert_before: LineCount::from(5),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            },
+            TemporaryBlock {
+                content: " ".to_string(),
+                insert_before: LineCount::from(5),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            },
+            TemporaryBlock {
+                content: " ".to_string(),
+                insert_before: LineCount::from(5),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            },
+        ];
+
+        let merged = merge_consecutive_spacers(blocks);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].insert_before, LineCount::from(5));
+        assert_eq!(merged[0].content, " \n \n \n"); // 3 行空格
+    }
+
+    #[test]
+    fn merge_empty_spacers() {
+        let merged = merge_consecutive_spacers(Vec::new());
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn merge_single_spacer() {
+        let blocks = vec![TemporaryBlock {
+            content: " ".to_string(),
+            insert_before: LineCount::from(3),
+            line_decoration: None,
+            inline_text_decorations: Vec::new(),
+        }];
+        let merged = merge_consecutive_spacers(blocks);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].content, " \n");
+        assert_eq!(merged[0].insert_before, LineCount::from(3));
+    }
+
+    #[test]
+    fn merge_alternating_insert_before() {
+        // 交替的 insert_before 不应被合并
+        let blocks = vec![
+            TemporaryBlock {
+                content: " ".to_string(),
+                insert_before: LineCount::from(1),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            },
+            TemporaryBlock {
+                content: " ".to_string(),
+                insert_before: LineCount::from(2),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            },
+            TemporaryBlock {
+                content: " ".to_string(),
+                insert_before: LineCount::from(1),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            },
+        ];
+        let merged = merge_consecutive_spacers(blocks);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].insert_before, LineCount::from(1));
+        assert_eq!(merged[0].content, " \n");
+        assert_eq!(merged[1].insert_before, LineCount::from(2));
+        assert_eq!(merged[1].content, " \n");
+        assert_eq!(merged[2].insert_before, LineCount::from(1));
+        assert_eq!(merged[2].content, " \n");
+    }
+
+    #[test]
+    fn test_spacer_grouping_optimization() {
+        // 测试 spacer 分组优化逻辑
+
+        // 模拟 compute_spacers 的输出：多个连续相同 insert_before 的 spacers
+        let left_spacers = vec![
+            TemporaryBlock {
+                content: " ".to_string(),
+                insert_before: LineCount::from(10),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            },
+            TemporaryBlock {
+                content: " ".to_string(),
+                insert_before: LineCount::from(10),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            },
+            TemporaryBlock {
+                content: " ".to_string(),
+                insert_before: LineCount::from(10),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            },
+            // 另一个不同的 insert_before
+            TemporaryBlock {
+                content: " ".to_string(),
+                insert_before: LineCount::from(20),
+                line_decoration: None,
+                inline_text_decorations: Vec::new(),
+            },
+        ];
+
+        // 应用优化：合并连续相同 insert_before 的 spacers
+        let optimized = merge_consecutive_spacers(left_spacers);
+
+        // 验证优化结果
+        assert_eq!(optimized.len(), 2);
+        assert_eq!(optimized[0].insert_before, LineCount::from(10));
+        assert_eq!(optimized[0].content, " \n \n \n"); // 3 行空格
+        assert_eq!(optimized[1].insert_before, LineCount::from(20));
+        assert_eq!(optimized[1].content, " \n"); // 1 行空格
+    }
+
+    #[test]
+    fn compute_spacers_multiple_hunks_produce_grouped_output() {
+        // 多个 hunk 产生的 spacers 会被正确分组合并
+        // OLD: a\nb\nc\nd\ne\nf\n
+        // NEW: a\nX\nY\nb\nc\nd\nZ\nW\ne\nf\n
+        let old = "a\nb\nc\nd\ne\nf\n";
+        let new = "a\nX\nY\nb\nc\nd\nZ\nW\ne\nf\n";
+        let hunks = diff_lines(old, new);
+
+        // 期望有 2 个 hunk：一个 for XY insertion, one for ZW insertion
+        assert!(hunks.len() >= 2, "should produce at least 2 hunks");
+
+        let (left_spacers, right_spacers) = compute_spacers(&hunks);
+
+        // 两个 hunk 都插入到相同位置，合并为一个 spacer
+        assert!(left_spacers.len() >= 1, "should have at least 1 left spacer");
+        assert!(right_spacers.is_empty(), "no deletions means no right spacers");
+    }
+
+    // -----------------------------------------------------------------------
+    // limit_spacers tests
+    // -----------------------------------------------------------------------
+
+    fn make_spacer(content: &str, insert_at: usize) -> TemporaryBlock {
+        TemporaryBlock {
+            content: content.to_string(),
+            insert_before: LineCount::from(insert_at),
+            line_decoration: None,
+            inline_text_decorations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn limit_spacers_under_budget() {
+        let left = vec![make_spacer(" \n \n", 5)]; // 2 lines
+        let right = vec![make_spacer(" \n", 3)]; // 1 line
+        let (l, r, skipped) = limit_spacers(left, right, 100);
+        assert_eq!(l.len(), 1);
+        assert_eq!(r.len(), 1);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn limit_spacers_caps_and_adds_placeholder() {
+        let left = vec![
+            make_spacer(" \n \n \n", 5),  // 3 lines
+            make_spacer(" \n \n \n", 10), // 3 lines
+        ];
+        let right = vec![
+            make_spacer(" \n \n", 3), // 2 lines
+        ];
+        // Budget of 4: keep left spacer 1 (3 lines) + right spacer (1 line, budget 4/5)
+        // Actually: left[0] = 3 lines → kept (3). left[1] = 3 lines → skip (3+3=6 > 4).
+        // right[0] = 2 lines → skip (3+2=5 > 4). So skipped = 3+2 = 5.
+        let (l, r, skipped) = limit_spacers(left, right, 4);
+        assert_eq!(l.len(), 2); // 1 original + 1 placeholder
+        assert!(r.is_empty());
+        assert_eq!(skipped, 5);
+        assert!(l[1].content.contains("skipped 5"));
+    }
+
+    #[test]
+    fn limit_spacers_empty() {
+        let (l, r, skipped) = limit_spacers(Vec::new(), Vec::new(), 10);
+        assert!(l.is_empty());
+        assert!(r.is_empty());
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn limit_spacers_exact_budget() {
+        let left = vec![make_spacer(" \n \n", 5)]; // 2 lines
+        let right = vec![make_spacer(" \n \n", 3)]; // 2 lines
+        let (l, r, skipped) = limit_spacers(left, right, 4);
+        assert_eq!(l.len(), 1);
+        assert_eq!(r.len(), 1);
+        assert_eq!(skipped, 0);
     }
 }
