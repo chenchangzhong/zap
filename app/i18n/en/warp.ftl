@@ -1748,6 +1748,7 @@ keybinding-desc-workspace-open-blank-web-preview = Open Blank Web Preview
 dsh-first-use-configure-model = DeepSeek Harness is ready. Configure your model API key in its settings to start.
 dsh-updating-toast = Updating DeepSeek Harness to { $version }…
 dsh-runtime-failed-toast = DeepSeek Harness stopped after repeated crashes. Reopen it from the command palette to start again.
+dsh-attach-context-not-ready-toast = DeepSeek Harness is still starting. Wait for it to load before attaching files as context.
 new-session-create-new-tab = Create New Tab
 new-session-create-new-window = Create New Window
 new-session-split-pane-down = Split Pane Down

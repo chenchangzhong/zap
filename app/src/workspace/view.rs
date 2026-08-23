@@ -58,6 +58,8 @@ use crate::app_state::{
     PaneNodeSnapshot, PaneUuid, RightPanelSnapshot, SettingsPaneSnapshot, TabSnapshot,
     TerminalPaneSnapshot, WindowSnapshot, WorkflowPaneSnapshot,
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::browser::BrowserWebViewManager;
 use crate::code_review::diff_state::DiffStateModel;
 #[cfg(feature = "local_fs")]
 use crate::code_review::CodeReviewTelemetryEvent;
@@ -2599,9 +2601,8 @@ impl Workspace {
         });
 
         if FeatureFlag::DshPane.is_enabled() {
-            ctx.subscribe_to_model(
-                &crate::dsh::DshRuntime::handle(ctx),
-                |me, _, event, ctx| match event {
+            ctx.subscribe_to_model(&crate::dsh::DshRuntime::handle(ctx), |me, _, event, ctx| {
+                match event {
                     crate::dsh::bridge::BridgeEvent::Ready { url } => {
                         // 已有 DshPane → set_ready(Loading) 或 navigate(Ready)
                         if me.navigate_existing_dsh_pane(url, ctx) {
@@ -2645,23 +2646,43 @@ impl Workspace {
                         let window_id = ctx.window_id();
                         WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
                             stack.add_persistent_toast(
-                                DismissibleToast::error(crate::t!(
-                                    "dsh-runtime-failed-toast"
-                                )),
+                                DismissibleToast::error(crate::t!("dsh-runtime-failed-toast")),
                                 window_id,
                                 ctx,
                             );
                         });
                     }
+                    crate::dsh::bridge::BridgeEvent::InstallingProgress { line } => {
+                        log::info!("[dsh] InstallingProgress: {}", line);
+                        // 实时进度行:更新 DshPaneView 显示(无 toast)。
+                        // 两阶段:1)收集 handle(不可变 ctx) 2)更新(可变 ctx)。
+                        // 只对非 Ready 态的 pane 发进度行,Ready 态时 get_browser_view() 返回 Some。
+                        let mut handles: Vec<_> = Vec::new();
+                        for tab in &me.tabs {
+                            let pane_group = tab.pane_group.clone();
+                            for dsh_pane in pane_group.as_ref(ctx).dsh_panes() {
+                                let dsh_view = dsh_pane.dsh_view(ctx);
+                                if dsh_view.as_ref(ctx).get_browser_view().is_none() {
+                                    handles.push(dsh_view);
+                                }
+                            }
+                        }
+                        let line = line.clone();
+                        for dsh_view in handles {
+                            dsh_view.update(ctx, |view, view_ctx| {
+                                view.update_installing_progress(&line);
+                                view_ctx.notify();
+                            });
+                        }
+                    }
                     _ => {}
-                },
-            );
+                }
+            });
 
             // 订阅桥事件:处理 dsh 插件通知请求。
             // 假设:DSH 只有一个 pane,取其 view id 作为通知 origin。
-            ctx.subscribe_to_model(
-                &crate::dsh::DshRuntime::handle(ctx),
-                |me, _, event, ctx| match event {
+            ctx.subscribe_to_model(&crate::dsh::DshRuntime::handle(ctx), |me, _, event, ctx| {
+                match event {
                     crate::dsh::bridge::BridgeEvent::Notify {
                         ref title,
                         ref body,
@@ -2690,8 +2711,8 @@ impl Workspace {
                         }
                     }
                     _ => {}
-                },
-            );
+                }
+            });
         }
 
         ctx.subscribe_to_model(
@@ -2963,22 +2984,29 @@ impl Workspace {
         // (DshRuntime singleton 由 lib.rs 在 flag 开启时注册;测试环境 flag
         // 关闭,避免未注册 singleton panic)。
         if FeatureFlag::DshPane.is_enabled() {
-            ctx.subscribe_to_model(
-                &crate::dsh::DshRuntime::handle(ctx),
-                |me, _, event, ctx| match event {
+            ctx.subscribe_to_model(&crate::dsh::DshRuntime::handle(ctx), |me, _, event, ctx| {
+                match event {
                     crate::dsh::bridge::BridgeEvent::SwitchProject { path } => {
-                        log::info!("[dsh-badge] SwitchProject path={}, has_dsh={}", path.display(), me.has_dsh_pane(ctx));
+                        log::info!(
+                            "[dsh-badge] SwitchProject path={}, has_dsh={}",
+                            path.display(),
+                            me.has_dsh_pane(ctx)
+                        );
                         me.handle_dsh_switch_project(path.clone(), ctx);
                     }
                     crate::dsh::bridge::BridgeEvent::OpenFileExplorer { path } => {
-                        log::info!("[dsh-file-explorer] OpenFileExplorer path={}, has_dsh={}", path.display(), me.has_dsh_pane(ctx));
+                        log::info!(
+                            "[dsh-file-explorer] OpenFileExplorer path={}, has_dsh={}",
+                            path.display(),
+                            me.has_dsh_pane(ctx)
+                        );
                         me.handle_dsh_open_file_explorer(path.clone(), ctx);
                     }
                     _ => {
                         log::debug!("[dsh] unhandled BridgeEvent: {:?}", event);
                     }
-                },
-            );
+                }
+            });
         }
 
         let mut ws = Self {
@@ -6204,7 +6232,6 @@ impl Workspace {
             );
         }
 
-
         // 8. Separator + worktree config entry + new tab config
         if FeatureFlag::TabConfigs.is_enabled() {
             menu_items.push(MenuItem::Separator);
@@ -7235,6 +7262,36 @@ impl Workspace {
     }
 
     fn attach_path_as_context(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        // 步骤1: dsh pane 分流
+        if FeatureFlag::DshPane.is_enabled() {
+            let pane_group = self.active_tab_pane_group().as_ref(ctx);
+            // 焦点 pane 是否为 DshPane
+            let focused_pane_id = pane_group.focused_pane_id(ctx);
+            if let Some(dsh_pane) =
+                pane_group.downcast_pane_by_id::<crate::dsh::DshPane>(focused_pane_id)
+            {
+                // 就绪判定：webview 已创建（get_browser_view Some）
+                let browser_view = dsh_pane.dsh_view(ctx).as_ref(ctx).get_browser_view();
+                if let Some(bv) = browser_view {
+                    let webview_id = bv.as_ref(ctx).model().platform_view_id;
+                    // 调用新增辅助方法插入路径到 dsh 输入框
+                    self.insert_path_into_dsh_input(&path, webview_id, ctx);
+                    return;
+                }
+                // dsh pane 聚焦但 webview 未就绪 → 提示用户(不回退终端)。
+                log::warn!("[dsh] attach_path_as_context: dsh pane focused but webview not ready");
+                let window_id = ctx.window_id();
+                WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
+                    stack.add_persistent_toast(
+                        DismissibleToast::default(crate::t!("dsh-attach-context-not-ready-toast")),
+                        window_id,
+                        ctx,
+                    );
+                });
+                return;
+            }
+        }
+        // 步骤2: 原终端分支保持不变
         let Some(view) = self.active_session_view(ctx) else {
             log::warn!("No active terminal view session when trying to attach path as context");
             return;
@@ -7243,6 +7300,55 @@ impl Workspace {
         view.update(ctx, |terminal_view, ctx| {
             terminal_view.attach_path_as_context(&path, ctx);
         });
+    }
+
+    /// 将文件路径插入 dsh webview 的输入框。
+    /// 由 attach_path_as_context 在 dsh pane 聚焦且就绪时调用。
+    #[cfg(not(target_family = "wasm"))]
+    fn insert_path_into_dsh_input(
+        &self,
+        path: &Path,
+        webview_id: u64,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let content = path.to_string_lossy();
+        if content.is_empty() {
+            return;
+        }
+        // 用 serde_json 转义,避免路径含引号/换行破坏 JS 字符串字面量。
+        // 序列化失败(path 含非法字符)时直接放弃,绝不注入未转义原文。
+        let Ok(escaped) = serde_json::to_string(&content.to_string()) else {
+            log::warn!("[dsh] attach_path_as_context: failed to escape path, skipping");
+            return;
+        };
+
+        // JS 策略（按优先级）: textarea → contenteditable → ProseMirror/CodeMirror
+        let js = format!(
+            r#"
+            (function() {{
+                var text = {escaped};
+                var el = document.querySelector('textarea[data-testid="dsh-input"]')
+                         || document.querySelector('textarea[placeholder]')
+                         || document.querySelector('div[contenteditable="true"][role="textbox"]')
+                         || document.querySelector('div.ProseMirror')
+                         || document.querySelector('.cm-content[contenteditable]');
+                if (!el) {{ console.warn('[dsh] No input element found for attach_as_context'); return; }}
+                if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {{
+                    el.focus();
+                    var start = el.selectionStart || el.value.length;
+                    var end = el.selectionEnd || el.value.length;
+                    el.setRangeText(text, start, end, 'end');
+                    el.dispatchEvent(new InputEvent('input', {{ bubbles: true, cancelable: true }}));
+                }} else {{
+                    el.focus();
+                    document.execCommand('insertText', false, text);
+                }}
+            }})()
+            "#
+        );
+
+        BrowserWebViewManager::as_ref(ctx).evaluate_script_on(webview_id, &js);
+        BrowserWebViewManager::as_ref(ctx).focus_webview(webview_id);
     }
 
     fn cd_to_directory(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
@@ -12539,7 +12645,8 @@ impl Workspace {
         // 以 pane_group_id 作稳定合成 id，避免 EntityId::new() 每帧新建
         // 导致 WorkingDirectoriesModel 抖动；按仓库根去重避免同库双根
         // 覆盖终端映射(下游会 canonicalize+get_root_for_path 归一)。
-        if FeatureFlag::DshPane.is_enabled() && pane_group.as_ref(ctx).dsh_panes().next().is_some() {
+        if FeatureFlag::DshPane.is_enabled() && pane_group.as_ref(ctx).dsh_panes().next().is_some()
+        {
             if let Some(dir) = crate::dsh::runtime::workspace_dir() {
                 let dir_str = dir.to_string_lossy().to_string();
                 let dsh_root = repo_metadata::repositories::DetectedRepositories::as_ref(ctx)
@@ -19006,7 +19113,6 @@ impl Workspace {
         }
         // 2. 无可用 DshPane tab → 创建 Loading tab(已有 stale pane 时复用,不重复建)
         if !self.has_dsh_pane(ctx) {
-            let first_use = !crate::dsh::DshRuntime::is_configured();
             let pane = crate::dsh::DshPane::new(ctx);
             let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
             let new_idx = match new_tab_placement_setting {
@@ -19014,22 +19120,22 @@ impl Workspace {
                 NewTabPlacement::AfterCurrentTab => self.active_tab_index + 1,
             };
             self.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
-            if first_use {
-                // 首次使用:提示配置模型 API key。
-                WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
-                    stack.add_persistent_toast(
-                        DismissibleToast::default(crate::t!("dsh-first-use-configure-model")),
-                        window_id,
-                        ctx,
-                    );
-                });
-            }
         }
         // 3. 启动/重启 runtime(Starting 返回等就绪;Ready 主动触发就绪;
         //    Stopped/Failed 重新 begin_start 以支持失败后重试)。
+        //    先收集所有 DshPane view handles(不可变 ctx),供 Install 分支
+        //    把 pane 状态从 Loading 切成 Installing(实时进度显示在 pane 上)。
+        let mut dsh_handles: Vec<_> = Vec::new();
+        for tab in &self.tabs {
+            let pane_group = tab.pane_group.clone();
+            for dsh_pane in pane_group.as_ref(ctx).dsh_panes() {
+                dsh_handles.push(dsh_pane.dsh_view(ctx));
+            }
+        }
         crate::dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
             match runtime.status() {
-                crate::dsh::DshRuntimeStatus::Starting => return,
+                crate::dsh::DshRuntimeStatus::Starting
+                | crate::dsh::DshRuntimeStatus::Installing => return,
                 crate::dsh::DshRuntimeStatus::Ready => {
                     if let Some(url) = runtime.url().map(str::to_string) {
                         ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
@@ -19040,51 +19146,87 @@ impl Workspace {
             }
             // 注入最近打开的 Zap 项目目录作 dsh 工作目录(DSH_CWD),
             // 使会话 cwd 跟随 Zap 项目(workspace 归组)。
-            let dir = crate::projects::ProjectManagementModel::handle(ctx).read(ctx, |model, _| {
-                model
-                    .all_projects()
-                    .filter(|p| p.last_opened_ts.is_some())
-                    .max_by_key(|p| p.last_opened_ts.unwrap())
-                    .map(|p| std::path::PathBuf::from(&p.path))
-            })
-            .or_else(|| {
-                // 无最近打开项目:fallback 到活动终端 cwd(更"当前"的工作目录)。
-                crate::workspace::ActiveSession::handle(ctx).read(ctx, |active, _| {
-                    active.path_if_local(window_id).map(std::path::PathBuf::from)
+            let dir = crate::projects::ProjectManagementModel::handle(ctx)
+                .read(ctx, |model, _| {
+                    model
+                        .all_projects()
+                        .filter(|p| p.last_opened_ts.is_some())
+                        .max_by_key(|p| p.last_opened_ts.unwrap())
+                        .map(|p| std::path::PathBuf::from(&p.path))
                 })
-            });
+                .or_else(|| {
+                    // 无最近打开项目:fallback 到活动终端 cwd(更"当前"的工作目录)。
+                    crate::workspace::ActiveSession::handle(ctx).read(ctx, |active, _| {
+                        active
+                            .path_if_local(window_id)
+                            .map(std::path::PathBuf::from)
+                    })
+                });
             if let Some(dir) = dir {
                 log::info!("[dsh] workspace dir set to {}", dir.display());
                 crate::dsh::runtime::set_workspace_dir(dir);
             }
             let gen = runtime.begin_start();
-            // 启动前检查 dsh 新版本:有更新则先提醒用户(Updating 事件),
-            // 并把目标版本传给 start_future 完成安装更新。
+            // 启动前检查 dsh 安装/更新:Install 则先进入 Installing 状态安装
+            // (实时进度显示在 UI);Ready 直接启动;Offline 提示网络失败。
             ctx.spawn(
                 crate::dsh::DshRuntime::check_update_future(),
-                move |runtime, update, ctx| {
-                    if let Some(version) = &update {
-                        ctx.emit(crate::dsh::bridge::BridgeEvent::Updating {
-                            version: version.clone(),
+                move |runtime, check, ctx| match check {
+                    crate::dsh::DshUpdateCheck::Install {
+                        version,
+                        first_install,
+                    } => {
+                        // 需要安装/更新到指定版本:进入 Installing 状态,无 toast,
+                        // 进度直接显示在 pane 上。已装旧版时强制重装。
+                        runtime.set_status(crate::dsh::DshRuntimeStatus::Installing);
+                        for dsh_view in &dsh_handles {
+                            dsh_view.update(ctx, |view, view_ctx| {
+                                view.set_installing(first_install);
+                                view_ctx.notify();
+                            });
+                        }
+                        ctx.spawn(
+                            crate::dsh::DshRuntime::start_future(Some(version)),
+                            move |runtime, result, ctx| match result {
+                                crate::dsh::DshStartResult::Ready { url, child } => {
+                                    if runtime.adopt_child(child, url.clone(), gen) {
+                                        ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
+                                    }
+                                }
+                                crate::dsh::DshStartResult::Failed { error } => {
+                                    log::error!("[dsh] start failed: {error}");
+                                    runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
+                                    ctx.emit(crate::dsh::bridge::BridgeEvent::Failed { error });
+                                }
+                            },
+                        );
+                    }
+                    crate::dsh::DshUpdateCheck::Ready => {
+                        // 已安装且无需更新:直接启动现有安装。
+                        ctx.spawn(
+                            crate::dsh::DshRuntime::start_future(None),
+                            move |runtime, result, ctx| match result {
+                                crate::dsh::DshStartResult::Ready { url, child } => {
+                                    if runtime.adopt_child(child, url.clone(), gen) {
+                                        ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
+                                    }
+                                }
+                                crate::dsh::DshStartResult::Failed { error } => {
+                                    log::error!("[dsh] start failed: {error}");
+                                    runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
+                                    ctx.emit(crate::dsh::bridge::BridgeEvent::Failed { error });
+                                }
+                            },
+                        );
+                    }
+                    crate::dsh::DshUpdateCheck::Offline => {
+                        // 网络不可达且未安装:提示用户网络失败。
+                        log::error!("[dsh] not installed and offline");
+                        runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
+                        ctx.emit(crate::dsh::bridge::BridgeEvent::Failed {
+                            error: "网络不可用，无法安装 DeepSeek Harness".to_string(),
                         });
                     }
-                    ctx.spawn(
-                        crate::dsh::DshRuntime::start_future(update),
-                        move |runtime, result, ctx| match result {
-                            crate::dsh::DshStartResult::Ready { url, child } => {
-                                if runtime.adopt_child(child, url.clone(), gen) {
-                                    ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
-                                }
-                            }
-                            crate::dsh::DshStartResult::Failed { error } => {
-                                log::error!("[dsh] start failed: {error}");
-                                runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
-                                // emit 失败事件触发既有 toast,避免失败后 Loading pane
-                                // 永久卡 spinner 而无任何用户反馈。
-                                ctx.emit(crate::dsh::bridge::BridgeEvent::Failed { error });
-                            }
-                        },
-                    );
                 },
             );
         });
@@ -19093,17 +19235,13 @@ impl Workspace {
         if self.has_dsh_pane(ctx) {
             self.update_dsh_git_status_subscription(ctx);
             // 文件浏览器跟随 dsh workspace_dir（首次打开即显示当前项目）。
-            if let Some(pane_group) = self
-                .tabs
-                .iter()
-                .find_map(|tab| {
-                    if tab.pane_group.as_ref(ctx).dsh_panes().next().is_some() {
-                        Some(tab.pane_group.clone())
-                    } else {
-                        None
-                    }
-                })
-            {
+            if let Some(pane_group) = self.tabs.iter().find_map(|tab| {
+                if tab.pane_group.as_ref(ctx).dsh_panes().next().is_some() {
+                    Some(tab.pane_group.clone())
+                } else {
+                    None
+                }
+            }) {
                 self.refresh_working_directories_for_pane_group(&pane_group, ctx);
             }
         }
@@ -19118,23 +19256,22 @@ impl Workspace {
     /// dsh 活跃会话切到其他项目 → Zap 跟随。同步 workspace 根目录与 git status
     /// 订阅;不创建新终端 tab(dsh 页面才是活动 tab)。
     fn handle_dsh_switch_project(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
-        log::info!("[dsh-badge] handle_dsh_switch_project path={}", path.display());
+        log::info!(
+            "[dsh-badge] handle_dsh_switch_project path={}",
+            path.display()
+        );
         crate::dsh::runtime::set_workspace_dir(path);
         // 仅在有 DshPane 时才订阅，避免 pane 已关闭时创建无用的 git watcher。
         if self.has_dsh_pane(ctx) {
             self.update_dsh_git_status_subscription(ctx);
             // 同步文件浏览器:注入 workspace_dir 到 WorkingDirectoriesModel。
-            if let Some(pane_group) = self
-                .tabs
-                .iter()
-                .find_map(|tab| {
-                    if tab.pane_group.as_ref(ctx).dsh_panes().next().is_some() {
-                        Some(tab.pane_group.clone())
-                    } else {
-                        None
-                    }
-                })
-            {
+            if let Some(pane_group) = self.tabs.iter().find_map(|tab| {
+                if tab.pane_group.as_ref(ctx).dsh_panes().next().is_some() {
+                    Some(tab.pane_group.clone())
+                } else {
+                    None
+                }
+            }) {
                 self.refresh_working_directories_for_pane_group(&pane_group, ctx);
             }
         }
@@ -19144,22 +19281,21 @@ impl Workspace {
     fn handle_dsh_open_file_explorer(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
         crate::dsh::runtime::set_workspace_dir(path.clone());
         if !self.has_dsh_pane(ctx) {
-            log::info!("[dsh-file-explorer] no DshPane, workspace_dir set for next pane path={}", path.display());
+            log::info!(
+                "[dsh-file-explorer] no DshPane, workspace_dir set for next pane path={}",
+                path.display()
+            );
             return;
         }
         log::info!("[dsh-file-explorer] handle path={}", path.display());
         self.update_dsh_git_status_subscription(ctx);
-        if let Some(pane_group) = self
-            .tabs
-            .iter()
-            .find_map(|tab| {
-                if tab.pane_group.as_ref(ctx).dsh_panes().next().is_some() {
-                    Some(tab.pane_group.clone())
-                } else {
-                    None
-                }
-            })
-        {
+        if let Some(pane_group) = self.tabs.iter().find_map(|tab| {
+            if tab.pane_group.as_ref(ctx).dsh_panes().next().is_some() {
+                Some(tab.pane_group.clone())
+            } else {
+                None
+            }
+        }) {
             self.refresh_working_directories_for_pane_group(&pane_group, ctx);
         }
         self.open_left_panel(ctx);
@@ -19323,9 +19459,6 @@ impl TypedActionView for Workspace {
             _ => ActionAccessibilityContent::from_debug(),
         }
     }
-
-
-
 
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         use WorkspaceAction::*;
@@ -22192,7 +22325,8 @@ impl View for Workspace {
             Fill::VerticalGradient(gradient) => gradient.get_most_opaque(),
             Fill::HorizontalGradient(gradient) => gradient.get_most_opaque(),
         };
-        app.windows().set_window_background_color(self.window_id, background_color);
+        app.windows()
+            .set_window_background_color(self.window_id, background_color);
 
         if let Some(img) = theme.background_image() {
             let opacity_ratio = background_opacity as f32 / 100.;

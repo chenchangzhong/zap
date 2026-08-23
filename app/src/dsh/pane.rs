@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::appearance::Appearance;
 use crate::app_state::LeafContents;
-use crate::browser::{BrowserPaneAction, BrowserPaneView, BrowserWebViewEvent, BrowserWebViewManager};
+use crate::browser::{BrowserPaneView, BrowserWebViewEvent, BrowserWebViewManager};
 use crate::dsh::DshRuntime;
 use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::pane_group::pane::view::{self, PaneView};
@@ -130,10 +130,15 @@ impl Element for EllipsisText {
 
 enum DshPaneState {
     Loading,
+    /// 正在安装/更新 dsh npm 包。is_install=true 为首次安装("安装中"),
+    /// false 为版本更新("更新中");progress_lines 是最近若干条进度行
+    /// (避免单行覆盖看不清)。
+    Installing {
+        is_install: bool,
+        progress_lines: Vec<String>,
+    },
     Ready(ViewHandle<BrowserPaneView>),
 }
-
-// ── DshPaneView (BackingView) ──
 
 pub struct DshPaneView {
     state: DshPaneState,
@@ -148,6 +153,8 @@ pub struct DshPaneView {
     load_started_at: Option<Instant>,
     /// DSH webview ID,用于 drop 时注销。
     webview_id: Option<u64>,
+    /// pane focus 句柄(BackingView required)。
+    focus_handle: Option<PaneFocusHandle>,
 }
 
 impl DshPaneView {
@@ -161,6 +168,7 @@ impl DshPaneView {
             webview_loaded: false,
             load_started_at: None,
             webview_id: None,
+            focus_handle: None,
         }
     }
 
@@ -169,9 +177,37 @@ impl DshPaneView {
     }
 
     pub fn is_loading(&self) -> bool {
-        matches!(self.state, DshPaneState::Loading)
+        matches!(self.state, DshPaneState::Loading | DshPaneState::Installing { .. })
     }
 
+    /// 进入安装/更新状态。is_install=true 首次安装("安装中"),false 更新("更新中")。
+    pub fn set_installing(&mut self, is_install: bool) {
+        log::info!("[dsh] pane set_installing: is_install={is_install}");
+        self.state = DshPaneState::Installing {
+            is_install,
+            progress_lines: Vec::new(),
+        };
+    }
+
+    /// 追加一条安装进度行,保留最近若干行。
+    pub fn update_installing_progress(&mut self, line: &str) {
+        const MAX_LINES: usize = 6;
+        match &mut self.state {
+            DshPaneState::Installing { progress_lines, .. } => {
+                progress_lines.push(line.to_string());
+                if progress_lines.len() > MAX_LINES {
+                    progress_lines.drain(0..progress_lines.len() - MAX_LINES);
+                }
+            }
+            DshPaneState::Loading => {
+                self.state = DshPaneState::Installing {
+                    is_install: true,
+                    progress_lines: vec![line.to_string()],
+                };
+            }
+            DshPaneState::Ready(_) => {}
+        }
+    }
     pub fn url(&self) -> &str {
         &self.current_url
     }
@@ -180,7 +216,7 @@ impl DshPaneView {
     pub fn get_browser_view(&self) -> Option<&ViewHandle<BrowserPaneView>> {
         match &self.state {
             DshPaneState::Ready(bv) => Some(bv),
-            DshPaneState::Loading => None,
+            DshPaneState::Loading | DshPaneState::Installing { .. } => None,
         }
     }
 
@@ -260,17 +296,87 @@ impl View for DshPaneView {
             DshPaneState::Ready(browser_view) if show_webview => {
                 ChildView::new(browser_view).finish()
             }
-            _ => {
-                // Loading 中或 webview 加载未完成:Align 占满父约束并居中
-                // 静态 DeepSeek 图标 + 省略号打字动画文字。
+            DshPaneState::Ready(_) => {
+                // webview 加载中或未达超时兜底:显示省略号动画(与 Loading 一致,
+                // 避免"启动中"静态文字让用户误以为卡死)。
                 let appearance = Appearance::as_ref(app);
                 Align::new(
                     Flex::column()
                         .with_main_axis_alignment(MainAxisAlignment::Center)
                         .with_cross_axis_alignment(CrossAxisAlignment::Center)
                         .with_child(Box::new(
-                            // 固定 40x40:Icon layout 返回 constraint.max,unbounded
-                            // 高度下会算出 inf 导致 scene.rs paint panic,故锁死尺寸。
+                            ConstrainedBox::new(Box::new(Icon::new(
+                                WarpIcon::DeepSeek.into(),
+                                appearance.theme().foreground(),
+                            )))
+                            .with_width(40.)
+                            .with_height(40.),
+                        ))
+                        .with_child(
+                            Container::new(Box::new(EllipsisText::new(
+                                "DeepSeek Harness 启动中",
+                                appearance.ui_font_family(),
+                                16.,
+                                appearance.theme().foreground(),
+                                self.loading_anim_start.clone(),
+                            )))
+                            .with_margin_top(16.)
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .finish()
+            }
+            DshPaneState::Installing {
+                is_install,
+                progress_lines,
+            } => {
+                let appearance = Appearance::as_ref(app);
+                // 首次安装显示"安装中",版本更新显示"更新中",带省略号循环动画。
+                let label = if *is_install { "安装中" } else { "更新中" };
+                let mut col = Flex::column()
+                    .with_main_axis_alignment(MainAxisAlignment::Center)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(Box::new(
+                        ConstrainedBox::new(Box::new(Icon::new(
+                            WarpIcon::DeepSeek.into(),
+                            appearance.theme().foreground(),
+                        )))
+                        .with_width(40.)
+                        .with_height(40.),
+                    ))
+                    .with_child(
+                        Container::new(Box::new(EllipsisText::new(
+                            label,
+                            appearance.ui_font_family(),
+                            16.,
+                            appearance.theme().foreground(),
+                            self.loading_anim_start.clone(),
+                        )))
+                        .with_margin_top(16.)
+                        .finish(),
+                    );
+                // 有进度行时,下方追加多行实时进度(无动画,仅文本)。
+                for line in progress_lines.iter().rev() {
+                    col = col.with_child(
+                        Container::new(Box::new(Text::new_inline(
+                            line.clone(),
+                            appearance.ui_font_family(),
+                            12.,
+                        )))
+                        .with_margin_top(6.)
+                        .finish(),
+                    );
+                }
+                Align::new(Box::new(col)).finish()
+            }
+            DshPaneState::Loading => {
+                let appearance = Appearance::as_ref(app);
+                Align::new(
+                    Flex::column()
+                        .with_main_axis_alignment(MainAxisAlignment::Center)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(Box::new(
                             ConstrainedBox::new(Box::new(Icon::new(
                                 WarpIcon::DeepSeek.into(),
                                 appearance.theme().foreground(),
@@ -297,16 +403,14 @@ impl View for DshPaneView {
     }
 }
 
+impl TypedActionView for DshPaneView {
+    type Action = ();
+}
+
 impl BackingView for DshPaneView {
     type PaneHeaderOverflowMenuAction = ();
     type CustomAction = ();
     type AssociatedData = ();
-
-    // dsh WebUI 自带完整界面,隐藏 in-pane header(避免出现不可用的 X 按钮),
-    // 与 BrowserPane 一致;tab 栏标题由 PaneConfiguration("DeepSeek") 提供。
-    fn should_render_header(&self, _app: &AppContext) -> bool {
-        false
-    }
 
     fn handle_pane_header_overflow_menu_action(
         &mut self,
@@ -315,18 +419,21 @@ impl BackingView for DshPaneView {
     ) {
     }
 
-    fn close(&mut self, _ctx: &mut ViewContext<Self>) {}
+    // dsh WebUI 自带完整界面,隐藏 in-pane header(避免出现标题栏),
+    // 与 BrowserPane 一致;tab 栏标题由 PaneConfiguration("DeepSeek") 提供。
+    fn should_render_header(&self, _app: &AppContext) -> bool {
+        false
+    }
 
-    fn focus_contents(&mut self, ctx: &mut ViewContext<Self>) {
-        if let DshPaneState::Ready(bv) = &self.state {
-            // Ready 态:把焦点交给子 BrowserPaneView,触发其 focus_webview
-            // (AppKit first responder 进页面,键盘可直接输入)。
-            bv.update(ctx, |view, ctx| {
-                view.handle_action(&BrowserPaneAction::Focus, ctx);
-            });
-        } else {
-            ctx.focus_self();
-        }
+    fn close(&mut self, ctx: &mut ViewContext<Self>) {
+        // 关闭 pane 时停止 dsh runtime,避免子进程泄漏。
+        crate::dsh::DshRuntime::handle(ctx).update(ctx, |runtime, _ctx| {
+            runtime.request_stop();
+        });
+    }
+
+    fn focus_contents(&mut self, _ctx: &mut ViewContext<Self>) {
+        // 无特殊 focus 行为;PaneView 已处理 pane 级别 focus。
     }
 
     fn render_header_content(
@@ -337,20 +444,16 @@ impl BackingView for DshPaneView {
         view::HeaderContent::simple("DeepSeek Harness")
     }
 
-    fn set_focus_handle(&mut self, _focus_handle: PaneFocusHandle, _ctx: &mut ViewContext<Self>) {}
+    fn set_focus_handle(&mut self, focus_handle: PaneFocusHandle, _ctx: &mut ViewContext<Self>) {
+        self.focus_handle = Some(focus_handle);
+    }
 }
-
-impl TypedActionView for DshPaneView {
-    type Action = ();
-    fn handle_action(&mut self, _action: &(), _ctx: &mut ViewContext<Self>) {}
-}
-
-// ── DshPane (PaneContent) ──
 
 pub struct DshPane {
     view: ViewHandle<PaneView<DshPaneView>>,
     pane_configuration: ModelHandle<PaneConfiguration>,
 }
+
 
 impl DshPane {
     /// 创建 DeepSeek tab,立即显示 Loading 态。Runtime 异步启动。

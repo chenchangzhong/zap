@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -154,10 +154,22 @@ pub enum DshRestartResult {
 pub enum DshRuntimeStatus {
     Stopped,
     Starting,
+    /// 正在安装/更新 dsh npm 包(首次安装或版本更新)。
+    Installing,
     Ready,
     Failed,
 }
-
+/// dsh 安装/更新检测结果,供 workspace 决定启动策略。
+#[derive(Debug, Clone)]
+pub enum DshUpdateCheck {
+    /// 首次安装或强制更新到指定版本。version 为目标版本号,
+    /// first_install 为 true 表示从未安装过(显示"安装中"而非"更新中")。
+    Install { version: String, first_install: bool },
+    /// 已安装且版本匹配,直接启动。
+    Ready,
+    /// 网络不可达或检测失败,无法安装/更新。
+    Offline,
+}
 /// 一次启动的完整结果(供 ctx.spawn 回调)。
 #[derive(Debug)]
 pub enum DshStartResult {
@@ -335,30 +347,67 @@ impl DshRuntime {
         }
     }
 
-    /// 启动前检查 dsh 是否有新版本。
+    /// 启动前检查 dsh 是否需要安装/更新。
     ///
-    /// 返回 `Some(latest)` 当 registry 最新版与当前已安装版本(`version.txt`,
-    /// 未安装视为需安装)不一致;一致或查询失败返回 `None`。
-    /// 供启动流程在 spawn `start_future` 前调用,以决定是否提醒用户更新。
-    pub async fn check_update_future() -> Option<String> {
-        let latest = Self::query_latest_version().await?;
-        let installed = Self::dsh_data_dir()
-            .ok()
-            .map(|dir| dir.join("dsh-install").join("version.txt"))
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+    /// 返回:
+    /// - `Install`:需要安装或更新(未安装 / registry 有新版),进入 Installing 状态安装。
+    ///   `first_install=true` 表示首次安装(未装过),false 表示版本更新。
+    /// - `Ready`:已安装且无需更新,直接启动现有安装。
+    /// - `Offline`:网络不可达(registry 查不到)且未安装,无法安装,提示用户网络失败。
+    pub async fn check_update_future() -> DshUpdateCheck {
+        let installed = Self::installed_dsh_version();
         if installed.is_empty() {
-            log::info!("[dsh] no installed version, will install {latest}");
-            return Some(latest);
+            // 未安装:查询 registry,失败(离线)则提示网络失败。
+            return match Self::query_latest_version().await {
+                Some(version) => {
+                    log::info!("[dsh] no installed version, will install {version}");
+                    DshUpdateCheck::Install {
+                        version,
+                        first_install: true,
+                    }
+                }
+                None => {
+                    log::warn!("[dsh] not installed and offline, cannot install");
+                    DshUpdateCheck::Offline
+                }
+            };
         }
+        // 已安装:查询最新版;失败视为无更新(直接用现有安装),不阻塞启动。
+        let Some(latest) = Self::query_latest_version().await else {
+            log::info!("[dsh] version check failed (offline?), using installed {installed}");
+            return DshUpdateCheck::Ready;
+        };
         if latest != installed {
             log::info!("[dsh] update available: {installed} -> {latest}");
-            Some(latest)
+            DshUpdateCheck::Install {
+                version: latest,
+                first_install: false,
+            }
         } else {
-            None
+            DshUpdateCheck::Ready
         }
+    }
+
+    /// 读取已安装 dsh 的版本号(读 `node_modules/@deepseek-ai/dsh/package.json`)。
+    /// 未安装返回空字符串。
+    fn installed_dsh_version() -> String {
+        Self::dsh_data_dir()
+            .ok()
+            .map(|dir| {
+                let pkg_json = dir
+                    .join("dsh-install")
+                    .join("node_modules")
+                    .join("@deepseek-ai")
+                    .join("dsh")
+                    .join("package.json");
+                serde_json::from_str::<serde_json::Value>(
+                    &std::fs::read_to_string(pkg_json).unwrap_or_default(),
+                )
+                .ok()
+                .and_then(|v| v.get("version").and_then(|v| v.as_str()).map(str::to_string))
+                .unwrap_or_default()
+            })
+            .unwrap_or_default()
     }
 
     /// dsh 数据目录:`~/.dsh`。
@@ -468,6 +517,8 @@ impl DshRuntime {
             .arg("web")
             .arg("--port")
             .arg("0")
+            // 不自动打开系统浏览器(Zap 用自己的 webview 承载 dsh UI)。
+            .arg("--no-open")
             .env("DSH_HOME", &dsh_home);
         // dsh 会话工作目录 = Zap 当前项目目录。dsh 的 workspaceRoot 取
         // process.cwd(),故设子进程 cwd(默认 agent preset standard 不读
@@ -522,10 +573,12 @@ impl DshRuntime {
 
     /// 确保 dsh 已安装,返回 CLI 入口 JS 路径。
     ///
+    /// 用 pnpm 安装(npm 11 对 dsh 依赖树 idealTree 解析卡死,实测 >180s 不完成;
+    /// pnpm 9s 装完且 peer 依赖经 .pnpm 虚拟目录正确解析,已验证 dsh web 正常启动)。
+    ///
     /// `target` 指定要安装的版本:
     /// - `Some(v)`:安装/更新到版本 v(启动前检测到新版本时传入)
-    /// - `None`:沿用已安装版本(`version.txt`),未安装时联网取 latest 安装;
-    ///   无网则 `bail`，上层 `start_future` 转 `Failed`，workspace 弹失败提示。
+    /// - `None`:未安装时联网取 latest 安装(失败返回空串,装 registry latest)
     async fn ensure_dsh_installed(node: &Path, target: Option<&str>) -> Result<PathBuf> {
         let data_dir = Self::dsh_data_dir()?;
         let dsh_dir = data_dir.join("dsh-install");
@@ -536,66 +589,164 @@ impl DshRuntime {
             .join("lib")
             .join("bin.js");
 
-        // 期望版本:target 优先;否则已装版本;都没有则联网取 latest，无网失败。
+        // 已安装且未指定目标版本(正常启动):直接复用现有安装,不重装。
+        if cli_js.is_file() && target.is_none() {
+            return Ok(cli_js);
+        }
+
         let want = match target {
             Some(v) => v.to_string(),
-            None => {
-                let installed = std::fs::read_to_string(dsh_dir.join("version.txt"))
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                if let Some(v) = installed {
-                    v
-                } else {
-                    Self::query_latest_version()
-                        .await
-                        .context("no installed dsh and failed to fetch latest version (offline?)")?
-                }
-            }
+            None => Self::query_latest_version().await.unwrap_or_default(),
         };
 
-        // 已安装且版本匹配则复用。
+        // 指定了目标版本(安装/更新):清掉旧安装,避免残留旧版。
         if cli_js.is_file() {
-            let installed =
-                std::fs::read_to_string(dsh_dir.join("version.txt")).unwrap_or_default();
-            if installed.trim() == want {
-                return Ok(cli_js);
+            if let Err(err) = std::fs::remove_dir_all(&dsh_dir) {
+                // 删除失败(权限/句柄占用等)不致命:后续 pnpm 覆盖安装。
+                log::warn!("[dsh] remove_dir_all {} failed: {err}", dsh_dir.display());
             }
-            log::info!(
-                "[dsh] version mismatch (installed {:?}, want {want}), reinstalling",
-                installed.trim()
-            );
-            let _ = std::fs::remove_dir_all(&dsh_dir);
         }
 
         std::fs::create_dir_all(&dsh_dir)?;
-        let npm = if node.file_name().map(|n| n == "node").unwrap_or(false) {
-            // system node:PATH 里找 npm
-            PathBuf::from("npm")
-        } else {
-            node_runtime::npm_binary_path().unwrap_or_else(|_| PathBuf::from("npm"))
-        };
+        // 写入最小 package.json 作 pnpm 项目根(避免沿父目录向上找到
+        // ~/package.json 污染用户主目录)。
+        let pkg_json = serde_json::json!({
+            "name": "dsh-install",
+            "private": true,
+        });
+        std::fs::write(
+            dsh_dir.join("package.json"),
+            serde_json::to_string_pretty(&pkg_json)?,
+        )
+        .context("Failed to write dsh-install package.json")?;
+        // pnpm 二进制:优先 PATH 里的 pnpm(系统 node 时可用;node_runtime
+        // 管理的 node 通常也有配套 pnpm,若缺失则靠 PATH 保底)。
+        let pnpm = PathBuf::from("pnpm");
 
-        log::info!("[dsh] installing {DSH_NPM_PACKAGE}@{want}...");
-        // 注意:不用 `--prefix`(npm 11 下不落盘 node_modules),改为
-        // 在目标目录内执行 npm install。
-        let mut cmd = Command::new(&npm);
+        let mut cmd = Command::new(&pnpm);
+        // want 为空时不拼 @version,pnpm 默认装 registry latest。
+        let pkg = if want.is_empty() {
+            DSH_NPM_PACKAGE.to_string()
+        } else {
+            format!("{DSH_NPM_PACKAGE}@{want}")
+        };
+        log::info!("[dsh] installing {pkg} in {} (pnpm)", dsh_dir.display());
         cmd.current_dir(&dsh_dir)
-            .arg("install")
-            .arg("--no-save")
-            .arg(format!("{DSH_NPM_PACKAGE}@{want}"));
-        let output = cmd
-            .output()
+            .arg("add")
+            .arg(&pkg)
+            // pnpm 10+ 默认忽略依赖的构建脚本。dsh 依赖树在快速迭代,
+            // 未来可能新增原生依赖/构建脚本,不硬编码 allow 列表(否则
+            // 会因列表过期而漏构建导致启动失败)。--dangerously-allow-all-builds
+            // 允许所有依赖跑脚本,零维护、天然适配未来变化。
+            .arg("--dangerously-allow-all-builds")
+            // 默认 reporter 用单行进度条刷新(不适合逐行读取推送)。
+            // append-only 输出逐行日志,可被 stdout 线程逐行 push 到 UI。
+            .arg("--reporter=append-only")
+            // 必须显式 piped,否则 stdout/stderr 默认继承/null,
+            // child.stdout.take() 返回 None,进度读线程直接跳过。
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .context("Failed to spawn pnpm install for dsh")?;
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        // 累积 stderr 全文,供安装失败时上报错误详情。
+        let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
+        // async_process::ChildStdout/Stderr 实现了 futures_lite::io::AsyncRead，
+        // 用 futures_lite::io::BufReader::new() + lines() 按行读取。
+        // 进度行通过 bridge::push_event 发到 DshRuntime 事件队列，
+        // 由 Workspace 的事件订阅回调更新 DshPaneView。
+        let _stdout_thread = tokio::task::spawn_blocking(move || {
+            futures_lite::future::block_on(async {
+                if let Some(stdout) = stdout {
+                    let mut reader = futures_lite::io::BufReader::new(stdout);
+                    let mut lines = futures_lite::io::AsyncBufReadExt::lines(&mut reader);
+                    let mut count = 0u32;
+                    while let Some(line) = futures_lite::StreamExt::next(&mut lines).await {
+                        if let Ok(line) = line {
+                            let trimmed = line.trim();
+                            // 过滤噪声行,只推送有意义的进度:解析/下载进度、包数、
+                            // 完成、依赖列表。跳过构建脚本行(.../node_modules、
+                            // install$/postinstall/preinstall 生命周期)、纯 +
+                            // 进度条、WARN 等,避免 UI 上长路径/命令刷屏看不清。
+                            // 注意:pnpm 构建行如 `koffi install$ node ./cnoke.cjs`
+                            // 中 `install$` 是字面文本(pnpm 生命周期 shell 语法),
+                            // `install: Done` 是构建完成行,均需过滤。
+                            let useful = !trimmed.is_empty()
+                                && !trimmed.starts_with(".../node_modules")
+                                && !trimmed.starts_with("+")
+                                && !trimmed.starts_with("[WARN]")
+                                && !trimmed.contains("postinstall")
+                                && !trimmed.contains("preinstall")
+                                && !trimmed.contains("install$")
+                                && !trimmed.contains("install: Done");
+                            if useful {
+                                count += 1;
+                                log::info!("[dsh] pnpm stdout line #{count}: {trimmed}");
+                                crate::dsh::bridge::push_event(
+                                    crate::dsh::bridge::BridgeEvent::InstallingProgress {
+                                        line: trimmed.to_string(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    log::info!("[dsh] pnpm stdout EOF, {count} lines pushed");
+                }
+            });
+        });
+
+        let stderr_buf_clone = stderr_buf.clone();
+        let _stderr_thread = tokio::task::spawn_blocking(move || {
+            futures_lite::future::block_on(async {
+                if let Some(stderr) = stderr {
+                    let mut reader = futures_lite::io::BufReader::new(stderr);
+                    let mut lines = futures_lite::io::AsyncBufReadExt::lines(&mut reader);
+                    while let Some(line) = futures_lite::StreamExt::next(&mut lines).await {
+                        if let Ok(line) = line {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                // 同时累积全文供失败上报。
+                                *stderr_buf_clone.lock() += &line;
+                                *stderr_buf_clone.lock() += "\n";
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        // 等待 pnpm 完成。stderr/stdout 线程已在后台持续 push_event。
+        let status = child
+            .status()
             .await
-            .context("Failed to run npm install for dsh")?;
-        if !output.status.success() {
-            bail!(
-                "npm install {} failed: {}",
-                DSH_NPM_PACKAGE,
-                String::from_utf8_lossy(&output.stderr)
-            );
+            .context("pnpm install wait failed")?;
+
+        if !status.success() {
+            let detail = stderr_buf.lock().trim().to_string();
+            if detail.is_empty() {
+                // pnpm 失败但无 stderr:尝试从 exit code 推断原因。
+                let exit_code = status.code();
+                let reason = match exit_code {
+                    // pnpm exit code 1 = ERR_PNPM_* 错误(依赖解析失败、引擎不兼容、peer 冲突等)。
+                    Some(1) => "pnpm exited with code 1 (ERR_PNPM_* error — dependency resolution, engine, or peer conflict)",
+                    // pnpm exit code 2 = 未捕获的 rejection / 内部错误。
+                    Some(2) => "pnpm exited with code 2 (unhandled rejection or internal error)",
+                    // pnpm exit code 5 = store 校验失败(建议清理 pnpm store 缓存后重试)。
+                    Some(5) => "pnpm exited with code 5 (store validation failed — try clearing the pnpm store)",
+                    Some(127) => "pnpm: command not found — ensure pnpm is installed and in PATH",
+                    Some(code) => "unknown pnpm failure",
+                    None => "unknown pnpm failure (no exit code)",
+                };
+                bail!("pnpm add {} failed: {}", DSH_NPM_PACKAGE, reason);
+            }
+            bail!("pnpm add {} failed: {detail}", DSH_NPM_PACKAGE);
         }
-        std::fs::write(dsh_dir.join("version.txt"), &want)?;
+
         if !cli_js.is_file() {
             bail!("dsh installed but entry not found at {}", cli_js.display());
         }

@@ -259,11 +259,14 @@ impl ConversationListView {
         });
 
         let select_button = ctx.add_typed_action_view(|_| {
-            ActionButton::new(crate::t!("workspace-conversation-list-select"), SecondaryTheme)
-                .with_size(ButtonSize::Small)
-                .on_click(|ctx| {
-                    ctx.dispatch_typed_action(ConversationListViewAction::ToggleMultiSelectMode);
-                })
+            ActionButton::new(
+                crate::t!("workspace-conversation-list-select"),
+                SecondaryTheme,
+            )
+            .with_size(ButtonSize::Small)
+            .on_click(|ctx| {
+                ctx.dispatch_typed_action(ConversationListViewAction::ToggleMultiSelectMode);
+            })
         });
 
         let delete_all_button = ctx.add_typed_action_view(|_| {
@@ -298,10 +301,7 @@ impl ConversationListView {
 
         let delete_selected_button = ctx.add_typed_action_view(|_| {
             ActionButton::new(
-                crate::t!(
-                    "workspace-conversation-list-delete-selected",
-                    count = 0
-                ),
+                crate::t!("workspace-conversation-list-delete-selected", count = 0),
                 DangerPrimaryTheme,
             )
             .with_size(ButtonSize::Small)
@@ -628,7 +628,8 @@ impl ConversationListView {
 
         // Remove stale multi-selection entries.
         if !self.selected_conversation_ids.is_empty() {
-            self.selected_conversation_ids.retain(|id| all_ids.contains(id));
+            self.selected_conversation_ids
+                .retain(|id| all_ids.contains(id));
         }
 
         // 列表清空(如清空全部后)时退出多选模式,避免没有退出入口。
@@ -665,10 +666,7 @@ impl ConversationListView {
         let count = self.selected_conversation_ids.len();
         self.delete_selected_button.update(ctx, |button, ctx| {
             button.set_label(
-                crate::t!(
-                    "workspace-conversation-list-delete-selected",
-                    count = count
-                ),
+                crate::t!("workspace-conversation-list-delete-selected", count = count),
                 ctx,
             );
             button.set_disabled(count == 0, ctx);

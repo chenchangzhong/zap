@@ -1668,6 +1668,7 @@ keybinding-desc-workspace-open-blank-web-preview = 打开空白 Web 预览
 dsh-first-use-configure-model = DeepSeek Harness 已就绪。请在设置中配置模型 API Key 后开始使用。
 dsh-updating-toast = 正在更新 DeepSeek Harness 到 { $version }…
 dsh-runtime-failed-toast = DeepSeek Harness 连续崩溃已停止。可从命令面板重新打开。
+dsh-attach-context-not-ready-toast = DeepSeek Harness 仍在启动中。请等待其加载完成后再将文件作为上下文附加。
 new-session-create-new-tab = 新建标签页
 new-session-create-new-window = 新建窗口
 new-session-split-pane-down = 向下拆分窗格

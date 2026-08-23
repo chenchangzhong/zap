@@ -33,9 +33,10 @@ pub enum BridgeEvent {
     Ready { url: String },
     /// 检测到 dsh 新版本,正在更新。
     Updating { version: String },
+    /// 安装进度行(实时 npm 输出)。
+    InstallingProgress { line: String },
     /// 崩溃后自动重启完成。
     Restarted { url: String },
-    /// 启动/重启失败。
     Failed { error: String },
 }
 
@@ -46,7 +47,7 @@ static PENDING_EVENTS: LazyLock<Mutex<Vec<BridgeEvent>>> =
 /// 将事件推入待处理队列(供 `drain_events` 在 `on_frame_drawn` 中消费)，
 /// 并立即返回事件供调用方在同一主线程栈内 drain(确保 IPC 事件即时生效，
 /// 不依赖下一帧绘制)。
-fn push_event(event: BridgeEvent) -> BridgeEvent {
+pub(crate) fn push_event(event: BridgeEvent) -> BridgeEvent {
     PENDING_EVENTS.lock().push(event.clone());
     event
 }
