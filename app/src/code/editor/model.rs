@@ -543,11 +543,22 @@ impl CodeEditorModel {
                 line: line_decorations,
                 text: text_decorations,
             });
-            // Store spacer blocks only; they are inserted by `mark_lazy_layout_initialized`
-            // once the content tree is laid out. Inserting them here AND re-inserting in
-            // `mark_lazy_layout_initialized` would duplicate/desync spacers.
-            self.pending_side_by_side_blocks = temporary_blocks;
         });
+        if self.lazy_layout_initialized {
+            // Layout has already run (e.g. a revert refresh after the first paint): submit the
+            // new spacers through the layout pipeline immediately. In lazy mode this queues them
+            // as pending edits; the next element layout flushes them via `reset_temporary_block`,
+            // which replaces (not appends) ALL temporary blocks — so stale spacers from the
+            // previous diff snapshot are removed, even when the new block list is empty.
+            self.render_state.update(ctx, |render_state, _| {
+                render_state.add_temporary_blocks(temporary_blocks);
+            });
+        } else {
+            // First layout has not run yet: store spacer blocks; they are inserted by
+            // `mark_lazy_layout_initialized` once the content tree is laid out. Inserting them
+            // here AND re-inserting in `mark_lazy_layout_initialized` would duplicate/desync spacers.
+            self.pending_side_by_side_blocks = temporary_blocks;
+        }
     }
 
     pub fn positioning(&self, ctx: &AppContext) -> OffsetPositioning {

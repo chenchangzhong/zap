@@ -253,7 +253,8 @@ impl LocalCodeEditorView {
             | CodeEditorEvent::DiffReverted
             | CodeEditorEvent::HiddenSectionExpanded
             | CodeEditorEvent::Scrolled
-            | CodeEditorEvent::NavScrolled => {}
+            | CodeEditorEvent::NavScrolled
+            | CodeEditorEvent::RevertDiffRequested { .. } => {}
             #[cfg(windows)]
             CodeEditorEvent::WindowsCtrlC { .. } => {}
         });

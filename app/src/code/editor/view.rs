@@ -123,6 +123,10 @@ pub enum CodeEditorEvent {
     },
     /// Emitted when a diff hunk is reverted
     DiffReverted,
+    /// Emitted when the (read-only, left/baseline) column of a side-by-side diff requests a
+    /// revert. The baseline column must not reverse its own buffer (it is read-only reference
+    /// content with a reversed base), so it delegates to the editable (right/modified) column.
+    RevertDiffRequested { hunk_index: usize },
     HiddenSectionExpanded,
     /// Emitted when a comment is saved. This gets propagated up so that it
     /// can be augmented with the file and repo paths and saved to the comment model.
@@ -184,6 +188,9 @@ struct CodeEditorViewDisplayOptions {
     diff_hunk_as_context: Option<AddAsContextButton>,
     /// The revert diff button, or `None` if it is not currently visible.
     revert_diff_hunk: Option<RevertHunkButton>,
+    /// Marks the left/baseline (read-only reference) column of a side-by-side diff. Its revert
+    /// button delegates to the editable right/modified column instead of reversing its own buffer.
+    is_side_by_side_baseline: bool,
     /// The add comment button, or `None` if it is not currently visible.
     comment_button: Option<CommentButton>,
     /// Whether to expand the width of the diff indicator in the gutter on hover.
@@ -390,6 +397,7 @@ impl CodeEditorView {
                 show_nav_bar: true,
                 diff_hunk_as_context: Default::default(),
                 revert_diff_hunk: Default::default(),
+                is_side_by_side_baseline: false,
                 comment_button: Default::default(),
                 // By default expand diff indicators on hover.
                 expand_diff_indicator_width_on_hover: true,
@@ -443,6 +451,14 @@ impl CodeEditorView {
     pub fn with_revert_diff_hunk_button(mut self) -> Self {
         self.display_options.revert_diff_hunk =
             Some(RevertHunkButton::new(true /* is_enabled */));
+        self
+    }
+
+    /// Marks this editor as the read-only, left/baseline column of a side-by-side diff. Its
+    /// revert button delegates to the editable right/modified column instead of reversing its own
+    /// (read-only reference) buffer.
+    pub fn with_side_by_side_baseline(mut self) -> Self {
+        self.display_options.is_side_by_side_baseline = true;
         self
     }
 
@@ -1294,6 +1310,17 @@ impl CodeEditorView {
         }
     }
 
+    /// Focus a specific diff hunk index without toggling navigation off. Used when refreshing
+    /// side-by-side diff status after a revert, where the nav bar must stay active.
+    pub fn focus_diff_hunk_index(&self, index: usize, ctx: &mut ViewContext<Self>) {
+        if !self.display_options.can_show_diff_ui {
+            return;
+        }
+        self.model.update(ctx, |model, ctx| {
+            model.focus_diff_index(index, ctx);
+        });
+    }
+
     /// Expands all diff hunks without focusing any specific diff hunk.
     /// All diff hunks will be shown expanded with normal highlighting.
     pub fn expand_diffs(&self, ctx: &mut ViewContext<Self>) {
@@ -1429,6 +1456,20 @@ impl CodeEditorView {
         self.model.update(ctx, |model, ctx| {
             model.reset_content(state, ctx);
         });
+    }
+
+    /// Revert the diff hunk at `index` by reversing it in the buffer, then emit `DiffReverted`
+    /// for the parent to handle (toast, refresh, undo). Used by the side-by-side diff view's
+    /// baseline (left) column, which delegates its revert to the editable (right) column.
+    pub fn revert_diff_hunk_by_index(&self, index: usize, ctx: &mut ViewContext<Self>) {
+        if !FeatureFlag::RevertDiffHunk.is_enabled() {
+            return;
+        }
+        self.model.update(ctx, |model, ctx| {
+            model.reverse_diff_by_index(index, ctx);
+        });
+        ctx.emit(CodeEditorEvent::DiffReverted);
+        ctx.notify();
     }
 
     pub fn apply_diffs(&self, diffs: Vec<DiffDelta>, ctx: &mut ViewContext<Self>) {

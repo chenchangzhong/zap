@@ -785,7 +785,12 @@ impl<V: EditorView> EditorWrapper<V> {
             let diff_range = self.diff_status.added_diff_range(line_count);
             let range_already_clicked = diff_range
                 .as_ref()
-                .is_some_and(|range| self.state_handle.is_range_clicked(range));
+                .is_some_and(|range| self.state_handle.is_range_clicked(range))
+                // Side-by-side left (baseline) column has an empty change_mapping, so
+                // `added_diff_range` is None and the gutter action records the fallback
+                // single-line range (`line_count..line_count+1`). Check that too so the
+                // revert button's hover/pointer style is released after clicking.
+                || self.state_handle.is_range_clicked(&(line_count..line_count + 1));
 
             // If the corresponding line in the editor element has a line decoration, we should apply the decoration
             // in the wrapper as well. This does assume the line could only have a single decoration. I think it's fine
@@ -1005,6 +1010,10 @@ impl<V: EditorView> EditorWrapper<V> {
 
         if enabled {
             button = button.with_cursor(warpui::platform::Cursor::PointingHand);
+            // Clicking the gutter button usually removes it (revert/add-context), so the
+            // pointing-hand cursor must be reset immediately; otherwise the pointer stays in
+            // "hand" mode over the now-button-less gutter until the next mouse move.
+            button = button.with_reset_cursor_after_click();
 
             if let Some(on_click_action) = on_click_action {
                 let action = on_click_action.clone();

@@ -1061,13 +1061,40 @@ impl TypedActionView for CodeEditorView {
                 if FeatureFlag::RevertDiffHunk.is_enabled() {
                     send_telemetry_from_ctx!(CodeReviewTelemetryEvent::RevertHunkClicked, ctx);
 
-                    // Convert line range to diff hunk index and revert it
+                    // Record this range as clicked so the hover/gutter button goes away
+                    // (mirrors AddDiffHunkContext). Without this, the pointer can stay in a
+                    // "pointing hand" state over the just-reverted hunk.
+                    self.display_states
+                        .wrapper_state_handle
+                        .record_clicked_range(line_range.clone());
+
+                    // Convert line range to diff hunk index. The left/baseline column reports
+                    // a single-line range for a clicked row; inside a multi-line hunk that row
+                    // still belongs to the hunk, so resolve it with an inclusive lookup rather
+                    // than counting hunks strictly before the line.
                     let hunk_index = self
                         .model
                         .as_ref(ctx)
                         .diff()
                         .as_ref(ctx)
-                        .diff_hunk_count_before_line(line_range.start.as_usize());
+                        .diff_hunk_index_at_line(line_range.start.as_usize())
+                        .unwrap_or_else(|| {
+                            self.model
+                                .as_ref(ctx)
+                                .diff()
+                                .as_ref(ctx)
+                                .diff_hunk_count_before_line(line_range.start.as_usize())
+                        });
+
+                    // The read-only, left/baseline column of a side-by-side diff must not reverse
+                    // its own buffer: it is reference content with a reversed base, so the action
+                    // would both compute wrong text and leave the actual file (right column) untouched.
+                    // Delegate to the editable right/modified column via the parent.
+                    if self.display_options.is_side_by_side_baseline {
+                        ctx.emit(CodeEditorEvent::RevertDiffRequested { hunk_index });
+                        ctx.notify();
+                        return;
+                    }
 
                     self.model.update(ctx, |model, ctx| {
                         model.reverse_diff_by_index(hunk_index, ctx);

@@ -5,7 +5,11 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -27,8 +31,8 @@ use crate::{
     code::editor::view::CodeEditorRenderOptions,
     code::editor::{
         add_inline_overlay_color, add_overlay_color, remove_inline_overlay_color,
-        remove_overlay_color, CommentEditor, CommentEditorEvent, EditorCommentsModel,
-        EditorReviewComment,
+        remove_overlay_color, ChangeType, CommentEditor, CommentEditorEvent, DiffStatus,
+        EditorCommentsModel, EditorReviewComment,
     },
     code_review::{comments::ReviewCommentBatch, DiffSetScope},
 };
@@ -62,8 +66,10 @@ use crate::{
     },
 };
 use warp_editor::content::diff::compute_spacers;
+use warp_editor::content::edit::TemporaryBlock;
 use warpui::color::ColorU;
 use warp_core::ui::theme::Fill;
+use rangemap::RangeMap;
 
 #[cfg(feature = "local_fs")]
 use crate::code_review::telemetry_event::DiffSetContextScope;
@@ -164,6 +170,7 @@ use warpui::{
 
 use crate::code::diff_layout::DiffLayout;
 use crate::code::footer::CodeFooterView;
+use crate::browser::BrowserWebViewManager;
 use crate::settings::AISettings;
 use crate::ui_components::{
     blended_colors::{neutral_2, neutral_3},
@@ -314,6 +321,9 @@ const FILE_SIDEBAR_MAX_WIDTH: f32 = 800.;
 const FILE_HEADER_HEIGHT: f32 = 41.;
 /// The gap between editors in the viewported list.
 const EDITOR_GAP: f32 = 12.;
+// Divides the viewport line count to derive the scroll offset (in lines) when
+// jumping to a diff hunk (same convention as the NavBar).
+const DIFF_NAV_VIEWPORT_LINE_DIVISOR: usize = 10;
 const FILE_SIDEBAR_PANE_WIDTH_PERCENTAGE: f32 = 0.25;
 /// Vertical gap between the right panel header row and the code review content below it
 /// (sub-header in loaded state, loading text in loading state).
@@ -403,11 +413,30 @@ pub enum CodeReviewAction {
 }
 
 /// Holds the two editor views for side-by-side diff rendering.
+#[derive(Clone)]
 pub struct SideBySideEditorState {
     pub baseline_editor: ViewHandle<LocalCodeEditorView>,
     pub modified_editor: ViewHandle<LocalCodeEditorView>,
     /// Prevents infinite scroll sync loop between the two editors.
     pub syncing: Rc<Cell<bool>>,
+    /// Last scroll sync timestamp in milliseconds for 16ms throttle (baseline → modified).
+    pub last_sync_time: Arc<AtomicI64>,
+    /// Last scroll sync timestamp in milliseconds for 16ms throttle (modified → baseline).
+    pub last_sync_time_reverse: Arc<AtomicI64>,
+}
+
+/// Decorations + diff statuses derived from the old (left) and new (right) buffer contents.
+/// Returned by [`CodeReviewView::compute_side_by_side_diff_data`] and reused after a hunk
+/// revert to refresh the two columns from their live buffer text.
+struct SideBySideDiffData {
+    left_decorations: Vec<LineDecoration>,
+    right_decorations: Vec<LineDecoration>,
+    left_text_decorations: Vec<Decoration>,
+    right_text_decorations: Vec<Decoration>,
+    left_spacers: Vec<TemporaryBlock>,
+    right_spacers: Vec<TemporaryBlock>,
+    left_diff_status: DiffStatus,
+    right_diff_status: DiffStatus,
 }
 
 pub struct FileState {
@@ -990,13 +1019,13 @@ impl CodeReviewView {
         let adjustment_handle = view_handle;
 
         let (list_state, scroll_rx) = ListState::new_with_scroll_preservation(
-            move |index, scroll_offset, app| {
+            move |index, scroll_offset, viewport_height, app| {
                 let view_handle = render_handle
                     .upgrade(app)
                     .expect("CodeReviewView dropped during render");
                 view_handle
                     .as_ref(app)
-                    .render_diff_at_index(index, scroll_offset, app)
+                    .render_diff_at_index(index, scroll_offset, viewport_height, app)
             },
             #[cfg(not(target_family = "wasm"))]
             move |index, captured_context, app| {
@@ -2515,6 +2544,7 @@ impl CodeReviewView {
                 };
 
                 let existing_index = diff_data.file_states.get_index_of(&file_path);
+                let mut removed_index = None;
 
                 match (existing_index, updated_diff) {
                     (Some(index), Some(diff)) => {
@@ -2526,6 +2556,7 @@ impl CodeReviewView {
                         if status_changed {
                             diff_data.file_states.shift_remove_index(index);
                             self.viewported_list_state.remove(index);
+                            removed_index = Some(index);
                             let new_states = self
                                 .build_view_state_for_file_diffs(std::slice::from_ref(&diff), ctx);
                             diff_data.file_states.extend(
@@ -2550,6 +2581,7 @@ impl CodeReviewView {
                     (Some(index), None) => {
                         diff_data.file_states.shift_remove_index(index);
                         self.viewported_list_state.remove(index);
+                        removed_index = Some(index);
                     }
                     (None, Some(diff)) => {
                         let new_states =
@@ -2565,6 +2597,30 @@ impl CodeReviewView {
 
                 if let Some(repo) = self.active_repo.as_mut() {
                     repo.state = CodeReviewViewState::Loaded(diff_data);
+                }
+
+                // A removed file can leave `active_file_index` stale (pointing past the end or
+                // at a different file). Reset it so `effective_active_index` falls back to the
+                // first expanded file, then (re)create the active file's side-by-side pair —
+                // otherwise the view stays on "Loading..." because `side_by_side_state` is None
+                // and no layout/maximize toggle fires to build it.
+                if removed_index.is_some() {
+                    self.active_file_index = None;
+                }
+                if self.diff_layout.is_side_by_side() {
+                    let needs_pair = self
+                        .effective_active_index()
+                        .and_then(|idx| match self.state() {
+                            CodeReviewViewState::Loaded(state) => state
+                                .file_states
+                                .get_index(idx)
+                                .map(|(_, f)| f.side_by_side_state.is_none()),
+                            _ => None,
+                        })
+                        .unwrap_or(false);
+                    if needs_pair {
+                        self.create_side_by_side_editors_for_expanded_files(ctx);
+                    }
                 }
 
                 self.update_editor_comment_markers(ctx);
@@ -2685,6 +2741,27 @@ impl CodeReviewView {
                 total_deletions: diff_data.total_deletions,
                 files_changed: diff_data.files_changed,
             });
+        }
+
+        // After a (re)load, (re)create the active file's side-by-side editor pair if we are
+        // in side-by-side mode. This fixes the "Loading..."-forever case after the panel is
+        // closed and reopened while already in side-by-side layout: diffs reload and rebuild
+        // `file_states` (resetting `side_by_side_state` to None), but no maximize/layout
+        // toggle fires to recreate the editors. Only recreate when missing to avoid resetting
+        // an already-built pair on every data refresh.
+        if self.diff_layout.is_side_by_side()
+            && self
+                .effective_active_index()
+                .and_then(|idx| {
+                    if let CodeReviewViewState::Loaded(state) = self.state() {
+                        state.file_states.get_index(idx).map(|(_, f)| f.side_by_side_state.is_none())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false)
+        {
+            self.create_side_by_side_editors_for_expanded_files(ctx);
         }
 
         self.recompute_merge_base_and_flush(ctx);
@@ -2889,6 +2966,7 @@ impl CodeReviewView {
         &self,
         index: usize,
         scroll_offset: ScrollOffset,
+        viewport_height: Pixels,
         app: &AppContext,
     ) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
@@ -2912,7 +2990,7 @@ impl CodeReviewView {
             return Empty::new().finish();
         }
 
-        self.render_file_diff(file_state, index, scroll_offset, appearance, app)
+        self.render_file_diff(file_state, index, scroll_offset, viewport_height, appearance, app)
     }
 
     /// The active file index, falling back to the first expanded file in side-by-side mode.
@@ -3060,6 +3138,12 @@ impl CodeReviewView {
     /// Get the terminal view for the current repo. Returns None if no repo or no terminal.
     pub fn terminal_view(&self, app: &AppContext) -> Option<ViewHandle<TerminalView>> {
         self.terminal_view.as_ref().and_then(|tv| tv.upgrade(app))
+    }
+
+    /// Whether this code review view was opened from the DSH (DeepSeek Harness) webview pane.
+    /// When true, context/comments route to the DSH session instead of a terminal.
+    pub fn is_dsh(&self) -> bool {
+        self.is_dsh
     }
 
     fn diff_state(&self, app: &AppContext) -> DiffState {
@@ -3457,6 +3541,15 @@ impl CodeReviewView {
                 });
             }
             LocalCodeEditorEvent::CommentSaved { comment } => {
+                // In side-by-side mode the inner CodeEditorView already forwards the
+                // comment via `handle_code_editor_event` (using the review view's own
+                // `file_path`), so skip this wrapper path to avoid a duplicate
+                // `update_review_comment` (which double-fires telemetry and races on the
+                // stored `file_path`). Single-column mode has no such inner subscription,
+                // so it must keep using this path.
+                if self.diff_layout.is_side_by_side() {
+                    return;
+                }
                 let Some(file_path) = editor.as_ref(ctx).file_path() else {
                     log::error!(
                         "Attempted to attach code review comment to a LocalCodeEditorView without a file path"
@@ -4759,13 +4852,21 @@ impl CodeReviewView {
                 self.viewported_list_state.clone(),
             )),
         };
+        // In side-by-side mode the content fills exactly one viewport (the active file's
+        // editor pair scrolls internally), so the outer list has nothing to scroll and
+        // must not show a scrollbar. Inline mode keeps the outer scrollbar.
+        let outer_scrollbar_width = if self.diff_layout.is_side_by_side() {
+            ScrollbarWidth::None
+        } else {
+            ScrollbarWidth::Auto
+        };
         let scrollable_diffs = NewScrollable::vertical(
             axis_config,
             appearance.theme().nonactive_ui_detail().into(),
             appearance.theme().active_ui_detail().into(),
             warpui::elements::Fill::None,
         )
-        .with_vertical_scrollbar(ScrollableAppearance::new(ScrollbarWidth::Auto, false))
+        .with_vertical_scrollbar(ScrollableAppearance::new(outer_scrollbar_width, false))
         .with_propagate_mousewheel_if_not_handled(true)
         .with_always_handle_events_first(false)
         .finish();
@@ -5046,6 +5147,7 @@ impl CodeReviewView {
         file: &FileState,
         file_index: usize,
         scroll_offset_from_top: ScrollOffset,
+        viewport_height: Pixels,
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
@@ -5054,11 +5156,19 @@ impl CodeReviewView {
         let is_first_item_with_no_scroll = file_index == 0
             && scroll_offset_from_top.list_item_index() == 0
             && scroll_offset_from_top.offset_from_start().as_f32() < 1.;
+        // The sticky-header path exists for inline mode, where the outer list scrolls
+        // through stacked files and the current file's header sticks to the top. In
+        // side-by-side mode the content fills exactly one viewport (the editor pair
+        // scrolls internally), so the outer list never scrolls and the sticky path must
+        // not run — it replaces the real header with an Empty element, adds a header-
+        // height margin to the content and layers a positioned header on the stack.
+        let use_sticky_header = !self.diff_layout.is_side_by_side()
+            && is_item_being_scrolled
+            && !is_first_item_with_no_scroll;
 
-        let file_header =
-            if is_item_being_scrolled && file.is_expanded && !is_first_item_with_no_scroll {
-                Empty::new().finish()
-            } else {
+        let file_header = if use_sticky_header && file.is_expanded {
+            Empty::new().finish()
+        } else {
                 let header = SavePosition::new(
                     self.render_file_header(file, file_index, appearance, app),
                     &self.file_diff_header_position(file_index),
@@ -5085,28 +5195,26 @@ impl CodeReviewView {
             stack.add_child(
                 SavePosition::new(
                     Container::new(self.render_file_content(file, appearance))
-                        .with_margin_top(
-                            if is_item_being_scrolled && !is_first_item_with_no_scroll {
-                                // This is the height of the header bar needs to be present. Otherwise,
-                                // the file contents shift up by this amount.
-                                if let Some(header_rect) = app.element_position_by_id_at_last_frame(
-                                    self.window_id,
-                                    self.file_diff_header_position(file_index),
-                                ) {
-                                    header_rect.height()
-                                } else {
-                                    FILE_HEADER_HEIGHT
-                                }
+                        .with_margin_top(if use_sticky_header {
+                            // This is the height of the header bar needs to be present. Otherwise,
+                            // the file contents shift up by this amount.
+                            if let Some(header_rect) = app.element_position_by_id_at_last_frame(
+                                self.window_id,
+                                self.file_diff_header_position(file_index),
+                            ) {
+                                header_rect.height()
                             } else {
-                                0.
-                            },
-                        )
+                                FILE_HEADER_HEIGHT
+                            }
+                        } else {
+                            0.
+                        })
                         .finish(),
                     &self.file_index_position(file_index),
                 )
                 .finish(),
             );
-            if is_item_being_scrolled && !is_first_item_with_no_scroll {
+            if use_sticky_header {
                 let sticky_file_header = self.render_file_header(file, file_index, appearance, app);
                 stack.add_positioned_child(
                     sticky_file_header,
@@ -5119,10 +5227,33 @@ impl CodeReviewView {
                     ),
                 );
             }
-            content.add_child(stack.finish());
+            content.add_child(if self.diff_layout.is_side_by_side() {
+                // In side-by-side mode the content is a fixed-height viewport: make it a
+                // flexible child so the finite constraint reaches the editor pair instead
+                // of being re-unbounded by the Flex column.
+                Shrinkable::new(1., stack.finish()).finish()
+            } else {
+                stack.finish()
+            });
         }
 
-        Container::new(Shrinkable::new(1., content.finish()).finish())
+        // In side-by-side mode clamp the whole item to the list's viewport height so the
+        // editors receive a finite constraint. Otherwise the unbounded column constraint
+        // reaches them and InfiniteHeight renders every line — no virtual scrolling and
+        // lag on 1000+ line files. Inline mode keeps the natural-height layout.
+        // Subtract EDITOR_GAP (the item's bottom margin) so the item exactly fills the
+        // viewport and the outer list does not scroll (avoids the sticky-header offset
+        // path firing for a few stray pixels).
+        let content = if self.diff_layout.is_side_by_side() {
+            let viewport_height = (viewport_height.as_f32() - EDITOR_GAP).max(0.);
+            ConstrainedBox::new(content.finish())
+                .with_max_height(viewport_height)
+                .finish()
+        } else {
+            content.finish()
+        };
+
+        Container::new(Shrinkable::new(1., content).finish())
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
             .with_margin_bottom(EDITOR_GAP)
             .finish()
@@ -5657,22 +5788,87 @@ impl CodeReviewView {
 
             // Now store it and set up scroll sync (needs &mut self)
             if let Some(pair) = editor_pair {
-                // Subscribe baseline editor's ViewportUpdated → sync scroll to modified editor
+                // Subscribe both editors' synchronous `Scrolled` events (fired at scroll
+                // time, before layout — no async element-update round-trip) so scrolling
+                // either column proportionally scrolls the other in the same frame.
+                // Each direction has its own 16ms throttle; `syncing` guards synchronous
+                // re-entrancy. Programmatic scrolls (including the sync itself) do not
+                // emit `Scrolled`, so there is no echo loop.
                 let baseline_code_editor = pair.baseline_editor.as_ref(ctx).editor().clone();
-                let modified_handle = pair.modified_editor.clone();
-                let syncing = pair.syncing.clone();
-                ctx.subscribe_to_view(&baseline_code_editor, move |_this, editor, event, ctx| {
-                    if matches!(event, CodeEditorEvent::ViewportUpdated) && !syncing.get() {
-                        syncing.set(true);
-                        Self::sync_scroll_to_target(&editor, &modified_handle, ctx);
-                        syncing.set(false);
+                let modified_code_editor = pair.modified_editor.as_ref(ctx).editor().clone();
+                Self::subscribe_scroll_sync(
+                    &baseline_code_editor,
+                    &pair.modified_editor,
+                    pair.syncing.clone(),
+                    pair.last_sync_time.clone(),
+                    ctx,
+                );
+                Self::subscribe_scroll_sync(
+                    &modified_code_editor,
+                    &pair.baseline_editor,
+                    pair.syncing.clone(),
+                    pair.last_sync_time_reverse.clone(),
+                    ctx,
+                );
+
+                // Mirror the single-column (inline) wiring: the inner code editors feed
+                // `handle_code_editor_event` (Add Context / Revert / Comment), and the
+                // `LocalCodeEditorView` wrappers feed `handle_local_code_editor_events`
+                // (comment save, selection-as-context). Without these subscriptions the
+                // gutter/comment buttons in side-by-side mode never reach the review view.
+                let diff_file_path = path.clone();
+                let full_file_path = self.repo_path().map(|repo| repo.join(&path));
+                let baseline_local = pair.baseline_editor.clone();
+                let modified_local = pair.modified_editor.clone();
+                ctx.subscribe_to_view(&baseline_code_editor, {
+                    let file_path = diff_file_path.clone();
+                    move |this, editor, event, ctx| {
+                        this.handle_code_editor_event(file_path.clone(), editor, event, ctx);
                     }
                 });
+                ctx.subscribe_to_view(&modified_code_editor, {
+                    let file_path = diff_file_path.clone();
+                    move |this, editor, event, ctx| {
+                        this.handle_code_editor_event(file_path.clone(), editor, event, ctx);
+                    }
+                });
+                if let Some(full_file_path) = full_file_path.clone() {
+                    ctx.subscribe_to_view(&baseline_local, {
+                        let full_file_path = full_file_path.clone();
+                        let diff_file_path = diff_file_path.clone();
+                        move |me, editor, event, ctx| {
+                            me.handle_local_code_editor_events(
+                                editor,
+                                event,
+                                &full_file_path,
+                                &diff_file_path,
+                                ctx,
+                            );
+                        }
+                    });
+                    ctx.subscribe_to_view(&modified_local, {
+                        let full_file_path = full_file_path.clone();
+                        let diff_file_path = diff_file_path.clone();
+                        move |me, editor, event, ctx| {
+                            me.handle_local_code_editor_events(
+                                editor,
+                                event,
+                                &full_file_path,
+                                &diff_file_path,
+                                ctx,
+                            );
+                        }
+                    });
+                }
 
                 if let Some(repo) = self.active_repo.as_mut() {
                     if let CodeReviewViewState::Loaded(state) = &mut repo.state {
                         if let Some(file) = state.file_states.get_mut(&path) {
-                            file.side_by_side_state = Some(pair);
+                            file.side_by_side_state = Some(pair.clone());
+                            // So save + unsaved-changes state target the editable
+                            // (right/modified) column, like the single-column path.
+                            file.editor_state =
+                                Some(CodeReviewEditorState::new_loaded(pair.modified_editor.clone()));
                         }
                     }
                 }
@@ -5680,8 +5876,54 @@ impl CodeReviewView {
         }
     }
 
-    /// Syncs scroll position from source editor to target editor proportionally.
-    /// Called when source editor's viewport is updated.
+    /// Subscribes `source` editor's synchronous `Scrolled` event and syncs the scroll of `target`.
+    fn subscribe_scroll_sync(
+        source: &ViewHandle<CodeEditorView>,
+        target: &ViewHandle<LocalCodeEditorView>,
+        syncing: Rc<Cell<bool>>,
+        last_sync_time: Arc<AtomicI64>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let source = source.clone();
+        let target = target.clone();
+        ctx.subscribe_to_view(&source, move |_this, editor, event, ctx| {
+            // Scrolled = user wheel/scrollbar → proportional sync.
+            // NavScrolled = nav-bar hunk navigation → jump the other column to the
+            // same hunk.
+            let from_nav = match event {
+                CodeEditorEvent::Scrolled => Some(false),
+                CodeEditorEvent::NavScrolled => Some(true),
+                _ => None,
+            };
+            let Some(from_nav) = from_nav else {
+                return;
+            };
+            if syncing.get() {
+                return;
+            }
+            // 16ms throttle: skip if less than 16ms since last sync.
+            // Note: use a wall-clock timestamp; Instant::now().elapsed() is ~0.
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let last_time = last_sync_time.load(Ordering::Relaxed);
+            if now - last_time < 16 {
+                return;
+            }
+            last_sync_time.store(now, Ordering::Relaxed);
+            syncing.set(true);
+            if from_nav {
+                Self::sync_focused_hunk_to_target(&editor, &target, ctx);
+            } else {
+                Self::sync_scroll_to_target(&editor, &target, ctx);
+            }
+            syncing.set(false);
+        });
+    }
+
+    /// Syncs scroll position from source editor to target editor proportionally
+    /// (vertical and horizontal). Called synchronously on user wheel/scrollbar scrolls.
     fn sync_scroll_to_target(
         source: &ViewHandle<CodeEditorView>,
         target: &ViewHandle<LocalCodeEditorView>,
@@ -5694,17 +5936,30 @@ impl CodeReviewView {
         let source_render = source_render_handle.as_ref(ctx);
         let source_vp = source_render.viewport();
         let source_scroll_top = source_vp.scroll_top().as_f32();
+        let source_scroll_left = source_vp.scroll_left().as_f32();
         let source_height = source_render.height().as_f32();
         let source_viewport_h = source_vp.height().as_f32();
+        let source_width = source_render.width().as_f32();
+        let source_viewport_w = source_vp.width().as_f32();
 
-        // Scrollable range = content height - viewport height
-        let source_scrollable = (source_height - source_viewport_h).max(0.0);
-        if source_scrollable <= 0.0 {
+        // Scrollable range = content size - viewport size
+        let source_scrollable_v = (source_height - source_viewport_h).max(0.0);
+        let source_scrollable_h = (source_width - source_viewport_w).max(0.0);
+        if source_scrollable_v <= 0.0 && source_scrollable_h <= 0.0 {
             return;
         }
 
-        // Compute scroll ratio (0.0 = top, 1.0 = bottom)
-        let ratio = (source_scroll_top / source_scrollable).clamp(0.0, 1.0);
+        // Compute scroll ratios (0.0 = start, 1.0 = end)
+        let ratio_v = if source_scrollable_v > 0.0 {
+            (source_scroll_top / source_scrollable_v).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let ratio_h = if source_scrollable_h > 0.0 {
+            (source_scroll_left / source_scrollable_h).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
         // Apply proportional scroll to target via model update
         let target_local = target.as_ref(ctx);
@@ -5717,12 +5972,121 @@ impl CodeReviewView {
             render_state_handle.update(ctx, |render_state, ctx| {
                 let target_height = render_state.height().as_f32();
                 let target_viewport_h = render_state.viewport().height().as_f32();
-                let target_scrollable = (target_height - target_viewport_h).max(0.0);
-                if target_scrollable > 0.0 {
-                    let target_scroll = Pixels::new(target_scrollable * ratio);
+                let target_width = render_state.width().as_f32();
+                let target_viewport_w = render_state.viewport().width().as_f32();
+
+                let target_scrollable_v = (target_height - target_viewport_h).max(0.0);
+                if target_scrollable_v > 0.0 {
+                    let target_scroll = Pixels::new(target_scrollable_v * ratio_v);
                     let current = render_state.viewport().scroll_top();
-                    let delta = target_scroll - current;
+                    // ViewportState::scroll(delta) moves scroll_top by `scroll_top - delta`
+                    // (positive delta scrolls up, wheel-style). So the delta to reach
+                    // `target_scroll` from `current` is `current - target_scroll`.
+                    let delta = current - target_scroll;
                     render_state.scroll(delta, ctx);
+                }
+
+                let target_scrollable_h = (target_width - target_viewport_w).max(0.0);
+                if target_scrollable_h > 0.0 {
+                    let target_scroll = Pixels::new(target_scrollable_h * ratio_h);
+                    let current = render_state.viewport().scroll_left();
+                    // Same wheel-style convention for horizontal scrolling.
+                    let delta = current - target_scroll;
+                    render_state.scroll_horizontal(delta, ctx);
+                }
+            });
+        });
+    }
+
+    /// Focuses the target editor onto the same diff hunk index as the source and scrolls
+    /// it to that hunk's start row (block-level sync for nav-bar navigation).
+    fn sync_focused_hunk_to_target(
+        source: &ViewHandle<CodeEditorView>,
+        target: &ViewHandle<LocalCodeEditorView>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let source_view = source.as_ref(ctx);
+        let source_model = source_view.model.as_ref(ctx);
+        let Some(index) = source_model.focused_diff_index() else {
+            return;
+        };
+        let source_render_handle = source_model.render_state().clone();
+        let source_render = source_render_handle.as_ref(ctx);
+        // Extract source horizontal scroll as plain values to avoid holding an immutable
+        // borrow of `ctx` across the target model update.
+        let source_vp = source_render.viewport();
+        let source_scroll_left = source_vp.scroll_left().as_f32();
+        let source_width = source_render.width().as_f32();
+        let source_viewport_w = source_vp.width().as_f32();
+
+        let target_local = target.as_ref(ctx);
+        let target_code_editor = target_local.editor();
+        let target_code_ref = target_code_editor.as_ref(ctx);
+        let target_model_handle = target_code_ref.model.clone();
+
+        target_model_handle.update(ctx, |model, ctx| {
+            let hunk_count = model.diff().as_ref(ctx).diff_hunk_count();
+            if hunk_count == 0 {
+                return;
+            }
+            let index = index.min(hunk_count - 1);
+            model.focus_diff_index(index, ctx);
+
+            // Scroll the target to the start of the focused hunk (same offset convention
+            // as the NavBar autoscroll).
+            let Some(range) = model.diff().as_ref(ctx).line_range_by_diff_hunk_index(index) else {
+                return;
+            };
+            let character_offset = model.start_of_line_offset(range.start, ctx);
+            let delta = (model.lines_in_viewport(ctx) / DIFF_NAV_VIEWPORT_LINE_DIVISOR).max(1);
+            let pixel_offset = -(delta as f32 * model.line_height(ctx));
+            model
+                .render_state()
+                .clone()
+                .update(ctx, |render_state, _ctx| {
+                    render_state.request_autoscroll_to_exact_vertical(
+                        character_offset,
+                        Pixels::new(pixel_offset),
+                    );
+                });
+        });
+
+        // Keep horizontal scroll proportionally synced for the hunk jump as well.
+        Self::sync_horizontal_to_target(
+            source_scroll_left,
+            source_width,
+            source_viewport_w,
+            &target_model_handle,
+            ctx,
+        );
+    }
+
+    /// Proportionally syncs the target's horizontal scroll to the source.
+    fn sync_horizontal_to_target(
+        source_scroll_left: f32,
+        source_width: f32,
+        source_viewport_w: f32,
+        target_model_handle: &warpui::ModelHandle<crate::code::editor::model::CodeEditorModel>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let source_scrollable_h = (source_width - source_viewport_w).max(0.0);
+        if source_scrollable_h <= 0.0 {
+            return;
+        }
+        let ratio_h = (source_scroll_left / source_scrollable_h).clamp(0.0, 1.0);
+
+        let target_model_handle = target_model_handle.clone();
+        target_model_handle.update(ctx, |model, ctx| {
+            let render_state_handle = model.render_state().clone();
+            render_state_handle.update(ctx, |render_state, ctx| {
+                let target_width = render_state.width().as_f32();
+                let target_viewport_w = render_state.viewport().width().as_f32();
+                let target_scrollable_h = (target_width - target_viewport_w).max(0.0);
+                if target_scrollable_h > 0.0 {
+                    let target_scroll = Pixels::new(target_scrollable_h * ratio_h);
+                    let current = render_state.viewport().scroll_left();
+                    let delta = current - target_scroll;
+                    render_state.scroll_horizontal(delta, ctx);
                 }
             });
         });
@@ -5814,40 +6178,21 @@ impl CodeReviewView {
         (left, right)
     }
 
-    fn create_side_by_side_editors(
-        &self,
-        file: &FileState,
-        ctx: &mut ViewContext<Self>,
-    ) -> Option<SideBySideEditorState> {
-        let repo_path = self.repo_path()?;
-
-        if file.file_diff.is_binary {
-            return None;
-        }
-
-        let old_content = file.content_at_head.as_deref().unwrap_or("");
-        let new_content = if matches!(file.file_diff.status, GitFileStatus::Deleted) {
-            Self::reconstruct_new_content(old_content, &file.file_diff.hunks)
-        } else {
-            let full_path = repo_path.join(&file.file_diff.file_path);
-            std::fs::read_to_string(&full_path).unwrap_or_else(|_| {
-                Self::reconstruct_new_content(old_content, &file.file_diff.hunks)
-            })
-        };
-
-        let appearance = Appearance::as_ref(ctx);
-
-        // Compute decorations from the BufferDiff line mapping (Zed approach): imara_diff on
-        // old vs new content. Left editor (old): red for changed old rows. Right editor (new):
-        // green for changed new rows. Character-level word diffs for equal-line-count (modification)
-        // hunks.
+    /// Computed decorations + diff statuses for the two side-by-side columns, derived from
+    /// the old (left) and new (right) buffer contents. Extracted from
+    /// [`Self::create_side_by_side_editors`] so it can be re-run after a hunk revert (when the
+    /// right column's live buffer content has changed) without duplicating the mapping logic.
+    fn compute_side_by_side_diff_data(
+        appearance: &Appearance,
+        old_content: &str,
+        new_content: &str,
+    ) -> SideBySideDiffData {
         let mut left_decorations = Vec::new();
         let mut right_decorations = Vec::new();
         let mut left_text_decorations = Vec::new();
         let mut right_text_decorations = Vec::new();
 
-        let diff_hunks =
-            warp_editor::content::diff::diff_lines(old_content, &new_content);
+        let diff_hunks = warp_editor::content::diff::diff_lines(old_content, new_content);
 
         for hunk in diff_hunks.iter() {
             // Line backgrounds (SplitSide colors): left = old rows (deleted/red),
@@ -5889,36 +6234,180 @@ impl CodeReviewView {
         // Compute spacer blocks for each side (Zed spacer-block alignment)
         let (left_spacers, right_spacers) = compute_spacers(&diff_hunks);
 
+        // Build precise diff statuses per side (git alignment): only mark rows that
+        // actually exist on that side.
+        //
+        // IMPORTANT: `diff_hunk(line_count)` is queried in the LINE domain — `start_line`
+        // sums `BlockItem::lines()` and `TemporaryBlock::lines() == 0` (render/model/
+        // mod.rs), so spacer blocks do NOT consume line numbers and every query uses the
+        // plain buffer row. Keys must therefore be buffer rows (no spacer offset).
+        // Spacers themselves are excluded at the gutter level via `is_spacer()`.
+        //
+        // change_mapping uses one range per hunk (not per row) so hunk-index based
+        // operations (diff_hunk_count_before_line / reverse_action_by_diff_hunk_index)
+        // keep working; deletion_mapping stays per-row (HashMap semantics).
+        let left_change_mapping = RangeMap::new();
+        let mut left_deletion_mapping = HashMap::new();
+        let mut left_deletion_hunks = Vec::new();
+        let mut right_change_mapping = RangeMap::new();
+        let right_deletion_mapping = HashMap::new();
+        let mut right_deletion_hunks = Vec::new();
+        // Reverse-insertion overrides for right-column pure-deletion hunks (see
+        // `DiffStatus::reverse_insertion_mapping`): the right buffer has no rows for
+        // a pure deletion, so we re-insert the deleted base lines at this zero-width
+        // navigation position when the hunk is reverted.
+        let mut right_reverse_insertion_mapping = HashMap::new();
+        // Every hunk contributes exactly one navigation range on EACH side so hunk
+        // indices stay aligned between the two columns:
+        //   - replacement: old rows on the left, new rows on the right
+        //   - pure deletion: old rows on the left, zero-length placeholder on the right
+        //   - pure addition: zero-length placeholder on the left, new rows on the right
+        for hunk in diff_hunks.iter() {
+            let old_has_rows = !hunk.old_rows.is_empty();
+            let new_has_rows = !hunk.new_rows.is_empty();
+            match (old_has_rows, new_has_rows) {
+                (true, true) => {
+                    for row in hunk.old_rows.clone() {
+                        left_deletion_mapping.insert(row, row..row + 1);
+                    }
+                    left_deletion_hunks.push(hunk.old_rows.clone());
+                    right_change_mapping.insert(
+                        hunk.new_rows.clone(),
+                        ChangeType::Replacement {
+                            replaced_range: hunk.old_rows.clone(),
+                            insertion: Vec::new(),
+                            deletion: Vec::new(),
+                        },
+                    );
+                }
+                (true, false) => {
+                    for row in hunk.old_rows.clone() {
+                        left_deletion_mapping.insert(row, row..row + 1);
+                    }
+                    left_deletion_hunks.push(hunk.old_rows.clone());
+                    right_deletion_hunks.push(hunk.new_rows.end..hunk.new_rows.end);
+                    // Right column has no rows for a pure deletion; record the base
+                    // range so reverting this hunk re-inserts the deleted lines at the
+                    // zero-width navigation position `new_rows.end`.
+                    right_reverse_insertion_mapping
+                        .insert(hunk.new_rows.end, hunk.old_rows.clone());
+                }
+                (false, true) => {
+                    right_change_mapping
+                        .insert(hunk.new_rows.clone(), ChangeType::Addition);
+                    left_deletion_hunks.push(hunk.old_rows.clone());
+                }
+                (false, false) => {}
+            }
+        }
+        let left_diff_status =
+            DiffStatus::from_mappings(left_change_mapping, left_deletion_mapping)
+                .with_deletion_hunks(left_deletion_hunks);
+        let right_diff_status =
+            DiffStatus::from_mappings(right_change_mapping, right_deletion_mapping)
+                .with_deletion_hunks(right_deletion_hunks)
+                .with_reverse_insertion_mapping(right_reverse_insertion_mapping);
+
+        SideBySideDiffData {
+            left_decorations,
+            right_decorations,
+            left_text_decorations,
+            right_text_decorations,
+            left_spacers,
+            right_spacers,
+            left_diff_status,
+            right_diff_status,
+        }
+    }
+
+    fn create_side_by_side_editors(
+        &self,
+        file: &FileState,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<SideBySideEditorState> {
+        let repo_path = self.repo_path()?;
+
+        if file.file_diff.is_binary {
+            return None;
+        }
+
+        let old_content = file.content_at_head.as_deref().unwrap_or("");
+        let new_content = if matches!(file.file_diff.status, GitFileStatus::Deleted) {
+            Self::reconstruct_new_content(old_content, &file.file_diff.hunks)
+        } else {
+            let full_path = repo_path.join(&file.file_diff.file_path);
+            std::fs::read_to_string(&full_path).unwrap_or_else(|_| {
+                Self::reconstruct_new_content(old_content, &file.file_diff.hunks)
+            })
+        };
+
+        let appearance = Appearance::as_ref(ctx);
+
+        // Compute decorations from the BufferDiff line mapping (Zed approach): imara_diff on
+        // old vs new content. Left editor (old): red for changed old rows. Right editor (new):
+        // green for changed new rows. Character-level word diffs for equal-line-count (modification)
+        // hunks.
+        let SideBySideDiffData {
+            left_decorations,
+            right_decorations,
+            left_text_decorations,
+            right_text_decorations,
+            left_spacers,
+            right_spacers,
+            left_diff_status,
+            right_diff_status,
+        } = Self::compute_side_by_side_diff_data(appearance, old_content, &new_content);
+
 
         // Create baseline (left) editor — old content with red deletion decorations + left spacers
         let baseline_editor = ctx.add_typed_action_view(|ctx| {
             CodeEditorView::new(
                 None,
                 None,
-                CodeEditorRenderOptions::new(VerticalExpansionBehavior::InfiniteHeight)
+                CodeEditorRenderOptions::new(VerticalExpansionBehavior::FillMaxHeight)
                     .lazy_layout()
-                    .line_height_override(CODE_REVIEW_EDITOR_LINE_HEIGHT_RATIO),
+                    .line_height_override(CODE_REVIEW_EDITOR_LINE_HEIGHT_RATIO)
+                    .with_show_comment_editor_provider(ShowCommentEditor {
+                        comment_list_save_position_id: self.code_review_list_position_id.clone(),
+                        window_id: ctx.window_id(),
+                    }),
                 ctx,
             )
             .with_comment_button()
+            .with_add_context_button() // Add Context
+            .with_revert_diff_hunk_button() // Revert Hunk
+            .with_side_by_side_baseline() // Left/baseline column: revert delegates to the right column
             .with_collapsible_diffs(false)
             .disable_diff_indicator_expansion_on_hover()
             .with_gutter_hover_target(GutterHoverTarget::Line)
             .disable_find_and_replace()
-            .with_can_show_diff_ui(false)
         });
 
         let full_file_path = repo_path.join(&file.file_diff.file_path);
         baseline_editor.update(ctx, |editor, ctx| {
             editor.set_language_with_path(&full_file_path, ctx);
             editor.reset(InitialBufferState::plain_text(old_content), ctx);
-            // Apply red deletion decorations + inline deletions + left spacers — no set_base, no diff engine
+            // base = new content (needed for revert actions), but do NOT recompute the
+            // diff: the engine's mappings would mark left-side spacer rows as diff lines.
+            // The precise status is injected manually below.
+            editor.set_base(&new_content, false, ctx);
+            editor.set_diff_status(left_diff_status.clone(), ctx);
+            // Apply red deletion decorations + inline deletions + left spacers FIRST so
+            // `using_manual_git_diff_decorations` is set before `expand_diffs`: otherwise
+            // refresh_diff_state would insert diff-engine removal blocks into the content
+            // tree and break the render-row mapping used by the gutter diff indicators.
             editor.set_git_diff_decorations(
                 left_decorations,
                 left_text_decorations,
                 left_spacers,
                 ctx,
             );
+            // Activate diff navigation in Focused state: `expand_diffs` sets Expanded,
+            // which shows the nav bar but makes the up/down buttons no-ops
+            // (nav_diff_up/down only act on DiffNavigationState::Focused).
+            editor.toggle_diff_nav(None, ctx);
+            // The left column is read-only reference content.
+            editor.set_interaction_state(InteractionState::Selectable, ctx);
         });
 
         let baseline_local = ctx.add_typed_action_view(|ctx| {
@@ -5930,39 +6419,62 @@ impl CodeReviewView {
             CodeEditorView::new(
                 None,
                 None,
-                CodeEditorRenderOptions::new(VerticalExpansionBehavior::InfiniteHeight)
+                CodeEditorRenderOptions::new(VerticalExpansionBehavior::FillMaxHeight)
                     .lazy_layout()
-                    .line_height_override(CODE_REVIEW_EDITOR_LINE_HEIGHT_RATIO),
+                    .line_height_override(CODE_REVIEW_EDITOR_LINE_HEIGHT_RATIO)
+                    .with_show_comment_editor_provider(ShowCommentEditor {
+                        comment_list_save_position_id: self.code_review_list_position_id.clone(),
+                        window_id: ctx.window_id(),
+                    }),
                 ctx,
             )
             .with_comment_button()
+            .with_add_context_button() // Add Context
+            .with_revert_diff_hunk_button() // Revert Hunk
             .with_collapsible_diffs(false)
             .disable_diff_indicator_expansion_on_hover()
             .with_gutter_hover_target(GutterHoverTarget::Line)
             .disable_find_and_replace()
-            .with_can_show_diff_ui(false)
         });
 
         modified_editor.update(ctx, |editor, ctx| {
             editor.set_language_with_path(&full_file_path, ctx);
             editor.reset(InitialBufferState::plain_text(&new_content), ctx);
-            // Apply green addition decorations + inline additions + right spacers — no set_base, no diff engine
+            // base = old content (needed for revert actions), but do NOT recompute the
+            // diff: the engine's mappings would mark right-side spacer rows as diff lines.
+            editor.set_base(&old_content, false, ctx);
+            editor.set_diff_status(right_diff_status.clone(), ctx);
+            // Apply green addition decorations + inline additions + right spacers FIRST
+            // (see baseline editor comment about `expand_diffs` ordering).
             editor.set_git_diff_decorations(
                 right_decorations,
                 right_text_decorations,
                 right_spacers,
                 ctx,
             );
+            // Focused diff nav (see baseline editor comment): keeps the nav bar buttons working.
+            editor.toggle_diff_nav(None, ctx);
+            // The right column stays editable; note that diff markers/spacers are a
+            // snapshot computed at creation and are not recomputed on edits yet.
         });
 
         let modified_local = ctx.add_typed_action_view(|ctx| {
             LocalCodeEditorView::new(modified_editor, None, false, None, ctx)
         });
 
+        // Associate the editable (right/modified) column with the on-disk file so it can
+        // save and report unsaved-changes state, mirroring the single-column path. The
+        // left (baseline) column is read-only and stays unbacked.
+        modified_local.update(ctx, |local, ctx| {
+            local.set_file_path(&full_file_path, ctx);
+        });
+
         Some(SideBySideEditorState {
             baseline_editor: baseline_local,
             modified_editor: modified_local,
             syncing: Rc::new(Cell::new(false)),
+            last_sync_time: Arc::new(AtomicI64::new(0)),
+            last_sync_time_reverse: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -6310,12 +6822,74 @@ impl CodeReviewView {
     ) {
         match event {
             CodeEditorEvent::DiffHunkContextAdded { line_range } => {
-                self.insert_diff_hunk_as_context(file_path, line_range.clone(), ctx);
+                // Side-by-side: the left (baseline) editor reports old-file line numbers,
+                // the right (modified) editor reports new-file line numbers.
+                let use_old_lines = self.is_side_by_side_baseline_editor(&editor, &file_path, ctx);
+                self.insert_diff_hunk_as_context(file_path, line_range.clone(), use_old_lines, ctx);
+            }
+            CodeEditorEvent::CommentSaved { comment } => {
+                // Comments in side-by-side mode arrive from the inner CodeEditorView
+                // subscription (the LocalCodeEditorView wrapper has no file path), so attach
+                // using the review view's own `file_path` rather than the wrapper's.
+                let base = self.get_diff_base(ctx).ok();
+                let head = self.get_current_head(ctx);
+                let comment_with_file_context = AttachedReviewComment::from_editor_review_comment(
+                    comment.clone(),
+                    file_path.to_path_buf(),
+                    base,
+                    head,
+                );
+                self.update_review_comment(comment_with_file_context, ctx);
+                ctx.notify();
+            }
+            CodeEditorEvent::RevertDiffRequested { hunk_index } => {
+                // Baseline (left) column of a side-by-side diff delegates its revert to the
+                // editable (right/modified) column, which owns the file and the correct diff
+                // base. The hunk indices are aligned across the two columns (see
+                // `compute_side_by_side_diff_data`), so the same index applies to the right column.
+                let modified_editor = match self.state() {
+                    CodeReviewViewState::Loaded(state) => state
+                        .file_states
+                        .get(&file_path)
+                        .and_then(|f| f.side_by_side_state.as_ref())
+                        .map(|pair| pair.modified_editor.clone()),
+                    _ => None,
+                };
+                let Some(modified_editor) = modified_editor else {
+                    log::debug!(
+                        "RevertDiffRequested ignored: no side-by-side pair for {} (hunk {})",
+                        file_path.display(),
+                        hunk_index
+                    );
+                    return;
+                };
+
+                modified_editor.update(ctx, |local, ctx| {
+                    local.editor().update(ctx, |editor, ctx| {
+                        editor.revert_diff_hunk_by_index(*hunk_index, ctx);
+                    });
+                });
             }
             CodeEditorEvent::DiffReverted => {
                 // Show toast notification that diff was removed.
                 let version = editor.as_ref(ctx).version(ctx);
                 self.last_revert = Some((editor, version));
+
+                // Side-by-side: re-derive the decorations/status from the live buffers so the
+                // reverted hunk disappears and the gutter button count drops (the manual diff
+                // status is a static snapshot and would otherwise stay frozen).
+                let is_side_by_side = matches!(
+                    self.state(),
+                    CodeReviewViewState::Loaded(state)
+                        if state
+                            .file_states
+                            .get(&file_path)
+                            .map(|f| f.side_by_side_state.is_some())
+                            .unwrap_or(false)
+                );
+                if is_side_by_side {
+                    self.refresh_side_by_side_diff_after_revert(&file_path, ctx);
+                }
 
                 let toast_id = self.revert_hunk_toast_id(ctx);
                 crate::workspace::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
@@ -6381,6 +6955,25 @@ impl CodeReviewView {
         selected_text: String,
         ctx: &mut ViewContext<Self>,
     ) {
+        // DSH 集成模式:把选区上下文插入 DSH 会话输入框,而非终端。
+        // 与终端非 CLI 分支一致:仅插入 `路径:起-止 ` 位置引用(不带选中文本)。
+        if self.is_dsh {
+            let text = if start_line == end_line {
+                format!("{file_path}:{start_line} ")
+            } else {
+                format!("{file_path}:{start_line}-{end_line} ")
+            };
+            BrowserWebViewManager::as_ref(ctx).insert_text_into_dsh_input(&text);
+            send_telemetry_from_ctx!(
+                CodeReviewTelemetryEvent::AddToContext {
+                    origin: AddToContextOrigin::SelectedText,
+                    destination: CodeReviewContextDestination::AgentInput,
+                    diff_set_scope: None,
+                },
+                ctx
+            );
+            return;
+        }
         if let Some(terminal_view) = self.terminal_view.as_ref().and_then(|tv| tv.upgrade(ctx)) {
             // If a CLI agent is active, send appropriate content to the PTY.
             let prompt = if start_line == end_line {
@@ -6449,6 +7042,25 @@ impl CodeReviewView {
                 editor.undo(ctx);
             });
 
+            // Undoing a revert restores the diff hunk, but the side-by-side diff statuses are
+            // a manual snapshot that is only refreshed on `DiffReverted`. Re-derive them so the
+            // gutter markers / revert buttons match the restored file content.
+            if let CodeReviewViewState::Loaded(state) = self.state() {
+                let editor_id = editor.id();
+                if let Some(file_path) = state
+                    .file_states
+                    .iter()
+                    .find_map(|(path, file)| {
+                        file.side_by_side_state.as_ref().and_then(|pair| {
+                            (pair.modified_editor.as_ref(ctx).editor().id() == editor_id)
+                                .then(|| path.clone())
+                        })
+                    })
+                {
+                    self.refresh_side_by_side_diff_after_revert(&file_path, ctx);
+                }
+            }
+
             self.dismiss_revert_toast(ctx);
         }
     }
@@ -6472,6 +7084,53 @@ impl CodeReviewView {
         let Some(repo_path) = self.repo_path() else {
             return;
         };
+        // DSH 集成模式:把 diff set 上下文插入 DSH 会话输入框,而非终端。
+        if self.is_dsh {
+            if let CodeReviewViewState::Loaded(state) = self.state() {
+                let files_to_process = match &scope {
+                    DiffSetScope::All => state
+                        .file_states
+                        .values()
+                        .map(|fs| &fs.file_diff)
+                        .collect_vec(),
+                    DiffSetScope::File(target_path) => state
+                        .file_states
+                        .get(target_path)
+                        .into_iter()
+                        .map(|fs| &fs.file_diff)
+                        .collect_vec(),
+                };
+                let mut text = String::new();
+                for file_diff in files_to_process {
+                    let relative = file_diff
+                        .file_path
+                        .strip_prefix(&repo_path)
+                        .unwrap_or(&file_diff.file_path)
+                        .to_path_buf();
+                    text.push_str(&format!(
+                        "{} (+{} -{})\n",
+                        relative.display(),
+                        file_diff.additions(),
+                        file_diff.deletions()
+                    ));
+                }
+                if !text.is_empty() {
+                    BrowserWebViewManager::as_ref(ctx).insert_text_into_dsh_input(&text);
+                    send_telemetry_from_ctx!(
+                        CodeReviewTelemetryEvent::AddToContext {
+                            origin: AddToContextOrigin::CodeReviewHeader,
+                            destination: CodeReviewContextDestination::AgentInput,
+                            diff_set_scope: Some(match &scope {
+                                DiffSetScope::All => DiffSetContextScope::All,
+                                DiffSetScope::File(_) => DiffSetContextScope::File,
+                            }),
+                        },
+                        ctx
+                    );
+                }
+            }
+            return;
+        }
         if let Some(terminal_view) = self
             .terminal_view
             .as_ref()
@@ -6673,16 +7332,143 @@ impl CodeReviewView {
         })
     }
 
+    /// Returns `true` if `editor` is the baseline (left, old-content) editor of the
+    /// side-by-side pair for the given file.
+    fn is_side_by_side_baseline_editor(
+        &self,
+        editor: &ViewHandle<CodeEditorView>,
+        file_path: &PathBuf,
+        ctx: &AppContext,
+    ) -> bool {
+        let CodeReviewViewState::Loaded(state) = self.state() else {
+            return false;
+        };
+        state
+            .file_states
+            .get(file_path)
+            .and_then(|file_state| file_state.side_by_side_state.as_ref())
+            .map(|pair| pair.baseline_editor.as_ref(ctx).editor().id() == editor.id())
+            .unwrap_or(false)
+    }
+
+    /// After a hunk is reverted in side-by-side mode, the manual diff status is a static
+    /// snapshot, so the gutter buttons and decorations would otherwise stay frozen on the
+    /// original diff and the revert could be clicked again. Re-derive the decorations and
+    /// statuses from the two columns' *live* buffer contents (the reverted edit already
+    /// mutated the right column) and re-apply them, so a fully-reverted hunk disappears and
+    /// the button count drops.
+    fn refresh_side_by_side_diff_after_revert(
+        &mut self,
+        file_path: &PathBuf,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let CodeReviewViewState::Loaded(state) = self.state() else {
+            return;
+        };
+        let Some(pair) = state
+            .file_states
+            .get(file_path)
+            .and_then(|file_state| file_state.side_by_side_state.as_ref())
+        else {
+            return;
+        };
+        let baseline_editor = pair.baseline_editor.clone();
+        let modified_editor = pair.modified_editor.clone();
+
+        let appearance = Appearance::as_ref(ctx);
+        let old_content = pair
+            .baseline_editor
+            .as_ref(ctx)
+            .editor()
+            .as_ref(ctx)
+            .text(ctx)
+            .into_string();
+        let new_content = pair
+            .modified_editor
+            .as_ref(ctx)
+            .editor()
+            .as_ref(ctx)
+            .text(ctx)
+            .into_string();
+
+        let SideBySideDiffData {
+            left_decorations,
+            right_decorations,
+            left_text_decorations,
+            right_text_decorations,
+            left_spacers,
+            right_spacers,
+            left_diff_status,
+            right_diff_status,
+        } = Self::compute_side_by_side_diff_data(appearance, &old_content, &new_content);
+
+        baseline_editor
+            .update(ctx, |local: &mut LocalCodeEditorView, ctx| {
+                local.editor().update(ctx, |editor: &mut CodeEditorView, ctx| {
+                    editor.set_diff_status(left_diff_status, ctx);
+                    editor.set_git_diff_decorations(
+                        left_decorations,
+                        left_text_decorations,
+                        left_spacers,
+                        ctx,
+                    );
+                    editor.focus_diff_hunk_index(0, ctx);
+                });
+            });
+        modified_editor
+            .update(ctx, |local: &mut LocalCodeEditorView, ctx| {
+                local.editor().update(ctx, |editor: &mut CodeEditorView, ctx| {
+                    editor.set_diff_status(right_diff_status, ctx);
+                    editor.set_git_diff_decorations(
+                        right_decorations,
+                        right_text_decorations,
+                        right_spacers,
+                        ctx,
+                    );
+                    editor.focus_diff_hunk_index(0, ctx);
+                });
+            });
+        ctx.notify();
+    }
+
     /// Insert diff hunk as an inline attachment in the terminal input
     fn insert_diff_hunk_as_context(
         &mut self,
         file_path: PathBuf,
         line_range: Range<warp_editor::render::model::LineCount>,
+        use_old_lines: bool,
         ctx: &mut ViewContext<Self>,
     ) {
         let Some(repo_path) = self.repo_path() else {
             return;
         };
+        // DSH 集成模式:把上下文插入 DSH 会话输入框,而非终端。
+        if self.is_dsh {
+            let relative_path = if file_path.is_absolute() {
+                file_path
+                    .strip_prefix(&repo_path)
+                    .unwrap_or(&file_path)
+                    .to_path_buf()
+            } else {
+                file_path.clone()
+            };
+            let start_line = line_range.start.as_usize() + 1;
+            let end_line = line_range.end.as_usize();
+            // 与终端路径一致:用 `<change:相对路径:起-止>` 引用格式(1-indexed 行号)。
+            let diff_hunk_key =
+                format!("{}:{start_line}-{end_line}", relative_path.display());
+            let text = format!("<change:{diff_hunk_key}>");
+            BrowserWebViewManager::as_ref(ctx).insert_text_into_dsh_input(&text);
+            send_telemetry_from_ctx!(
+                CodeReviewTelemetryEvent::AddToContext {
+                    origin: AddToContextOrigin::Gutter,
+                    destination: CodeReviewContextDestination::AgentInput,
+                    diff_set_scope: None,
+                },
+                ctx
+            );
+            return;
+        }
         // Try to get the terminal view and insert the context
         if let Some(terminal_view) = self.terminal_view.as_ref().and_then(|tv| tv.upgrade(ctx)) {
             let is_long_running =
@@ -6701,7 +7487,7 @@ impl CodeReviewView {
             // Case 1: CLI agent — send location + change stats to PTY or rich input
             if active_cli_agent.is_some() {
                 if let Some((_, lines_added, lines_removed)) =
-                    self.extract_diff_hunk_data(&relative_path, &line_range)
+                    self.extract_diff_hunk_data(&relative_path, &line_range, use_old_lines)
                 {
                     // Use relative_path so the prompt shows repo-relative paths (e.g. src/foo.rs)
                     // rather than absolute machine-specific paths.
@@ -6755,7 +7541,7 @@ impl CodeReviewView {
                 return;
             }
             if let Some((hunk, lines_added, lines_removed)) =
-                self.extract_diff_hunk_data(&relative_path, &line_range)
+                self.extract_diff_hunk_data(&relative_path, &line_range, use_old_lines)
             {
                 // Create a descriptive key using filename and line range
                 let filename = relative_path.display().to_string();
@@ -6846,11 +7632,14 @@ impl CodeReviewView {
         }
     }
 
-    /// Extract diff hunk data for the given file and line range
+    /// Extract diff hunk data for the given file and line range.
+    /// `use_old_lines` matches the range against the old (baseline/left) side line
+    /// numbers; otherwise it matches the new (right) side.
     fn extract_diff_hunk_data(
         &self,
         file_path: &PathBuf,
         line_range: &Range<warp_editor::render::model::LineCount>,
+        use_old_lines: bool,
     ) -> Option<(DiffHunk, u32, u32)> {
         if let CodeReviewViewState::Loaded(state) = self.state() {
             // Find the file state that matches the given file path
@@ -6864,6 +7653,25 @@ impl CodeReviewView {
 
             // Find the diff hunk that contains this line range
             for hunk in file_diff.hunks.iter() {
+                // On the old (left) side the range is in old-file coordinates; just return
+                // the whole hunk (its new-side content is the context we attach).
+                if use_old_lines {
+                    let hunk_start = hunk.old_start_line;
+                    let hunk_end = hunk_start + hunk.old_line_count;
+                    if requested_start <= hunk_end && requested_end >= hunk_start {
+                        let (lines_added, lines_removed) = hunk.lines.iter().fold(
+                            (0u32, 0u32),
+                            |(added, removed), line| match line.line_type {
+                                DiffLineType::Add => (added + 1, removed),
+                                DiffLineType::Delete => (added, removed + 1),
+                                _ => (added, removed),
+                            },
+                        );
+                        return Some((hunk.clone(), lines_added, lines_removed));
+                    }
+                    continue;
+                }
+
                 // Check if this hunk overlaps with the requested line range
                 let hunk_start = hunk.new_start_line;
                 let hunk_end = hunk_start + hunk.lines.len();
@@ -6948,7 +7756,14 @@ impl CodeReviewView {
     fn save_file(&mut self, path: &PathBuf, ctx: &mut ViewContext<CodeReviewView>) {
         if let CodeReviewViewState::Loaded(state) = self.state() {
             if let Some(file_state) = state.file_states.get(path) {
-                if let Some(editor) = file_state.editor_state.as_ref().map(|state| state.editor()) {
+                // In side-by-side mode prefer the editable (modified) column, which holds
+                // the live buffer; see `get_unsaved_file_paths` for the rationale.
+                let editor = file_state
+                    .side_by_side_state
+                    .as_ref()
+                    .map(|s| s.modified_editor.clone())
+                    .or_else(|| file_state.editor_state.as_ref().map(|s| s.editor().clone()));
+                if let Some(editor) = editor {
                     if let Err(err) =
                         editor.update(ctx, |local_editor, ctx| local_editor.save_local(ctx))
                     {
@@ -7439,8 +8254,18 @@ impl CodeReviewView {
         let mut unsaved_paths = Vec::new();
         if let CodeReviewViewState::Loaded(state) = self.state() {
             for file_state in state.file_states.values() {
-                if let Some(model) = &file_state.editor_state {
-                    if model.has_unsaved_changes(app) {
+                // In side-by-side mode the editable (modified) column holds the live
+                // buffer; the single-column `editor_state` is stale for non-active files
+                // (only the active file is re-pointed at `modified_editor` on entry).
+                // Prefer the side-by-side editor when present so save/unsaved checks
+                // target the buffer the user is actually editing.
+                let editor = file_state
+                    .side_by_side_state
+                    .as_ref()
+                    .map(|s| &s.modified_editor)
+                    .or_else(|| file_state.editor_state.as_ref().map(|s| s.editor()));
+                if let Some(editor) = editor {
+                    if editor.as_ref(app).has_unsaved_changes(app) {
                         unsaved_paths.push(file_state.file_diff.file_path.clone());
                     }
                 }
