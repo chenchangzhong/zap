@@ -7,6 +7,11 @@
 # This should be kept in sync with the definition of this variable in
 # `script/bundle`.
 MACOSX_DEPLOYMENT_TARGET = "10.14"
+# 关闭增量编译,让 sccache 接管 debug 构建缓存。本仓库不依赖 lldb 单步调试,
+# 关掉后可避免 sccache 因 incremental 而 non-cacheable,从而把 1500+ 包的编译
+# 产物缓存起来(命中后清 target/ 也不再全量重编)。需要临时单步调试时,用
+# `CARGO_INCREMENTAL=1 cargo build --config 'env.CARGO_INCREMENTAL=1'` 覆盖。
+CARGO_INCREMENTAL = "0"
 
 [build]
 rustc-wrapper = "sccache"

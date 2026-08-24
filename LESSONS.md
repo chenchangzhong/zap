@@ -79,4 +79,17 @@ macOS 27 上 `[button convertPoint:event.locationInWindow fromView:nil]` 对 tit
 ## 13. 合并冲突在测试文件中
 
 `app/src/ai/agent/task_store_tests.rs` 有残留的 `>>>>>>>` 合并冲突标记，导致 `cargo test` build 失败（非首次遇到）。  
-**教训**：merge 后检查冲突标记。有问题的文件在 `rg '<<<<<<|======|>>>>>>' --type rust`。
+**教训**：merge 后检查冲突标记。有问题的文件在 `rg '<<<<<||======|>>>>>>' --type rust`。
+
+## 14. `cargo clean` 全清是重编慢 + 磁盘爆的根因，别用
+
+debug 默认开增量编译，会让 sccache 对绝大多数 crate 判定为 `non-cacheable`（incremental 与 sccache 缓存单元冲突）。
+结果 `target/` 滚到 90G+，sccache 那 10G 上限空着没用，全清后还要把 1500+ 包全重编。
+
+**做法**：
+- `.cargo/config.toml` 已加 `CARGO_INCREMENTAL = "0"`（在 `[env]` 段），让 sccache 真正缓存。
+- 回收空间用 `rm -rf target/debug/incremental`，别 `cargo clean` 全清。
+- sccache 本地缓存 `10 GiB` 上限按 LRU 自动淘汰旧的，不用手动管。
+- 实测：清 `deps` 后二次 `cargo build --bin zap-oss` 比首次快约 1 分钟（sccache 命中）。
+- 坑：`sccache --show-stats` 在本机偶尔卡死（0.17.0 客户端/守护交互问题），验证缓存改看
+  `~/Library/Caches/Mozilla.sccache` 的文件数与占用即可。
