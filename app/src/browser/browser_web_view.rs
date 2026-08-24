@@ -418,6 +418,47 @@ setInterval(() => {
         }
     }
 
+    /// 将文本插入已注册的 DSH 插件 webview 的输入框(供 code review 等视图在 DSH
+    /// 集成模式下把"添加到上下文"内容送到 DSH 会话,而非终端)。
+    /// 找到首个已注册的 DSH webview 即注入;未就绪则静默放弃(由调用方决定是否提示)。
+    pub fn insert_text_into_dsh_input(&self, text: &str) {
+        let id = DSH_WEBVIEW_IDS.lock().iter().next().copied();
+        let Some(id) = id else {
+            log::warn!("[dsh] insert_text_into_dsh_input: no registered dsh webview");
+            return;
+        };
+        // 用 serde_json 转义,避免文本含引号/换行破坏 JS 字符串字面量。
+        let Ok(escaped) = serde_json::to_string(&text.to_string()) else {
+            log::warn!("[dsh] insert_text_into_dsh_input: failed to escape text, skipping");
+            return;
+        };
+        let js = format!(
+            r#"
+            (function() {{
+                var text = {escaped};
+                var el = document.querySelector('textarea[data-testid="dsh-input"]')
+                         || document.querySelector('textarea[placeholder]')
+                         || document.querySelector('div[contenteditable="true"][role="textbox"]')
+                         || document.querySelector('div.ProseMirror')
+                         || document.querySelector('.cm-content[contenteditable]');
+                if (!el) {{ console.warn('[dsh] No input element found for attach_as_context'); return; }}
+                if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {{
+                    el.focus();
+                    var start = el.selectionStart || el.value.length;
+                    var end = el.selectionEnd || el.value.length;
+                    el.setRangeText(text, start, end, 'end');
+                    el.dispatchEvent(new InputEvent('input', {{ bubbles: true, cancelable: true }}));
+                }} else {{
+                    el.focus();
+                    document.execCommand('insertText', false, text);
+                }}
+            }})()
+            "#
+        );
+        self.evaluate_script_on(id, &js);
+        self.focus_webview(id);
+    }
+
     /// 在指定 webview 中执行 JavaScript。
     pub fn evaluate_script_on(&self, id: u64, script: &str) {
         #[cfg(target_os = "macos")]

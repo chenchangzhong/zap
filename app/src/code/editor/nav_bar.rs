@@ -38,6 +38,9 @@ const DIFF_NAV_OFFSET_PIXEL_RATIO: usize = 10;
 #[derive(Debug, Clone, Copy)]
 pub enum NavBarEvent {
     Close,
+    /// Emitted after a navigation action scrolled the editor (up/down/revert), so the
+    /// side-by-side partner can follow.
+    Scrolled,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -247,6 +250,7 @@ impl NavBar {
             model.nav_diff_up(ctx);
         });
         self.autoscroll(ctx);
+        ctx.emit(NavBarEvent::Scrolled);
         ctx.notify();
     }
 
@@ -255,6 +259,7 @@ impl NavBar {
             model.nav_diff_down(ctx);
         });
         self.autoscroll(ctx);
+        ctx.emit(NavBarEvent::Scrolled);
         ctx.notify();
     }
 }
@@ -327,6 +332,7 @@ impl TypedActionView for NavBar {
                 self.model.update(ctx, |model, ctx| {
                     model.revert_diff_index(ctx);
                 });
+                ctx.emit(NavBarEvent::Scrolled);
             }
         }
     }

@@ -277,6 +277,30 @@ impl<'a> RenderContentTreeRef<'a> {
         ViewportIterator::new(&self.0, scroll_top, viewport_height, viewport_width)
     }
 
+    /// Y ranges (content coordinates) occupied by blank temporary blocks
+    /// (side-by-side alignment spacers). Diff line decorations must not paint
+    /// over these ranges.
+    pub fn spacer_y_ranges(&self) -> Vec<Range<f32>> {
+        let mut ranges = Vec::new();
+        let mut cursor = self.0.cursor::<(), Height>();
+        cursor.descend_to_first_item(&self.0, |_| true);
+        while let Some(item) = cursor.item() {
+            if let BlockItem::TemporaryBlock {
+                decoration,
+                paragraph_block,
+                ..
+            } = item
+            {
+                if decoration.is_none() {
+                    let y = cursor.start().0 .0 as f32;
+                    ranges.push(y..y + paragraph_block.content_size().y());
+                }
+            }
+            cursor.next();
+        }
+        ranges
+    }
+
     /// Describe only the content of the rendering model.
     #[cfg(test)]
     pub fn describe_content(&self) -> impl fmt::Display + '_ {

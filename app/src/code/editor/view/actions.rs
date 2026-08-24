@@ -861,16 +861,26 @@ impl TypedActionView for CodeEditorView {
                     }
                 }
             }
-            ScrollVertical(delta) => self.model.update(ctx, |model, ctx| {
-                model.render_state().update(ctx, |render_state, ctx| {
-                    render_state.scroll(*delta, ctx);
-                })
-            }),
-            ScrollHorizontal(delta) => self.model.update(ctx, |model, ctx| {
-                model.render_state().update(ctx, |render_state, ctx| {
-                    render_state.scroll_horizontal(*delta, ctx);
-                })
-            }),
+            ScrollVertical(delta) => {
+                self.model.update(ctx, |model, ctx| {
+                    model.render_state().update(ctx, |render_state, ctx| {
+                        render_state.scroll(*delta, ctx);
+                    })
+                });
+                // Emit synchronously (before layout) so side-by-side diff scroll sync
+                // has no async element-update round-trip delay.
+                ctx.emit(CodeEditorEvent::Scrolled);
+            }
+            ScrollHorizontal(delta) => {
+                self.model.update(ctx, |model, ctx| {
+                    model.render_state().update(ctx, |render_state, ctx| {
+                        render_state.scroll_horizontal(*delta, ctx);
+                    })
+                });
+                // Emit synchronously so side-by-side diff scroll sync also covers
+                // horizontal scrolling (same frame, no async round-trip).
+                ctx.emit(CodeEditorEvent::Scrolled);
+            }
             SelectUp => self.model.update(ctx, |model, ctx| {
                 model.select_up(ctx);
             }),

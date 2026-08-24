@@ -588,7 +588,14 @@ impl<V: EditorView> EditorWrapper<V> {
                 .into_pixels(),
                 InnerEditor::FullEditor(_) => block.viewport_item().viewport_offset,
             };
-            let diff_hunk = self.diff_status.diff_hunk(line_count, appearance);
+            // Spacer blocks (blank alignment blocks in the side-by-side view) must
+            // never show a diff indicator: their line-domain row can coincide with a
+            // real diff row of a neighbouring hunk.
+            let diff_hunk = if block.is_spacer() {
+                None
+            } else {
+                self.diff_status.diff_hunk(line_count, appearance)
+            };
             let is_removal = matches!(diff_hunk, Some(DiffHunkDisplay::Remove(_)));
 
             let current_line =
@@ -821,11 +828,11 @@ impl<V: EditorView> EditorWrapper<V> {
 
             // We want to show the gutter buttons if either:
             // 1) This line is part of a diff hunk that is being hovered and the comment box
-            // isn't open on another line.
+            // isn't open on another line. (Removed lines in the side-by-side view are
+            // regular content rows, so they must show buttons here too.)
             // 2) We're currently on a line where the comment box is open.
             let should_show_diff_hunk_button = (is_diff_line
                 && is_this_line_hovered
-                && !is_removal
                 && !range_already_clicked
                 && !is_comment_box_open_on_different_line)
                 || is_comment_box_open_on_current_line;
@@ -861,18 +868,15 @@ impl<V: EditorView> EditorWrapper<V> {
                 appearance,
             );
 
-            let diff_hunk = if is_removal && self.diff_hunks_are_expanded() {
-                None
-            } else {
-                diff_hunk
-            };
+            // The gutter for a removed line is normally rendered on the temporary block
+            // that represents it (single-column diff). In the side-by-side view the
+            // removed lines are regular content rows (no temporary block), so keep the
+            // diff hunk here to show the red indicator and hover buttons.
             elements.push(GutterElement {
                 element,
                 height,
                 offset,
                 hovered: range_hovered,
-                // We can skip rendering this removal gutter element if its hunk is expanded since
-                // the gutter is rendered on the temporary block.
                 line,
                 element_type: GutterElementType::DiffHunk {
                     hunk: diff_hunk,
@@ -1357,12 +1361,34 @@ impl<V: EditorView> Element for EditorWrapper<V> {
             for decoration in model.decorations().line_decoration_ranges() {
                 let start_y = content.y_offset_at_line(decoration.start);
                 let end_y = content.y_offset_at_line(decoration.end);
-                ctx.scene
-                    .draw_rect_without_hit_recording(RectF::new(
-                        content_origin + vec2f(0., (start_y - y_adjustment).as_f32()),
-                        vec2f(content_width, (end_y - start_y).as_f32()),
-                    ))
-                    .with_background(decoration.overlay);
+
+                // Split the decoration rectangle around side-by-side spacer rows so diff
+                // red/green backgrounds never paint over blank spacer lines (they render
+                // their own striped placeholder instead).
+                let mut segments = vec![(start_y.as_f32(), end_y.as_f32())];
+                for range in content.spacer_y_ranges() {
+                    let mut next = Vec::new();
+                    for (seg_start, seg_end) in segments {
+                        if range.start > seg_start {
+                            next.push((seg_start, range.start.min(seg_end)));
+                        }
+                        if range.end < seg_end {
+                            next.push((range.end.max(seg_start), seg_end));
+                        }
+                    }
+                    segments = next;
+                }
+                for (seg_start, seg_end) in segments {
+                    if seg_end - seg_start > 0.5 {
+                        ctx.scene
+                            .draw_rect_without_hit_recording(RectF::new(
+                                content_origin
+                                    + vec2f(0., (seg_start - y_adjustment.as_f32())),
+                                vec2f(content_width, seg_end - seg_start),
+                            ))
+                            .with_background(decoration.overlay);
+                    }
+                }
             }
         }
 

@@ -23,7 +23,7 @@ impl RootView {
         let font_family = warpui::fonts::Cache::handle(ctx)
             .update(ctx, |cache, _| cache.load_system_font("Arial").unwrap());
 
-        let list_state = ListState::new(move |i, _scroll_offset, _app| {
+        let list_state = ListState::new(move |i, _scroll_offset, _viewport_height, _app| {
             println!("  📦 Creating element for item {i}"); // This should only appear for visible items!
             Self::make_list_item(i, font_family).finish()
         });

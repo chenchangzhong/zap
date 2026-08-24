@@ -8203,7 +8203,15 @@ impl Workspace {
         let should_close = !panel_update_params.target_open_state;
 
         let new_is_maximized = panel_update_params.pane_group.update(ctx, |pane_group, _| {
+            let was_open = pane_group.right_panel_open;
             pane_group.right_panel_open = should_open;
+            // 默认最大化:面板从关闭→打开时直接以最大化呈现。与手动最大化的持久化
+            // 机制一致——以 pane-group 的 is_right_panel_maximized 为唯一事实来源,
+            // 下面的 set_maximized(new_is_maximized) 会同步到 code review 视图
+            // (切换 SideBySide 布局 + 创建双列编辑器)。
+            if should_open && !was_open && !pane_group.is_right_panel_maximized {
+                pane_group.is_right_panel_maximized = true;
+            }
             pane_group.is_right_panel_maximized
         });
 

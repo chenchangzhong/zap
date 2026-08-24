@@ -1,4 +1,6 @@
 use crate::ai::agent::AgentReviewCommentBatch;
+use crate::browser::BrowserWebViewManager;
+use crate::code_review::comments::AttachedReviewCommentTarget;
 use crate::code_review::code_review_header::HEADER_BUTTON_PADDING;
 #[cfg(feature = "local_fs")]
 use crate::code_review::code_review_view::CodeReviewAction;
@@ -69,6 +71,8 @@ pub enum ReviewDestination {
     Zap,
     /// A CLI agent (e.g. Claude Code, Gemini) is running in a terminal.
     Cli(CLIAgent),
+    /// The DSH (DeepSeek Harness) webview session is the destination.
+    Dsh,
 }
 
 /// Result of attempting to submit review comments to a terminal.
@@ -1243,6 +1247,64 @@ impl RightPanelView {
             return;
         };
 
+        // DSH 集成模式:把评论批量注入 DSH 会话输入框,而非终端。
+        if code_review_view.read(ctx, |view, _| view.is_dsh()) {
+            let mut text = String::new();
+            for comment in &comments.comments {
+                match &comment.target {
+                    AttachedReviewCommentTarget::Line {
+                        absolute_file_path,
+                        line,
+                        ..
+                    } => {
+                        let line_no = line
+                            .line_number()
+                            .map(|lc| lc.as_usize() + 1)
+                            .unwrap_or(0);
+                        text.push_str(&format!(
+                            "{absolute_file_path}:{line_no}: {content}\n",
+                            absolute_file_path = absolute_file_path.display(),
+                            line_no = line_no,
+                            content = comment.content
+                        ));
+                    }
+                    AttachedReviewCommentTarget::File { absolute_file_path } => {
+                        text.push_str(&format!(
+                            "{absolute_file_path}: {content}\n",
+                            absolute_file_path = absolute_file_path.display(),
+                            content = comment.content
+                        ));
+                    }
+                    AttachedReviewCommentTarget::General => {
+                        text.push_str(&format!("{content}\n", content = comment.content));
+                    }
+                }
+            }
+            BrowserWebViewManager::as_ref(ctx).insert_text_into_dsh_input(&text);
+            let comment_count = comments.comments.len();
+            let file_count = comments
+                .comments
+                .iter()
+                .filter_map(|c| {
+                    c.target
+                        .absolute_file_path()
+                        .map(|p| p.to_string_lossy().to_string())
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            code_review_view.update(ctx, |view, ctx| {
+                view.handle_review_submission_result(
+                    ReviewSubmissionResult::Success {
+                        comment_count,
+                        file_count,
+                        destination: CodeReviewContextDestination::AgentReview,
+                    },
+                    ctx,
+                );
+            });
+            return;
+        }
+
         let ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
         let chosen = self.find_review_terminal(pane_group, repo_path, ai_enabled, ctx);
 
@@ -1587,6 +1649,14 @@ impl RightPanelView {
             });
             return;
         };
+
+        // DSH 集成模式:评论提交目标是 DSH 会话,而非终端。
+        if code_review_view.read(ctx, |view, _| view.is_dsh()) {
+            code_review_view.update(ctx, |view, ctx| {
+                view.set_review_destination(ReviewDestination::Dsh, ctx);
+            });
+            return;
+        }
 
         let ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
         let destination = self

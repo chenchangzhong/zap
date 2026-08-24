@@ -81,9 +81,13 @@ impl<V: EditorView> Element for RichTextElementLens<V> {
                     decoration,
                     text_decoration,
                     ..
-                } => {
-                    Some(RenderableTemporaryBlock::new(item, decoration, text_decoration).finish())
-                }
+                } => Some(RenderableTemporaryBlock::new(
+                    item,
+                    decoration,
+                    text_decoration,
+                    decoration.is_none(),
+                )
+                .finish()),
                 _ => None, /* other block types not supported */
             })
             .collect();

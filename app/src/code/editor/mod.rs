@@ -21,5 +21,6 @@ pub(crate) use diff::{
     add_color, remove_color, add_overlay_color, remove_overlay_color,
     add_inline_overlay_color, remove_inline_overlay_color,
 };
+pub use diff::{ChangeType, DiffStatus};
 pub use element::GutterHoverTarget;
 pub use nav_bar::NavBarBehavior;

@@ -31,7 +31,7 @@ impl ScrollPreservationTestView {
         let item_heights_clone = item_heights.clone();
 
         let (list_state, _scroll_rx) = ListState::new_with_scroll_preservation(
-            move |index, _scroll_offset, _app| {
+            move |index, _scroll_offset, _viewport_height, _app| {
                 let heights = item_heights_clone.borrow();
                 let height = heights.get(index).copied().unwrap_or(100.0.into_pixels());
                 ConstrainedBox::new(Rect::new().finish())
@@ -293,7 +293,7 @@ fn test_list_state_without_scroll_preservation_backward_compatible() {
         }
 
         let (window_id, view) = app.add_window(WindowStyle::NotStealFocus, |_| {
-            let list_state = ListState::new(|_index, _scroll_offset, _app| {
+            let list_state = ListState::new(|_index, _scroll_offset, _viewport_height, _app| {
                 ConstrainedBox::new(Rect::new().finish())
                     .with_height(50.)
                     .with_width(200.)
@@ -396,7 +396,7 @@ fn test_scroll_sender_receives_events_on_scroll() {
 
         let (window_id, _view) = app.add_window(WindowStyle::NotStealFocus, |_| {
             let (list_state, scroll_rx) = ListState::new_with_scroll_preservation(
-                |_index, _scroll_offset, _app| {
+                |_index, _scroll_offset, _viewport_height, _app| {
                     ConstrainedBox::new(Rect::new().finish())
                         .with_height(100.)
                         .with_width(200.)
@@ -464,7 +464,7 @@ struct TestView {
 impl TestView {
     fn new(item_heights: Vec<f32>, ctx: &mut ViewContext<Self>) -> Self {
         let handle = ctx.handle();
-        let list_state = ListState::new(move |index, _, app| {
+        let list_state = ListState::new(move |index, _, _viewport_height, app| {
             let height = handle
                 .upgrade(app)
                 .and_then(|handle| handle.as_ref(app).heights.get(index).copied())

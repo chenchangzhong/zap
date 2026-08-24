@@ -911,6 +911,8 @@ impl CommentListView {
             ))
         } else if matches!(destination, ReviewDestination::None) {
             Cow::Owned(crate::t!("code-review-all-terminals-are-busy"))
+        } else if matches!(destination, ReviewDestination::Dsh) {
+            Cow::Owned(crate::t!("code-review-send-diff-comments-to-agent"))
         } else if !has_sendable_comments {
             Cow::Owned(crate::t!("code-review-no-non-outdated-comments-to-send"))
         } else {
@@ -928,6 +930,8 @@ impl CommentListView {
             ReviewDestination::None => false,
             ReviewDestination::Cli(_) => has_sendable_comments,
             ReviewDestination::Zap => ai_available && has_sendable_comments,
+            // DSH 集成模式:评论直接注入 DSH 会话输入框,不消耗 AI credits。
+            ReviewDestination::Dsh => has_sendable_comments,
         };
 
         let tooltip_text = Self::send_button_tooltip_text(

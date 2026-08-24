@@ -734,6 +734,17 @@ impl CodeEditorModel {
         self.refresh_diff_state(ctx);
     }
 
+    /// Focus a specific diff hunk index (used to keep both side-by-side columns on the
+    /// same hunk when one column navigates).
+    pub fn focus_diff_index(&mut self, index: usize, ctx: &mut ModelContext<Self>) {
+        if self.diff_navigation_state == DiffNavigationState::Focused(index) {
+            return;
+        }
+        self.diff_navigation_state = DiffNavigationState::Focused(index);
+        self.refresh_diff_state(ctx);
+        ctx.notify();
+    }
+
     pub fn revert_diff_index(&mut self, ctx: &mut ModelContext<Self>) {
         let total = self.diff().as_ref(ctx).diff_hunk_count();
 
@@ -1216,6 +1227,13 @@ impl CodeEditorModel {
 
     pub fn diff_status(&self, app: &AppContext) -> DiffStatus {
         self.diff.as_ref(app).diff_status().clone()
+    }
+
+    /// Replace the diff status directly (bypasses the diff engine). Used by the
+    /// side-by-side diff view, which computes hunks itself and must not let the
+    /// engine mark spacer rows as diff lines.
+    pub fn set_diff_status(&self, status: DiffStatus, ctx: &mut ModelContext<Self>) {
+        self.diff.update(ctx, |diff, _ctx| diff.set_status(status));
     }
 
     /// Set the language of the syntax map based on the file path.

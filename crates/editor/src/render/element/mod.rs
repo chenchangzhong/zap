@@ -231,6 +231,13 @@ pub trait RenderableBlock {
         false
     }
 
+    /// Whether this block is a side-by-side alignment spacer (a blank temporary
+    /// block). Spacers must never render diff indicators, even though their
+    /// line-domain row can coincide with a real diff row.
+    fn is_spacer(&self) -> bool {
+        false
+    }
+
     /// The visible bounds of this block, based on its viewport location.
     ///
     /// If the block is fully out of view, this will return `None`. In practice, this should
@@ -892,8 +899,15 @@ impl<V: EditorView> RichTextElement<V> {
                         decoration,
                         text_decoration,
                         ..
-                    } => RenderableTemporaryBlock::new(item, *decoration, text_decoration.clone())
-                        .finish(),
+                    } => RenderableTemporaryBlock::new(
+                        item,
+                        *decoration,
+                        text_decoration.clone(),
+                        // Side-by-side alignment spacers are blank temporary blocks
+                        // with no decoration; single-column removal hunks carry one.
+                        decoration.is_none(),
+                    )
+                    .finish(),
                     BlockItem::HorizontalRule(_) => HorizontalRule::new(item).finish(),
                     BlockItem::Image { .. } => RenderableImage::new(item).finish(),
                     BlockItem::Table { .. } => RenderableTable::new(item).finish(),

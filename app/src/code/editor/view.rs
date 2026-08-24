@@ -132,6 +132,14 @@ pub enum CodeEditorEvent {
     RequestOpenComment(CommentId),
     /// Emitted when the viewport is updated after layout
     ViewportUpdated,
+    /// Emitted synchronously when the user scrolls the editor (wheel / scrollbar),
+    /// before layout runs. Used for side-by-side diff scroll sync so the other
+    /// column can be scrolled in the same frame (no async layout round-trip).
+    Scrolled,
+    /// Emitted synchronously when diff-nav navigation (nav-bar up/down/revert) moved
+    /// the editor. Side-by-side sync uses this to jump the other column to the SAME
+    /// hunk instead of doing a proportional scroll.
+    NavScrolled,
     DelayedRenderingFlushed,
     /// Emitted when the render state layout has been updated.
     LayoutInvalidated,
@@ -329,6 +337,11 @@ impl CodeEditorView {
             NavBarEvent::Close => {
                 me.toggle_diff_nav(None, ctx);
                 ctx.notify();
+            }
+            NavBarEvent::Scrolled => {
+                // Reuse the synchronous scroll event so side-by-side diff sync follows
+                // diff-navigation jumps (autoscroll does not go through ScrollVertical).
+                ctx.emit(CodeEditorEvent::NavScrolled);
             }
         });
 
@@ -560,6 +573,14 @@ impl CodeEditorView {
         self.model.update(ctx, |model, ctx| {
             model.set_git_diff_decorations(line_decorations, text_decorations, temporary_blocks, ctx);
         });
+    }
+
+    /// Replace the diff status directly (bypasses the diff engine). Used by the
+    /// side-by-side view so the gutter hover buttons work without the engine's
+    /// spacer-row mappings.
+    pub fn set_diff_status(&self, status: DiffStatus, ctx: &mut ViewContext<Self>) {
+        self.model
+            .update(ctx, |model, ctx| model.set_diff_status(status, ctx));
     }
 
     pub fn lens_for_line_range(

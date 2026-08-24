@@ -1,3 +1,7 @@
+use warpui::{
+    color::ColorU,
+    geometry::{rect::RectF, vector::vec2f},
+};
 use warp_core::ui::theme::Fill;
 
 use crate::render::model::{BlockItem, Decoration, RenderState, viewport::ViewportItem};
@@ -8,6 +12,7 @@ pub struct RenderableTemporaryBlock {
     viewport_item: ViewportItem,
     decoration: Option<Fill>,
     text_decoration: Vec<Decoration>,
+    is_spacer: bool,
 }
 
 impl RenderableTemporaryBlock {
@@ -15,11 +20,13 @@ impl RenderableTemporaryBlock {
         viewport_item: ViewportItem,
         decoration: Option<Fill>,
         text_decoration: Vec<Decoration>,
+        is_spacer: bool,
     ) -> Self {
         Self {
             viewport_item,
             decoration,
             text_decoration,
+            is_spacer,
         }
     }
 }
@@ -31,6 +38,10 @@ impl RenderableBlock for RenderableTemporaryBlock {
 
     fn overlay_decoration(&self) -> Option<Fill> {
         self.decoration
+    }
+
+    fn is_spacer(&self) -> bool {
+        self.is_spacer
     }
 
     fn layout(
@@ -63,6 +74,27 @@ impl RenderableBlock for RenderableTemporaryBlock {
             },
             None => return,
         };
+
+        // Side-by-side alignment spacers: paint a very light neutral background.
+        // Diff line decorations are excluded from spacer rows by EditorWrapper, so
+        // no red/green cover-up is needed here.
+        if self.is_spacer {
+            let background: Fill = ColorU::new(140, 140, 140, 26).into();
+            let viewport_width = ctx.visible_bound().size().x();
+            for paragraph in paragraph_block.paragraphs() {
+                let line_height = paragraph.item.first_line_height();
+                let mut y = paragraph.content_origin().y();
+                for _ in paragraph.item.frame().lines() {
+                    let screen_origin = ctx.content_to_screen(vec2f(0., y));
+                    ctx.paint.scene.draw_rect_without_hit_recording(RectF::new(
+                        screen_origin,
+                        vec2f(viewport_width, line_height),
+                    ))
+                    .with_background(background);
+                    y += line_height;
+                }
+            }
+        }
 
         let start = paragraph_block.start_char_offset;
         let paragraph_styles = &model.styles().base_text;
