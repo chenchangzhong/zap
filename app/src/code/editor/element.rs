@@ -1294,7 +1294,10 @@ impl<V: EditorView> Element for EditorWrapper<V> {
         );
 
         // Layout the editor element first so we can read the laid out visible blocks.
+        let _layout_start = std::time::Instant::now();
+        let editor_layout_start = std::time::Instant::now();
         let editor_size = self.editor.layout(content_constraint, ctx, app);
+        let editor_layout_elapsed = editor_layout_start.elapsed();
 
         let size = match self.vertical_expansion_behavior {
             VerticalExpansionBehavior::GrowToMaxHeight
@@ -1331,6 +1334,14 @@ impl<V: EditorView> Element for EditorWrapper<V> {
 
         self.gutter_elements = gutter_elements;
         self.element_size = Some(size);
+        // Both timers guarded by >1ms threshold — no overhead on fast frames.
+        let layout_elapsed = _layout_start.elapsed();
+        if layout_elapsed.as_micros() > 1000 {
+            log::debug!("[perf] EditorWrapper::layout took {:?}", layout_elapsed);
+        }
+        if editor_layout_elapsed.as_micros() > 1000 {
+            log::debug!("[perf] inner editor layout took {:?}", editor_layout_elapsed);
+        }
         size
     }
 
@@ -1343,6 +1354,7 @@ impl<V: EditorView> Element for EditorWrapper<V> {
         let element_origin = Point::from_vec2f(origin, ctx.scene.z_index());
         self.element_origin = Some(element_origin);
 
+        let paint_start = std::time::Instant::now();
         let size_buffer = self.size_buffer();
         let wrapper_size = self.size().unwrap_or_default();
 
@@ -1367,15 +1379,56 @@ impl<V: EditorView> Element for EditorWrapper<V> {
                     .into_pixels(),
                 InnerEditor::FullEditor(_) => model.viewport().scroll_top(),
             };
-            for decoration in model.decorations().line_decoration_ranges() {
+            // Compute spacer Y ranges once per paint (they are content-space coordinates and
+            // do not depend on the decoration being drawn). Doing this inside the decoration
+            // loop would re-walk the whole render tree for every decoration — O(d * s) with a
+            // fresh Vec allocation each time, which is very slow for large side-by-side diffs.
+            // 结果已由 RenderState 内部缓存(内容树未变时直接返回,不重新遍历),这里每次
+            // paint 调用一次即可。
+            let spacer_ranges = model.spacer_y_ranges();
+            // Only paint decorations that intersect the visible content region. `y_adjustment`
+            // is the viewport scroll (full editor) or lens offset, so visible content is
+            // [y_adjustment, y_adjustment + wrapper height]. Skipping off-screen decorations
+            // makes the diff-highlight pass O(visible decorations * spacers) instead of O(all
+            // decorations * spacers) when virtual scrolling shows only a few dozen rows.
+            let visible_top = y_adjustment.as_f32();
+            let visible_bottom = visible_top + wrapper_size.y();
+            let line_decorations = model.decorations().line_decoration_ranges();
+            // `line_decorations` is sorted by `end` (ascending). Use a binary search to skip
+            // decorations whose whole range is above the viewport, so we don't pay a SumTree
+            // seek for every decoration on every paint frame (thousands of decorations on large
+            // diffs). `partition_point` costs O(log d) seeks instead of O(d).
+            let first_visible = line_decorations.partition_point(|decoration| {
+                content.y_offset_at_line(decoration.end).as_f32() <= visible_top
+            });
+            let mut seek_total = std::time::Duration::ZERO;
+            for decoration in &line_decorations[first_visible..] {
+                let seek_start = std::time::Instant::now();
                 let start_y = content.y_offset_at_line(decoration.start);
                 let end_y = content.y_offset_at_line(decoration.end);
+                let seek_elapsed = seek_start.elapsed();
+                if seek_elapsed.as_micros() > 50 {
+                    log::debug!(
+                        "[perf] decoration seek {:?}..{:?} took {:?} (total deco {}, first_visible {})",
+                        decoration.start,
+                        decoration.end,
+                        seek_elapsed,
+                        line_decorations.len(),
+                        first_visible
+                    );
+                }
+                seek_total += seek_elapsed;
+                let start_f = start_y.as_f32();
+                let end_f = end_y.as_f32();
+                if end_f <= visible_top || start_f >= visible_bottom {
+                    continue;
+                }
 
                 // Split the decoration rectangle around side-by-side spacer rows so diff
                 // red/green backgrounds never paint over blank spacer lines (they render
                 // their own striped placeholder instead).
-                let mut segments = vec![(start_y.as_f32(), end_y.as_f32())];
-                for range in content.spacer_y_ranges() {
+                let mut segments = vec![(start_f, end_f)];
+                for range in &spacer_ranges {
                     let mut next = Vec::new();
                     for (seg_start, seg_end) in segments {
                         if range.start > seg_start {
@@ -1399,13 +1452,36 @@ impl<V: EditorView> Element for EditorWrapper<V> {
                     }
                 }
             }
+            if seek_total.as_micros() > 500 {
+                log::debug!(
+                    "[perf] visible decoration seek total took {:?} (n={})",
+                    seek_total,
+                    line_decorations.len() - first_visible
+                );
+            }
         }
 
         ctx.scene.stop_layer();
 
+        let overlay_elapsed = paint_start.elapsed();
+        if overlay_elapsed.as_micros() > 2000 {
+            log::debug!(
+                "[perf] diff overlay pass took {:?}",
+                overlay_elapsed
+            );
+        }
+
         self.paint_removed_line_overlays(origin, wrapper_size, ctx);
 
+        let editor_paint_start = std::time::Instant::now();
         self.editor.paint(origin + size_buffer, ctx, app);
+        let editor_paint_elapsed = editor_paint_start.elapsed();
+        if editor_paint_elapsed.as_micros() > 3000 {
+            log::debug!(
+                "[perf] inner editor paint took {:?}",
+                editor_paint_elapsed
+            );
+        }
 
         let diff_hunks_are_expanded = self.diff_hunks_are_expanded();
         let gutter_width = self.size_buffer().x();
@@ -1547,6 +1623,14 @@ impl<V: EditorView> Element for EditorWrapper<V> {
 
         // Cache find references anchor position if we have one.
         // LSP 下线后不再需要缓存 find-references gutter 位置。
+
+        let total_paint = paint_start.elapsed();
+        if total_paint.as_micros() > 5000 {
+            log::debug!(
+                "[perf] EditorWrapper::paint total {:?} (decoration overlay was part of it)",
+                total_paint
+            );
+        }
 
         self.child_max_z_index = Some(ctx.scene.max_active_z_index());
     }

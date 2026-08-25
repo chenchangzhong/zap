@@ -36,7 +36,7 @@ use super::model::{
 use crate::{content::version::BufferVersion, editor::EditorView};
 use string_offset::CharOffset;
 
-use self::{
+pub use self::{
     empty::Empty, header::RenderableHeader, hidden_section::RenderableHiddenSection,
     horizontal_rule::HorizontalRule, image::RenderableImage, mermaid::RenderableMermaidDiagram,
     ordered_list::RenderableOrderedListItem, paragraph::RenderableParagraph,
@@ -849,7 +849,8 @@ impl<V: EditorView> RichTextElement<V> {
             scroll_data.scroll_start,
         );
 
-        let blocks = viewport_items
+        let _build_start = Instant::now();
+        let blocks: Vec<_> = viewport_items
             .map(|(item, block)| {
                 let renderable_block = match block {
                     BlockItem::Paragraph(_) => RenderableParagraph::new(item).finish(),
@@ -928,6 +929,15 @@ impl<V: EditorView> RichTextElement<V> {
             })
             .collect();
 
+        let _build_elapsed = _build_start.elapsed();
+        if _build_elapsed > Duration::from_micros(500) {
+            log::debug!(
+                "[perf] renderable_blocks build took {:.3}ms ({} blocks)",
+                _build_elapsed.as_secs_f64() * 1000.0,
+                blocks.len(),
+            );
+        }
+
         self.blocks = Some(blocks);
     }
 
@@ -987,7 +997,6 @@ impl<V: EditorView> Element for RichTextElement<V> {
     ) -> Vector2F {
         let model = self.model.as_ref(app);
         self.buffer_version = model.next_render_buffer_version();
-        // Try flushing any pending edits at layout time (if we are performing layout lazily).
         self.pending_edits_flushed = model.try_layout_pending_edits(app);
 
         let size_buffer = vec2f(
@@ -1001,8 +1010,6 @@ impl<V: EditorView> Element for RichTextElement<V> {
             self.display_options.vertical_expansion_behavior,
             VerticalExpansionBehavior::GrowToMaxHeight | VerticalExpansionBehavior::InfiniteHeight
         ) {
-            // If we should grow to the max height as more code is added, instead of filling all available space,
-            // we should set the max height to be the shorter of the content height and the max height.
             constraint
                 .max
                 .set_y(constraint.max.y().min(model.height().as_f32()))

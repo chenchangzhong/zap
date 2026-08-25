@@ -27,6 +27,7 @@ use chrono::Local;
 use repo_metadata::repositories::DetectedRepositories;
 use std::path::PathBuf;
 use std::sync::Arc;
+use string_offset::CharOffset;
 use warp_core::ui::appearance::Appearance;
 use warp_editor::content::buffer::InitialBufferState;
 use warp_editor::render::element::VerticalExpansionBehavior;
@@ -306,6 +307,8 @@ fn create_loaded_state_with_editors(
                 copy_path_button,
                 side_by_side_state: None,
                 content_at_head: None,
+                side_by_side_diff_token: 0,
+                pending_diff_abort: None,
             };
             (file_path, state)
         })
@@ -950,4 +953,108 @@ fn test_active_comments_not_marked_outdated() {
             );
         });
     });
+}
+
+// ---------------------------------------------------------------------------
+// H-B 优化:word diff 字节 range → CharOffset 的顺序递增游标转换
+// ---------------------------------------------------------------------------
+
+/// 顺序推进的游标计数必须与旧实现 `text[..target].chars().count()` 完全一致,
+/// 且包含多字节 UTF-8 字符(证明是字符偏移而非字节偏移)。
+#[test]
+fn test_advance_char_cursor_matches_full_prefix_count() {
+    // "héllo 日本語 world":字节边界与字符边界不一致(é 占 2 字节、每个汉字占 3 字节),
+    // 目标字节全部落在字符边界上,且单调递增。
+    let text = "héllo 日本語 world";
+    let boundaries = [1usize, 3, 7, 10, 16, 22];
+    let mut byte_cursor = 0usize;
+    let mut char_cursor = CharOffset::zero();
+    for &target in &boundaries {
+        let off = CodeReviewView::advance_char_cursor(text, &mut byte_cursor, char_cursor, target);
+        assert_eq!(off, CharOffset::from(text[..target].chars().count()));
+        assert_eq!(byte_cursor, target, "游标字节位置应推进到 target");
+        char_cursor = off;
+    }
+    // 推进到文本末尾后,游标等于整串字符数(15,远小于字节数 22)。
+    assert_eq!(char_cursor, CharOffset::from(text.chars().count()));
+    assert!(char_cursor.as_usize() < text.len(), "多字节字符使字节数大于字符数");
+}
+
+/// 多 hunk + 每侧多个 range + 多字节 UTF-8 字符场景:游标增量转换(H-B 优化)的产出
+/// 必须与旧实现(逐 range 从文本头 `chars().count()`)完全一致。
+#[test]
+fn test_side_by_side_word_diff_char_offsets_match_naive_reference() {
+    // 两个修改 hunk,每侧多个 range;首处修改 "foo"→"bar" 之前有 `café`(4 字符 5 字节),
+    // 用于区分字符偏移与字节偏移。
+    let old_content = "\
+let x = café + foo;
+let same_1 = 1;
+let a = alpha + beta;
+let b = gamma + delta;
+let same_2 = 2;
+let z = tail;
+";
+    let new_content = "\
+let x = café + bar;
+let same_1 = 1;
+let a = alpha + bata;
+let b = gamma + delt;
+let same_2 = 2;
+let z = tail;
+";
+    let appearance = Appearance::mock();
+    let data = CodeReviewView::compute_side_by_side_diff_data(&appearance, old_content, new_content);
+
+    // 参考实现:与旧代码完全相同的 O(ranges × len) 转换(只比对 CharOffset 区间,
+    // background 颜色与本次优化无关)。
+    let diff_hunks = warp_editor::content::diff::diff_lines(old_content, new_content);
+    let mut left_ref: Vec<(CharOffset, CharOffset)> = Vec::new();
+    let mut right_ref: Vec<(CharOffset, CharOffset)> = Vec::new();
+    for hunk in &diff_hunks {
+        for r in &hunk.old_word_diffs {
+            left_ref.push((
+                CharOffset::from(old_content[..r.start].chars().count()),
+                CharOffset::from(old_content[..r.end].chars().count()),
+            ));
+        }
+        for r in &hunk.new_word_diffs {
+            right_ref.push((
+                CharOffset::from(new_content[..r.start].chars().count()),
+                CharOffset::from(new_content[..r.end].chars().count()),
+            ));
+        }
+    }
+
+    let left_actual: Vec<(CharOffset, CharOffset)> =
+        data.left_text_decorations.iter().map(|d| (d.start, d.end)).collect();
+    let right_actual: Vec<(CharOffset, CharOffset)> =
+        data.right_text_decorations.iter().map(|d| (d.start, d.end)).collect();
+
+    // 场景必须真实产生 word diff(多 hunk、多 range),否则测试无意义。
+    assert!(!left_ref.is_empty() && !right_ref.is_empty(), "场景应产生 word diff range");
+    assert!(
+        diff_hunks
+            .iter()
+            .filter(|h| !h.old_word_diffs.is_empty() || !h.new_word_diffs.is_empty())
+            .count()
+            >= 2,
+        "场景应覆盖至少两个含 word diff 的 hunk"
+    );
+    assert_eq!(left_actual, left_ref, "左列 CharOffset 必须与旧实现逐值一致");
+    assert_eq!(right_actual, right_ref, "右列 CharOffset 必须与旧实现逐值一致");
+
+    // 多字节校验:首处修改的旧侧 range 之前有 `café`,其字符偏移必须小于字节偏移,
+    // 证明输出按字符计数而非字节计数。
+    let first_old_range = diff_hunks
+        .iter()
+        .flat_map(|h| &h.old_word_diffs)
+        .next()
+        .expect("应有 old word diff range");
+    let first_char = old_content[..first_old_range.start].chars().count();
+    assert!(first_char < first_old_range.start, "café 使该处字符偏移小于字节偏移");
+    assert_eq!(
+        left_actual[0].0,
+        CharOffset::from(first_char),
+        "首个 decoration 起点必须是字符偏移"
+    );
 }

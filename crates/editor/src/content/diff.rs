@@ -170,6 +170,15 @@ fn tokenize(text: &str) -> impl Iterator<Item = &str> {
 ///
 /// Returns `(old_ranges, new_ranges)`: the byte ranges (relative to each input string)
 /// that were changed, with adjacent changed ranges merged.
+///
+/// 仍然做字符级 word diff 的最大 hunk 行数(每侧)。
+///
+/// 对齐 Zed 的 `MAX_WORD_DIFF_LINE_COUNT = 5`:只对「修改前后行数相等且 ≤ 该值」的
+/// 纯修改 hunk 计算字符级 diff,更大的 hunk 只保留行级红/绿高亮,跳过昂贵的字级计算。
+/// 取舍说明:本仓库实测 200 行 hunk ≈ release 1ms 且随行数线性叠加,几千行的大
+/// modification hunk 若做字级 diff 会在打开大 diff 时卡住;完全对齐 Zed = 5 能拿到
+/// 最佳打开性能,代价仅是 6 行以上的就地修改不再有字符级精细高亮(Zed 默认行为一致)。
+pub const WORD_DIFF_MAX_HUNK_LINES: usize = 5;
 pub fn word_diff_ranges(
     old_text: &str,
     new_text: &str,
@@ -289,7 +298,15 @@ pub fn diff_lines(old_text: &str, new_text: &str) -> Vec<LineDiffHunk> {
         let new_rows = hunk.after.start as usize..hunk.after.end as usize;
 
         // Character-level diff only for pure modifications (equal line counts).
-        let (old_word_diffs, new_word_diffs) = if old_rows.len() == new_rows.len()
+        //
+        // Guard against pathological hunks: a thousands-of-lines "modification" (e.g. a file-wide
+        // line-ending or whitespace change) would otherwise run a character-level Histogram diff
+        // over the entire hunk on the main thread, freezing the UI when opening a large diff.
+        // Above this size we keep the line-level red/green highlighting but skip the finer
+        // character-level word diff.
+        let hunk_size_is_tractable = old_rows.len() <= WORD_DIFF_MAX_HUNK_LINES;
+        let (old_word_diffs, new_word_diffs) = if hunk_size_is_tractable
+            && old_rows.len() == new_rows.len()
             && !new_rows.is_empty()
             && old_rows.end < old_offsets.len()
             && new_rows.end < new_offsets.len()
@@ -686,6 +703,32 @@ mod tests {
         assert_eq!(hunks[0].new_rows, 1..3);
         assert!(!hunks[0].old_word_diffs.is_empty());
         assert!(!hunks[0].new_word_diffs.is_empty());
+    }
+
+    #[test]
+    fn diff_lines_huge_modification_skips_word_diff() {
+        // A modification hunk above `WORD_DIFF_MAX_HUNK_LINES` must skip the character-level
+        // word diff (keeping line-level highlighting) so opening very large diffs stays
+        // responsive.
+        let lines_before: String = (0..(WORD_DIFF_MAX_HUNK_LINES + 10))
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let mut lines_after = lines_before.clone();
+        // Modify every line so the diff merges into one big MODIFY hunk.
+        lines_after = lines_after
+            .lines()
+            .map(|l| format!("{l} changed\n"))
+            .collect();
+        let hunks = diff_lines(&lines_before, &lines_after);
+        assert!(!hunks.is_empty(), "should produce at least one hunk");
+        for hunk in &hunks {
+            if hunk.old_rows.len() > WORD_DIFF_MAX_HUNK_LINES {
+                assert!(
+                    hunk.old_word_diffs.is_empty() && hunk.new_word_diffs.is_empty(),
+                    "超大 hunk 应跳过字符级 word diff"
+                );
+            }
+        }
     }
 
     #[test]

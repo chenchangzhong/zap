@@ -65,7 +65,7 @@ use crate::{
         },
     },
 };
-use warp_editor::content::diff::compute_spacers;
+use warp_editor::content::diff::{compute_spacers, limit_spacers};
 use warp_editor::content::edit::TemporaryBlock;
 use warpui::color::ColorU;
 use warp_core::ui::theme::Fill;
@@ -324,6 +324,10 @@ const EDITOR_GAP: f32 = 12.;
 // Divides the viewport line count to derive the scroll offset (in lines) when
 // jumping to a diff hunk (same convention as the NavBar).
 const DIFF_NAV_VIEWPORT_LINE_DIVISOR: usize = 10;
+/// Cap for side-by-side alignment spacer lines. Diffs that drift by more than this many
+/// alignment rows get the excess folded into a "skipped N lines" placeholder, keeping
+/// large-file views responsive.
+const SIDE_BY_SIDE_MAX_SPACER_LINES: usize = 2000;
 const FILE_SIDEBAR_PANE_WIDTH_PERCENTAGE: f32 = 0.25;
 /// Vertical gap between the right panel header row and the code review content below it
 /// (sub-header in loaded state, loading text in loading state).
@@ -426,9 +430,10 @@ pub struct SideBySideEditorState {
 }
 
 /// Decorations + diff statuses derived from the old (left) and new (right) buffer contents.
-/// Returned by [`CodeReviewView::compute_side_by_side_diff_data`] and reused after a hunk
+/// Returned by [`CodeReviewView::prepare_side_by_side_diff_data`] and reused after a hunk
 /// revert to refresh the two columns from their live buffer text.
-struct SideBySideDiffData {
+#[derive(Clone)]
+pub(crate) struct SideBySideDiffData {
     left_decorations: Vec<LineDecoration>,
     right_decorations: Vec<LineDecoration>,
     left_text_decorations: Vec<Decoration>,
@@ -437,6 +442,245 @@ struct SideBySideDiffData {
     right_spacers: Vec<TemporaryBlock>,
     left_diff_status: DiffStatus,
     right_diff_status: DiffStatus,
+}
+
+/// 缓存键:`(old_content_hash, new_content_hash)`。命中即跳过后台 diff 计算。
+type SideBySideDiffCacheKey = (u64, u64);
+
+/// 后台 diff 计算的缓存上限:超过即驱逐一个条目(LRU 近似,见 prepare 内的驱逐逻辑)。
+const SIDE_BY_SIDE_DIFF_CACHE_MAX: usize = 64;
+
+/// 仅用颜色值(可跨线程 Copy)在后台线程复刻 [`CodeReviewView::build_side_by_side_diff_data`]
+/// 的纯映射逻辑。`&Appearance` 不能跨线程,因此由同步层先抽取这 4 个颜色传入。
+fn build_side_by_side_diff_data(
+    remove_color: ColorU,
+    add_color: ColorU,
+    remove_inline: ColorU,
+    add_inline: ColorU,
+    old_content: &str,
+    new_content: &str,
+) -> SideBySideDiffData {
+    let mut left_decorations = Vec::new();
+    let mut right_decorations = Vec::new();
+    let mut left_text_decorations = Vec::new();
+    let mut right_text_decorations = Vec::new();
+
+    let diff_start = std::time::Instant::now();
+    let diff_hunks = warp_editor::content::diff::diff_lines(old_content, new_content);
+    let diff_elapsed = diff_start.elapsed();
+    if diff_elapsed.as_micros() > 200 {
+        log::debug!("[perf] side-by-side diff_lines took {:?}", diff_elapsed);
+    }
+
+    // Word diff 字节 range → CharOffset 的顺序递增游标(H-B 优化,见
+    // [`advance_char_cursor`]):每个 range 只从上一次位置继续数到目标字节,
+    // 避免旧的 O(ranges × len) —— 每个 range 都从文本头重新 `chars().count()`。
+    let mut old_byte_cursor = 0usize;
+    let mut old_char_cursor = CharOffset::zero();
+    let mut new_byte_cursor = 0usize;
+    let mut new_char_cursor = CharOffset::zero();
+
+    for hunk in diff_hunks.iter() {
+        // Line backgrounds (SplitSide colors): left = old rows (deleted/red),
+        // right = new rows (added/green).
+        for row in hunk.old_rows.clone() {
+            left_decorations.push(LineDecoration::new(
+                LineCount::from(row),
+                LineCount::from(row + 1),
+                remove_color.into(),
+            ));
+        }
+        for row in hunk.new_rows.clone() {
+            right_decorations.push(LineDecoration::new(
+                LineCount::from(row),
+                LineCount::from(row + 1),
+                add_color.into(),
+            ));
+        }
+
+        // Character-level word diffs (byte ranges relative to whole text → CharOffset)。
+        // 用递增游标增量计数:每个 range 从 `old_char_cursor`/`new_char_cursor` 继续
+        // 数到 `r.end`,与旧的逐 range `chars().count()` 产出完全一致,但总复杂度
+        // 从 O(ranges × len) 降为 O(len + ranges)。
+        for r in &hunk.old_word_diffs {
+            let start =
+                advance_char_cursor(old_content, &mut old_byte_cursor, old_char_cursor, r.start);
+            let end = advance_char_cursor(old_content, &mut old_byte_cursor, start, r.end);
+            old_char_cursor = end;
+            left_text_decorations.push(
+                Decoration::new(start, end).with_background(remove_inline.into()),
+            );
+        }
+        for r in &hunk.new_word_diffs {
+            let start =
+                advance_char_cursor(new_content, &mut new_byte_cursor, new_char_cursor, r.start);
+            let end = advance_char_cursor(new_content, &mut new_byte_cursor, start, r.end);
+            new_char_cursor = end;
+            right_text_decorations.push(
+                Decoration::new(start, end).with_background(add_inline.into()),
+            );
+        }
+    }
+
+    // Compute spacer blocks for each side (Zed spacer-block alignment)
+    let (left_spacers, right_spacers) = compute_spacers(&diff_hunks);
+    // Cap spacer volume for very large diffs: fold excess alignment rows into a
+    // "skipped N lines" placeholder instead of creating thousands of temporary blocks
+    // (which stalls opening large side-by-side diffs and slows scrolling).
+    let (left_spacers, right_spacers, _skipped) =
+        limit_spacers(left_spacers, right_spacers, SIDE_BY_SIDE_MAX_SPACER_LINES);
+
+    // Build precise diff statuses per side (git alignment): only mark rows that
+    // actually exist on that side.
+    //
+    // IMPORTANT: `diff_hunk(line_count)` is queried in the LINE domain — `start_line`
+    // sums `BlockItem::lines()` and `TemporaryBlock::lines() == 0` (render/model/
+    // mod.rs), so spacer blocks do NOT consume line numbers and every query uses the
+    // plain buffer row. Keys must therefore be buffer rows (no spacer offset).
+    // Spacers themselves are excluded at the gutter level via `is_spacer()`.
+    //
+    // change_mapping uses one range per hunk (not per row) so hunk-index based
+    // operations (diff_hunk_count_before_line / reverse_action_by_diff_hunk_index)
+    // keep working; deletion_mapping stays per-row (HashMap semantics).
+    let left_change_mapping = RangeMap::new();
+    let mut left_deletion_mapping = HashMap::new();
+    let mut left_deletion_hunks = Vec::new();
+    let mut right_change_mapping = RangeMap::new();
+    let right_deletion_mapping = HashMap::new();
+    let mut right_deletion_hunks = Vec::new();
+    // Reverse-insertion overrides for right-column pure-deletion hunks (see
+    // `DiffStatus::reverse_insertion_mapping`): the right buffer has no rows for
+    // a pure deletion, so we re-insert the deleted base lines at this zero-width
+    // navigation position when the hunk is reverted.
+    let mut right_reverse_insertion_mapping = HashMap::new();
+    // Every hunk contributes exactly one navigation range on EACH side so hunk
+    // indices stay aligned between the two columns:
+    //   - replacement: old rows on the left, new rows on the right
+    //   - pure deletion: old rows on the left, zero-length placeholder on the right
+    //   - pure addition: zero-length placeholder on the left, new rows on the right
+    for hunk in diff_hunks.iter() {
+        let old_has_rows = !hunk.old_rows.is_empty();
+        let new_has_rows = !hunk.new_rows.is_empty();
+        match (old_has_rows, new_has_rows) {
+            (true, true) => {
+                for row in hunk.old_rows.clone() {
+                    left_deletion_mapping.insert(row, row..row + 1);
+                }
+                left_deletion_hunks.push(hunk.old_rows.clone());
+                right_change_mapping.insert(
+                    hunk.new_rows.clone(),
+                    ChangeType::Replacement {
+                        replaced_range: hunk.old_rows.clone(),
+                        insertion: Vec::new(),
+                        deletion: Vec::new(),
+                    },
+                );
+            }
+            (true, false) => {
+                for row in hunk.old_rows.clone() {
+                    left_deletion_mapping.insert(row, row..row + 1);
+                }
+                left_deletion_hunks.push(hunk.old_rows.clone());
+                right_deletion_hunks.push(hunk.new_rows.end..hunk.new_rows.end);
+                // Right column has no rows for a pure deletion; record the base
+                // range so reverting this hunk re-inserts the deleted lines at the
+                // zero-width navigation position `new_rows.end`.
+                right_reverse_insertion_mapping
+                    .insert(hunk.new_rows.end, hunk.old_rows.clone());
+            }
+            (false, true) => {
+                right_change_mapping
+                    .insert(hunk.new_rows.clone(), ChangeType::Addition);
+                left_deletion_hunks.push(hunk.old_rows.clone());
+            }
+            (false, false) => {}
+        }
+    }
+    let left_diff_status =
+        DiffStatus::from_mappings(left_change_mapping, left_deletion_mapping)
+            .with_deletion_hunks(left_deletion_hunks);
+    let right_diff_status =
+        DiffStatus::from_mappings(right_change_mapping, right_deletion_mapping)
+            .with_deletion_hunks(right_deletion_hunks)
+            .with_reverse_insertion_mapping(right_reverse_insertion_mapping);
+
+    SideBySideDiffData {
+        left_decorations,
+        right_decorations,
+        left_text_decorations,
+        right_text_decorations,
+        left_spacers,
+        right_spacers,
+        left_diff_status,
+        right_diff_status,
+    }
+}
+
+/// 字节游标从当前位置推进到 `target_byte`,返回该字节位置对应的字符偏移(CharOffset)。
+/// 见 [`build_side_by_side_diff_data`] 的 H-B 优化说明。
+fn advance_char_cursor(
+    text: &str,
+    cursor_byte: &mut usize,
+    cursor_char: CharOffset,
+    target_byte: usize,
+) -> CharOffset {
+    debug_assert!(
+        *cursor_byte <= target_byte && target_byte <= text.len(),
+        "word diff range 必须按字节偏移递增顺序遍历"
+    );
+    let mut char_off = cursor_char;
+    for _ in text[*cursor_byte..target_byte].chars() {
+        char_off += CharOffset::from(1);
+    }
+    *cursor_byte = target_byte;
+    char_off
+}
+
+/// 计算 side-by-side diff 缓存键:`(hash(old), hash(new))`。纯文本哈希,
+/// 对齐 Zed A5 的版本比对短路思想。
+fn side_by_side_diff_cache_key(old_content: &str, new_content: &str) -> SideBySideDiffCacheKey {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    old_content.hash(&mut h);
+    let old_hash = h.finish();
+    let mut h = DefaultHasher::new();
+    new_content.hash(&mut h);
+    let new_hash = h.finish();
+    (old_hash, new_hash)
+}
+
+/// 把 [`SideBySideDiffData`] 的左右两列装饰一次性回填到双列 editor。
+/// 左列 = 旧内容(红/删除),右列 = 新内容(绿/新增)。两个 `update` 在同一主线程帧内
+/// 连续执行,无 yield,因此不会出现"左新右旧"的中间态错乱。
+fn apply_side_by_side_decorations(
+    baseline: &ViewHandle<LocalCodeEditorView>,
+    modified: &ViewHandle<LocalCodeEditorView>,
+    data: &SideBySideDiffData,
+    ctx: &mut ViewContext<CodeReviewView>,
+) {
+    baseline.update(ctx, |local, ctx| {
+        local.editor().update(ctx, |editor, ctx| {
+            editor.set_diff_status(data.left_diff_status.clone(), ctx);
+            editor.set_git_diff_decorations(
+                data.left_decorations.clone(),
+                data.left_text_decorations.clone(),
+                data.left_spacers.clone(),
+                ctx,
+            );
+        });
+    });
+    modified.update(ctx, |local, ctx| {
+        local.editor().update(ctx, |editor, ctx| {
+            editor.set_diff_status(data.right_diff_status.clone(), ctx);
+            editor.set_git_diff_decorations(
+                data.right_decorations.clone(),
+                data.right_text_decorations.clone(),
+                data.right_spacers.clone(),
+                ctx,
+            );
+        });
+    });
 }
 
 pub struct FileState {
@@ -454,6 +698,11 @@ pub struct FileState {
     pub side_by_side_state: Option<SideBySideEditorState>,
     /// Baseline content (HEAD) for this file, used by side-by-side editor creation.
     pub content_at_head: Option<String>,
+    /// 后台 diff 计算的请求令牌:每次(重新)发起计算时自增,回调时比对,
+    /// 不符即丢弃结果,防止 stale 装饰(见 `SideBySideDiffAsync` FeatureFlag)。
+    pub side_by_side_diff_token: u64,
+    /// 进行中的后台 diff 计算句柄,新请求发起时 abort 旧任务,避免浪费与竞态。
+    pub pending_diff_abort: Option<SpawnedFutureHandle>,
 }
 
 pub(crate) struct LoadedState {
@@ -461,6 +710,9 @@ pub(crate) struct LoadedState {
     pub(crate) total_additions: usize,
     pub(crate) total_deletions: usize,
     pub(crate) files_changed: usize,
+    /// 后台 diff 计算结果的缓存:键为 `(old_hash, new_hash)`,仅主线程读写。
+    /// 见 [`side_by_side_diff_cache_key`] 与 `SideBySideDiffAsync` FeatureFlag。
+    pub(crate) side_by_side_diff_cache: HashMap<SideBySideDiffCacheKey, SideBySideDiffData>,
 }
 
 impl LoadedState {
@@ -2740,6 +2992,7 @@ impl CodeReviewView {
                 total_additions: diff_data.total_additions,
                 total_deletions: diff_data.total_deletions,
                 files_changed: diff_data.files_changed,
+                side_by_side_diff_cache: HashMap::new(),
             });
         }
 
@@ -2952,6 +3205,8 @@ impl CodeReviewView {
                 content_at_head: file.content_at_head.clone(),
                 sidebar_mouse_state: MouseStateHandle::default(),
                 header_mouse_state: MouseStateHandle::default(),
+                side_by_side_diff_token: 0,
+                pending_diff_abort: None,
             })
         }
 
@@ -5780,10 +6035,10 @@ impl CodeReviewView {
                 let CodeReviewViewState::Loaded(state) = &repo.state else {
                     break;
                 };
-                let Some(file) = state.file_states.get(&path) else {
+                let Some(_file) = state.file_states.get(&path) else {
                     continue;
                 };
-                self.create_side_by_side_editors(file, ctx)
+                self.create_side_by_side_editors(&path, ctx)
             };
 
             // Now store it and set up scroll sync (needs &mut self)
@@ -5929,6 +6184,7 @@ impl CodeReviewView {
         target: &ViewHandle<LocalCodeEditorView>,
         ctx: &mut ViewContext<Self>,
     ) {
+        let sync_start = std::time::Instant::now();
         // Read source scroll position
         let source_view = source.as_ref(ctx);
         let source_model = source_view.model.as_ref(ctx);
@@ -5996,6 +6252,10 @@ impl CodeReviewView {
                 }
             });
         });
+        let sync_elapsed = sync_start.elapsed();
+        if sync_elapsed.as_micros() > 200 {
+            log::debug!("[perf] scroll-sync to target took {:?}", sync_elapsed);
+        }
     }
 
     /// Focuses the target editor onto the same diff hunk index as the source and scrolls
@@ -6178,185 +6438,263 @@ impl CodeReviewView {
         (left, right)
     }
 
-    /// Computed decorations + diff statuses for the two side-by-side columns, derived from
-    /// the old (left) and new (right) buffer contents. Extracted from
-    /// [`Self::create_side_by_side_editors`] so it can be re-run after a hunk revert (when the
-    /// right column's live buffer content has changed) without duplicating the mapping logic.
-    fn compute_side_by_side_diff_data(
-        appearance: &Appearance,
+    /// 把字节游标从当前位置推进到 `target_byte`,返回该字节位置对应的字符偏移(CharOffset)。
+    ///
+    /// H-B 优化(对标 Zed 的 forward-only cursor):`build_side_by_side_diff_data` 里 word
+    /// diff 的字节 range 按 hunk 顺序遍历时,起点/终点字节偏移单调递增(hunk 内 range 已
+    /// 按 offset 合并且有序,hunk 间按 old/new 行序排列)。因此每个 range 只需沿用上一个
+    /// range 的游标继续数到目标字节,而不是每个 range 都从文本头重新 `chars().count()`
+    /// (旧的 O(ranges × len))。总复杂度降为 O(len + ranges),产出与旧实现逐值一致
+    /// (仍是按字符计数,只是改为增量计算)。
+    ///
+    /// 调用前提:`target_byte` 不小于当前游标位置,且落在字符边界上(word diff 的 byte
+    /// range 全部来自 tokenizer 的字符边界,天然满足)。
+    fn advance_char_cursor(
+        text: &str,
+        cursor_byte: &mut usize,
+        cursor_char: CharOffset,
+        target_byte: usize,
+    ) -> CharOffset {
+        debug_assert!(
+            *cursor_byte <= target_byte && target_byte <= text.len(),
+            "word diff range 必须按字节偏移递增顺序遍历"
+        );
+        let mut char_off = cursor_char;
+        for _ in text[*cursor_byte..target_byte].chars() {
+            char_off += CharOffset::from(1);
+        }
+        *cursor_byte = target_byte;
+        char_off
+    }
+
+    /// 准备两列 diff 装饰数据,并按 `SideBySideDiffAsync` FeatureFlag 决定同步或异步:
+    /// - 关闭:直接同步计算并返回 `Some(data)`(与现状行为完全一致)。
+    /// - 开启:
+    ///   1. 先查缓存(`(old_hash, new_hash)` 命中即返回,跳过后台计算 —— 对齐 Zed A5 短路);
+    ///   2. 未命中则派发后台线程计算,返回 `None`(调用方先创建无装饰 editor,
+    ///      计算完由回调 [`Self::apply_side_by_side_diff_data`] 回填)。
+    ///
+    /// 每次发起(无论同步/异步)都会自增 `file.side_by_side_diff_token` 并 abort 旧的后台任务,
+    /// 旧结果回调时令牌不符即被丢弃,杜绝 stale 装饰。
+    fn prepare_side_by_side_diff_data(
+        &mut self,
+        file_path: &PathBuf,
+        remove_color: ColorU,
+        add_color: ColorU,
+        remove_inline: ColorU,
+        add_inline: ColorU,
         old_content: &str,
         new_content: &str,
-    ) -> SideBySideDiffData {
-        let mut left_decorations = Vec::new();
-        let mut right_decorations = Vec::new();
-        let mut left_text_decorations = Vec::new();
-        let mut right_text_decorations = Vec::new();
+        focus_after: bool,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<SideBySideDiffData> {
+        if !FeatureFlag::SideBySideDiffAsync.is_enabled() {
+            return Some(build_side_by_side_diff_data(
+                remove_color,
+                add_color,
+                remove_inline,
+                add_inline,
+                old_content,
+                new_content,
+            ));
+        }
 
-        let diff_hunks = warp_editor::content::diff::diff_lines(old_content, new_content);
+        let key = side_by_side_diff_cache_key(old_content, new_content);
 
-        for hunk in diff_hunks.iter() {
-            // Line backgrounds (SplitSide colors): left = old rows (deleted/red),
-            // right = new rows (added/green).
-            for row in hunk.old_rows.clone() {
-                left_decorations.push(LineDecoration::new(
-                    LineCount::from(row),
-                    LineCount::from(row + 1),
-                    remove_overlay_color(appearance).into(),
+        // 缓存命中:直接复用上次结果,主线程零成本。
+        if let Some(CodeReviewViewState::Loaded(state)) = self.state_mut() {
+            if let Some(cached) = state.side_by_side_diff_cache.get(&key) {
+                return Some(cached.clone());
+            }
+        }
+
+        // 失效并作废上一次针对该文件的在途请求。
+        let token = {
+            let Some(repo) = self.active_repo.as_mut() else {
+                return Some(build_side_by_side_diff_data(
+                    remove_color,
+                    add_color,
+                    remove_inline,
+                    add_inline,
+                    old_content,
+                    new_content,
                 ));
-            }
-            for row in hunk.new_rows.clone() {
-                right_decorations.push(LineDecoration::new(
-                    LineCount::from(row),
-                    LineCount::from(row + 1),
-                    add_overlay_color(appearance).into(),
+            };
+            let CodeReviewViewState::Loaded(state) = &mut repo.state else {
+                return Some(build_side_by_side_diff_data(
+                    remove_color,
+                    add_color,
+                    remove_inline,
+                    add_inline,
+                    old_content,
+                    new_content,
                 ));
+            };
+            let Some(file) = state.file_states.get_mut(file_path) else {
+                return Some(build_side_by_side_diff_data(
+                    remove_color,
+                    add_color,
+                    remove_inline,
+                    add_inline,
+                    old_content,
+                    new_content,
+                ));
+            };
+            file.side_by_side_diff_token = file.side_by_side_diff_token.wrapping_add(1);
+            if let Some(handle) = file.pending_diff_abort.take() {
+                handle.abort();
             }
+            file.side_by_side_diff_token
+        };
 
-            // Character-level word diffs (byte ranges relative to whole text → CharOffset).
-            for r in &hunk.old_word_diffs {
-                let start = CharOffset::from(old_content[..r.start].chars().count());
-                let end = CharOffset::from(old_content[..r.end].chars().count());
-                left_text_decorations.push(
-                    Decoration::new(start, end)
-                        .with_background(remove_inline_overlay_color(appearance).into()),
+        // 仅抽取 4 个颜色值(Copy)传入后台闭包;`&Appearance` 本身不能跨线程。
+        let old_owned = old_content.to_owned();
+        let new_owned = new_content.to_owned();
+        let file_path_for_cb = file_path.clone();
+        let handle = ctx.spawn_abortable(
+            async move {
+                build_side_by_side_diff_data(
+                    remove_color,
+                    add_color,
+                    remove_inline,
+                    add_inline,
+                    &old_owned,
+                    &new_owned,
+                )
+            },
+            move |this, data, ctx| {
+                this.apply_side_by_side_diff_data(
+                    &file_path_for_cb,
+                    token,
+                    key,
+                    focus_after,
+                    data,
+                    ctx,
                 );
-            }
-            for r in &hunk.new_word_diffs {
-                let start = CharOffset::from(new_content[..r.start].chars().count());
-                let end = CharOffset::from(new_content[..r.end].chars().count());
-                right_text_decorations.push(
-                    Decoration::new(start, end)
-                        .with_background(add_inline_overlay_color(appearance).into()),
-                );
-            }
-        }
-
-        // Compute spacer blocks for each side (Zed spacer-block alignment)
-        let (left_spacers, right_spacers) = compute_spacers(&diff_hunks);
-
-        // Build precise diff statuses per side (git alignment): only mark rows that
-        // actually exist on that side.
-        //
-        // IMPORTANT: `diff_hunk(line_count)` is queried in the LINE domain — `start_line`
-        // sums `BlockItem::lines()` and `TemporaryBlock::lines() == 0` (render/model/
-        // mod.rs), so spacer blocks do NOT consume line numbers and every query uses the
-        // plain buffer row. Keys must therefore be buffer rows (no spacer offset).
-        // Spacers themselves are excluded at the gutter level via `is_spacer()`.
-        //
-        // change_mapping uses one range per hunk (not per row) so hunk-index based
-        // operations (diff_hunk_count_before_line / reverse_action_by_diff_hunk_index)
-        // keep working; deletion_mapping stays per-row (HashMap semantics).
-        let left_change_mapping = RangeMap::new();
-        let mut left_deletion_mapping = HashMap::new();
-        let mut left_deletion_hunks = Vec::new();
-        let mut right_change_mapping = RangeMap::new();
-        let right_deletion_mapping = HashMap::new();
-        let mut right_deletion_hunks = Vec::new();
-        // Reverse-insertion overrides for right-column pure-deletion hunks (see
-        // `DiffStatus::reverse_insertion_mapping`): the right buffer has no rows for
-        // a pure deletion, so we re-insert the deleted base lines at this zero-width
-        // navigation position when the hunk is reverted.
-        let mut right_reverse_insertion_mapping = HashMap::new();
-        // Every hunk contributes exactly one navigation range on EACH side so hunk
-        // indices stay aligned between the two columns:
-        //   - replacement: old rows on the left, new rows on the right
-        //   - pure deletion: old rows on the left, zero-length placeholder on the right
-        //   - pure addition: zero-length placeholder on the left, new rows on the right
-        for hunk in diff_hunks.iter() {
-            let old_has_rows = !hunk.old_rows.is_empty();
-            let new_has_rows = !hunk.new_rows.is_empty();
-            match (old_has_rows, new_has_rows) {
-                (true, true) => {
-                    for row in hunk.old_rows.clone() {
-                        left_deletion_mapping.insert(row, row..row + 1);
-                    }
-                    left_deletion_hunks.push(hunk.old_rows.clone());
-                    right_change_mapping.insert(
-                        hunk.new_rows.clone(),
-                        ChangeType::Replacement {
-                            replaced_range: hunk.old_rows.clone(),
-                            insertion: Vec::new(),
-                            deletion: Vec::new(),
-                        },
-                    );
+            },
+            |_, _| {},
+        );
+        // 存回 file 以便下次请求时 abort。
+        if let Some(repo) = self.active_repo.as_mut() {
+            if let CodeReviewViewState::Loaded(state) = &mut repo.state {
+                if let Some(file) = state.file_states.get_mut(file_path) {
+                    file.pending_diff_abort = Some(handle);
                 }
-                (true, false) => {
-                    for row in hunk.old_rows.clone() {
-                        left_deletion_mapping.insert(row, row..row + 1);
-                    }
-                    left_deletion_hunks.push(hunk.old_rows.clone());
-                    right_deletion_hunks.push(hunk.new_rows.end..hunk.new_rows.end);
-                    // Right column has no rows for a pure deletion; record the base
-                    // range so reverting this hunk re-inserts the deleted lines at the
-                    // zero-width navigation position `new_rows.end`.
-                    right_reverse_insertion_mapping
-                        .insert(hunk.new_rows.end, hunk.old_rows.clone());
-                }
-                (false, true) => {
-                    right_change_mapping
-                        .insert(hunk.new_rows.clone(), ChangeType::Addition);
-                    left_deletion_hunks.push(hunk.old_rows.clone());
-                }
-                (false, false) => {}
             }
         }
-        let left_diff_status =
-            DiffStatus::from_mappings(left_change_mapping, left_deletion_mapping)
-                .with_deletion_hunks(left_deletion_hunks);
-        let right_diff_status =
-            DiffStatus::from_mappings(right_change_mapping, right_deletion_mapping)
-                .with_deletion_hunks(right_deletion_hunks)
-                .with_reverse_insertion_mapping(right_reverse_insertion_mapping);
+        None
+    }
 
-        SideBySideDiffData {
-            left_decorations,
-            right_decorations,
-            left_text_decorations,
-            right_text_decorations,
-            left_spacers,
-            right_spacers,
-            left_diff_status,
-            right_diff_status,
+    /// 后台 diff 计算完成后的主线程回调:校验令牌、写缓存、回填双列装饰。
+    /// 令牌不符(期间又发起了新请求 / revert / 内容变更)即丢弃,避免 stale 装饰。
+    fn apply_side_by_side_diff_data(
+        &mut self,
+        file_path: &PathBuf,
+        token: u64,
+        key: SideBySideDiffCacheKey,
+        focus_after: bool,
+        data: SideBySideDiffData,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(repo) = self.active_repo.as_mut() else {
+            return;
+        };
+        let CodeReviewViewState::Loaded(state) = &mut repo.state else {
+            return;
+        };
+        let Some(file) = state.file_states.get(file_path) else {
+            return;
+        };
+        // stale 防护:令牌已被新请求覆盖,丢弃本次结果。
+        if file.side_by_side_diff_token != token {
+            return;
         }
+        // 写入缓存(超上限则驱逐一个条目,近似 LRU)。
+        if state.side_by_side_diff_cache.len() >= SIDE_BY_SIDE_DIFF_CACHE_MAX {
+            if let Some(evict_key) = state.side_by_side_diff_cache.keys().next().cloned() {
+                state.side_by_side_diff_cache.remove(&evict_key);
+            }
+        }
+        state.side_by_side_diff_cache.insert(key, data.clone());
+
+        // 双列编辑器可能尚未创建(例如极速切换期间),此时装饰随 editor 创建时再算,无碍。
+        let Some(pair) = file.side_by_side_state.as_ref() else {
+            return;
+        };
+        let baseline = pair.baseline_editor.clone();
+        let modified = pair.modified_editor.clone();
+        apply_side_by_side_decorations(&baseline, &modified, &data, ctx);
+        if focus_after {
+            baseline.update(ctx, |local, ctx| {
+                local.editor().update(ctx, |editor, ctx| {
+                    editor.focus_diff_hunk_index(0, ctx);
+                });
+            });
+            modified.update(ctx, |local, ctx| {
+                local.editor().update(ctx, |editor, ctx| {
+                    editor.focus_diff_hunk_index(0, ctx);
+                });
+            });
+        }
+        ctx.notify();
     }
 
     fn create_side_by_side_editors(
-        &self,
-        file: &FileState,
+        &mut self,
+        file_path: &PathBuf,
         ctx: &mut ViewContext<Self>,
     ) -> Option<SideBySideEditorState> {
-        let repo_path = self.repo_path()?;
+        let repo_path = self.repo_path()?.clone();
 
-        if file.file_diff.is_binary {
-            return None;
-        }
+        let create_start = std::time::Instant::now();
 
-        let old_content = file.content_at_head.as_deref().unwrap_or("");
-        let new_content = if matches!(file.file_diff.status, GitFileStatus::Deleted) {
-            Self::reconstruct_new_content(old_content, &file.file_diff.hunks)
-        } else {
-            let full_path = repo_path.join(&file.file_diff.file_path);
-            std::fs::read_to_string(&full_path).unwrap_or_else(|_| {
-                Self::reconstruct_new_content(old_content, &file.file_diff.hunks)
-            })
+        // 在独立作用域内计算 old/new 内容(返回 owned String),释放对 self 的借用,
+        // 以便后续 prepare_side_by_side_diff_data 能再次以 &mut self 访问 state。
+        let (old_content, new_content) = {
+            let Some(repo) = self.active_repo.as_ref() else {
+                return None;
+            };
+            let CodeReviewViewState::Loaded(state) = &repo.state else {
+                return None;
+            };
+            let Some(file) = state.file_states.get(file_path) else {
+                return None;
+            };
+            if file.file_diff.is_binary {
+                return None;
+            }
+            let old = file.content_at_head.as_deref().unwrap_or("");
+            let new = if matches!(file.file_diff.status, GitFileStatus::Deleted) {
+                Self::reconstruct_new_content(old, &file.file_diff.hunks)
+            } else {
+                let full_path = repo_path.join(&file.file_diff.file_path);
+                std::fs::read_to_string(&full_path).unwrap_or_else(|_| {
+                    Self::reconstruct_new_content(old, &file.file_diff.hunks)
+                })
+            };
+            (old.to_owned(), new)
         };
 
         let appearance = Appearance::as_ref(ctx);
+        let remove_color = remove_overlay_color(appearance);
+        let add_color = add_overlay_color(appearance);
+        let remove_inline = remove_inline_overlay_color(appearance);
+        let add_inline = add_inline_overlay_color(appearance);
+        let _ = appearance;
 
-        // Compute decorations from the BufferDiff line mapping (Zed approach): imara_diff on
-        // old vs new content. Left editor (old): red for changed old rows. Right editor (new):
-        // green for changed new rows. Character-level word diffs for equal-line-count (modification)
-        // hunks.
-        let SideBySideDiffData {
-            left_decorations,
-            right_decorations,
-            left_text_decorations,
-            right_text_decorations,
-            left_spacers,
-            right_spacers,
-            left_diff_status,
-            right_diff_status,
-        } = Self::compute_side_by_side_diff_data(appearance, old_content, &new_content);
+        // 准备两列装饰:FeatureFlag 关闭时同步返回(Some);开启时命中缓存则同步返回,
+        // 否则派发后台计算并返回 None(本函数先创建无装饰 editor,计算完由回调回填)。
+        let diff_data = self.prepare_side_by_side_diff_data(
+            file_path,
+            remove_color,
+            add_color,
+            remove_inline,
+            add_inline,
+            &old_content,
+            &new_content,
+            false,
+            ctx,
+        );
 
 
         // Create baseline (left) editor — old content with red deletion decorations + left spacers
@@ -6383,25 +6721,33 @@ impl CodeReviewView {
             .disable_find_and_replace()
         });
 
-        let full_file_path = repo_path.join(&file.file_diff.file_path);
+        let full_file_path = repo_path.join(file_path);
         baseline_editor.update(ctx, |editor, ctx| {
             editor.set_language_with_path(&full_file_path, ctx);
-            editor.reset(InitialBufferState::plain_text(old_content), ctx);
+            let reset_start_old = std::time::Instant::now();
+            editor.reset(InitialBufferState::plain_text(&old_content), ctx);
+            let reset_elapsed_old = reset_start_old.elapsed();
+            if reset_elapsed_old.as_micros() > 200 {
+                log::debug!("[perf] editor reset (old) took {:?}", reset_elapsed_old);
+            }
             // base = new content (needed for revert actions), but do NOT recompute the
             // diff: the engine's mappings would mark left-side spacer rows as diff lines.
             // The precise status is injected manually below.
             editor.set_base(&new_content, false, ctx);
-            editor.set_diff_status(left_diff_status.clone(), ctx);
-            // Apply red deletion decorations + inline deletions + left spacers FIRST so
-            // `using_manual_git_diff_decorations` is set before `expand_diffs`: otherwise
-            // refresh_diff_state would insert diff-engine removal blocks into the content
-            // tree and break the render-row mapping used by the gutter diff indicators.
-            editor.set_git_diff_decorations(
-                left_decorations,
-                left_text_decorations,
-                left_spacers,
-                ctx,
-            );
+            // 装饰异步计算时为 None,由后台回调回填;同步/缓存命中时此处立即注入。
+            if let Some(data) = &diff_data {
+                editor.set_diff_status(data.left_diff_status.clone(), ctx);
+                // Apply red deletion decorations + inline deletions + left spacers FIRST so
+                // `using_manual_git_diff_decorations` is set before `expand_diffs`: otherwise
+                // refresh_diff_state would insert diff-engine removal blocks into the content
+                // tree and break the render-row mapping used by the gutter diff indicators.
+                editor.set_git_diff_decorations(
+                    data.left_decorations.clone(),
+                    data.left_text_decorations.clone(),
+                    data.left_spacers.clone(),
+                    ctx,
+                );
+            }
             // Activate diff navigation in Focused state: `expand_diffs` sets Expanded,
             // which shows the nav bar but makes the up/down buttons no-ops
             // (nav_diff_up/down only act on DiffNavigationState::Focused).
@@ -6439,19 +6785,27 @@ impl CodeReviewView {
 
         modified_editor.update(ctx, |editor, ctx| {
             editor.set_language_with_path(&full_file_path, ctx);
+            let reset_start_new = std::time::Instant::now();
             editor.reset(InitialBufferState::plain_text(&new_content), ctx);
+            let reset_elapsed_new = reset_start_new.elapsed();
+            if reset_elapsed_new.as_micros() > 200 {
+                log::debug!("[perf] editor reset (new) took {:?}", reset_elapsed_new);
+            }
             // base = old content (needed for revert actions), but do NOT recompute the
             // diff: the engine's mappings would mark right-side spacer rows as diff lines.
             editor.set_base(&old_content, false, ctx);
-            editor.set_diff_status(right_diff_status.clone(), ctx);
-            // Apply green addition decorations + inline additions + right spacers FIRST
-            // (see baseline editor comment about `expand_diffs` ordering).
-            editor.set_git_diff_decorations(
-                right_decorations,
-                right_text_decorations,
-                right_spacers,
-                ctx,
-            );
+            // 装饰异步计算时为 None,由后台回调回填;同步/缓存命中时此处立即注入。
+            if let Some(data) = &diff_data {
+                editor.set_diff_status(data.right_diff_status.clone(), ctx);
+                // Apply green addition decorations + inline additions + right spacers FIRST
+                // (see baseline editor comment about `expand_diffs` ordering).
+                editor.set_git_diff_decorations(
+                    data.right_decorations.clone(),
+                    data.right_text_decorations.clone(),
+                    data.right_spacers.clone(),
+                    ctx,
+                );
+            }
             // Focused diff nav (see baseline editor comment): keeps the nav bar buttons working.
             editor.toggle_diff_nav(None, ctx);
             // The right column stays editable; note that diff markers/spacers are a
@@ -6468,6 +6822,11 @@ impl CodeReviewView {
         modified_local.update(ctx, |local, ctx| {
             local.set_file_path(&full_file_path, ctx);
         });
+
+        let create_elapsed = create_start.elapsed();
+        if create_elapsed.as_micros() > 2000 {
+            log::debug!("[perf] create side-by-side took {:?}", create_elapsed);
+        }
 
         Some(SideBySideEditorState {
             baseline_editor: baseline_local,
@@ -6846,7 +7205,7 @@ impl CodeReviewView {
                 // Baseline (left) column of a side-by-side diff delegates its revert to the
                 // editable (right/modified) column, which owns the file and the correct diff
                 // base. The hunk indices are aligned across the two columns (see
-                // `compute_side_by_side_diff_data`), so the same index applies to the right column.
+                // `build_side_by_side_diff_data`), so the same index applies to the right column.
                 let modified_editor = match self.state() {
                     CodeReviewViewState::Loaded(state) => state
                         .file_states
@@ -7362,73 +7721,72 @@ impl CodeReviewView {
         file_path: &PathBuf,
         ctx: &mut ViewContext<Self>,
     ) {
-        let CodeReviewViewState::Loaded(state) = self.state() else {
-            return;
+        // 在独立作用域内取出所需的编辑器句柄与实时内容(owned),释放对 self/ctx 的借用,
+        // 以便后续 prepare_side_by_side_diff_data 能以 &mut self / &mut ctx 访问 state。
+        let (baseline_editor, modified_editor, old_content, new_content) = {
+            let CodeReviewViewState::Loaded(state) = self.state() else {
+                return;
+            };
+            let Some(pair) = state
+                .file_states
+                .get(file_path)
+                .and_then(|file_state| file_state.side_by_side_state.as_ref())
+            else {
+                return;
+            };
+            let baseline = pair.baseline_editor.clone();
+            let modified = pair.modified_editor.clone();
+            let old = baseline
+                .as_ref(ctx)
+                .editor()
+                .as_ref(ctx)
+                .text(ctx)
+                .into_string();
+            let new = modified
+                .as_ref(ctx)
+                .editor()
+                .as_ref(ctx)
+                .text(ctx)
+                .into_string();
+            (baseline, modified, old, new)
         };
-        let Some(pair) = state
-            .file_states
-            .get(file_path)
-            .and_then(|file_state| file_state.side_by_side_state.as_ref())
-        else {
-            return;
-        };
-        let baseline_editor = pair.baseline_editor.clone();
-        let modified_editor = pair.modified_editor.clone();
 
+        // 抽取颜色(避免把 &Appearance 跨线程/`&mut ctx` 冲突带入 prepare)。
         let appearance = Appearance::as_ref(ctx);
-        let old_content = pair
-            .baseline_editor
-            .as_ref(ctx)
-            .editor()
-            .as_ref(ctx)
-            .text(ctx)
-            .into_string();
-        let new_content = pair
-            .modified_editor
-            .as_ref(ctx)
-            .editor()
-            .as_ref(ctx)
-            .text(ctx)
-            .into_string();
+        let remove_color = remove_overlay_color(appearance);
+        let add_color = add_overlay_color(appearance);
+        let remove_inline = remove_inline_overlay_color(appearance);
+        let add_inline = add_inline_overlay_color(appearance);
+        let _ = appearance;
 
-        let SideBySideDiffData {
-            left_decorations,
-            right_decorations,
-            left_text_decorations,
-            right_text_decorations,
-            left_spacers,
-            right_spacers,
-            left_diff_status,
-            right_diff_status,
-        } = Self::compute_side_by_side_diff_data(appearance, &old_content, &new_content);
-
-        baseline_editor
-            .update(ctx, |local: &mut LocalCodeEditorView, ctx| {
-                local.editor().update(ctx, |editor: &mut CodeEditorView, ctx| {
-                    editor.set_diff_status(left_diff_status, ctx);
-                    editor.set_git_diff_decorations(
-                        left_decorations,
-                        left_text_decorations,
-                        left_spacers,
-                        ctx,
-                    );
+        // prepare 内部已递增 token 并 abort 旧任务;revert 后右列内容已变 → 缓存键变 →
+        // 不命中(正确)。focus_after=true 保持 revert 后聚焦到 hunk 0 的既有行为。
+        let diff_data = self.prepare_side_by_side_diff_data(
+            file_path,
+            remove_color,
+            add_color,
+            remove_inline,
+            add_inline,
+            &old_content,
+            &new_content,
+            true,
+            ctx,
+        );
+        // 仅同步/缓存命中时此处立即应用;异步路径由回调 apply_side_by_side_diff_data 回填(含 focus)。
+        if let Some(data) = diff_data {
+            apply_side_by_side_decorations(&baseline_editor, &modified_editor, &data, ctx);
+            baseline_editor.update(ctx, |local, ctx| {
+                local.editor().update(ctx, |editor, ctx| {
                     editor.focus_diff_hunk_index(0, ctx);
                 });
             });
-        modified_editor
-            .update(ctx, |local: &mut LocalCodeEditorView, ctx| {
-                local.editor().update(ctx, |editor: &mut CodeEditorView, ctx| {
-                    editor.set_diff_status(right_diff_status, ctx);
-                    editor.set_git_diff_decorations(
-                        right_decorations,
-                        right_text_decorations,
-                        right_spacers,
-                        ctx,
-                    );
+            modified_editor.update(ctx, |local, ctx| {
+                local.editor().update(ctx, |editor, ctx| {
                     editor.focus_diff_hunk_index(0, ctx);
                 });
             });
-        ctx.notify();
+            ctx.notify();
+        }
     }
 
     /// Insert diff hunk as an inline attachment in the terminal input

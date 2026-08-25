@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     fmt, mem,
     ops::{Add, AddAssign, Range, Sub, SubAssign},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -277,30 +278,6 @@ impl<'a> RenderContentTreeRef<'a> {
         ViewportIterator::new(&self.0, scroll_top, viewport_height, viewport_width)
     }
 
-    /// Y ranges (content coordinates) occupied by blank temporary blocks
-    /// (side-by-side alignment spacers). Diff line decorations must not paint
-    /// over these ranges.
-    pub fn spacer_y_ranges(&self) -> Vec<Range<f32>> {
-        let mut ranges = Vec::new();
-        let mut cursor = self.0.cursor::<(), Height>();
-        cursor.descend_to_first_item(&self.0, |_| true);
-        while let Some(item) = cursor.item() {
-            if let BlockItem::TemporaryBlock {
-                decoration,
-                paragraph_block,
-                ..
-            } = item
-            {
-                if decoration.is_none() {
-                    let y = cursor.start().0 .0 as f32;
-                    ranges.push(y..y + paragraph_block.content_size().y());
-                }
-            }
-            cursor.next();
-        }
-        ranges
-    }
-
     /// Describe only the content of the rendering model.
     #[cfg(test)]
     pub fn describe_content(&self) -> impl fmt::Display + '_ {
@@ -426,6 +403,15 @@ pub struct RenderState {
     /// Content is wrapped in a RefCell so we could mutate it when we are laying out the editor element.
     /// We know this is safe because there is a one-to-one relationship between element and model.
     content: RefCell<SumTree<BlockItem>>,
+
+    /// 缓存 [`Self::spacer_y_ranges`] 的结果,避免每个 paint 帧都全树遍历 O(N)。
+    /// 任何内容树变更(临时块替换 / 文本编辑 / 末尾换行切换)都必须通过
+    /// [`Self::invalidate_spacer_y_ranges_cache`] 使缓存失效。
+    spacer_y_ranges_cache: RefCell<Option<Rc<Vec<Range<f32>>>>>,
+
+    /// 测试专用:统计 spacer_y_ranges 实际重算次数(经缓存直接返回不计数)。
+    #[cfg(any(test, feature = "test-util"))]
+    spacer_y_ranges_recompute_count: Cell<usize>,
 
     selections: RefCell<RenderedSelectionSet>,
     decorations: RenderDecoration,
@@ -1788,6 +1774,9 @@ impl RenderState {
             selections: Default::default(),
             decorations: Default::default(),
             content: RefCell::new(content),
+            spacer_y_ranges_cache: RefCell::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            spacer_y_ranges_recompute_count: Cell::new(0),
             element_tx,
             layout_tx,
             width_setting: Default::default(),
@@ -1848,6 +1837,7 @@ impl RenderState {
 
         *content = new_tree;
         self.has_final_trailing_newline.set(false);
+        self.invalidate_spacer_y_ranges_cache();
     }
 
     fn add_final_trailing_newline_if_missing(&mut self) {
@@ -1859,11 +1849,61 @@ impl RenderState {
             .get_mut()
             .push(Self::final_trailing_newline_cursor(&self.styles));
         self.has_final_trailing_newline.set(true);
+        self.invalidate_spacer_y_ranges_cache();
     }
 
     /// Returns reference to the underlying content tree.
     pub fn content(&self) -> RenderContentTreeRef<'_> {
         RenderContentTreeRef(self.content.borrow())
+    }
+
+    /// Y ranges (content coordinates) occupied by blank temporary blocks
+    /// (side-by-side alignment spacers). Diff line decorations must not paint
+    /// over these ranges.
+    ///
+    /// 结果缓存在 [`Self::spacer_y_ranges_cache`],只有内容树变更(临时块替换 /
+    /// 文本编辑 / 末尾换行切换)时才重新全树遍历,否则每次 paint 调用都是 O(1)。
+    pub fn spacer_y_ranges(&self) -> Vec<Range<f32>> {
+        if let Some(cached) = self.spacer_y_ranges_cache.borrow().as_ref() {
+            return (**cached).clone();
+        }
+
+        let ranges = {
+            let content = self.content.borrow();
+            let mut ranges = Vec::new();
+            let mut cursor = content.cursor::<(), Height>();
+            cursor.descend_to_first_item(&content, |_| true);
+            while let Some(item) = cursor.item() {
+                if let BlockItem::TemporaryBlock {
+                    decoration,
+                    paragraph_block,
+                    ..
+                } = item
+                {
+                    if decoration.is_none() {
+                        let y = cursor.start().0 .0 as f32;
+                        ranges.push(y..y + paragraph_block.content_size().y());
+                    }
+                }
+                cursor.next();
+            }
+            ranges
+        };
+
+        #[cfg(any(test, feature = "test-util"))]
+        self.spacer_y_ranges_recompute_count
+            .set(self.spacer_y_ranges_recompute_count.get() + 1);
+
+        let ranges = Rc::new(ranges);
+        let result = (*ranges).clone();
+        *self.spacer_y_ranges_cache.borrow_mut() = Some(ranges);
+        result
+    }
+
+    /// 清除 spacer_y_ranges 缓存。内容树发生任何变更(临时块替换、文本编辑、
+    /// 末尾换行切换)后都必须调用,否则下一次 paint 会拿到过期的 Y 范围。
+    fn invalidate_spacer_y_ranges_cache(&self) {
+        *self.spacer_y_ranges_cache.borrow_mut() = None;
     }
 
     pub fn with_width_setting(mut self, setting: WidthSetting) -> Self {
@@ -2603,23 +2643,73 @@ impl RenderState {
             }
 
             cursor.descend_to_first_item(&content, |_| true);
+
+            // 旧临时块不贡献行数(lines == 0),只能落在内容项的边界上;而整段
+            // push_tree 保留的区间里不能夹带旧临时块(它们必须被替换掉)。所以先
+            // 轻量扫描一遍(不克隆任何 item),收集所有旧临时块所在的边界行号,
+            // 与本次要插入的 blocks 键合并成「必须逐项处理」的边界集合。
+            let mut boundaries: Vec<LineCount> = blocks.keys().copied().collect();
             while let Some(item) = cursor.item() {
+                if matches!(item, BlockItem::TemporaryBlock { .. }) {
+                    boundaries.push(cursor.end_seek_position());
+                }
+                cursor.next();
+            }
+            boundaries.sort_unstable();
+            boundaries.dedup();
+
+            // 重新从树首开始,按边界逐个切割:未变化的区间整体搬入 new_tree,
+            // 只在有旧临时块 / 需要插入新块的边界上逐项处理,把 O(全量行数) 的
+            // 逐项克隆降为 O(#临时块 + 受影响片段)。
+            let mut cursor = content.cursor::<LineCount, CharOffset>();
+            cursor.descend_to_first_item(&content, |_| true);
+            for boundary in boundaries {
+                // 当前游标位置起、严格位于该边界之前的内容整段保留(zero item 克隆)。
+                new_tree.push_tree(cursor.slice(&boundary, SeekBias::Left));
+
+                let Some(item) = cursor.item() else {
+                    // 边界已越过树尾:原实现中这些键同样不会命中任何 item,直接丢弃。
+                    break;
+                };
+
+                // 边界落在某个跨行项的中间:该键不会命中任何 item 的
+                // end_seek_position(与原实现行为一致),丢弃该键。
+                if cursor.end_seek_position() != boundary {
+                    blocks.remove(&boundary);
+                    continue;
+                }
+
+                // 第一个以该边界结束的项:非临时块则保留,随后插入挂在该插入点的新块。
                 if !matches!(item, BlockItem::TemporaryBlock { .. }) {
                     new_tree.push(item.clone());
                 }
-
-                if let Some(items) = blocks.remove(&cursor.end_seek_position()) {
+                if let Some(items) = blocks.remove(&boundary) {
                     for item in items {
                         new_tree.push(item);
                     }
                 }
-
                 cursor.next();
+
+                // 边界上可能还叠着多个零行 item:旧的临时块要被替换掉,其他零行
+                // 内容项继续保留,逐项处理直到越过该边界。
+                while let Some(item) = cursor.item() {
+                    if cursor.end_seek_position() != boundary {
+                        break;
+                    }
+                    if !matches!(item, BlockItem::TemporaryBlock { .. }) {
+                        new_tree.push(item.clone());
+                    }
+                    cursor.next();
+                }
             }
+
+            // 最后一个边界之后的内容全部未受影响,直接整体保留。
+            new_tree.push_tree(cursor.suffix());
         }
         self.has_final_trailing_newline
             .set(Self::tree_ends_with_trailing_newline(&new_tree));
         *self.content.borrow_mut() = new_tree;
+        self.invalidate_spacer_y_ranges_cache();
     }
 
     /// Update the render state with laid out new edits.
@@ -2764,6 +2854,7 @@ impl RenderState {
             .set(Self::tree_ends_with_trailing_newline(&new_tree));
         let mut content_mut = self.content.borrow_mut();
         *content_mut = new_tree;
+        self.invalidate_spacer_y_ranges_cache();
     }
 
     /// Dedupe adjacent hidden ranges into one.
@@ -3243,6 +3334,7 @@ impl RenderState {
         self.has_final_trailing_newline
             .set(Self::tree_ends_with_trailing_newline(&content));
         self.content = content.into();
+        self.invalidate_spacer_y_ranges_cache();
     }
 
     /// Scroll to the start of a given block, possibly adjusted.
@@ -3253,6 +3345,12 @@ impl RenderState {
         cursor.seek(&offset, SeekBias::Right);
         self.viewport
             .set_scroll_top(cursor.start().into_pixels() + adjustment.into_pixels());
+    }
+
+    /// Set an exact vertical scroll offset, for scroll-simulation benchmarks.
+    #[cfg(test)]
+    pub fn set_scroll_top_for_test(&mut self, scroll_top: Pixels) {
+        self.viewport.set_scroll_top(scroll_top);
     }
 
     /// Line number of the first line in the block.
