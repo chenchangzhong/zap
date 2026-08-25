@@ -37,9 +37,15 @@ cargo clean
 
 #### 不必全清：用 sccache + 关增量编译
 
-本仓库 `.cargo/config.toml` 已强制 `rustc-wrapper = "sccache"`，并设 `CARGO_INCREMENTAL = "0"`。
-debug 默认开启的增量编译会让 sccache 对绝大多数 crate 判定为 `non-cacheable`（incremental 与 sccache 缓存单元冲突），
-导致 `target/` 无限膨胀、且 `cargo clean` 全清后必须全量重编。关掉增量编译后，sccache 才会真正缓存 1500+ 包的编译产物。
+本仓库 `.cargo/config.toml` 已强制 `rustc-wrapper = "sccache"`。debug 默认开启的增量编译会让 sccache
+对绝大多数 crate 判定为 `non-cacheable`（incremental 与 sccache 缓存单元冲突），导致 `target/`
+无限膨胀、且 `cargo clean` 全清后必须全量重编。
+
+> **关增量编译必须走环境变量，不能写在 `.cargo/config.toml` 的 `[env]` 段。**
+> `CARGO_INCREMENTAL` 是 cargo 的特殊变量，`.cargo/config.toml` 的 `[env]` 设置对它无效——
+> 写在 `[env]` 里会造成"已配置"的假象，但增量编译实际仍然开着、`target/debug/incremental` 持续累加。
+> 已在 `~/.zshrc` 写入 `export CARGO_INCREMENTAL=0`（新开终端自动生效）。临时单步调试时
+> 用 `CARGO_INCREMENTAL=1 cargo build ...` 覆盖即可。
 
 - sccache 本地缓存上限 `10 GiB`（`Max cache size`），超出按 LRU 自动淘汰最旧的，**无需手动全清**。
 - 回收磁盘空间优先删增量中间产物，而不是 `cargo clean` 全清：
@@ -53,7 +59,7 @@ debug 默认开启的增量编译会让 sccache 对绝大多数 crate 判定为 
 - 需要临时单步调试（lldb / VS Code F5）时，用以下命令覆盖、临时开回增量编译：
 
   ```bash
-  CARGO_INCREMENTAL=1 cargo build --bin zap-oss --config 'env.CARGO_INCREMENTAL=1'
+  CARGO_INCREMENTAL=1 cargo build --bin zap-oss
   ```
 
 ### 2. 构建 DockTilePlugin
