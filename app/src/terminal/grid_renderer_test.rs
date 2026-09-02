@@ -608,6 +608,11 @@ fn scene_glyph_count(hide_cursor_cell: bool, use_ligature_rendering: bool) -> us
     })
 }
 
+fn ligature_mapped_columns(hide_cursor_cell: bool) -> Vec<usize> {
+    let _ = scene_glyph_count(hide_cursor_cell, true);
+    super::take_last_ligature_cell_map()
+}
+
 #[test]
 fn paints_glyph_at_hidden_pty_cursor_cell_without_ligatures() {
     let hidden = scene_glyph_count(true, false);
@@ -623,6 +628,15 @@ fn paints_glyph_at_hidden_pty_cursor_cell_without_ligatures() {
 }
 
 #[test]
-fn paints_hidden_pty_cursor_cell_with_ligatures_without_panicking() {
-    let _ = scene_glyph_count(true, true);
+fn paints_glyph_at_hidden_pty_cursor_cell_with_ligatures() {
+    let hidden = ligature_mapped_columns(true);
+    let shown = ligature_mapped_columns(false);
+    assert_eq!(
+        hidden, shown,
+        "hiding the Zap cursor overlay must still include the PTY cursor cell in ligature mapping"
+    );
+    assert!(
+        hidden.contains(&0),
+        "expected the PTY cursor cell column to remain in the ligature character map"
+    );
 }
