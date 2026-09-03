@@ -129,14 +129,6 @@ pub(super) fn upsert_ai_query(
 pub(super) fn get_all_restored_blocks(
     conn: &mut SqliteConnection,
 ) -> Result<PersistedBlocks, diesel::result::Error> {
-    get_all_restored_blocks_with_limit(conn, MAX_TERMINAL_BLOCKS_TO_PERSIST_PER_SESSION)
-}
-
-/// Same as [`get_all_restored_blocks`], with a caller-supplied per-pane cap.
-fn get_all_restored_blocks_with_limit(
-    conn: &mut SqliteConnection,
-    per_pane_limit: i64,
-) -> Result<PersistedBlocks, diesel::result::Error> {
     use diesel::sql_types::BigInt;
 
     let terminal_sessions = schema::terminal_panes::table
@@ -167,7 +159,7 @@ fn get_all_restored_blocks_with_limit(
          WHERE ranked.rn <= ?
          ORDER BY blocks.pane_leaf_uuid ASC, blocks.start_ts ASC, blocks.id ASC",
     )
-    .bind::<BigInt, _>(per_pane_limit)
+    .bind::<BigInt, _>(MAX_TERMINAL_BLOCKS_TO_PERSIST_PER_SESSION)
     .load::<Block>(conn)?;
 
     for block in blocks {
