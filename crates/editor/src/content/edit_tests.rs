@@ -4,7 +4,7 @@ use super::{
 use crate::{
     content::{
         buffer::{StyledBufferRun, StyledTextBlock},
-        edit::{ParsedUrl, highlight_urls, resolve_asset_source_relative_to_directory},
+        edit::{EditDelta, ParsedUrl, PreciseDelta, highlight_urls, resolve_asset_source_relative_to_directory},
         mermaid_diagram::{mermaid_asset_source, mermaid_diagram_layout},
         text::{BufferBlockStyle, CodeBlockType, TextStylesWithMetadata},
     },
@@ -14,13 +14,15 @@ use crate::{
     },
 };
 use std::path::Path;
-use string_offset::CharOffset;
+use std::sync::Arc;
+use string_offset::{ByteOffset, CharOffset};
 use warp_core::features::FeatureFlag;
 use warpui::{
     App, SingletonEntity,
     assets::asset_cache::{AssetCache, AssetSource, AssetState},
     fonts::{Properties, Style, Weight},
     image_cache::ImageType,
+    text::point::Point,
     text_layout::{LayoutCache, StyleAndFont, TextStyle},
 };
 
@@ -761,3 +763,24 @@ fn test_layout_code_block_urls() {
         });
     })
 }
+
+#[test]
+fn test_edit_delta_clone_shares_precise_delta_allocation() {
+    let delta = EditDelta {
+        precise_deltas: Arc::new(vec![PreciseDelta {
+            replaced_range: CharOffset::from(1)..CharOffset::from(2),
+            replaced_points: Point::new(1, 0)..Point::new(1, 1),
+            replaced_byte_range: ByteOffset::from(1)..ByteOffset::from(2),
+            new_byte_length: 1,
+            new_end_point: Point::new(1, 1),
+            resolved_range: CharOffset::from(1)..CharOffset::from(2),
+        }]),
+        ..Default::default()
+    };
+
+    let cloned = delta.clone();
+
+    assert_eq!(delta.precise_deltas, cloned.precise_deltas);
+    assert!(Arc::ptr_eq(&delta.precise_deltas, &cloned.precise_deltas));
+}
+

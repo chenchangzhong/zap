@@ -21,6 +21,7 @@ use crate::content::{
 use enum_iterator::all;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use std::ops::Range;
+use std::sync::Arc;
 use string_offset::CharOffset;
 use sum_tree::SumTree;
 use warpui::elements::ListIndentLevel;
@@ -357,7 +358,7 @@ impl Buffer {
         EditResult {
             undo_item: Some(undo_arg),
             delta: Some(EditDelta {
-                precise_deltas,
+                precise_deltas: Arc::new(precise_deltas),
                 old_offset: replacement_range.old_range,
                 new_lines,
             }),
