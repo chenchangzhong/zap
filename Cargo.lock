@@ -16407,6 +16407,7 @@ dependencies = [
  "futures",
  "log",
  "notify-debouncer-full",
+ "tempfile",
  "warpui",
 ]
 
