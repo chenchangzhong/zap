@@ -411,6 +411,8 @@ pub enum CodeReviewAction {
     ViewPr(String),
     PublishBranch,
     ToggleDiffLayout,
+    /// 双列模式下跳到上一个/下一个 diff hunk(文件头操作栏的图标按钮触发)。
+    NavigateDiffHunk { previous: bool },
 }
 
 /// Holds the two editor views for side-by-side diff rendering.
@@ -694,6 +696,10 @@ pub struct FileState {
     discard_button: ViewHandle<ActionButton>,
     add_context_button: ViewHandle<ActionButton>,
     copy_path_button: ViewHandle<ActionButton>,
+    /// 双列模式下文件头操作栏的上一个/下一个 hunk 图标按钮。
+    /// View 始终创建,仅在 side-by-side 且该文件为 active 时渲染。
+    prev_hunk_button: ViewHandle<ActionButton>,
+    next_hunk_button: ViewHandle<ActionButton>,
     /// Side-by-side editors, created lazily when diff_layout is SideBySide.
     pub side_by_side_state: Option<SideBySideEditorState>,
     /// Baseline content (HEAD) for this file, used by side-by-side editor creation.
@@ -1698,6 +1704,43 @@ impl CodeReviewView {
 
             ctx.notify();
         }
+    }
+
+    /// 双列模式下把 active 文件的 diff 导航跳到上一个/下一个 hunk。
+    ///
+    /// 走右列(可编辑列)内层编辑器既有的 nav 逻辑:`navigate_previous/next_diff_hunk`
+    /// 会 autoscroll 并 emit `NavScrolled`,双列滚动同步(`subscribe_scroll_sync`)
+    /// 收到后把左列跳到同一 hunk,两列保持对齐。
+    fn navigate_active_side_by_side_hunk(&mut self, previous: bool, ctx: &mut ViewContext<Self>) {
+        if !self.diff_layout.is_side_by_side() {
+            return;
+        }
+        let Some(editor) = self.active_side_by_side_modified_editor() else {
+            return;
+        };
+        let code_editor = editor.as_ref(ctx).editor().clone();
+        code_editor.update(ctx, |editor, ctx| {
+            if previous {
+                editor.navigate_previous_diff_hunk(ctx);
+            } else {
+                editor.navigate_next_diff_hunk(ctx);
+            }
+        });
+    }
+
+    /// active 文件双列编辑器对中的右列(可编辑列),diff 导航以其为准。
+    fn active_side_by_side_modified_editor(&self) -> Option<ViewHandle<LocalCodeEditorView>> {
+        let index = self.effective_active_index()?;
+        let CodeReviewViewState::Loaded(state) = self.state() else {
+            return None;
+        };
+        state
+            .file_states
+            .get_index(index)?
+            .1
+            .side_by_side_state
+            .as_ref()
+            .map(|s| s.modified_editor.clone())
     }
 
     fn fetch_branches_and_setup_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
@@ -3192,6 +3235,38 @@ impl CodeReviewView {
                     })
             });
 
+            let has_hunks = !file.file_diff.hunks.is_empty();
+            let prev_hunk_button = ctx.add_typed_action_view(move |ctx| {
+                let mut button = ActionButton::new("", NakedTheme)
+                    .with_icon(Icon::ArrowUp)
+                    .with_size(ButtonSize::InlineActionHeader)
+                    .with_tooltip(crate::t!("common-previous"))
+                    .on_click(|ctx| {
+                        ctx.dispatch_typed_action(CodeReviewAction::NavigateDiffHunk {
+                            previous: true,
+                        })
+                    });
+                if !has_hunks {
+                    button.set_disabled(true, ctx);
+                }
+                button
+            });
+            let next_hunk_button = ctx.add_typed_action_view(move |ctx| {
+                let mut button = ActionButton::new("", NakedTheme)
+                    .with_icon(Icon::ArrowDown)
+                    .with_size(ButtonSize::InlineActionHeader)
+                    .with_tooltip(crate::t!("common-next"))
+                    .on_click(|ctx| {
+                        ctx.dispatch_typed_action(CodeReviewAction::NavigateDiffHunk {
+                            previous: false,
+                        })
+                    });
+                if !has_hunks {
+                    button.set_disabled(true, ctx);
+                }
+                button
+            });
+
             file_states.push(FileState {
                 file_diff: file.file_diff.clone(),
                 editor_state,
@@ -3201,6 +3276,8 @@ impl CodeReviewView {
                 discard_button,
                 add_context_button,
                 copy_path_button,
+                prev_hunk_button,
+                next_hunk_button,
                 side_by_side_state: None, // Created lazily in render_file_content when diff_layout is SideBySide
                 content_at_head: file.content_at_head.clone(),
                 sidebar_mouse_state: MouseStateHandle::default(),
@@ -5653,6 +5730,23 @@ impl CodeReviewView {
             .with_main_axis_alignment(MainAxisAlignment::End)
             .with_cross_axis_alignment(CrossAxisAlignment::Center);
 
+        // 双列模式:文件头操作栏提供上一个/下一个 hunk 的图标导航(列下方的
+        // nav bar 已移除),仅 active 文件(唯一持有编辑器对)显示。
+        if file.side_by_side_state.is_some() && self.effective_active_index() == Some(file_index) {
+            for button in [&file.prev_hunk_button, &file.next_hunk_button] {
+                right_row.add_child(
+                    EventHandler::new(
+                        Container::new(ChildView::new(button).finish())
+                            .with_margin_left(4.)
+                            .finish(),
+                    )
+                    .on_left_mouse_up(|_, _, _| DispatchEventResult::StopPropagation)
+                    .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
+                    .finish(),
+                );
+            }
+        }
+
         // Add file diff as context button (before remove button)
         if FeatureFlag::DiffSetAsContext.is_enabled() {
             right_row.add_child(
@@ -6884,7 +6978,7 @@ impl CodeReviewView {
                 );
             }
             // Activate diff navigation in Focused state: `expand_diffs` sets Expanded,
-            // which shows the nav bar but makes the up/down buttons no-ops
+            // which makes the up/down navigation no-ops
             // (nav_diff_up/down only act on DiffNavigationState::Focused).
             // 不走 `toggle_diff_nav`(会触发 nav bar 按列 autoscroll,两列目标 y
             // 因单侧 spacer 而不等,打开即错位);打开跳转统一由下方
@@ -6892,6 +6986,9 @@ impl CodeReviewView {
             editor.activate_diff_nav_without_autoscroll(ctx);
             // The left column is read-only reference content.
             editor.set_interaction_state(InteractionState::Selectable, ctx);
+            // hunk 导航入口收敛到文件头操作栏的 prev/next 按钮,不渲染列下方的
+            // nav bar;diff nav 状态(Focused)仍保留,驱动 hunk 高亮与跨列同步。
+            editor.set_show_nav_bar(false);
         });
 
         let baseline_local = ctx.add_typed_action_view(|ctx| {
@@ -6944,10 +7041,13 @@ impl CodeReviewView {
                     ctx,
                 );
             }
-            // Focused diff nav (see baseline editor comment): keeps the nav bar buttons working.
+            // Focused diff nav (see baseline editor comment): keeps the header
+            // prev/next buttons working.
             editor.activate_diff_nav_without_autoscroll(ctx);
             // The right column stays editable; note that diff markers/spacers are a
             // snapshot computed at creation and are not recomputed on edits yet.
+            // 同 baseline:导航入口在文件头操作栏,不渲染列下方 nav bar。
+            editor.set_show_nav_bar(false);
         });
 
         let modified_local = ctx.add_typed_action_view(|ctx| {
@@ -9269,6 +9369,9 @@ impl TypedActionView for CodeReviewView {
                     self.create_side_by_side_editors_for_expanded_files(ctx);
                 }
                 ctx.notify();
+            }
+            CodeReviewAction::NavigateDiffHunk { previous } => {
+                self.navigate_active_side_by_side_hunk(*previous, ctx);
             }
             CodeReviewAction::SaveAllFiles { paths } => {
                 self.save_files(paths, ctx);

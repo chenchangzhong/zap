@@ -285,6 +285,8 @@ fn create_loaded_state_with_editors(
             let discard_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
             let add_context_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
             let copy_path_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
+            let prev_hunk_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
+            let next_hunk_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
 
             let state = FileState {
                 file_diff: FileDiff {
@@ -306,6 +308,8 @@ fn create_loaded_state_with_editors(
                 discard_button,
                 add_context_button,
                 copy_path_button,
+                prev_hunk_button,
+                next_hunk_button,
                 side_by_side_state: None,
                 content_at_head: None,
                 side_by_side_diff_token: 0,
