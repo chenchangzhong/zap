@@ -2625,21 +2625,6 @@ impl Workspace {
                         // 崩溃后自动重启完成:导航已有 dsh pane 到新 URL。
                         me.navigate_existing_dsh_pane(url, ctx);
                     }
-                    crate::dsh::bridge::BridgeEvent::Updating { version } => {
-                        // 检测到 dsh 新版本,提醒用户正在更新(更新完成后
-                        // Ready 事件会照常导航到 Web UI)。
-                        let window_id = ctx.window_id();
-                        WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
-                            stack.add_persistent_toast(
-                                DismissibleToast::default(crate::t!(
-                                    "dsh-updating-toast",
-                                    version = version.as_str()
-                                )),
-                                window_id,
-                                ctx,
-                            );
-                        });
-                    }
                     crate::dsh::bridge::BridgeEvent::Failed { error } => {
                         log::error!("[dsh] runtime failed: {error}");
                         // 提示用户:runtime 已停止,可重新打开。
@@ -2651,29 +2636,6 @@ impl Workspace {
                                 ctx,
                             );
                         });
-                    }
-                    crate::dsh::bridge::BridgeEvent::InstallingProgress { line } => {
-                        log::info!("[dsh] InstallingProgress: {}", line);
-                        // 实时进度行:更新 DshPaneView 显示(无 toast)。
-                        // 两阶段:1)收集 handle(不可变 ctx) 2)更新(可变 ctx)。
-                        // 只对非 Ready 态的 pane 发进度行,Ready 态时 get_browser_view() 返回 Some。
-                        let mut handles: Vec<_> = Vec::new();
-                        for tab in &me.tabs {
-                            let pane_group = tab.pane_group.clone();
-                            for dsh_pane in pane_group.as_ref(ctx).dsh_panes() {
-                                let dsh_view = dsh_pane.dsh_view(ctx);
-                                if dsh_view.as_ref(ctx).get_browser_view().is_none() {
-                                    handles.push(dsh_view);
-                                }
-                            }
-                        }
-                        let line = line.clone();
-                        for dsh_view in handles {
-                            dsh_view.update(ctx, |view, view_ctx| {
-                                view.update_installing_progress(&line);
-                                view_ctx.notify();
-                            });
-                        }
                     }
                     _ => {}
                 }
@@ -19108,6 +19070,20 @@ impl Workspace {
     /// - 否则 → 创建 Loading tab(若尚无),异步启动/重启 runtime
     fn open_dsh_pane(&mut self, ctx: &mut ViewContext<Self>) {
         let window_id = ctx.window_id();
+        // 非阻塞检查全局 dsh 更新(每会话一次):有新版仅 toast 提示,
+        // 不影响启动流程;离线/检查失败静默。
+        if crate::dsh::runtime::should_check_update_now() {
+            ctx.spawn(
+                crate::dsh::DshRuntime::check_update_future(),
+                move |me, check, ctx| {
+                    if let crate::dsh::DshUpdateCheck::UpdateAvailable { installed, latest } =
+                        check
+                    {
+                        me.show_dsh_update_toast(installed, latest, ctx);
+                    }
+                },
+            );
+        }
         // 读当前 runtime 状态(同步,不借用 self)。
         let status = crate::dsh::DshRuntime::handle(ctx).read(ctx, |runtime, _| runtime.status());
 
@@ -19131,19 +19107,9 @@ impl Workspace {
         }
         // 3. 启动/重启 runtime(Starting 返回等就绪;Ready 主动触发就绪;
         //    Stopped/Failed 重新 begin_start 以支持失败后重试)。
-        //    先收集所有 DshPane view handles(不可变 ctx),供 Install 分支
-        //    把 pane 状态从 Loading 切成 Installing(实时进度显示在 pane 上)。
-        let mut dsh_handles: Vec<_> = Vec::new();
-        for tab in &self.tabs {
-            let pane_group = tab.pane_group.clone();
-            for dsh_pane in pane_group.as_ref(ctx).dsh_panes() {
-                dsh_handles.push(dsh_pane.dsh_view(ctx));
-            }
-        }
         crate::dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
             match runtime.status() {
-                crate::dsh::DshRuntimeStatus::Starting
-                | crate::dsh::DshRuntimeStatus::Installing => return,
+                crate::dsh::DshRuntimeStatus::Starting => return,
                 crate::dsh::DshRuntimeStatus::Ready => {
                     if let Some(url) = runtime.url().map(str::to_string) {
                         ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
@@ -19175,65 +19141,19 @@ impl Workspace {
                 crate::dsh::runtime::set_workspace_dir(dir);
             }
             let gen = runtime.begin_start();
-            // 启动前检查 dsh 安装/更新:Install 则先进入 Installing 状态安装
-            // (实时进度显示在 UI);Ready 直接启动;Offline 提示网络失败。
+            // 直接启动全局 dsh 命令(用户自装自升级,Zap 不做安装/版本管理)。
             ctx.spawn(
-                crate::dsh::DshRuntime::check_update_future(),
-                move |runtime, check, ctx| match check {
-                    crate::dsh::DshUpdateCheck::Install {
-                        version,
-                        first_install,
-                    } => {
-                        // 需要安装/更新到指定版本:进入 Installing 状态,无 toast,
-                        // 进度直接显示在 pane 上。已装旧版时强制重装。
-                        runtime.set_status(crate::dsh::DshRuntimeStatus::Installing);
-                        for dsh_view in &dsh_handles {
-                            dsh_view.update(ctx, |view, view_ctx| {
-                                view.set_installing(first_install);
-                                view_ctx.notify();
-                            });
+                crate::dsh::DshRuntime::start_future(),
+                move |runtime, result, ctx| match result {
+                    crate::dsh::DshStartResult::Ready { url, child } => {
+                        if runtime.adopt_child(child, url.clone(), gen) {
+                            ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
                         }
-                        ctx.spawn(
-                            crate::dsh::DshRuntime::start_future(Some(version)),
-                            move |runtime, result, ctx| match result {
-                                crate::dsh::DshStartResult::Ready { url, child } => {
-                                    if runtime.adopt_child(child, url.clone(), gen) {
-                                        ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
-                                    }
-                                }
-                                crate::dsh::DshStartResult::Failed { error } => {
-                                    log::error!("[dsh] start failed: {error}");
-                                    runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
-                                    ctx.emit(crate::dsh::bridge::BridgeEvent::Failed { error });
-                                }
-                            },
-                        );
                     }
-                    crate::dsh::DshUpdateCheck::Ready => {
-                        // 已安装且无需更新:直接启动现有安装。
-                        ctx.spawn(
-                            crate::dsh::DshRuntime::start_future(None),
-                            move |runtime, result, ctx| match result {
-                                crate::dsh::DshStartResult::Ready { url, child } => {
-                                    if runtime.adopt_child(child, url.clone(), gen) {
-                                        ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
-                                    }
-                                }
-                                crate::dsh::DshStartResult::Failed { error } => {
-                                    log::error!("[dsh] start failed: {error}");
-                                    runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
-                                    ctx.emit(crate::dsh::bridge::BridgeEvent::Failed { error });
-                                }
-                            },
-                        );
-                    }
-                    crate::dsh::DshUpdateCheck::Offline => {
-                        // 网络不可达且未安装:提示用户网络失败。
-                        log::error!("[dsh] not installed and offline");
+                    crate::dsh::DshStartResult::Failed { error } => {
+                        log::error!("[dsh] start failed: {error}");
                         runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
-                        ctx.emit(crate::dsh::bridge::BridgeEvent::Failed {
-                            error: "网络不可用，无法安装 DeepSeek Harness".to_string(),
-                        });
+                        ctx.emit(crate::dsh::bridge::BridgeEvent::Failed { error });
                     }
                 },
             );
@@ -19253,6 +19173,65 @@ impl Workspace {
                 self.refresh_working_directories_for_pane_group(&pane_group, ctx);
             }
         }
+    }
+
+    /// dsh 有新版本:toast 提示,点击后打开终端 tab 并自动执行升级命令。
+    fn show_dsh_update_toast(
+        &mut self,
+        installed: String,
+        latest: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let upgrade_command = format!("npm install -g {}", crate::dsh::runtime::DSH_NPM_PACKAGE);
+        let window_id = ctx.window_id();
+        let toast = DismissibleToast::default(crate::t!(
+            "dsh-update-available-toast",
+            installed = installed.as_str(),
+            latest = latest.as_str()
+        ))
+        .with_object_id("dsh-update-available".to_string())
+        .with_on_body_click(move |toast_ctx| {
+            let Some(workspace) =
+                WorkspaceRegistry::as_ref(toast_ctx).get(toast_ctx.window_id(), toast_ctx)
+            else {
+                return;
+            };
+            workspace.update(toast_ctx, |workspace, ctx| {
+                workspace.upgrade_dsh_in_terminal(&upgrade_command, ctx);
+            });
+        });
+        WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
+            stack.add_persistent_toast(toast, window_id, ctx);
+        });
+    }
+
+    /// 打开新的终端 tab 并执行 `command`(等价于用户敲命令后按回车)。
+    ///
+    /// 用 `DefaultSessionModeBehavior::Ignore` 跳过默认会话模式:用户默认
+    /// 模式是 Agent 时,`add_terminal_tab` 会开 Agent tab,升级命令会发进
+    /// 对话而非 shell。
+    fn upgrade_dsh_in_terminal(&mut self, command: &str, ctx: &mut ViewContext<Self>) {
+        self.add_new_session_tab_internal_with_default_session_mode_behavior(
+            NewSessionSource::Tab,
+            Some(ctx.window_id()),
+            None,
+            None,
+            false,
+            DefaultSessionModeBehavior::Ignore,
+            ctx,
+        );
+        ctx.notify();
+        let Some(input) = self.get_active_input_view_handle(ctx) else {
+            log::warn!("[dsh] no active terminal input for upgrade command");
+            return;
+        };
+        input.update(ctx, |input, ctx| {
+            if input.try_execute_command(command, ctx) {
+                log::info!("[dsh] upgrade command submitted: {command}");
+            } else {
+                log::warn!("[dsh] failed to submit upgrade command");
+            }
+        });
     }
 
     /// 是否有 DshPane tab(任意)。

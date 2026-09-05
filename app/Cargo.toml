@@ -154,6 +154,7 @@ unic-langid.workspace = true
 sys-locale.workspace = true
 inventory = "0.3"
 schemars = { version = "1", features = ["uuid1"] }
+semver.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 serde-bytes-repr.workspace = true

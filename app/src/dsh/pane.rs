@@ -130,13 +130,6 @@ impl Element for EllipsisText {
 
 enum DshPaneState {
     Loading,
-    /// 正在安装/更新 dsh npm 包。is_install=true 为首次安装("安装中"),
-    /// false 为版本更新("更新中");progress_lines 是最近若干条进度行
-    /// (避免单行覆盖看不清)。
-    Installing {
-        is_install: bool,
-        progress_lines: Vec<String>,
-    },
     Ready(ViewHandle<BrowserPaneView>),
 }
 
@@ -177,37 +170,9 @@ impl DshPaneView {
     }
 
     pub fn is_loading(&self) -> bool {
-        matches!(self.state, DshPaneState::Loading | DshPaneState::Installing { .. })
+        matches!(self.state, DshPaneState::Loading)
     }
 
-    /// 进入安装/更新状态。is_install=true 首次安装("安装中"),false 更新("更新中")。
-    pub fn set_installing(&mut self, is_install: bool) {
-        log::info!("[dsh] pane set_installing: is_install={is_install}");
-        self.state = DshPaneState::Installing {
-            is_install,
-            progress_lines: Vec::new(),
-        };
-    }
-
-    /// 追加一条安装进度行,保留最近若干行。
-    pub fn update_installing_progress(&mut self, line: &str) {
-        const MAX_LINES: usize = 6;
-        match &mut self.state {
-            DshPaneState::Installing { progress_lines, .. } => {
-                progress_lines.push(line.to_string());
-                if progress_lines.len() > MAX_LINES {
-                    progress_lines.drain(0..progress_lines.len() - MAX_LINES);
-                }
-            }
-            DshPaneState::Loading => {
-                self.state = DshPaneState::Installing {
-                    is_install: true,
-                    progress_lines: vec![line.to_string()],
-                };
-            }
-            DshPaneState::Ready(_) => {}
-        }
-    }
     pub fn url(&self) -> &str {
         &self.current_url
     }
@@ -216,7 +181,7 @@ impl DshPaneView {
     pub fn get_browser_view(&self) -> Option<&ViewHandle<BrowserPaneView>> {
         match &self.state {
             DshPaneState::Ready(bv) => Some(bv),
-            DshPaneState::Loading | DshPaneState::Installing { .. } => None,
+            DshPaneState::Loading => None,
         }
     }
 
@@ -326,49 +291,6 @@ impl View for DshPaneView {
                         .finish(),
                 )
                 .finish()
-            }
-            DshPaneState::Installing {
-                is_install,
-                progress_lines,
-            } => {
-                let appearance = Appearance::as_ref(app);
-                // 首次安装显示"安装中",版本更新显示"更新中",带省略号循环动画。
-                let label = if *is_install { "安装中" } else { "更新中" };
-                let mut col = Flex::column()
-                    .with_main_axis_alignment(MainAxisAlignment::Center)
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(Box::new(
-                        ConstrainedBox::new(Box::new(Icon::new(
-                            WarpIcon::DeepSeek.into(),
-                            appearance.theme().foreground(),
-                        )))
-                        .with_width(40.)
-                        .with_height(40.),
-                    ))
-                    .with_child(
-                        Container::new(Box::new(EllipsisText::new(
-                            label,
-                            appearance.ui_font_family(),
-                            16.,
-                            appearance.theme().foreground(),
-                            self.loading_anim_start.clone(),
-                        )))
-                        .with_margin_top(16.)
-                        .finish(),
-                    );
-                // 有进度行时,下方追加多行实时进度(无动画,仅文本)。
-                for line in progress_lines.iter().rev() {
-                    col = col.with_child(
-                        Container::new(Box::new(Text::new_inline(
-                            line.clone(),
-                            appearance.ui_font_family(),
-                            12.,
-                        )))
-                        .with_margin_top(6.)
-                        .finish(),
-                    );
-                }
-                Align::new(Box::new(col)).finish()
             }
             DshPaneState::Loading => {
                 let appearance = Appearance::as_ref(app);

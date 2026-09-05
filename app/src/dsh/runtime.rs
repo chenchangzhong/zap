@@ -1,9 +1,10 @@
 //! DshRuntime:DeepSeek Harness runtime 子进程管理。
 //!
 //! 职责:
-//! - 定位/安装 Node(node_runtime)与 dsh(npm 包,版本锁定)
-//! - 启动 `dsh web --port 0`(OS 分配空闲端口),`DSH_HOME` 指向 Zap 数据目录
-//! - 就绪探测(HTTP GET /),暴露最终 URL
+//! - 定位 PATH 中的全局 `dsh` 命令(由用户自行安装/升级,Zap 不做安装/版本管理)
+//! - 启动 Zap 专属 profile(`dsh --profile zap --port 0`,OS 分配空闲端口),
+//!   `DSH_HOME` 指向 `~/.dsh`
+//! - 就绪探测(解析 dsh 输出的 URL 并 HTTP 探测),暴露最终 URL
 //! - 停止(SIGTERM → 超时 kill)、崩溃监听与自动重启(带次数限制)
 //!
 //! 并发模型:启动/重启是 `'static` 异步任务(不借用 self),结果经
@@ -14,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -22,11 +23,13 @@ use command::r#async::Command;
 use parking_lot::Mutex;
 use warpui::{Entity, ModelContext, SingletonEntity, WindowId};
 
-use super::bridge;
-
-/// dsh npm 包名。版本动态取 registry latest，不再硬编码。
-const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh";
-/// 就绪探测超时(含首次安装)。
+/// Zap 专属 dsh profile 名(`$DSH_HOME/profiles/<name>`;由 desktop profile
+/// 复制而来,与用户终端自用的 web profile、DSH Desktop 的 desktop profile
+/// 互不干扰,插件/配置各自独立)。
+const DSH_PROFILE: &str = "zap";
+/// dsh npm 包名(升级命令与 registry 查询共用)。
+pub(crate) const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh";
+/// 就绪探测超时。
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// 就绪探测间隔。
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
@@ -154,21 +157,8 @@ pub enum DshRestartResult {
 pub enum DshRuntimeStatus {
     Stopped,
     Starting,
-    /// 正在安装/更新 dsh npm 包(首次安装或版本更新)。
-    Installing,
     Ready,
     Failed,
-}
-/// dsh 安装/更新检测结果,供 workspace 决定启动策略。
-#[derive(Debug, Clone)]
-pub enum DshUpdateCheck {
-    /// 首次安装或强制更新到指定版本。version 为目标版本号,
-    /// first_install 为 true 表示从未安装过(显示"安装中"而非"更新中")。
-    Install { version: String, first_install: bool },
-    /// 已安装且版本匹配,直接启动。
-    Ready,
-    /// 网络不可达或检测失败,无法安装/更新。
-    Offline,
 }
 /// 一次启动的完整结果(供 ctx.spawn 回调)。
 #[derive(Debug)]
@@ -178,6 +168,39 @@ pub enum DshStartResult {
         child: async_process::Child,
     },
     Failed { error: String },
+}
+
+/// 全局 dsh 更新检查结果(仅提示用,不参与启动流程)。
+#[derive(Debug, Clone)]
+pub enum DshUpdateCheck {
+    /// 无更新,或检查失败/离线(静默,不打扰用户)。
+    UpToDate,
+    /// registry 有比当前已装版本更新的 semver 版本。
+    UpdateAvailable {
+        installed: String,
+        latest: String,
+    },
+}
+
+/// registry 版本是否比已装版本新。两边都需为合法 semver(预发布号按
+/// semver 规则排序,如 0.1.2-rc.1 < 0.1.2);任一不可解析则视为无法
+/// 比较,静默不提示。
+fn is_update_available(latest: &str, installed: &str) -> bool {
+    match (
+        semver::Version::parse(latest),
+        semver::Version::parse(installed),
+    ) {
+        (Ok(latest), Ok(installed)) => latest > installed,
+        _ => false,
+    }
+}
+
+/// 本会话是否已做过 dsh 更新检查(每次打开 pane 触发,一次即可)。
+static UPDATE_CHECKED: AtomicBool = AtomicBool::new(false);
+
+/// 是否应执行本会话的 dsh 更新检查(首次调用 true 并置位,之后 false)。
+pub fn should_check_update_now() -> bool {
+    !UPDATE_CHECKED.swap(true, Ordering::Relaxed)
 }
 
 /// 每帧轮询子进程的判定结果。
@@ -301,14 +324,13 @@ impl DshRuntime {
 
     /// 启动 dsh runtime(异步,不借用 self)。
     ///
-    /// `target` 为检测到的最新版本(经 [`check_update_future`] 得到):
-    /// - `Some(v)`:强制安装/更新到版本 v
-    /// - `None`:用已安装版本(`version.txt`),未安装时用 `DSH_VERSION`
+    /// 运行 Zap 专属 profile(`dsh --profile zap --port 0 --no-open`)。
+    /// dsh 由用户自行安装/升级,Zap 不做安装与版本管理(启动前无需网络检查)。
     ///
     /// 代次校验不在本函数内:调用方持 `begin_start`/`begin_restart` 返回的
     /// 代次,完成回调里传给 `adopt_child` 做代次比对,代次不匹配时丢弃子进程。
-    pub async fn start_future(target: Option<String>) -> DshStartResult {
-        match Self::start_inner(target).await {
+    pub async fn start_future() -> DshStartResult {
+        match Self::start_inner().await {
             Ok((child, url)) => DshStartResult::Ready { url, child },
             Err(err) => {
                 log::error!("[dsh] start failed: {err:#}");
@@ -319,11 +341,45 @@ impl DshRuntime {
         }
     }
 
-    /// 查询 npm registry 上 `@deepseek-ai/dsh` 的最新版本号。
+    /// 非阻塞检查全局 dsh 是否有新版本(仅提示,不参与启动流程)。
     ///
-    /// 失败(网络不可达 / 响应异常 / 超时)返回 `None`,调用方按"无更新"
-    /// 处理,不阻塞启动。reqwest 默认无总超时,故用 `tokio::time::timeout`
-    /// 兜底,避免网络黑洞时启动永久卡 Loading。
+    /// 比较 `dsh --version` 与 npm registry latest(并行执行,registry 查询
+    /// 5s 超时)。dsh 不存在、命令失败、离线或版本不可解析时一律返回
+    /// `UpToDate`(静默;dsh 不存在时启动路径已有明确报错)。
+    pub async fn check_update_future() -> DshUpdateCheck {
+        let Ok(dsh_bin) = Self::find_global_dsh() else {
+            return DshUpdateCheck::UpToDate;
+        };
+        let (latest, installed) = tokio::join!(
+            Self::query_latest_version(),
+            Self::installed_version(&dsh_bin)
+        );
+        let (Some(latest), Ok(installed)) = (latest, installed) else {
+            return DshUpdateCheck::UpToDate;
+        };
+        if is_update_available(&latest, &installed) {
+            log::info!("[dsh] update available: {installed} -> {latest}");
+            DshUpdateCheck::UpdateAvailable { installed, latest }
+        } else {
+            DshUpdateCheck::UpToDate
+        }
+    }
+
+    /// 读取全局 dsh 版本号(`dsh --version`)。
+    async fn installed_version(dsh_bin: &Path) -> Result<String> {
+        let mut cmd = Command::new(dsh_bin);
+        cmd.arg("--version");
+        let output = cmd.output().await.context("Failed to run dsh --version")?;
+        if !output.status.success() {
+            bail!("dsh --version exited with {}", output.status);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// 查询 npm registry 上 dsh 的最新版本号。
+    ///
+    /// 失败(网络不可达 / 响应异常 / 超时)返回 `None`,调用方静默跳过。
+    /// reqwest 默认无总超时,故用 `tokio::time::timeout` 兜底。
     async fn query_latest_version() -> Option<String> {
         const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
         let client = http_client::Client::new();
@@ -331,7 +387,7 @@ impl DshRuntime {
         let result = tokio::time::timeout(CHECK_TIMEOUT, async {
             let resp = client.get(&url).send().await.ok()?;
             if !resp.status().is_success() {
-                log::warn!("[dsh] version check failed: HTTP {}", resp.status());
+                log::warn!("[dsh] update check failed: HTTP {}", resp.status());
                 return None;
             }
             let body: serde_json::Value = resp.json().await.ok()?;
@@ -341,78 +397,16 @@ impl DshRuntime {
         match result {
             Ok(version) => version,
             Err(_) => {
-                log::warn!("[dsh] version check timed out after {CHECK_TIMEOUT:?}");
+                log::warn!("[dsh] update check timed out after {CHECK_TIMEOUT:?}");
                 None
             }
         }
     }
 
-    /// 启动前检查 dsh 是否需要安装/更新。
+    /// dsh 数据目录:`~/.dsh`(与用户终端 dsh、DSH Desktop 共用的 DSH_HOME;
+    /// Zap 通过专属 profile 隔离,见 [`DSH_PROFILE`])。
     ///
-    /// 返回:
-    /// - `Install`:需要安装或更新(未安装 / registry 有新版),进入 Installing 状态安装。
-    ///   `first_install=true` 表示首次安装(未装过),false 表示版本更新。
-    /// - `Ready`:已安装且无需更新,直接启动现有安装。
-    /// - `Offline`:网络不可达(registry 查不到)且未安装,无法安装,提示用户网络失败。
-    pub async fn check_update_future() -> DshUpdateCheck {
-        let installed = Self::installed_dsh_version();
-        if installed.is_empty() {
-            // 未安装:查询 registry,失败(离线)则提示网络失败。
-            return match Self::query_latest_version().await {
-                Some(version) => {
-                    log::info!("[dsh] no installed version, will install {version}");
-                    DshUpdateCheck::Install {
-                        version,
-                        first_install: true,
-                    }
-                }
-                None => {
-                    log::warn!("[dsh] not installed and offline, cannot install");
-                    DshUpdateCheck::Offline
-                }
-            };
-        }
-        // 已安装:查询最新版;失败视为无更新(直接用现有安装),不阻塞启动。
-        let Some(latest) = Self::query_latest_version().await else {
-            log::info!("[dsh] version check failed (offline?), using installed {installed}");
-            return DshUpdateCheck::Ready;
-        };
-        if latest != installed {
-            log::info!("[dsh] update available: {installed} -> {latest}");
-            DshUpdateCheck::Install {
-                version: latest,
-                first_install: false,
-            }
-        } else {
-            DshUpdateCheck::Ready
-        }
-    }
-
-    /// 读取已安装 dsh 的版本号(读 `node_modules/@deepseek-ai/dsh/package.json`)。
-    /// 未安装返回空字符串。
-    fn installed_dsh_version() -> String {
-        Self::dsh_data_dir()
-            .ok()
-            .map(|dir| {
-                let pkg_json = dir
-                    .join("dsh-install")
-                    .join("node_modules")
-                    .join("@deepseek-ai")
-                    .join("dsh")
-                    .join("package.json");
-                serde_json::from_str::<serde_json::Value>(
-                    &std::fs::read_to_string(pkg_json).unwrap_or_default(),
-                )
-                .ok()
-                .and_then(|v| v.get("version").and_then(|v| v.as_str()).map(str::to_string))
-                .unwrap_or_default()
-            })
-            .unwrap_or_default()
-    }
-
-    /// dsh 数据目录:`~/.dsh`。
-    ///
-    /// 存放 DSH_HOME(profiles/storages)与 dsh npm 安装缓存,不污染用户目录。
+    /// 存放 DSH_HOME(profiles/storages)与运行日志,不污染用户目录。
     /// 首次使用时把旧位置 `~/.zap/dsh` 的数据一次性迁移过来。
     pub fn dsh_data_dir() -> Result<PathBuf> {
         let home = dirs::home_dir()
@@ -468,53 +462,27 @@ impl DshRuntime {
     }
 
 
-    async fn start_inner(target: Option<String>) -> Result<(async_process::Child, String)> {
-        // 1. 定位/安装 Node。
-        let path_env = std::env::var("PATH").unwrap_or_default();
-        let mut node = match node_runtime::find_working_node_binary(Some(&path_env)).await {
-            Some(node) => node,
-            None => {
-                log::info!("[dsh] no working node found, installing...");
-                let client = http_client::Client::new();
-                node_runtime::install_npm(&client)
-                    .await
-                    .context("Failed to install Node.js")?;
-                node_runtime::find_working_node_binary(Some(&path_env))
-                    .await
-                    .context("Node.js installed but not usable")?
-            }
-        };
+    async fn start_inner() -> Result<(async_process::Child, String)> {
+        // 1. 定位全局 dsh 命令(用户自装自升级,Zap 不做安装/版本管理)。
+        let dsh_bin = Self::find_global_dsh()?;
+        log::info!("[dsh] using global dsh at {}", dsh_bin.display());
 
-        // dsh 要求 Node >= 22.19(node_runtime 的 MIN_NODE_VERSION 是 20,
-        // 系统 Node 20/21 会被误接受);版本不足时回退到 Zap 管理的安装。
-        if !Self::node_satisfies_min_version(&node).await {
-            log::info!("[dsh] system node too old, installing managed Node...");
-            let client = http_client::Client::new();
-            node_runtime::install_npm(&client)
-                .await
-                .context("Failed to install Node.js for dsh")?;
-            node = node_runtime::find_working_node_binary(Some(&path_env))
-                .await
-                .context("Node.js installed but not usable")?;
-        }
-
-        // 2. 定位/安装 dsh。
-        let dsh_cli = Self::ensure_dsh_installed(&node, target.as_deref()).await?;
-
-        // 3. 启动 `dsh web --port 0`(带客户端插件注入)。
+        // 2. 启动 Zap 专属 profile(`dsh --profile zap --port 0`,带客户端
+        //    插件注入;`--profile web` 是 `dsh web` 的等价形式,Zap 用自己的
+        //    profile 隔离插件与配置)。
         let dsh_home = Self::dsh_data_dir()?;
         // 注入 zap-bridge-client 浏览器端插件(经 webview IPC 发项目切换通知)。
         if let Err(err) = Self::install_client_plugin(&dsh_home) {
             log::warn!("[dsh] install_client_plugin failed: {err}");
         }
-        let mut cmd = Command::new(&node);
+        let mut cmd = Command::new(&dsh_bin);
         // command crate 默认 stdout/stderr = null;dsh web 对 null/socket 无效
         // stdout 会启动即退出(exit 1)。重定向到文件(正常可写目标),顺带留日志。
         let dsh_web_log = std::fs::File::create(dsh_home.join("dsh-web.log"))?;
         cmd.stdout(std::process::Stdio::from(dsh_web_log.try_clone()?));
         cmd.stderr(std::process::Stdio::from(dsh_web_log));
-        cmd.arg(&dsh_cli)
-            .arg("web")
+        cmd.arg("--profile")
+            .arg(DSH_PROFILE)
             .arg("--port")
             .arg("0")
             // 不自动打开系统浏览器(Zap 用自己的 webview 承载 dsh UI)。
@@ -531,9 +499,12 @@ impl DshRuntime {
         }
         let mut child = cmd.spawn().context("Failed to spawn dsh web")?;
 
-        // 4. 就绪探测:等端口出现 + HTTP 200。失败时显式清理子进程,
-        // 避免 async-process 的 Child drop 不杀进程导致泄漏。
-        let url = match Self::wait_until_ready(&child).await {
+        // 4. 就绪探测:dsh 启动成功后会把最终 URL(含随机端口与访问 token)
+        //    打到 stdout(已重定向到 dsh-web.log),解析出该 URL 并 HTTP 探测。
+        //    失败时显式清理子进程,避免 async-process 的 Child drop 不杀进程
+        //    导致泄漏。
+        let log_path = dsh_home.join("dsh-web.log");
+        let url = match Self::wait_until_ready(&log_path).await {
             Ok(url) => url,
             Err(err) => {
                 let _ = child.kill();
@@ -547,214 +518,44 @@ impl DshRuntime {
         Ok((child, url))
     }
 
-    /// 检查 node 版本是否满足 dsh 要求(engines: `^22.19 || >=24`)。
-    async fn node_satisfies_min_version(node: &Path) -> bool {
-        let mut cmd = Command::new(node);
-        cmd.arg("--version");
-        let Ok(output) = cmd.output().await else {
-            return false;
-        };
-        if !output.status.success() {
-            return false;
+    /// 在 PATH 中定位全局 `dsh` 命令(Zap 不管理安装/版本,由用户自装自升级)。
+    ///
+    /// 返回绝对路径而非依赖 execvp 隐式 PATH 解析:便于日志记录实际命中的
+    /// dsh 位置,且找不到时能给出行 actionable 的错误信息。
+    fn find_global_dsh() -> Result<PathBuf> {
+        let path_env = std::env::var("PATH").unwrap_or_default();
+        for dir in std::env::split_paths(&path_env) {
+            let candidate = dir.join("dsh");
+            if Self::is_executable_file(&candidate) {
+                return Ok(candidate);
+            }
         }
-        let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let version_str = version_str.trim_start_matches('v');
-        let parts: Vec<u64> = version_str
-            .split('.')
-            .take(2)
-            .filter_map(|p| p.parse().ok())
-            .collect();
-        match parts.as_slice() {
-            // ^22.19.0:22.19 <= v < 23;或 v >= 24。
-            [major, minor] => (*major, *minor) >= (22, 19) && *major < 23 || *major >= 24,
-            _ => false,
-        }
+        bail!(
+            "dsh command not found in PATH; install it globally first, \
+             e.g. `npm install -g @deepseek-ai/dsh`"
+        )
     }
 
-    /// 确保 dsh 已安装,返回 CLI 入口 JS 路径。
-    ///
-    /// 用 pnpm 安装(npm 11 对 dsh 依赖树 idealTree 解析卡死,实测 >180s 不完成;
-    /// pnpm 9s 装完且 peer 依赖经 .pnpm 虚拟目录正确解析,已验证 dsh web 正常启动)。
-    ///
-    /// `target` 指定要安装的版本:
-    /// - `Some(v)`:安装/更新到版本 v(启动前检测到新版本时传入)
-    /// - `None`:未安装时联网取 latest 安装(失败返回空串,装 registry latest)
-    async fn ensure_dsh_installed(node: &Path, target: Option<&str>) -> Result<PathBuf> {
-        let data_dir = Self::dsh_data_dir()?;
-        let dsh_dir = data_dir.join("dsh-install");
-        let cli_js = dsh_dir
-            .join("node_modules")
-            .join("@deepseek-ai")
-            .join("dsh")
-            .join("lib")
-            .join("bin.js");
-
-        // 已安装且未指定目标版本(正常启动):直接复用现有安装,不重装。
-        if cli_js.is_file() && target.is_none() {
-            return Ok(cli_js);
+    /// 路径存在且为可执行文件。
+    fn is_executable_file(path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            return std::fs::metadata(path)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
         }
-
-        let want = match target {
-            Some(v) => v.to_string(),
-            None => Self::query_latest_version().await.unwrap_or_default(),
-        };
-
-        // 指定了目标版本(安装/更新):清掉旧安装,避免残留旧版。
-        if cli_js.is_file() {
-            if let Err(err) = std::fs::remove_dir_all(&dsh_dir) {
-                // 删除失败(权限/句柄占用等)不致命:后续 pnpm 覆盖安装。
-                log::warn!("[dsh] remove_dir_all {} failed: {err}", dsh_dir.display());
-            }
+        #[cfg(not(unix))]
+        {
+            std::fs::metadata(path).is_ok_and(|m| m.is_file())
         }
-
-        std::fs::create_dir_all(&dsh_dir)?;
-        // 写入最小 package.json 作 pnpm 项目根(避免沿父目录向上找到
-        // ~/package.json 污染用户主目录)。
-        let pkg_json = serde_json::json!({
-            "name": "dsh-install",
-            "private": true,
-        });
-        std::fs::write(
-            dsh_dir.join("package.json"),
-            serde_json::to_string_pretty(&pkg_json)?,
-        )
-        .context("Failed to write dsh-install package.json")?;
-        // pnpm 二进制:优先 PATH 里的 pnpm(系统 node 时可用;node_runtime
-        // 管理的 node 通常也有配套 pnpm,若缺失则靠 PATH 保底)。
-        let pnpm = PathBuf::from("pnpm");
-
-        let mut cmd = Command::new(&pnpm);
-        // want 为空时不拼 @version,pnpm 默认装 registry latest。
-        let pkg = if want.is_empty() {
-            DSH_NPM_PACKAGE.to_string()
-        } else {
-            format!("{DSH_NPM_PACKAGE}@{want}")
-        };
-        log::info!("[dsh] installing {pkg} in {} (pnpm)", dsh_dir.display());
-        cmd.current_dir(&dsh_dir)
-            .arg("add")
-            .arg(&pkg)
-            // pnpm 10+ 默认忽略依赖的构建脚本。dsh 依赖树在快速迭代,
-            // 未来可能新增原生依赖/构建脚本,不硬编码 allow 列表(否则
-            // 会因列表过期而漏构建导致启动失败)。--dangerously-allow-all-builds
-            // 允许所有依赖跑脚本,零维护、天然适配未来变化。
-            .arg("--dangerously-allow-all-builds")
-            // 默认 reporter 用单行进度条刷新(不适合逐行读取推送)。
-            // append-only 输出逐行日志,可被 stdout 线程逐行 push 到 UI。
-            .arg("--reporter=append-only")
-            // 必须显式 piped,否则 stdout/stderr 默认继承/null,
-            // child.stdout.take() 返回 None,进度读线程直接跳过。
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .context("Failed to spawn pnpm install for dsh")?;
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        // 累积 stderr 全文,供安装失败时上报错误详情。
-        let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-
-        // async_process::ChildStdout/Stderr 实现了 futures_lite::io::AsyncRead，
-        // 用 futures_lite::io::BufReader::new() + lines() 按行读取。
-        // 进度行通过 bridge::push_event 发到 DshRuntime 事件队列，
-        // 由 Workspace 的事件订阅回调更新 DshPaneView。
-        let _stdout_thread = tokio::task::spawn_blocking(move || {
-            futures_lite::future::block_on(async {
-                if let Some(stdout) = stdout {
-                    let mut reader = futures_lite::io::BufReader::new(stdout);
-                    let mut lines = futures_lite::io::AsyncBufReadExt::lines(&mut reader);
-                    let mut count = 0u32;
-                    while let Some(line) = futures_lite::StreamExt::next(&mut lines).await {
-                        if let Ok(line) = line {
-                            let trimmed = line.trim();
-                            // 过滤噪声行,只推送有意义的进度:解析/下载进度、包数、
-                            // 完成、依赖列表。跳过构建脚本行(.../node_modules、
-                            // install$/postinstall/preinstall 生命周期)、纯 +
-                            // 进度条、WARN 等,避免 UI 上长路径/命令刷屏看不清。
-                            // 注意:pnpm 构建行如 `koffi install$ node ./cnoke.cjs`
-                            // 中 `install$` 是字面文本(pnpm 生命周期 shell 语法),
-                            // `install: Done` 是构建完成行,均需过滤。
-                            let useful = !trimmed.is_empty()
-                                && !trimmed.starts_with(".../node_modules")
-                                && !trimmed.starts_with("+")
-                                && !trimmed.starts_with("[WARN]")
-                                && !trimmed.contains("postinstall")
-                                && !trimmed.contains("preinstall")
-                                && !trimmed.contains("install$")
-                                && !trimmed.contains("install: Done");
-                            if useful {
-                                count += 1;
-                                log::info!("[dsh] pnpm stdout line #{count}: {trimmed}");
-                                crate::dsh::bridge::push_event(
-                                    crate::dsh::bridge::BridgeEvent::InstallingProgress {
-                                        line: trimmed.to_string(),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    log::info!("[dsh] pnpm stdout EOF, {count} lines pushed");
-                }
-            });
-        });
-
-        let stderr_buf_clone = stderr_buf.clone();
-        let _stderr_thread = tokio::task::spawn_blocking(move || {
-            futures_lite::future::block_on(async {
-                if let Some(stderr) = stderr {
-                    let mut reader = futures_lite::io::BufReader::new(stderr);
-                    let mut lines = futures_lite::io::AsyncBufReadExt::lines(&mut reader);
-                    while let Some(line) = futures_lite::StreamExt::next(&mut lines).await {
-                        if let Ok(line) = line {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                // 同时累积全文供失败上报。
-                                *stderr_buf_clone.lock() += &line;
-                                *stderr_buf_clone.lock() += "\n";
-                            }
-                        }
-                    }
-                }
-            });
-        });
-
-        // 等待 pnpm 完成。stderr/stdout 线程已在后台持续 push_event。
-        let status = child
-            .status()
-            .await
-            .context("pnpm install wait failed")?;
-
-        if !status.success() {
-            let detail = stderr_buf.lock().trim().to_string();
-            if detail.is_empty() {
-                // pnpm 失败但无 stderr:尝试从 exit code 推断原因。
-                let exit_code = status.code();
-                let reason = match exit_code {
-                    // pnpm exit code 1 = ERR_PNPM_* 错误(依赖解析失败、引擎不兼容、peer 冲突等)。
-                    Some(1) => "pnpm exited with code 1 (ERR_PNPM_* error — dependency resolution, engine, or peer conflict)",
-                    // pnpm exit code 2 = 未捕获的 rejection / 内部错误。
-                    Some(2) => "pnpm exited with code 2 (unhandled rejection or internal error)",
-                    // pnpm exit code 5 = store 校验失败(建议清理 pnpm store 缓存后重试)。
-                    Some(5) => "pnpm exited with code 5 (store validation failed — try clearing the pnpm store)",
-                    Some(127) => "pnpm: command not found — ensure pnpm is installed and in PATH",
-                    Some(code) => "unknown pnpm failure",
-                    None => "unknown pnpm failure (no exit code)",
-                };
-                bail!("pnpm add {} failed: {}", DSH_NPM_PACKAGE, reason);
-            }
-            bail!("pnpm add {} failed: {detail}", DSH_NPM_PACKAGE);
-        }
-
-        if !cli_js.is_file() {
-            bail!("dsh installed but entry not found at {}", cli_js.display());
-        }
-        Ok(cli_js)
     }
 
     /// 注入 zap-bridge-client 浏览器端插件到 dsh 并注册 cordis patch。
     /// 客户端插件经 webview IPC 发项目切换通知给 Zap。
+    ///
+    /// Zap 的 profile 由 desktop profile 复制而来,patch 文件已带用户插件的
+    /// 配置,故第 2 步只幂等追加 zap-bridge-client 条目,不覆写整个文件。
     fn install_client_plugin(dsh_home: &Path) -> Result<()> {
         // 1. 写入客户端插件文件到 DSH_HOME/node_modules。
         let node_modules = dsh_home.join("node_modules").join("@zap").join("zap-bridge-client");
@@ -766,38 +567,81 @@ impl DshRuntime {
         std::fs::write(node_modules.join("client.js"), CLIENT_JS)?;
         std::fs::write(node_modules.join("package.json"), CLIENT_PKG)?;
         log::info!("[dsh] installed zap-bridge-client to {}", node_modules.display());
-        // 2. 写入 cordis.patch.yml 注册客户端插件(dsh web 启动时加载)。
-        let patch_dir = dsh_home.join("profiles").join("web");
+        // 2. 向 profile 的 cordis.patch.yml 幂等追加 zap-bridge-client 条目
+        //    (dsh 启动时加载)。
+        let patch_dir = dsh_home.join("profiles").join(DSH_PROFILE);
         std::fs::create_dir_all(&patch_dir)?;
         // patch 行 name 必须是包名:client-modules 用
         // `require.resolve('<name>/package.json')` 解析 client 声明,
         // 文件路径无法解析会导致 entry 静默不入表、客户端插件永不加载。
-        let content = format!(
-            "- insert:
-    - id: zap-bridge-client
-      name: '@zap/zap-bridge-client'
-"
-        );
-        std::fs::write(patch_dir.join("cordis.patch.yml"), content)?;
+        const INSERT_ENTRY: &str =
+            "- insert:\n    - id: zap-bridge-client\n      name: '@zap/zap-bridge-client'\n";
+        let patch_path = patch_dir.join("cordis.patch.yml");
+        let existing = std::fs::read_to_string(&patch_path).unwrap_or_default();
+        if existing.contains("zap-bridge-client") {
+            return Ok(());
+        }
+        let mut content = existing;
+        // dsh 生成的空 patch 是 flow 风格 `[]`,直接追加块条目会成非法 YAML。
+        if content.trim() == "[]" {
+            content = String::new();
+        } else if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(INSERT_ENTRY);
+        std::fs::write(&patch_path, content)?;
         Ok(())
     }
 
-    /// 轮询探测 dsh web 就绪(端口监听 + HTTP 200),返回 URL。
-    async fn wait_until_ready(child: &async_process::Child) -> Result<String> {
+    /// 轮询等待 dsh web 就绪并返回其 URL。
+    ///
+    /// dsh 启动成功后把最终 URL(随机端口 + 访问 token)打到 stdout(已重
+    /// 定向到 dsh-web.log):`dsh web: http://127.0.0.1:<port>/?token=<token>`。
+    /// 0.1.2-rc.1 起 web 端有 token 鉴权,裸地址 GET 返回 401,故必须解析
+    /// 该 URL 用作探测与 webview 加载地址;URL 中的 token 随启动随机生成。
+    async fn wait_until_ready(log_path: &Path) -> Result<String> {
         let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
-        let client = http_client::Client::new();
-        let pid = child.id();
+        // 探活专用客户端,与业务 http_client 隔离:
+        // - 不跟重定向:token URL 响应 303 → Location `/` 并种认证 cookie,
+        //   跟随后落地 401(浏览器场景由 cookie 会话兜住,探活只看服务是否
+        //   应答),若跟随会永远探测失败;
+        // - 不走代理(loopback 不应经代理);
+        // - 单次请求限时,任何一环挂死只损失一个探测周期,不会卡死启动。
+        let probe = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .context("Failed to build dsh probe client")?;
 
+        let mut last_probe_log = String::new();
         loop {
             if std::time::Instant::now() > deadline {
                 bail!("dsh web did not become ready within {STARTUP_TIMEOUT:?}");
             }
 
-            if let Some(port) = Self::find_listening_port(pid) {
-                let url = format!("http://127.0.0.1:{port}");
-                match client.get(&url).send().await {
-                    Ok(resp) if resp.status().is_success() => return Ok(url),
-                    _ => {}
+            if let Some(url) = Self::read_ready_url(log_path) {
+                match probe.get(&url).send().await {
+                    // 2xx 直接就绪;303(种 cookie 跳 `/`)同样视为服务已就绪。
+                    Ok(resp)
+                        if resp.status().is_success() || resp.status().is_redirection() =>
+                    {
+                        return Ok(url)
+                    }
+                    Ok(resp) => {
+                        let state = format!("status {}", resp.status());
+                        if last_probe_log != state {
+                            log::info!("[dsh] probe: url={url} unexpected {state}");
+                            last_probe_log = state;
+                        }
+                    }
+                    Err(err) => {
+                        let state = format!("error {err}");
+                        if last_probe_log != state {
+                            log::info!("[dsh] probe: url={url} {state}");
+                            last_probe_log = state;
+                        }
+                    }
                 }
             }
 
@@ -805,26 +649,22 @@ impl DshRuntime {
         }
     }
 
-    /// 找到 `pid` 进程监听的本地端口(仅 macOS;其他平台返回 None)。
-    fn find_listening_port(pid: u32) -> Option<u16> {
-        let output = std::process::Command::new("lsof")
-            .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", &pid.to_string()])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines().skip(1) {
-            if let Some(idx) = line.rfind("127.0.0.1:") {
-                let rest = &line[idx + "127.0.0.1:".len()..];
-                let port_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(port) = port_str.parse() {
-                    return Some(port);
-                }
-            }
-        }
-        None
+    /// 从 dsh-web.log 读取就绪 URL(尚无输出时返回 None)。
+    fn read_ready_url(log_path: &Path) -> Option<String> {
+        Self::parse_ready_url(&std::fs::read_to_string(log_path).ok()?)
+    }
+
+    /// 从日志文本解析 dsh 启动器打印的 web UI 就绪 URL。
+    ///
+    /// 锚定启动器自身的 `dsh web: ` 输出行:profile 插件也可能往 stdout 打
+    /// 自己的 `http://127.0.0.1:` URL 且先于 web UI 输出,取"第一个
+    /// 127.0.0.1 URL"会解析到无关地址导致探测永远失败。
+    fn parse_ready_url(text: &str) -> Option<String> {
+        const MARKER: &str = "dsh web: http://127.0.0.1:";
+        let idx = text.find(MARKER)?;
+        let rest = &text[idx + "dsh web: ".len()..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        Some(rest[..end].to_string())
     }
 
     /// 标记一次用户主动启动开始(由主线程在 spawn 前调用)。
@@ -940,10 +780,8 @@ impl DshRuntime {
     }
 
     /// 崩溃后重启(由外部在 `poll_child` 返回 `Crashed` 后调度,`'static` future)。
-    ///
-    /// 崩溃重启不触发版本检查/更新(仅用户主动打开时更新),沿用已装版本。
     pub async fn restart_future() -> DshRestartResult {
-        match Self::start_future(None).await {
+        match Self::start_future().await {
             DshStartResult::Ready { url, child } => DshRestartResult::Restarted { url, child },
             DshStartResult::Failed { error } => DshRestartResult::GiveUp { error },
         }
@@ -960,27 +798,39 @@ impl SingletonEntity for DshRuntime {}
 mod tests {
     use super::*;
 
-    /// 验证 lsof 输出解析:取 127.0.0.1 端口,忽略 IPv6/其他地址。
+    /// 验证就绪 URL 解析:锚定启动器的 `dsh web: ` 行,忽略插件先输出的
+    /// 其他 127.0.0.1 URL。
     #[test]
-    fn parses_listening_port_from_lsof_output() {
-        let sample = "\
-COMMAND  PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
-node    1234 zhong  14u  IPv4 0x1234      0t0  TCP 127.0.0.1:63815 (LISTEN)
-node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
-";
-        // 把 lsof 输出喂给解析逻辑:构造临时文件并 mock lsof 不可行,
-        // 直接测试行解析的辅助逻辑。
-        let lines: Vec<&str> = sample.lines().collect();
-        assert!(lines.len() >= 2);
-        // 第二行含 127.0.0.1:63815
-        let line = lines[1];
-        let idx = line.rfind("127.0.0.1:").expect("has 127.0.0.1");
-        let rest = &line[idx + "127.0.0.1:".len()..];
-        let port_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        assert_eq!(port_str, "63815");
+    fn parses_ready_url_from_log_text() {
+        let sample = "noise before\n\
+                      [some-plugin] page http://127.0.0.1:3080/qr\n\
+                      dsh web: http://127.0.0.1:64536/?token=hkVHyTzitwrF-wWC7NpO00F7u\n\
+                      trailing line\n";
+        assert_eq!(
+            DshRuntime::parse_ready_url(sample).as_deref(),
+            Some("http://127.0.0.1:64536/?token=hkVHyTzitwrF-wWC7NpO00F7u")
+        );
+        // 无 `dsh web: ` 行时不误取插件 URL。
+        assert_eq!(
+            DshRuntime::parse_ready_url("some-plugin page http://127.0.0.1:3080/qr"),
+            None
+        );
+        assert_eq!(DshRuntime::parse_ready_url("no url here"), None);
     }
 
-    /// 已移除硬编码版本常量；启动时动态取 latest，无网且未安装则失败。
+    /// 更新判定:semver 比较(预发布号 < 正式版),不可解析时静默不提示。
+    #[test]
+    fn update_available_comparison() {
+        assert!(is_update_available("0.1.3", "0.1.2-rc.1"));
+        assert!(is_update_available("0.1.2", "0.1.2-rc.1"));
+        assert!(!is_update_available("0.1.2-rc.1", "0.1.2-rc.1"));
+        assert!(!is_update_available("0.1.2-rc.1", "0.1.2"));
+        assert!(!is_update_available("0.1.1", "0.1.2-rc.1"));
+        assert!(!is_update_available("not-semver", "0.1.2"));
+        assert!(!is_update_available("0.1.2", "not-semver"));
+    }
+
+    /// 已移除安装/版本管理:dsh 由用户全局安装,Zap 仅定位 PATH 中的命令。
 
     /// set_workspace_dir / workspace_dir 存取与缺省。
     #[test]
@@ -1011,11 +861,11 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
     /// 端到端冒烟:真实启动 dsh runtime(需网络安装 dsh,首次较慢)。
     /// 验证:启动成功、URL 可访问、子进程可停止。
     #[test]
-    #[ignore = "requires network + npm install, run manually"]
+    #[ignore = "requires global dsh in PATH, run manually"]
     fn smoke_start_stop() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let result = DshRuntime::start_future(None).await;
+            let result = DshRuntime::start_future().await;
             match result {
                 DshStartResult::Ready { url, mut child } => {
                     // URL 可达。
@@ -1033,11 +883,11 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
 
     /// 生命周期:启动 → 同步 kill + 轮询回收,进程退出。
     #[test]
-    #[ignore = "requires network + npm install, run manually"]
+    #[ignore = "requires global dsh in PATH, run manually"]
     fn lifecycle_start_stop() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let result = DshRuntime::start_future(None).await;
+            let result = DshRuntime::start_future().await;
             let (url, mut child) = match result {
                 DshStartResult::Ready { url, child } => (url, child),
                 DshStartResult::Failed { error } => panic!("start failed: {error}"),
@@ -1270,12 +1120,12 @@ node    1234 zhong  15u  IPv6 0x5678      0t0  TCP [::1]:63816 (LISTEN)
     /// 崩溃重启完整链路:启动 → kill 子进程 → poll_child 检测 →
     /// restart_future 重启 → 新 URL 可达。
     #[test]
-    #[ignore = "requires network + npm install, run manually"]
+    #[ignore = "requires global dsh in PATH, run manually"]
     fn crash_restart_cycle() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
             // 1. 启动。
-            let (url1, mut child) = match DshRuntime::start_future(None).await {
+            let (url1, mut child) = match DshRuntime::start_future().await {
                 DshStartResult::Ready { url, child } => (url, child),
                 DshStartResult::Failed { error } => panic!("start failed: {error}"),
             };

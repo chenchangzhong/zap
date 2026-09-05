@@ -266,6 +266,7 @@ i18n-embed = { version = "0.15", features = ["fluent-system", "desktop-requester
 i18n-embed-fl = "0.9"
 fluent = "0.16"
 schemars = { version = "1", features = ["chrono04"] }
+semver = "1.0"
 rustls = "0.23.39"
 unic-langid = { version = "0.9", features = ["macros"] }
 sys-locale = "0.3"

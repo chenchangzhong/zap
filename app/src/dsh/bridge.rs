@@ -31,10 +31,6 @@ pub enum BridgeEvent {
     OpenFileExplorer { path: PathBuf },
     /// runtime 就绪,`url` 为 dsh Web UI 地址。
     Ready { url: String },
-    /// 检测到 dsh 新版本,正在更新。
-    Updating { version: String },
-    /// 安装进度行(实时 npm 输出)。
-    InstallingProgress { line: String },
     /// 崩溃后自动重启完成。
     Restarted { url: String },
     Failed { error: String },
