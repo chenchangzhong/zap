@@ -4,6 +4,7 @@ use std::{
     mem,
     ops::Range,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -486,6 +487,7 @@ impl LayOutArgs {
 impl EditDelta {
     /// Lay out the given EditDelta into TextFrames.
     /// If hidden_lines is provided, lines within hidden ranges will be laid out as BlockItem::Hidden.
+    /// Returns (result, collect_duration, build_duration, parallel_duration, fold_duration).
     pub fn layout_delta(
         self,
         layout: &TextLayout,
@@ -493,39 +495,45 @@ impl EditDelta {
         layout_options: RenderLayoutOptions,
         hidden_ranges: Option<RangeSet<CharOffset>>,
         app: &AppContext,
-    ) -> LaidOutRenderDelta {
+    ) -> (LaidOutRenderDelta, Duration, Duration, Duration, Duration) {
+        log::debug!("[perf] layout_edit_delta start | old_offset={:?} new_lines={}", self.old_offset, self.new_lines.len());
+
         let hidden_ranges = hidden_ranges.unwrap_or_default();
 
         // old_offset is in the same 1-indexed coordinate system as hidden ranges.
         let mut current_offset = (self.old_offset.start).max(CharOffset::from(1));
 
-        // First, build a Vec of layout tasks with information about whether they're hidden
-        let layout_tasks: Vec<_> = self
-            .new_lines
+        // Step 1: collect_edits — iterate new_lines and filter out zero-length blocks.
+        let collect_start = Instant::now();
+        let raw_blocks: Vec<_> = self.new_lines.into_iter().filter(|block| {
+            block.content_length() != CharOffset::zero()
+        }).collect();
+        let collect_duration = collect_start.elapsed();
+
+        // Step 2: build_layout_tasks — construct LayoutTask for each block.
+        let build_start = Instant::now();
+        let layout_tasks: Vec<_> = raw_blocks
             .into_iter()
-            .filter_map(|block| {
+            .map(|block| {
                 let content_length = block.content_length();
-                if content_length == CharOffset::zero() {
-                    None
-                } else {
-                    let task = LayoutTask::from_styled_block(
-                        block,
-                        layout,
-                        layout_options,
-                        app,
-                        document_path,
-                    );
-                    let is_hidden = hidden_ranges.contains(&current_offset);
-                    current_offset += content_length;
-                    Some((task, is_hidden))
-                }
+                let task = LayoutTask::from_styled_block(
+                    block,
+                    layout,
+                    layout_options,
+                    app,
+                    document_path,
+                );
+                let is_hidden = hidden_ranges.contains(&current_offset);
+                current_offset += content_length;
+                (task, is_hidden)
             })
             .collect();
+        let build_duration = build_start.elapsed();
 
         let last_task = layout_tasks.len().saturating_sub(1);
 
-        // Then, run each task in parallel, collecting (a) the laid out BlockItems and (b) whether
-        // or not the last item ends with a newline.
+        // Step 3: parallel_layout — rayon parallel iteration.
+        let parallel_start = Instant::now();
         let (block_items, has_trailing_newline): (Vec<_>, Last<_>) = layout_tasks
             .into_par_iter()
             .enumerate()
@@ -551,8 +559,10 @@ impl EditDelta {
                 }
             })
             .unzip();
+        let parallel_duration = parallel_start.elapsed();
 
-        // Iterate through block_items, and collapse adjacent Hidden items.
+        // Step 4: fold_collapse — collapse adjacent Hidden items.
+        let fold_start = Instant::now();
         let block_items = block_items.into_iter().fold(Vec::new(), |mut acc, item| {
             if let Some(last) = acc.last_mut() {
                 // If the last item is Hidden and the current item is also Hidden,
@@ -567,6 +577,7 @@ impl EditDelta {
             acc.push(item);
             acc
         });
+        let fold_duration = fold_start.elapsed();
 
         // Trailing newline is default to true. This default value is used when
         // edit delta has no new line, which means one or multiple entire lines have
@@ -574,20 +585,26 @@ impl EditDelta {
         let has_trailing_newline = has_trailing_newline.into_inner().unwrap_or(true);
         let rich_text_styles = layout.rich_text_styles();
 
-        LaidOutRenderDelta {
-            old_offset: self.old_offset.clone(),
-            laid_out_line: block_items,
-            trailing_newline: has_trailing_newline.then(|| {
-                Cursor::new(
-                    rich_text_styles.base_line_height(),
-                    rich_text_styles.cursor_width.into_pixels(),
-                    rich_text_styles
-                        .block_spacings
-                        .from_block_style(&BufferBlockStyle::PlainText),
-                    rich_text_styles.minimum_paragraph_height,
-                )
-            }),
-        }
+        (
+            LaidOutRenderDelta {
+                old_offset: self.old_offset.clone(),
+                laid_out_line: block_items,
+                trailing_newline: has_trailing_newline.then(|| {
+                    Cursor::new(
+                        rich_text_styles.base_line_height(),
+                        rich_text_styles.cursor_width.into_pixels(),
+                        rich_text_styles
+                            .block_spacings
+                            .from_block_style(&BufferBlockStyle::PlainText),
+                        rich_text_styles.minimum_paragraph_height,
+                    )
+                }),
+            },
+            collect_duration,
+            build_duration,
+            parallel_duration,
+            fold_duration,
+        )
     }
 }
 

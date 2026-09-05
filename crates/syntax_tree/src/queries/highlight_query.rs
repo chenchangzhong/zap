@@ -62,6 +62,11 @@ impl HighlightQuery {
         let byte_start = range.start.to_buffer_byte_offset(buffer).as_usize();
         let byte_end = range.end.to_buffer_byte_offset(buffer).as_usize();
         cursor.set_byte_range(byte_start..byte_end);
+        // Must start from the root: the cursor only visits the start node's subtree, so
+        // starting from `descendant_for_byte_range` misses captures anchored at ancestors
+        // of that node (e.g. `(string_literal) @string` when the range starts inside a
+        // multi-line string). With the byte range bounded to the viewport by
+        // `viewport_charoffset_range`, the cursor's own range pruning keeps this fast.
         let mut captures = cursor.captures(query, tree.root_node(), TextBuffer(buffer));
 
         while let Some(matches) = captures.next() {

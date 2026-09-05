@@ -515,95 +515,10 @@ pub fn compute_spacers(
     (left_spacers, right_spacers)
 }
 
-/// Limit the total number of spacer lines across both sides.
-///
-/// When spacers exceed `max_total_lines`, truncate the list and append a
-/// single placeholder spacer that renders "skipped N lines" as its content.
-/// This prevents creating millions of temporary blocks for very large diffs.
-///
-/// Returns the capped `(left_spacers, right_spacers)` and the total number
-/// of skipped lines (0 if no capping occurred).
-pub fn limit_spacers(
-    mut left_spacers: Vec<TemporaryBlock>,
-    mut right_spacers: Vec<TemporaryBlock>,
-    max_total_lines: usize,
-) -> (Vec<TemporaryBlock>, Vec<TemporaryBlock>, usize) {
-    // Count total spacer lines (merged spacers: content.lines().count()).
-    let count_lines = |spacers: &[TemporaryBlock]| -> usize {
-        spacers
-            .iter()
-            .map(|s| s.content.lines().count().max(1))
-            .sum()
-    };
-
-    let total = count_lines(&left_spacers) + count_lines(&right_spacers);
-    if total <= max_total_lines {
-        return (left_spacers, right_spacers, 0);
-    }
-
-    let mut kept_lines = 0usize;
-    let mut skipped_lines = 0usize;
-
-    // Keep spacers from both sides until we hit the budget.
-    // Interleave by keeping all left first, then right (simpler, and the
-    // visual order doesn't matter for spacers since they're all at different
-    // positions).
-    let mut capped_left = Vec::new();
-    for spacer in &left_spacers {
-        let h = spacer.content.lines().count().max(1);
-        if kept_lines + h <= max_total_lines {
-            capped_left.push(spacer.clone());
-            kept_lines += h;
-        } else {
-            skipped_lines += h;
-        }
-    }
-    left_spacers = capped_left;
-
-    let mut capped_right = Vec::new();
-    for spacer in &right_spacers {
-        let h = spacer.content.lines().count().max(1);
-        if kept_lines + h <= max_total_lines {
-            capped_right.push(spacer.clone());
-            kept_lines += h;
-        } else {
-            skipped_lines += h;
-        }
-    }
-    right_spacers = capped_right;
-
-    // Add a placeholder at the end of the longer side.
-    if skipped_lines > 0 {
-        let placeholder = format!(" ⋯ skipped {skipped_lines} lines ⋯\n");
-        if left_spacers.len() >= right_spacers.len() {
-            left_spacers.push(TemporaryBlock {
-                content: placeholder,
-                insert_before: left_spacers
-                    .last()
-                    .map(|s| s.insert_before)
-                    .unwrap_or_else(LineCount::zero),
-                line_decoration: None,
-                inline_text_decorations: Vec::new(),
-            });
-        } else {
-            right_spacers.push(TemporaryBlock {
-                content: placeholder,
-                insert_before: right_spacers
-                    .last()
-                    .map(|s| s.insert_before)
-                    .unwrap_or_else(LineCount::zero),
-                line_decoration: None,
-                inline_text_decorations: Vec::new(),
-            });
-        }
-    }
-
-    (left_spacers, right_spacers, skipped_lines)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use super::super::edit::TemporaryBlock;
 
     #[test]
@@ -989,62 +904,252 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // limit_spacers tests
+    // side-by-side 对齐不变量
     // -----------------------------------------------------------------------
 
-    fn make_spacer(content: &str, insert_at: usize) -> TemporaryBlock {
-        TemporaryBlock {
-            content: content.to_string(),
-            insert_before: LineCount::from(insert_at),
-            line_decoration: None,
-            inline_text_decorations: Vec::new(),
+    /// 模拟一列的视觉行序:`(buffer 行号, 是否 spacer)`。
+    /// spacer 不占 buffer 行号,视觉上插在 `insert_before` 行之前;`insert_before == base_rows`
+    /// (EOF)时追加在列尾。
+    fn visual_column(base_rows: usize, spacers: &[(usize, usize)]) -> Vec<(usize, bool)> {
+        let mut by_at: HashMap<usize, usize> = HashMap::new();
+        for &(at, n) in spacers {
+            *by_at.entry(at).or_insert(0) += n;
+        }
+        let mut rows = Vec::new();
+        for row in 0..base_rows {
+            if let Some(&n) = by_at.get(&row) {
+                rows.extend(std::iter::repeat_n((row, true), n));
+            }
+            rows.push((row, false));
+        }
+        if let Some(&n) = by_at.get(&base_rows) {
+            rows.extend(std::iter::repeat_n((base_rows, true), n));
+        }
+        rows
+    }
+
+    fn spacer_pairs(blocks: &[TemporaryBlock]) -> Vec<(usize, usize)> {
+        blocks
+            .iter()
+            .map(|b| (b.insert_before.as_usize(), b.content.lines().count()))
+            .collect()
+    }
+
+    /// 核心不变量:应用 spacers 后两列必须逐行对齐 ——
+    /// 1) 两列视觉总行数相等;
+    /// 2) 每个 hunk 前后的「未变行」在两列中的视觉行号一致。
+    /// 这两条 together 是 side-by-side 两列对齐的充要条件(区间行数按望远镜求和闭合)。
+    fn assert_columns_aligned(
+        old_len: usize,
+        new_len: usize,
+        hunks: &[LineDiffHunk],
+        context: &str,
+    ) {
+        let (left_blocks, right_blocks) = compute_spacers(hunks);
+        let left_vis = visual_column(old_len, &spacer_pairs(&left_blocks));
+        let right_vis = visual_column(new_len, &spacer_pairs(&right_blocks));
+
+        assert_eq!(
+            left_vis.len(),
+            right_vis.len(),
+            "{context}: 两列视觉总行数不相等 (old={old_len} new={new_len}) hunks={hunks:?} left={left_blocks:?} right={right_blocks:?}"
+        );
+
+        let find_row = |vis: &[(usize, bool)], row: usize| {
+            vis.iter()
+                .position(|&(r, is_spacer)| r == row && !is_spacer)
+                .unwrap_or_else(|| panic!("{context}: 视觉列中找不到 buffer 行 {row}"))
+        };
+
+        let mut old_consumed = 0usize;
+        let mut new_consumed = 0usize;
+        for hunk in hunks {
+            let gap = hunk.old_rows.start - old_consumed;
+            assert_eq!(
+                gap,
+                hunk.new_rows.start - new_consumed,
+                "{context}: hunk 前未变区长度不一致 hunks={hunks:?}"
+            );
+            for k in 0..gap {
+                let o = old_consumed + k;
+                let n = new_consumed + k;
+                assert_eq!(
+                    find_row(&left_vis, o),
+                    find_row(&right_vis, n),
+                    "{context}: 未变行错位 old 行 {o} ↔ new 行 {n} 视觉行号不同 hunks={hunks:?}"
+                );
+            }
+            old_consumed = hunk.old_rows.end;
+            new_consumed = hunk.new_rows.end;
+        }
+        // 末尾未变区
+        assert_eq!(
+            old_len - old_consumed,
+            new_len - new_consumed,
+            "{context}: 尾部未变区长度不一致 hunks={hunks:?}"
+        );
+        for k in 0..(old_len - old_consumed) {
+            let o = old_consumed + k;
+            let n = new_consumed + k;
+            assert_eq!(
+                find_row(&left_vis, o),
+                find_row(&right_vis, n),
+                "{context}: 尾部未变行错位 old 行 {o} ↔ new 行 {n}"
+            );
+        }
+    }
+
+    fn apply_random_edit(
+        rng: &mut u64,
+        lines: &mut Vec<String>,
+        tag: &mut usize,
+    ) -> Vec<String> {
+        // xorshift64* —— 确定性伪随机
+        *rng ^= *rng >> 12;
+        *rng ^= *rng << 25;
+        *rng ^= *rng >> 27;
+        let r = rng.wrapping_mul(0x2545F4914F6CDD1D);
+        *tag += 1;
+        let kind = r % 5;
+        match kind {
+            0..=1 => {
+                // 插入 1-3 行
+                let at = (r as usize) % (lines.len() + 1);
+                let count = 1 + ((r >> 8) as usize) % 3;
+                let inserted: Vec<String> = (0..count)
+                    .map(|i| format!("ins{}-{}", *tag, i))
+                    .collect();
+                lines.splice(at..at, inserted);
+            }
+            2 => {
+                // 删除 1-3 行
+                if lines.len() > 1 {
+                    let at = (r as usize) % lines.len();
+                    let count = 1 + ((r >> 8) as usize) % 3;
+                    let end = (at + count).min(lines.len());
+                    lines.drain(at..end);
+                }
+            }
+            3 => {
+                // 就地修改 1-2 行(行数不变)
+                if !lines.is_empty() {
+                    let at = (r as usize) % lines.len();
+                    let count = 1 + ((r >> 8) as usize) % 2;
+                    for i in 0..count.min(lines.len() - at) {
+                        lines[at + i] = format!("mod{}-{}", *tag, i);
+                    }
+                }
+            }
+            _ => {
+                // 连续「删几行再插不同行数」—— 产生行数不等的替换 hunk
+                if lines.len() > 2 {
+                    let at = (r as usize) % (lines.len() - 1);
+                    let del = 1 + ((r >> 8) as usize) % 3;
+                    let end = (at + del).min(lines.len());
+                    lines.drain(at..end);
+                    let ins = ((r >> 16) as usize) % 4;
+                    let inserted: Vec<String> =
+                        (0..ins).map(|i| format!("rep{}-{}", *tag, i)).collect();
+                    lines.splice(at..at, inserted);
+                }
+            }
+        }
+        lines.clone()
+    }
+
+    #[test]
+    fn side_by_side_alignment_property_random_edits() {
+        let mut rng: u64 = 0x1234_5678_9ABC_DEF0;
+        for case in 0..200 {
+            let line_count = 1 + (case % 40);
+            let mut old_lines: Vec<String> =
+                (0..line_count).map(|i| format!("line {i}")).collect();
+            let mut tag = 0usize;
+            let edits = 1 + (case % 6);
+            let mut new_lines = old_lines.clone();
+            for _ in 0..edits {
+                new_lines = apply_random_edit(&mut rng, &mut new_lines, &mut tag);
+            }
+            let old_text = old_lines.join("\n");
+            let old_text = if old_text.is_empty() {
+                String::new()
+            } else {
+                format!("{old_text}\n")
+            };
+            let new_text = new_lines.join("\n");
+            let new_text = if new_text.is_empty() {
+                String::new()
+            } else {
+                format!("{new_text}\n")
+            };
+            old_lines = old_text.lines().map(str::to_string).collect();
+            new_lines = new_text.lines().map(str::to_string).collect();
+
+            let hunks = diff_lines(&old_text, &new_text);
+            assert_columns_aligned(
+                old_lines.len(),
+                new_lines.len(),
+                &hunks,
+                &format!("case {case}: old={old_text:?} new={new_text:?}"),
+            );
         }
     }
 
     #[test]
-    fn limit_spacers_under_budget() {
-        let left = vec![make_spacer(" \n \n", 5)]; // 2 lines
-        let right = vec![make_spacer(" \n", 3)]; // 1 line
-        let (l, r, skipped) = limit_spacers(left, right, 100);
-        assert_eq!(l.len(), 1);
-        assert_eq!(r.len(), 1);
-        assert_eq!(skipped, 0);
-    }
-
-    #[test]
-    fn limit_spacers_caps_and_adds_placeholder() {
-        let left = vec![
-            make_spacer(" \n \n \n", 5),  // 3 lines
-            make_spacer(" \n \n \n", 10), // 3 lines
+    fn side_by_side_alignment_edge_cases() {
+        // 纯增/纯删在文件头、文件尾、空文件等边界
+        let cases: Vec<(&str, &str)> = vec![
+            ("", "a\nb\n"),                       // 全增(空文件 → 内容)
+            ("a\nb\n", ""),                       // 全删(内容 → 空文件)
+            ("a\n", "X\na\n"),                    // 头部插入
+            ("a\n", "a\nX\n"),                    // 尾部插入(EOF spacer)
+            ("a\nb\nc\n", "a\nc\n"),              // 中间删除
+            ("a\nb\nc\nd\n", "a\nX\nY\nZ\nd\n"),  // 行数不等的替换
+            ("a\nb\n", "b\na\n"),                 // 换序(histogram 可能切多 hunk)
+            ("a\nb\nc\nd\ne\n", "a\nb\n"),        // 尾部删除
+            ("a\nb\nc\n", "\na\nb\nc\n"),         // 头部插入空行
+            ("a\nb\nc\n", "a\nb\nc\n"),           // 无变化
         ];
-        let right = vec![
-            make_spacer(" \n \n", 3), // 2 lines
-        ];
-        // Budget of 4: keep left spacer 1 (3 lines) + right spacer (1 line, budget 4/5)
-        // Actually: left[0] = 3 lines → kept (3). left[1] = 3 lines → skip (3+3=6 > 4).
-        // right[0] = 2 lines → skip (3+2=5 > 4). So skipped = 3+2 = 5.
-        let (l, r, skipped) = limit_spacers(left, right, 4);
-        assert_eq!(l.len(), 2); // 1 original + 1 placeholder
-        assert!(r.is_empty());
-        assert_eq!(skipped, 5);
-        assert!(l[1].content.contains("skipped 5"));
+        for (i, (old, new)) in cases.iter().enumerate() {
+            let hunks = diff_lines(old, new);
+            assert_columns_aligned(
+                old.lines().count(),
+                new.lines().count(),
+                &hunks,
+                &format!("edge {i}: old={old:?} new={new:?}"),
+            );
+        }
     }
 
     #[test]
-    fn limit_spacers_empty() {
-        let (l, r, skipped) = limit_spacers(Vec::new(), Vec::new(), 10);
-        assert!(l.is_empty());
-        assert!(r.is_empty());
-        assert_eq!(skipped, 0);
-    }
+    fn side_by_side_alignment_large_mixed_diff_exceeding_old_line_budget() {
+        // 回归:旧实现按"spacer 总行数 > 2000"截断并把被截行折叠成 1 行占位块,
+        // 两侧被截高度不同,总高差 = 新旧行数差,首个被截 hunk 之下整体错位。
+        // 这里构造 spacer 总行数超过旧预算(2000)的大混合 diff,锁死对齐不变量。
+        let old_lines: Vec<String> = (0..3000).map(|i| format!("line {i}")).collect();
+        let mut new_lines: Vec<String> = Vec::with_capacity(old_lines.len() + 3000);
+        for (i, line) in old_lines.iter().enumerate() {
+            match i % 3 {
+                // 每 3 行一组:2 行插入(左侧 spacer)+ 保留 1 行
+                0 => {
+                    new_lines.push(format!("head-a-{i}"));
+                    new_lines.push(format!("head-b-{i}"));
+                    new_lines.push(line.clone());
+                }
+                // 每 9 行一组:删除 1 行(右侧 spacer)
+                1 if i % 9 == 1 => {}
+                _ => new_lines.push(line.clone()),
+            }
+        }
+        let old_text = old_lines.join("\n") + "\n";
+        let new_text = new_lines.join("\n") + "\n";
 
-    #[test]
-    fn limit_spacers_exact_budget() {
-        let left = vec![make_spacer(" \n \n", 5)]; // 2 lines
-        let right = vec![make_spacer(" \n \n", 3)]; // 2 lines
-        let (l, r, skipped) = limit_spacers(left, right, 4);
-        assert_eq!(l.len(), 1);
-        assert_eq!(r.len(), 1);
-        assert_eq!(skipped, 0);
+        let hunks = diff_lines(&old_text, &new_text);
+        assert_columns_aligned(
+            old_lines.len(),
+            new_lines.len(),
+            &hunks,
+            "大混合 diff(超旧 2000 行 spacer 预算)",
+        );
     }
 }

@@ -25,6 +25,7 @@ use crate::NotebookKeybindings;
 use ai::agent::action::InsertReviewComment;
 use chrono::Local;
 use repo_metadata::repositories::DetectedRepositories;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use string_offset::CharOffset;
@@ -319,6 +320,7 @@ fn create_loaded_state_with_editors(
         total_additions: 0,
         total_deletions: 0,
         files_changed: 0,
+        side_by_side_diff_cache: HashMap::new(),
     }
 }
 
@@ -1003,7 +1005,14 @@ let same_2 = 2;
 let z = tail;
 ";
     let appearance = Appearance::mock();
-    let data = CodeReviewView::compute_side_by_side_diff_data(&appearance, old_content, new_content);
+    let data = build_side_by_side_diff_data(
+        remove_overlay_color(&appearance),
+        add_overlay_color(&appearance),
+        remove_inline_overlay_color(&appearance),
+        add_inline_overlay_color(&appearance),
+        old_content,
+        new_content,
+    );
 
     // 参考实现:与旧代码完全相同的 O(ranges × len) 转换(只比对 CharOffset 区间,
     // background 颜色与本次优化无关)。
@@ -1056,5 +1065,62 @@ let z = tail;
         left_actual[0].0,
         CharOffset::from(first_char),
         "首个 decoration 起点必须是字符偏移"
+    );
+}
+
+/// 回归:spacer 不能按"总行数"截断。两侧 spacer 总高必须满足
+/// left − right = 新旧行数差(高度不变量),否则同一 scroll_top 下两列错位。
+/// 旧实现(limit_spacers)在 spacer 总行数 > 2000 时把超出部分折叠成 1 行
+/// 占位块,两侧被折叠高度不同——大 diff 文件(如 3000+ 行、超 2000 spacer 行)
+/// 在首个被截断 hunk 之下整体错位。本测试构造超过旧预算的场景锁死不变量。
+#[test]
+fn test_side_by_side_spacers_keep_height_invariant_beyond_old_line_budget() {
+    // 混合 diff:每 3 行一组插入 2 行(左侧 spacer),每 9 行删 1 行(右侧 spacer),
+    // spacer 总行数约 2000 + 333 > 旧预算 2000。
+    let old_lines: Vec<String> = (0..3000).map(|i| format!("line {i}")).collect();
+    let mut new_lines: Vec<String> = Vec::with_capacity(old_lines.len() + 3000);
+    for (i, line) in old_lines.iter().enumerate() {
+        match i % 3 {
+            0 => {
+                new_lines.push(format!("head-a-{i}"));
+                new_lines.push(format!("head-b-{i}"));
+                new_lines.push(line.clone());
+            }
+            1 if i % 9 == 1 => {}
+            _ => new_lines.push(line.clone()),
+        }
+    }
+    let old_content = old_lines.join("\n") + "\n";
+    let new_content = new_lines.join("\n") + "\n";
+
+    let appearance = Appearance::mock();
+    let data = build_side_by_side_diff_data(
+        remove_overlay_color(&appearance),
+        add_overlay_color(&appearance),
+        remove_inline_overlay_color(&appearance),
+        add_inline_overlay_color(&appearance),
+        &old_content,
+        &new_content,
+    );
+
+    let spacer_lines = |blocks: &[warp_editor::content::edit::TemporaryBlock]| -> usize {
+        blocks
+            .iter()
+            .map(|b| b.content.lines().count().max(1))
+            .sum()
+    };
+    let left = spacer_lines(&data.left_spacers);
+    let right = spacer_lines(&data.right_spacers);
+
+    // 场景必须超过旧 2000 行预算,否则测试没有覆盖被截断的路径。
+    assert!(
+        left + right > 2000,
+        "场景 spacer 总行数应超过旧预算 2000,实际 left={left} right={right}"
+    );
+    // 高度不变量:两侧 spacer 行数差 == 新旧行数差。
+    assert_eq!(
+        left as isize - right as isize,
+        new_lines.len() as isize - old_lines.len() as isize,
+        "两侧 spacer 行数差必须等于新旧行数差(左={left} 右={right})"
     );
 }

@@ -559,11 +559,20 @@ impl<V: EditorView> EditorWrapper<V> {
     /// Returning **no** gutter means the gutter shouldn't be rendered at all.
     /// Returning an **empty** gutter means the gutter should be rendered with no contents.
     fn gutter_elements(&self, app: &AppContext) -> Option<Vec<GutterElement>> {
+        let _build_start = std::time::Instant::now();
         let appearance = Appearance::as_ref(app);
         let Some(line_number_config) = &self.line_number_config else {
+            let elapsed = _build_start.elapsed();
+            if elapsed.as_micros() > 500 {
+                log::debug!("[perf] gutter_elements took {:.3}ms (no line_number_config)", elapsed.as_secs_f64() * 1000.0);
+            }
             return None;
         };
         let Some(blocks) = self.editor.blocks() else {
+            let elapsed = _build_start.elapsed();
+            if elapsed.as_micros() > 500 {
+                log::debug!("[perf] gutter_elements took {:.3}ms (no blocks)", elapsed.as_secs_f64() * 1000.0);
+            }
             return Some(Vec::new());
         };
 
@@ -889,6 +898,15 @@ impl<V: EditorView> EditorWrapper<V> {
                 },
                 overlay: None,
             });
+        }
+        let elapsed = _build_start.elapsed();
+        if elapsed.as_micros() > 500 {
+            let block_count = blocks.len();
+            log::debug!(
+                "[perf] gutter_elements took {:.3}ms (blocks={block_count}, elements={})",
+                elapsed.as_secs_f64() * 1000.0,
+                elements.len(),
+            );
         }
         Some(elements)
     }
@@ -1307,40 +1325,57 @@ impl<V: EditorView> Element for EditorWrapper<V> {
             VerticalExpansionBehavior::FillMaxHeight => constraint.max,
         };
 
+        // Time gutter_elements construction and layout separately.
+        let gutter_build_start = std::time::Instant::now();
         let mut gutter_elements = self.gutter_elements(app);
-        if let Some(gutter_elements) = &mut gutter_elements {
-            for gutter_element in gutter_elements {
-                let gutter_element_size = gutter_element.element.layout(constraint, ctx, app);
+        let gutter_build_elapsed = gutter_build_start.elapsed();
 
-                if FeatureFlag::InlineCodeReview.is_enabled() {
-                    if let Some(comment_box) = &mut self.comment_box {
-                        let highlight_line = &comment_box.line;
-                        if gutter_element.line == *highlight_line {
-                            let highlight_width = size.x();
-                            let highlight_height = gutter_element_size.y();
-                            comment_box.line_highlight_element.layout(
-                                SizeConstraint {
-                                    min: vec2f(0.0, 0.0),
-                                    max: vec2f(highlight_width, highlight_height),
-                                },
-                                ctx,
-                                app,
-                            );
+        let gutter_layout_start = std::time::Instant::now();
+        let gutter_count = match &mut gutter_elements {
+            Some(gutter_elements) => {
+                let count = gutter_elements.len();
+                for gutter_element in gutter_elements {
+                    let gutter_element_size =
+                        gutter_element.element.layout(constraint, ctx, app);
+
+                    if FeatureFlag::InlineCodeReview.is_enabled() {
+                        if let Some(comment_box) = &mut self.comment_box {
+                            let highlight_line = &comment_box.line;
+                            if gutter_element.line == *highlight_line {
+                                let highlight_width = size.x();
+                                let highlight_height = gutter_element_size.y();
+                                comment_box.line_highlight_element.layout(
+                                    SizeConstraint {
+                                        min: vec2f(0.0, 0.0),
+                                        max: vec2f(highlight_width, highlight_height),
+                                    },
+                                    ctx,
+                                    app,
+                                );
+                            }
                         }
                     }
                 }
+                count
             }
-        }
+            None => 0,
+        };
+        let gutter_layout_elapsed = gutter_layout_start.elapsed();
 
         self.gutter_elements = gutter_elements;
         self.element_size = Some(size);
-        // Both timers guarded by >1ms threshold — no overhead on fast frames.
+        // All timers guarded by >500μs threshold.
         let layout_elapsed = _layout_start.elapsed();
-        if layout_elapsed.as_micros() > 1000 {
-            log::debug!("[perf] EditorWrapper::layout took {:?}", layout_elapsed);
-        }
-        if editor_layout_elapsed.as_micros() > 1000 {
-            log::debug!("[perf] inner editor layout took {:?}", editor_layout_elapsed);
+        if layout_elapsed.as_micros() > 500 {
+            log::debug!(
+                "[perf] EditorWrapper::layout total {:.3}ms | \
+                 editor {:.3}ms | gutter_build {:.3}ms ({gutter_count} elements) | \
+                 gutter_layout {:.3}ms",
+                layout_elapsed.as_secs_f64() * 1000.0,
+                editor_layout_elapsed.as_secs_f64() * 1000.0,
+                gutter_build_elapsed.as_secs_f64() * 1000.0,
+                gutter_layout_elapsed.as_secs_f64() * 1000.0,
+            );
         }
         size
     }

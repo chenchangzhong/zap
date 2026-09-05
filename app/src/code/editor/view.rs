@@ -1310,6 +1310,21 @@ impl CodeEditorView {
         }
     }
 
+    /// 仅激活 diff 导航(Focused(0)),不触发 nav bar 的按列自动滚动。
+    ///
+    /// side-by-side 双列打开时专用:nav bar 的 autoscroll 按各列自己的 hunk 起始行
+    /// 解析滚动目标,而该行之上恰有单侧 spacer(纯增行 hunk 在左列、纯删行 hunk 在
+    /// 右列),两列解析出的 y 相差 spacer 高度,打开即错位、滚动一次才对齐。
+    /// 双列改用 [`CodeReviewView`] 的对齐锚行跳转(两列同一 scroll_top)。
+    pub fn activate_diff_nav_without_autoscroll(&self, ctx: &mut ViewContext<Self>) {
+        if !self.display_options.can_show_diff_ui {
+            return;
+        }
+
+        self.model
+            .update(ctx, |model, ctx| model.toggle_diff_nav(None, ctx));
+    }
+
     /// Focus a specific diff hunk index without toggling navigation off. Used when refreshing
     /// side-by-side diff status after a revert, where the nav bar must stay active.
     pub fn focus_diff_hunk_index(&self, index: usize, ctx: &mut ViewContext<Self>) {
@@ -1330,6 +1345,15 @@ impl CodeEditorView {
 
         self.model.update(ctx, |model, ctx| {
             model.expand_diffs(ctx);
+        });
+    }
+
+    /// Pre-load all pending edits synchronously to avoid blocking the first UI layout frame.
+    ///
+    /// Call after the editor content has been set but before the first layout frame is dispatched.
+    pub fn preload_pending_edits(&self, ctx: &mut ViewContext<Self>) {
+        self.model.update(ctx, |model, ctx| {
+            model.preload_pending_edits(ctx);
         });
     }
 
@@ -1453,8 +1477,17 @@ impl CodeEditorView {
     /// Reset editor content using InitialBufferState.
     /// This is the preferred method for resetting editor content as it consolidates all parameters.
     pub fn reset(&self, state: InitialBufferState, ctx: &mut ViewContext<Self>) {
+        // First update: set content and emit ContentChanged event.
+        // The event is queued in pending_effects and NOT processed until the
+        // closure returns (flush_effects runs after all update closures).
         self.model.update(ctx, |model, ctx| {
             model.reset_content(state, ctx);
+        });
+        // Second update: after flush_effects() has processed ContentChanged →
+        // handle_content_model_event → add_pending_edit → layout_rx → pending_edits,
+        // drain all pending edits synchronously to avoid first-frame blocking.
+        self.model.update(ctx, |model, ctx| {
+            model.preload_pending_edits(ctx);
         });
     }
 

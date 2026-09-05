@@ -5,12 +5,9 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        Arc,
-    },
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Arc,
 };
+
 
 use crate::{
     ai::{
@@ -65,7 +62,7 @@ use crate::{
         },
     },
 };
-use warp_editor::content::diff::{compute_spacers, limit_spacers};
+use warp_editor::content::diff::compute_spacers;
 use warp_editor::content::edit::TemporaryBlock;
 use warpui::color::ColorU;
 use warp_core::ui::theme::Fill;
@@ -324,10 +321,10 @@ const EDITOR_GAP: f32 = 12.;
 // Divides the viewport line count to derive the scroll offset (in lines) when
 // jumping to a diff hunk (same convention as the NavBar).
 const DIFF_NAV_VIEWPORT_LINE_DIVISOR: usize = 10;
-/// Cap for side-by-side alignment spacer lines. Diffs that drift by more than this many
-/// alignment rows get the excess folded into a "skipped N lines" placeholder, keeping
-/// large-file views responsive.
-const SIDE_BY_SIDE_MAX_SPACER_LINES: usize = 2000;
+/// side-by-side 首次加载同步渲染的行数(含其间 spacer)。两列在创建时同步渲染
+/// 这部分,首屏(含锚行跳转目标)立即完整且两列对称;其余内容仍按帧 8ms 分批
+/// 懒加载。
+const SIDE_BY_SIDE_HEAD_PRELOAD_ROWS: usize = 1000;
 const FILE_SIDEBAR_PANE_WIDTH_PERCENTAGE: f32 = 0.25;
 /// Vertical gap between the right panel header row and the code review content below it
 /// (sub-header in loaded state, loading text in loading state).
@@ -423,10 +420,11 @@ pub struct SideBySideEditorState {
     pub modified_editor: ViewHandle<LocalCodeEditorView>,
     /// Prevents infinite scroll sync loop between the two editors.
     pub syncing: Rc<Cell<bool>>,
-    /// Last scroll sync timestamp in milliseconds for 16ms throttle (baseline → modified).
-    pub last_sync_time: Arc<AtomicI64>,
-    /// Last scroll sync timestamp in milliseconds for 16ms throttle (modified → baseline).
-    pub last_sync_time_reverse: Arc<AtomicI64>,
+    /// 打开时待执行的"跳到首个 hunk"锚行。懒布局逐帧排空,创建时树是空的,
+    /// 立即解析会被钳制到 0(无效跳转);这里先挂起,等任一列的布局覆盖到
+    /// 锚行(Zed 共享滚动锚的思想:锚定行、布局就绪后落位)再解析一次,
+    /// 两列落**同一** scroll_top,打开即对齐并跳到首个 hunk。
+    pub pending_anchor_row: Rc<Cell<Option<usize>>>,
 }
 
 /// Decorations + diff statuses derived from the old (left) and new (right) buffer contents.
@@ -522,13 +520,15 @@ fn build_side_by_side_diff_data(
         }
     }
 
-    // Compute spacer blocks for each side (Zed spacer-block alignment)
+    // Compute spacer blocks for each side (Zed spacer-block alignment).
+    //
+    // 注意:这里**不能**按"总行数"截断 spacer。两侧 spacer 总高必须满足
+    // left_sp − right_sp = 新旧行数差(高度不变量),同一 scroll_top 才对应
+    // 同一配对行。旧实现(limit_spacers)把超预算的 spacer 折叠成 1 行高的
+    // "skipped N lines" 占位块,两侧被折叠的高度不同,总高差被破坏——表现为
+    // 大 diff 文件(>2000 行 spacer)在首个被截断 hunk 之下整体错位。
+    // 块数已被 merge_consecutive_spacers 合并到 ≈hunk 数量级,无性能风险。
     let (left_spacers, right_spacers) = compute_spacers(&diff_hunks);
-    // Cap spacer volume for very large diffs: fold excess alignment rows into a
-    // "skipped N lines" placeholder instead of creating thousands of temporary blocks
-    // (which stalls opening large side-by-side diffs and slows scrolling).
-    let (left_spacers, right_spacers, _skipped) =
-        limit_spacers(left_spacers, right_spacers, SIDE_BY_SIDE_MAX_SPACER_LINES);
 
     // Build precise diff statuses per side (git alignment): only mark rows that
     // actually exist on that side.
@@ -3983,6 +3983,8 @@ impl CodeReviewView {
                     });
                 }
 
+                // Phase 1: apply content changes. expand_diffs must stay inside the closure
+                // so ContentChanged is queued for flush_effects() below.
                 local_editor.editor().update(ctx, |editor, ctx| {
                     // When global buffer is enabled (and file is not deleted), hidden line configuration is handed off to the model itself.
                     if is_deleted_file {
@@ -3997,20 +3999,36 @@ impl CodeReviewView {
                         }
                     }
                     editor.expand_diffs(ctx);
+                });
 
-                    // Restore cursor position if it was saved
-                    if let Some(selections) = saved_selections {
+                // Phase 2: AFTER flush_effects() has processed ContentChanged from expand_diffs,
+                // drain the now-populated pending_edits synchronously. This avoids the ~140ms
+                // first-frame blocking that would otherwise occur inside try_layout_pending_edits.
+                // Pre-load all pending edits so the first UI layout frame is not blocked.
+                // Without this, the first layout flushes hundreds of pending edits (~134ms)
+                // causing a visible freeze.
+                local_editor.editor().update(ctx, |editor, ctx| {
+                    editor.preload_pending_edits(ctx);
+                });
+
+                // Phase 3: restore cursor and finalize interaction state (no layout work).
+                if let Some(selections) = saved_selections {
+                    let editor_ref = local_editor.editor();
+                    editor_ref.update(ctx, |editor, ctx| {
                         Self::restore_cursor_position(editor, selections, ctx);
-                    }
+                    });
+                }
 
-                    if is_initial_setup {
+                if is_initial_setup {
+                    let editor_ref = local_editor.editor();
+                    editor_ref.update(ctx, |editor, ctx| {
                         if FeatureFlag::CodeReviewSaveChanges.is_enabled() {
                             editor.set_interaction_state(InteractionState::Editable, ctx);
                         } else {
                             editor.set_interaction_state(InteractionState::Selectable, ctx);
                         }
-                    }
-                });
+                    });
+                }
             });
         }
     }
@@ -6055,14 +6073,14 @@ impl CodeReviewView {
                     &baseline_code_editor,
                     &pair.modified_editor,
                     pair.syncing.clone(),
-                    pair.last_sync_time.clone(),
+                    pair.pending_anchor_row.clone(),
                     ctx,
                 );
                 Self::subscribe_scroll_sync(
                     &modified_code_editor,
                     &pair.baseline_editor,
                     pair.syncing.clone(),
-                    pair.last_sync_time_reverse.clone(),
+                    pair.pending_anchor_row.clone(),
                     ctx,
                 );
 
@@ -6136,55 +6154,159 @@ impl CodeReviewView {
         source: &ViewHandle<CodeEditorView>,
         target: &ViewHandle<LocalCodeEditorView>,
         syncing: Rc<Cell<bool>>,
-        last_sync_time: Arc<AtomicI64>,
+        pending_anchor_row: Rc<Cell<Option<usize>>>,
         ctx: &mut ViewContext<Self>,
     ) {
         let source = source.clone();
         let target = target.clone();
         ctx.subscribe_to_view(&source, move |_this, editor, event, ctx| {
-            // Scrolled = user wheel/scrollbar → proportional sync.
-            // NavScrolled = nav-bar hunk navigation → jump the other column to the
-            // same hunk.
-            let from_nav = match event {
-                CodeEditorEvent::Scrolled => Some(false),
-                CodeEditorEvent::NavScrolled => Some(true),
-                _ => None,
-            };
-            let Some(from_nav) = from_nav else {
-                return;
-            };
-            if syncing.get() {
-                return;
+            match event {
+                // Scrolled = user wheel/scrollbar → absolute copy sync.
+                // NavScrolled = nav-bar hunk navigation → jump the other column to the
+                // same hunk.
+                //
+                // 注意:**不做 16ms 节流**。绝对拷贝幂等且 O(log n),而滚轮事件间隔
+                // (~8-16ms)小于等于节流窗口,节流会把每次拷贝推迟一个事件——日志
+                // 实测滚动期间目标列持续落后 1 个滚轮事件(1-2 行可见错位),停下
+                // 才收敛。去掉节流后逐事件同步,滚动中即对齐。
+                CodeEditorEvent::Scrolled | CodeEditorEvent::NavScrolled => {
+                    let from_nav = matches!(event, CodeEditorEvent::NavScrolled);
+                    if syncing.get() {
+                        return;
+                    }
+                    syncing.set(true);
+                    if from_nav {
+                        Self::sync_focused_hunk_to_target(&editor, &target, ctx);
+                    } else {
+                        Self::sync_scroll_to_target(&editor, &target, ctx);
+                    }
+                    syncing.set(false);
+                }
+                CodeEditorEvent::LayoutInvalidated | CodeEditorEvent::ViewportUpdated => {
+                    // 懒布局逐帧排空:两列树的增长节奏彼此独立(LayoutUpdated 只在
+                    // 装饰提交时发,排空期间只有 ViewportUpdated 每帧发)。这里做
+                    // 两件事(Zed 共享滚动锚思想的落地:锚定行、布局就绪后落位):
+                    // 1) 打开时挂起的"跳到首个 hunk"锚行——布局覆盖锚行后解析
+                    //    一次,两列落同一 scroll_top;
+                    // 2) 钳制漂移纠偏——目标列懒加载期间被钳到自己的较小范围,
+                    //    布局推进后与源列 scroll_top 不等时纠回,相等则跳过。
+                    if syncing.get() {
+                        return;
+                    }
+                    if pending_anchor_row.get().is_some() {
+                        syncing.set(true);
+                        Self::try_scroll_side_by_side_pair_to_pending_anchor(
+                            &editor,
+                            &target,
+                            &pending_anchor_row,
+                            ctx,
+                        );
+                        syncing.set(false);
+                        return;
+                    }
+                    let src_top = editor
+                        .as_ref(ctx)
+                        .model
+                        .as_ref(ctx)
+                        .render_state()
+                        .as_ref(ctx)
+                        .viewport()
+                        .scroll_top()
+                        .as_f32();
+                    let tgt_top = target
+                        .as_ref(ctx)
+                        .editor()
+                        .as_ref(ctx)
+                        .model
+                        .as_ref(ctx)
+                        .render_state()
+                        .as_ref(ctx)
+                        .viewport()
+                        .scroll_top()
+                        .as_f32();
+                    if (src_top - tgt_top).abs() > 0.5 {
+                        syncing.set(true);
+                        Self::sync_scroll_to_target(&editor, &target, ctx);
+                        syncing.set(false);
+                    }
+                }
+                _ => (),
             }
-            // 16ms throttle: skip if less than 16ms since last sync.
-            // Note: use a wall-clock timestamp; Instant::now().elapsed() is ~0.
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let last_time = last_sync_time.load(Ordering::Relaxed);
-            if now - last_time < 16 {
-                return;
-            }
-            last_sync_time.store(now, Ordering::Relaxed);
-            syncing.set(true);
-            if from_nav {
-                Self::sync_focused_hunk_to_target(&editor, &target, ctx);
-            } else {
-                Self::sync_scroll_to_target(&editor, &target, ctx);
-            }
-            syncing.set(false);
         });
     }
 
-    /// Syncs scroll position from source editor to target editor proportionally
-    /// (vertical and horizontal). Called synchronously on user wheel/scrollbar scrolls.
+    /// side-by-side 打开时的对齐初始跳转(Zed 共享滚动锚思想的落地):
+    /// 两列以同一锚行(`anchor_row`,hunk 0 起始行的前一行——该行之上两列均无
+    /// spacer,解析出的 y 恒等)+ 同一上下文偏移滚动,scroll_top 必然相等。
+    ///
+    /// 懒布局逐帧排空:创建时树是空的,立即解析会被钳制到 0。因此锚行先挂起
+    /// (`SideBySideEditorState::pending_anchor_row`),布局覆盖锚行后调用本函数
+    /// 一次落位。
+    ///
+    /// 不能沿用各列 `nav_bar.autoscroll` 的打开跳转:它按各列自己的 hunk 起始行
+    /// 解析滚动目标,而该行之上恰有单侧 spacer(纯增行 hunk 在左列、纯删行 hunk
+    /// 在右列),两列目标 y 相差 spacer 高度,打开即错位。
+    fn try_scroll_side_by_side_pair_to_pending_anchor(
+        source: &ViewHandle<CodeEditorView>,
+        target: &ViewHandle<LocalCodeEditorView>,
+        pending_anchor_row: &Cell<Option<usize>>,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(anchor_row) = pending_anchor_row.get() else {
+            return false;
+        };
+        let source_view = source.as_ref(ctx);
+        let source_model = source_view.model.as_ref(ctx);
+        let source_render_handle = source_model.render_state().clone();
+        let source_render = source_render_handle.as_ref(ctx);
+        let line_height = source_model.line_height(ctx);
+        // 懒布局尚未覆盖锚行(树还只有零星项),保持挂起等下一帧布局事件。
+        if source_render.height().as_f32() < (anchor_row as f32 + 1.0) * line_height {
+            return false;
+        }
+        // 复刻 nav bar 跳转的解析公式:y(hunk 起始行上一行的首项)− (视口行数/10)×行高。
+        // `anchor_row` 已是起始行前一行(0-based),故直接取该行顶部 y——与
+        // `sync_focused_hunk_to_target` 的 `y_offset_at_line(range.start - 1)` 参数
+        // 恒等(range.start = 0-based 起始行 = old_start_line - 1),打开跳转与
+        // nav 跳转落在同一 scroll_top。两列同值(行等高 ⇒ 同一配对行)。
+        let anchor_y = source_render
+            .content()
+            .y_offset_at_line(LineCount::from(anchor_row))
+            .as_f32();
+        let delta_lines =
+            (source_model.lines_in_viewport(ctx) / DIFF_NAV_VIEWPORT_LINE_DIVISOR).max(1);
+        let intended_scroll = anchor_y - (delta_lines as f32 * line_height);
+
+        let target_model_handle = target.as_ref(ctx).editor().as_ref(ctx).model.clone();
+        let source_render_state = source_model.render_state().clone();
+        let target_render_state = target_model_handle.as_ref(ctx).render_state().clone();
+        for render_state_handle in [source_render_state, target_render_state] {
+            render_state_handle.update(ctx, |render_state, ctx| {
+                let current = render_state.viewport().scroll_top();
+                let delta = current - Pixels::new(intended_scroll);
+                render_state.scroll(delta, ctx);
+            });
+        }
+        pending_anchor_row.set(None);
+        true
+    }
+
+    /// Syncs scroll position from source editor to target editor: vertical scroll is
+    /// copied **absolutely** (row-locked), horizontal scroll proportionally.
+    ///
+    /// The two columns are line-aligned by construction (spacer-balanced equal heights),
+    /// so the target must show the same top row as the source. Copying the absolute
+    /// `scroll_top` — clamped to the target's own range by `ViewportState::scroll` —
+    /// keeps rows locked even while the target's scrollable range differs from the
+    /// source's (e.g. during its lazy chunked layout, or when spacer capping shrank one
+    /// column). The previous proportional (ratio) mapping scrolled the target to a
+    /// different row whenever the two scrollable ranges differed, visibly desyncing the
+    /// columns until the next scroll event.
     fn sync_scroll_to_target(
         source: &ViewHandle<CodeEditorView>,
         target: &ViewHandle<LocalCodeEditorView>,
         ctx: &mut ViewContext<Self>,
     ) {
-        let sync_start = std::time::Instant::now();
         // Read source scroll position
         let source_view = source.as_ref(ctx);
         let source_model = source_view.model.as_ref(ctx);
@@ -6205,12 +6327,9 @@ impl CodeReviewView {
             return;
         }
 
-        // Compute scroll ratios (0.0 = start, 1.0 = end)
-        let ratio_v = if source_scrollable_v > 0.0 {
-            (source_scroll_top / source_scrollable_v).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        // Compute the horizontal scroll ratio (0.0 = start, 1.0 = end). Vertical scroll
+        // is synced absolutely below — the two columns are row-aligned, so the target
+        // must show the same top row, not the same fractional position.
         let ratio_h = if source_scrollable_h > 0.0 {
             (source_scroll_left / source_scrollable_h).clamp(0.0, 1.0)
         } else {
@@ -6226,21 +6345,20 @@ impl CodeReviewView {
         target_model_handle.update(ctx, |model, ctx| {
             let render_state_handle = model.render_state().clone();
             render_state_handle.update(ctx, |render_state, ctx| {
-                let target_height = render_state.height().as_f32();
-                let target_viewport_h = render_state.viewport().height().as_f32();
                 let target_width = render_state.width().as_f32();
                 let target_viewport_w = render_state.viewport().width().as_f32();
 
-                let target_scrollable_v = (target_height - target_viewport_h).max(0.0);
-                if target_scrollable_v > 0.0 {
-                    let target_scroll = Pixels::new(target_scrollable_v * ratio_v);
-                    let current = render_state.viewport().scroll_top();
-                    // ViewportState::scroll(delta) moves scroll_top by `scroll_top - delta`
-                    // (positive delta scrolls up, wheel-style). So the delta to reach
-                    // `target_scroll` from `current` is `current - target_scroll`.
-                    let delta = current - target_scroll;
-                    render_state.scroll(delta, ctx);
-                }
+                // Absolute vertical mapping: the target shows the same top row as the
+                // source. `ViewportState::scroll` clamps to the target's own scrollable
+                // range, so a shorter (still-loading) target pins at its bottom and
+                // self-corrects on the next scroll event once its chunks finish.
+                let target_scroll = Pixels::new(source_scroll_top);
+                let current = render_state.viewport().scroll_top();
+                // ViewportState::scroll(delta) moves scroll_top by `scroll_top - delta`
+                // (positive delta scrolls up, wheel-style). So the delta to reach
+                // `target_scroll` from `current` is `current - target_scroll`.
+                let delta = current - target_scroll;
+                render_state.scroll(delta, ctx);
 
                 let target_scrollable_h = (target_width - target_viewport_w).max(0.0);
                 if target_scrollable_h > 0.0 {
@@ -6252,14 +6370,11 @@ impl CodeReviewView {
                 }
             });
         });
-        let sync_elapsed = sync_start.elapsed();
-        if sync_elapsed.as_micros() > 200 {
-            log::debug!("[perf] scroll-sync to target took {:?}", sync_elapsed);
-        }
     }
 
     /// Focuses the target editor onto the same diff hunk index as the source and scrolls
-    /// it to that hunk's start row (block-level sync for nav-bar navigation).
+    /// it to the **source's** nav-jump scroll position (block-level sync for nav-bar
+    /// navigation).
     fn sync_focused_hunk_to_target(
         source: &ViewHandle<CodeEditorView>,
         target: &ViewHandle<LocalCodeEditorView>,
@@ -6279,6 +6394,30 @@ impl CodeReviewView {
         let source_width = source_render.width().as_f32();
         let source_viewport_w = source_vp.width().as_f32();
 
+        // 目标列必须落在与源列 nav 跳转**完全相同**的 scroll_top 上:两列行等高,
+        // 同一 scroll_top 即同一配对行带。不能让目标列按"自己的 hunk 起始行"
+        // 自行解析 y——该行之上恰有单侧 spacer(纯增 hunk 在左列、纯删 hunk 在
+        // 右列),两列解析值相差 spacer 高度,跳转后必然错位,直到下一次滚轮
+        // 同步才被修正("有时对齐有时不对")。
+        // 这里用源列自己的树复刻 nav bar 的解析公式:
+        //   y(起始行的上一行首项) − (lines_in_viewport/10)×行高
+        // 源列自身的延迟 autoscroll(由 nav bar 提交)会解析到同一值,两列收敛。
+        let Some(source_range) = source_model
+            .diff()
+            .as_ref(ctx)
+            .line_range_by_diff_hunk_index(index)
+        else {
+            return;
+        };
+        let prev_row = source_range.start.saturating_sub(1);
+        let source_y = source_render
+            .content()
+            .y_offset_at_line(LineCount::from(prev_row))
+            .as_f32();
+        let delta_lines =
+            (source_model.lines_in_viewport(ctx) / DIFF_NAV_VIEWPORT_LINE_DIVISOR).max(1);
+        let intended_scroll = source_y - (delta_lines as f32 * source_model.line_height(ctx));
+
         let target_local = target.as_ref(ctx);
         let target_code_editor = target_local.editor();
         let target_code_ref = target_code_editor.as_ref(ctx);
@@ -6289,26 +6428,16 @@ impl CodeReviewView {
             if hunk_count == 0 {
                 return;
             }
+            // 仅同步导航高亮(focus 不触发滚动),滚动按上面算出的同一 scroll_top 绝对执行。
             let index = index.min(hunk_count - 1);
             model.focus_diff_index(index, ctx);
 
-            // Scroll the target to the start of the focused hunk (same offset convention
-            // as the NavBar autoscroll).
-            let Some(range) = model.diff().as_ref(ctx).line_range_by_diff_hunk_index(index) else {
-                return;
-            };
-            let character_offset = model.start_of_line_offset(range.start, ctx);
-            let delta = (model.lines_in_viewport(ctx) / DIFF_NAV_VIEWPORT_LINE_DIVISOR).max(1);
-            let pixel_offset = -(delta as f32 * model.line_height(ctx));
-            model
-                .render_state()
-                .clone()
-                .update(ctx, |render_state, _ctx| {
-                    render_state.request_autoscroll_to_exact_vertical(
-                        character_offset,
-                        Pixels::new(pixel_offset),
-                    );
-                });
+            let render_state_handle = model.render_state().clone();
+            render_state_handle.update(ctx, |render_state, ctx| {
+                let current = render_state.viewport().scroll_top();
+                let delta = current - Pixels::new(intended_scroll);
+                render_state.scroll(delta, ctx);
+            });
         });
 
         // Keep horizontal scroll proportionally synced for the hunk jump as well.
@@ -6650,7 +6779,8 @@ impl CodeReviewView {
 
         // 在独立作用域内计算 old/new 内容(返回 owned String),释放对 self 的借用,
         // 以便后续 prepare_side_by_side_diff_data 能再次以 &mut self 访问 state。
-        let (old_content, new_content) = {
+        // 同时取出 hunk 0 起始行的前一 0-based 行号,作打开时对齐跳转的公共锚行。
+        let (old_content, new_content, first_hunk_anchor_row) = {
             let Some(repo) = self.active_repo.as_ref() else {
                 return None;
             };
@@ -6672,7 +6802,12 @@ impl CodeReviewView {
                     Self::reconstruct_new_content(old, &file.file_diff.hunks)
                 })
             };
-            (old.to_owned(), new)
+            let first_hunk_anchor_row = file.file_diff.hunks.first().map(|hunk| {
+                // hunk.old_start_line 为 1-based;锚行 = 0-based 起始行的前一行,
+                // 该行之上两列均无 spacer,两列解析出的滚动 y 恒等。
+                hunk.old_start_line.saturating_sub(2)
+            });
+            (old.to_owned(), new, first_hunk_anchor_row)
         };
 
         let appearance = Appearance::as_ref(ctx);
@@ -6751,7 +6886,10 @@ impl CodeReviewView {
             // Activate diff navigation in Focused state: `expand_diffs` sets Expanded,
             // which shows the nav bar but makes the up/down buttons no-ops
             // (nav_diff_up/down only act on DiffNavigationState::Focused).
-            editor.toggle_diff_nav(None, ctx);
+            // 不走 `toggle_diff_nav`(会触发 nav bar 按列 autoscroll,两列目标 y
+            // 因单侧 spacer 而不等,打开即错位);打开跳转统一由下方
+            // `scroll_side_by_side_pair_to_anchor` 以同一锚行完成。
+            editor.activate_diff_nav_without_autoscroll(ctx);
             // The left column is read-only reference content.
             editor.set_interaction_state(InteractionState::Selectable, ctx);
         });
@@ -6807,7 +6945,7 @@ impl CodeReviewView {
                 );
             }
             // Focused diff nav (see baseline editor comment): keeps the nav bar buttons working.
-            editor.toggle_diff_nav(None, ctx);
+            editor.activate_diff_nav_without_autoscroll(ctx);
             // The right column stays editable; note that diff markers/spacers are a
             // snapshot computed at creation and are not recomputed on edits yet.
         });
@@ -6815,6 +6953,44 @@ impl CodeReviewView {
         let modified_local = ctx.add_typed_action_view(|ctx| {
             LocalCodeEditorView::new(modified_editor, None, false, None, ctx)
         });
+
+        // 首次加载只同步渲染前 `SIDE_BY_SIDE_HEAD_PRELOAD_ROWS` 行(含其间已覆盖
+        // 的 spacer):两列首屏立即完整且对称,锚行跳转(若 ≤ 预算行)当帧可解析;
+        // 其余内容与 spacer 按帧 300 行/列同步排空(见 try_layout_pending_edits)——
+        // 两列同帧同进度,任意时刻树行数一致,滚动即对齐。
+        //
+        // 滚动钳制上限统一固定为理论总高:总行数 = max(旧行数, 新行数)(spacer
+        // 把短板补齐到长板),两列 clamp 上限相等且不随排空进度变化 —— 绝对拷贝
+        // 的 scroll_top 永不被「各自当前树高」截断,也消除了「卡树尾」后等树长
+        // 才恢复的错位。
+        let total_rows = old_content.lines().count().max(new_content.lines().count());
+        for column in [&baseline_local, &modified_local] {
+            let model_handle = column.as_ref(ctx).editor().as_ref(ctx).model.clone();
+            model_handle.update(ctx, |model, ctx| {
+                let head_start = std::time::Instant::now();
+                model.preload_side_by_side_head(SIDE_BY_SIDE_HEAD_PRELOAD_ROWS, ctx);
+                let head_elapsed = head_start.elapsed();
+                if head_elapsed.as_micros() > 200 {
+                    log::debug!("[perf] sbs head preload took {:?}", head_elapsed);
+                }
+                let line_h = model.line_height(ctx);
+                model.render_state().update(ctx, |render_state, _| {
+                    render_state.set_scroll_clamp_height(Pixels::new(
+                        total_rows as f32 * line_h,
+                    ));
+                });
+            });
+        }
+
+        // 打开时的对齐初始跳转:两列以同一锚行(hunk 0 起始行的前一行,其上两列
+        // 均无 spacer)+ 同一上下文偏移滚动,scroll_top 恒等,打开即对齐并跳到
+        // 首个 hunk。创建时树还是空的(懒布局逐帧排空),立即解析必被钳制到 0,
+        // 因此挂起,等布局覆盖锚行后由 subscribe_scroll_sync 的 LayoutInvalidated
+        // 分支落位。
+        let pending_anchor_row: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        if let Some(anchor_row) = first_hunk_anchor_row {
+            pending_anchor_row.set(Some(anchor_row));
+        }
 
         // Associate the editable (right/modified) column with the on-disk file so it can
         // save and report unsaved-changes state, mirroring the single-column path. The
@@ -6832,8 +7008,7 @@ impl CodeReviewView {
             baseline_editor: baseline_local,
             modified_editor: modified_local,
             syncing: Rc::new(Cell::new(false)),
-            last_sync_time: Arc::new(AtomicI64::new(0)),
-            last_sync_time_reverse: Arc::new(AtomicI64::new(0)),
+            pending_anchor_row,
         })
     }
 

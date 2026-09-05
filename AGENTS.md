@@ -339,6 +339,41 @@ app/  (主二进制:装配、入口、平台粘合、持久化迁移、UI 视图
 - 大任务拆分为**写入域不重叠**的子任务并行下发;信息收集类任务可以并行。
 - 简单任务直接做,不要过度拆分。
 
+### 5.9 构建与打包流程（强制执行！）
+
+> **⚠️ 警告：每次构建都必须严格遵循 `docs/build-and-bundle.md`！不遵守将导致签名失效、图标缺失等问题。**
+
+#### 快速构建（debug 运行）
+```bash
+cargo run --bin zap-oss
+```
+
+#### 发布版打包（一键完成）
+```bash
+./script/macos/bundle --channel oss --selfsign --nouniversal --arch aarch64
+```
+
+#### 前置依赖（构建前必须确认已安装）
+```bash
+# 必须带 --features cli，否则 cargo-about 0.9+ 不会安装二进制
+cargo install cargo-about --features cli
+# DMG 打包必需
+brew install create-dmg
+```
+
+#### 签名验证（打包后必须执行）
+```bash
+# 检查签名（正常应输出 Signature size=xxxx，不是 adhoc）
+codesign -dv target/release-lto/bundle/osx/Zap.app
+# 校验签名完整
+codesign --verify --deep --strict target/release-lto/bundle/osx/Zap.app
+```
+
+#### 绝对禁止
+- **禁止使用 `--skip-build`**：会导致图标缺失和路径错位
+- 禁止用其他打包命令替代 `script/macos/bundle`
+- 禁止跳过签名验证
+
 ---
 
 ## 6. 常用入口速查
