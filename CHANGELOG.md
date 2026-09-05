@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- **上游同步（2026-09-06）**:两个上游开放 PR 批次拣入 14 项——warp 上游:CoreText autorelease 排水(#15746)、bash 首个 precmd 丢失死锁(#15652)、终端 resize 每行深拷贝(#15751)、macOS History/Up 菜单 Circular update 崩溃(#15719)、APFS case-only rename 文件树残留(#15699)、AppContext 订阅泄漏(#15764)、连续 ViewNotification 去重(#15741)、EditDelta precise_deltas Arc 化(#15810)、Code editor 文件读 100MiB 守卫(#15835)、编辑器文本绕过 LayoutCache(#15831);zerx 上游:BYOP 模型名 `-max` 后缀被剥修复(#338)、硬编码中文接入 Fluent(#339,新增 91 key)
+
 - **AI / BYOP**:port opencode `applyCaching`,启用 prompt caching;`write_to_long_running_shell_command` 在 line 模式下拒绝嵌入 LF;BYOP LRC monitor fallback 改走 silent subtask;`cancel_execution` 50ms 窗口内 sender 泄漏修复(#134 follow-up,#137)
 - **对话历史**:对话列表面板新增多选批量删除(选择 → 勾选 → 删除选中 N)与"删除全部"功能;进行中/ambient 对话受保护不可删;确认弹窗接入 en/ja/zh-CN 多语言
 - **CLI agent rich input**:↑ 历史菜单读取 omp 当前会话的用户消息(仅 omp agent;有消息时只显示 omp 消息,新会话为空,非 omp 回退命令历史;Zap 不持久化,按需读 `~/.omp/agent/` 磁盘记录);输入 `/` 优先级最高,其它菜单打开时自动关闭并打开 slash 命令菜单

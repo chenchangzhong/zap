@@ -115,7 +115,7 @@ app/  (主二进制:装配、入口、平台粘合、持久化迁移、UI 视图
 
 | Crate | 职责 |
 |-------|------|
-| `persistence` | Diesel + SQLite 持久层基础;**migrations 在 `app/migrations/`,schema 在 `app/src/persistence/schema.rs`** |
+| `persistence` | Diesel + SQLite 持久层基础;**migrations 在 `crates/persistence/migrations/`,schema 在 `app/src/persistence/schema.rs`** |
 | `warp_files` | Drive 文件、Workflow、Notebook 等可同步文件对象 |
 | `virtual_fs` | 抽象文件系统(测试用 mock 与生产用真实 FS 同接口) |
 | `repo_metadata` | 仓库元数据:文件树构建、`.gitignore` 处理、文件系统监听 |
@@ -227,7 +227,7 @@ app/  (主二进制:装配、入口、平台粘合、持久化迁移、UI 视图
 
 ### 4.9 持久化
 - `persistence/` (9) — Diesel migrations 装配、`schema.rs`(由 Diesel 生成)、迁移运行器。
-- 迁移文件在仓库 `migrations/` 顶级目录(由 Diesel CLI 管理)。
+- 迁移文件在 `crates/persistence/migrations/`(由 Diesel CLI 管理)。
 
 ### 4.10 平台 / 系统集成
 - `platform/` (2), `system/` (3) / `system.rs`
@@ -292,7 +292,7 @@ app/  (主二进制:装配、入口、平台粘合、持久化迁移、UI 视图
 
 ### 5.5 数据库
 - ORM:Diesel + SQLite。
-- 新增/改 schema 必须走 migration:在 `migrations/` 加新目录(`up.sql` / `down.sql`),不要手改 `app/src/persistence/schema.rs`(由 `diesel print-schema` 生成)。
+- 新增/改 schema 必须走 migration:在 `crates/persistence/migrations/` 加新目录(`up.sql` / `down.sql`),不要手改 `app/src/persistence/schema.rs`(由 `diesel print-schema` 生成)。
 
 ### 5.6 测试
 - 用 `cargo nextest run --no-fail-fast --workspace --exclude command-signatures-v2`。

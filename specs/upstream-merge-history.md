@@ -1837,5 +1837,68 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 
 ---
 
-*文档版本:v2.10*
+## 34. 2026-09 批次拣入（2026-09-06）：两上游开放 PR 逐个评估后 14 项落地
+
+> 触发：用户要求评估两个上游（直接父仓库 `zerx-lab/zap`、根上游 `warpdotdev/warp`）的开放 PR。
+> 评估记录见 `specs/upstream-merge-plan-2026-09.md`；执行在独立 worktree
+> `.worktrees/upstream-sync-2026-09`（分支同名）完成，每 PR 一个 commit。
+
+### 34.1 来自 warpdotdev/warp（10 个 PR）
+
+| PR | 内容 | 关键适配/偏差 |
+|----|------|--------------|
+| #15746 | CoreText autorelease 排水（APP-5744） | 直拣；与 12e455c56 同文件不重叠 |
+| #15652 | line editor 首个 precmd 丢失 | 直拣；实为 bash 终端永久死锁（Enter 无响应）修复 |
+| #15751 | 终端 resize 每行深拷贝（APP-5749） | 直拣 + 冲突解决时误带上游其他提交的 hyperlink 测试（本地无 HyperlinkRegistry），删除（独立 commit `c53d60a52`） |
+| #15719 [draft] | macOS History/Up 菜单 Circular view update 崩溃 | 上游 3 提交为中间态重构（含本地不存在的 auth-secret-ftux），按 §18.1 取净 diff 手工移植；测试落本地 input_test.rs；assert_eventually 本地已有；test_page_up_and_down 断言按上游拆出 update 块 |
+| #15699 [draft] | APFS case-only rename 文件树残留 | 直拣 + 冲突块混入未移植的 ensure_watchable_path，剔除；lib_tests.rs 仅留 case-only 测试；本地按惯例补 mod tests 声明 |
+| #15764 | AppContext 订阅泄漏（APP-5762） | 手工落（行号偏移）；含 drop mid-emit 断言测试；测试落本地 mod_test.rs |
+| #15741 | 连续 ViewNotification 去重（APP-5741） | 手工移植；enqueue_effect 超大队列告警以进程内单次 log::warn 替代 warp_errors OncePerRun；let-chain 改嵌套 if（2021 edition）；弃同主题 draft #15739 |
+| #15810 | EditDelta.precise_deltas Arc 化（APP-5810） | cherry-pick + 补本地 edit.rs/core.rs 的 `use std::sync::Arc`（上游因 APP-4844 已有）；测试文件名 buffer_test.rs 靠 git 重命名检测自动映射；上游 APP-4844 测试未带 |
+| #15835 | Code editor 文件读 100MiB 守卫 | 混合：warp_files 守卫 + code/view.rs 融合（保留 Zap 关闭失败 tab 定制；TooLarge 显示 file_load_error_message 详情，其余保持 Zap i18n toast）；**code_review 侧本地 API 保留**（editor_state 增 load_error 跟踪但不改 is_loaded/set_loaded 结构）；上游 lib_tests.rs 可编译，保留（30 测试过） |
+| #15831 | 编辑器文本绕过 LayoutCache（APP-5825） | 拣 3/8 提交（跳过 4 个 Criterion bench + 1 测试提交）；本地已有 for_render_state/uncached 函数（早期同步），主路径 layout_text 切换至 uncached；上游 layout_text_uncached 的 truncate_text_for_layout/clamp_style_runs_for_layout 属其他未同步 PR，未带；element 文件仅 ctx→_ctx |
+
+### 34.2 来自 zerx-lab/zap（2 个 PR + 2 个确认已有）
+
+| PR | 内容 | 结论 |
+|----|------|------|
+| #338 | BYOP 模型名 `-max` 后缀被剥 | 直拣（rust-genai adapter_shared.rs 零偏离）。**其 crate 单测因独立解析依赖不可运行（patch 依赖），生产代码经 cargo check 验证** |
+| #339 | 硬编码中文接入 Fluent（拆 2 commit） | 26+5 个干净文件直拣；en/zh-CN 各 +91 key（73+18）；跳过 tools/*.rs（本地已英文化）、ja（本地无日语）、autoupdate/linux.rs（非 macOS，曾误入已剔除）；workspace/view.rs 日志导出段自动合并落地 |
+| #331 | kitty graphics 协议补全 | 本地已是超集，不动 |
+| #322 | CLI agent 浮窗尺寸记忆 | 本地已有等效（含迁移），不动 |
+
+### 34.3 明确跳过（评估证据见 plan 文档）
+
+- 依赖已删/不适用：#15825、#15803、#15801、#15829、#15796、#15820、#15834
+- 前置链缺失：#15797、#15818、#15817、#15713
+- 高成本缓议：#15800、#15793、#15733、zerx #321（其中 4e4ff90d9 关机持久化活动 block 值得单独重做）
+- 等转正：#15802（转正后高优先）、#15830、#15785、#15742、#15777、#15828、#15833、#15765
+- 可选未排期：#340 俄语、#15665 Hermes 门禁、#15683、#15716、#15687、#15682、#15748
+
+### 34.4 发现的文档过时事实（本轮顺带修正）
+
+1. 本地 i18n 实为 en/zh-CN，日语已移除（README「三语」表述过时）
+2. 迁移实际在 `crates/persistence/migrations/`，AGENTS.md 写顶级 `migrations/` 已过时
+
+### 34.5 验证状态
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp` | 0 error，27 warnings 与基线一致 |
+| `cargo test -p warpui text_layout` | 33/33 |
+| `cargo test -p watcher` | 3/3 |
+| `cargo test -p warp_terminal -- flat_storage row_iterator` | 33/33 |
+| `cargo test -p warp --lib`（input/paints_glyph/file_load_error） | 5/5 |
+| `cargo test -p warpui_core`（订阅/notify 新测试） | 6/6 |
+| `cargo test -p warp_files` | 30/30 |
+| `cargo test -p warp_editor` | 410 过 / 9 失败 = **基线（拣入前临时 worktree）完全相同的既存并行干扰集** |
+| 品牌/空行扫描 | 干净 |
+
+### 34.6 流程记录
+
+- 执行前 `cargo clean` 释放 101G（主仓 target 78G + dsh-plugin 23G）；磁盘门禁（<10G 先清理）全程未触发（最低 86G）
+- 本轮教训：`rg -rn` 中 `-r` 是 replace 而非 recursive，曾污染查重输出（本次靠复核纠正）；cherry-pick 冲突解决用 `git add -A` 前必须确认无残留冲突标记（本轮回滚过一次带标记的提交）
+- 上游 factory PR 常把「功能重构 + 基建重构」揉在同一提交：#15719（auth-secret-ftux）、#15835（code_review LocalOrRemotePath 体系）均按「取净效果、适配本地」处理，中间态一律不拣
+
+*文档版本:v2.11*
 *下次合并前必读*
