@@ -38,7 +38,7 @@ use std::{
     pin::pin,
     rc::{self, Rc},
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, OnceLock,
     },
 };
@@ -3202,6 +3202,27 @@ impl AppContext {
             });
             !observers.is_empty()
         });
+    }
+
+    const UNUSUALLY_LARGE_PENDING_EFFECTS: usize = 10_000;
+
+    pub(super) fn enqueue_effect(&mut self, effect: Effect) {
+        self.pending_effects.push_back(effect);
+        self.report_if_pending_effects_unusually_large();
+    }
+
+    fn report_if_pending_effects_unusually_large(&self) {
+        static REPORTED_UNUSUALLY_LARGE: AtomicBool = AtomicBool::new(false);
+        if self.is_unit_test || self.pending_effects.len() < Self::UNUSUALLY_LARGE_PENDING_EFFECTS {
+            return;
+        }
+        // 上游用 warp_errors 的 OncePerRun 上报；本地无该链，退化为进程内单次 log。
+        if !REPORTED_UNUSUALLY_LARGE.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "pending_effects queue is unusually large: {}",
+                self.pending_effects.len()
+            );
+        }
     }
 
     fn flush_effects(&mut self) {
