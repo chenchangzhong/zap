@@ -2,15 +2,18 @@
 
 #[cfg(test)]
 use markdown_parser::FormattedTextInline;
-use warpui_core::AppContext;
-use warpui_core::color::ColorU;
-use warpui_core::fonts::TextLayoutSystem;
+use std::ops::Range;
+use std::sync::Arc;
+
+use crate::content::text::{BufferBlockStyle, TextStylesWithMetadata};
+use warpui::fonts::TextLayoutSystem;
 #[cfg(test)]
-use warpui_core::fonts::{Style, Weight};
-use warpui_core::text_layout::{
+use warpui::fonts::{Style, Weight};
+use warpui::text_layout::{
     ClipConfig, Line, StyleAndFont, TextAlignment, TextBorder, TextFrame, TextStyle,
 };
-use warpui_core::units::{IntoPixels, Pixels};
+use warpui::units::{IntoPixels, Pixels};
+use warpui::{AppContext, color::ColorU};
 
 use super::model::{BlockSpacing, ParagraphStyles, RenderState, RichTextStyles};
 
