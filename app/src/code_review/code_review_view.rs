@@ -185,6 +185,7 @@ use super::{
     git_dialog::{GitDialog, GitDialogEvent, GitDialogKind},
     GlobalCodeReviewEvent, GlobalCodeReviewModel,
 };
+use crate::code::file_load_error_message;
 use crate::code::ShowCommentEditorProvider;
 use crate::code_review::comments::CommentId;
 use crate::ui_components::render_file_search_row::{render_file_search_row, FileSearchRowOptions};
@@ -3438,7 +3439,7 @@ impl CodeReviewView {
             .file_states
             .values()
             .filter_map(|file_state| file_state.editor_state.as_ref())
-            .all(|editor_state| editor_state.load_finished())
+            .all(|editor_state| editor_state.is_loaded())
     }
 
     fn apply_diff_to_code_editor(

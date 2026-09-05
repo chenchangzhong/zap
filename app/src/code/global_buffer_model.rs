@@ -18,7 +18,6 @@ use super::buffer_location::{BufferLocation, SyncClock};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "local_fs")] {
-        use lsp::LspManagerModelEvent;
         use warp_files::{FileModelEvent, FileModel, MAX_LOADABLE_FILE_SIZE_BYTES};
         use warp_editor::content::text::IndentBehavior;
         use warp_editor::content::text::IndentUnit;
@@ -604,6 +603,20 @@ impl GlobalBufferModel {
                 base_version,
                 new_version,
             } => {
+                if self.buffers.get(id).is_some_and(|state| !state.is_loaded()) {
+                    if let Some(state) = self.buffers.get_mut(id) {
+                        state.set_base_content_version(*new_version);
+                    }
+                    self.populate_buffer_with_read_content(
+                        *id,
+                        content,
+                        *base_version,
+                        *new_version,
+                        true,
+                        ctx,
+                    );
+                    return;
+                }
                 if let Some(buffer) = self.buffer_handle_for_id(*id, ctx) {
                     if buffer.as_ref(ctx).version_match(base_version) {
                         self.populate_buffer_with_read_content(

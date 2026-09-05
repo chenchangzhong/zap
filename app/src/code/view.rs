@@ -2,7 +2,7 @@ use crate::code::editor::scroll::ScrollPosition;
 use crate::code::editor::view::CodeEditorRenderOptions;
 use crate::code::editor_management::CodeEditorStatus;
 use crate::code::global_buffer_model::GlobalBufferModel;
-use crate::code::{ImmediateSaveError, SaveOutcome, SaveStatus};
+use crate::code::{ImmediateSaveError, SaveOutcome, SaveStatus, file_load_error_message};
 use crate::editor::InteractionState;
 use crate::input::Vector2F;
 use crate::pane_group::focus_state::PaneFocusHandle;

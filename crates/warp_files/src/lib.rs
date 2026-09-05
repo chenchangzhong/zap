@@ -19,7 +19,7 @@ use remote_server::manager::RemoteServerManager;
 use warp_core::HostId;
 use warp_util::standardized_path::StandardizedPath;
 
-use futures::io::{AsyncBufReadExt, BufReader};
+use futures::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use futures::StreamExt;
 
 use async_channel::Sender;
@@ -447,6 +447,21 @@ impl FileModel {
                     });
                 }
                 Err(err) => {
+                    // 超大文件也补上版本号并注册 watcher：否则 version 留空，
+                    // 后续 repo reload 的 expect() 会 panic，且文件缩小后无法恢复。
+                    if matches!(&err, FileLoadError::TooLarge { .. }) {
+                        let version = ContentVersion::new();
+                        me.set_version(file_id, version);
+                        if use_individual_watcher {
+                            me.watcher.update(ctx, |watcher, _ctx| {
+                                std::mem::drop(watcher.register_path(
+                                    &file_path_clone,
+                                    WatchFilter::accept_all(),
+                                    RecursiveMode::Recursive,
+                                ));
+                            });
+                        }
+                    }
                     ctx.emit(FileModelEvent::FailedToLoad {
                         id: file_id,
                         error: Rc::new(err),
