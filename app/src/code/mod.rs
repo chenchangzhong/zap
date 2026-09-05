@@ -157,7 +157,3 @@ impl DropTargetData for EditorTabBarDropTargetData {
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "mod_tests.rs"]
-mod tests;
