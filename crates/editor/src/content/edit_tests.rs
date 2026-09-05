@@ -224,8 +224,6 @@ fn test_text_around_link_not_auto_highlighted() {
 fn test_layout_partial_url() {
     // Regression test for laying out a partially-styled autodetected URL (CLD-871).
     App::test((), |app| async move {
-        let layout_cache = LayoutCache::new();
-
         let runs = vec![
             StyledBufferRun {
                 run: "A link: https://www.".to_string(),
@@ -246,7 +244,6 @@ fn test_layout_partial_url() {
 
         app.read(|ctx| {
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -313,13 +310,8 @@ fn test_layout_mermaid_block_uses_loaded_svg_aspect_ratio() {
         }
 
         app.read(|ctx| {
-            let layout_cache = LayoutCache::new();
-            let text_layout = TextLayout::new(
-                &layout_cache,
-                ctx.font_cache().text_layout_system(),
-                &TEST_STYLES,
-                800.,
-            );
+            let text_layout =
+                TextLayout::new(ctx.font_cache().text_layout_system(), &TEST_STYLES, 800.);
             let block_style = BufferBlockStyle::CodeBlock {
                 code_block_type: CodeBlockType::Mermaid,
             };
@@ -404,9 +396,7 @@ fn test_layout_text_block_uses_rich_table_when_flag_enabled() {
     App::test((), |app| async move {
         app.read(|ctx| {
             let _flag = FeatureFlag::MarkdownTables.override_enabled(true);
-            let layout_cache = LayoutCache::new();
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -437,9 +427,7 @@ fn test_layout_text_block_uses_plain_text_when_flag_disabled() {
     App::test((), |app| async move {
         app.read(|ctx| {
             let _flag = FeatureFlag::MarkdownTables.override_enabled(false);
-            let layout_cache = LayoutCache::new();
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -468,9 +456,7 @@ fn test_layout_text_block_uses_plain_text_when_flag_disabled() {
 fn test_layout_table_block_caches_cell_text_frames() {
     App::test((), |app| async move {
         app.read(|ctx| {
-            let layout_cache = LayoutCache::new();
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -517,9 +503,7 @@ fn test_layout_table_block_caches_cell_text_frames() {
 fn test_layout_table_block_clamps_cell_width_to_max() {
     App::test((), |app| async move {
         app.read(|ctx| {
-            let layout_cache = LayoutCache::new();
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -577,10 +561,8 @@ fn test_layout_table_block_clamps_cell_width_to_max() {
 #[test]
 fn test_table_inline_style_runs_apply_header_bold_default() {
     App::test((), |app| async move {
-        let layout_cache = LayoutCache::new();
         app.read(|ctx| {
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -615,10 +597,8 @@ fn test_table_inline_style_runs_apply_header_bold_default() {
 #[test]
 fn test_table_inline_style_runs_preserve_markdown_cell_styles() {
     App::test((), |app| async move {
-        let layout_cache = LayoutCache::new();
         app.read(|ctx| {
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -696,9 +676,7 @@ fn test_layout_code_block_urls() {
         ];
 
         app.read(|ctx| {
-            let layout_cache = LayoutCache::new();
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,

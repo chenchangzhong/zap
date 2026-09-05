@@ -47,15 +47,13 @@ impl RenderableBlock for RenderableParagraph {
     fn layout(
         &mut self,
         model: &RenderState,
-        ctx: &mut warpui::LayoutContext,
+        _ctx: &mut warpui::LayoutContext,
         app: &warpui::AppContext,
     ) {
         self.placeholder
-            .layout(&self.viewport_item, model, ctx, app, |_| {
-                placeholder::Options {
-                    text: paragraph_placeholder_text(model.selections().len() == 1),
-                    block_style: BufferBlockStyle::PlainText,
-                }
+            .layout(&self.viewport_item, model, app, |_| placeholder::Options {
+                text: paragraph_placeholder_text(model.selections().len() == 1),
+                block_style: BufferBlockStyle::PlainText,
             });
     }
 
