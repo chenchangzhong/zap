@@ -10,6 +10,8 @@
 // - 项目切换时,经 webview IPC 发 `zap.switch_project`,让 Zap 跟随
 // - 订阅 sessions 快照,检测会话终态(完成/需确认),经 webview IPC 发 `zap.notify`
 // - 为侧边栏每个项目行注入"打开文件浏览器"按钮(hover 显示,右侧第一位)
+// - 暴露 `window.__zapInsertFileReference`:「附加为上下文」末端,把文件路径以 dsh `@`
+//   引用芯片(ReferenceChipNode)形态插入当前会话输入框(Rust 侧 evaluate_script 调用)
 //
 // 通信方式:webview IPC(webkit.messageHandlers.ipc.postMessage)。
 // 不再使用 WebSocket 桥(端口每次启动随机分配导致连接不稳定)。
@@ -286,6 +288,78 @@ window.__ModuleLoader__.load({
 			});
 		}
 
+		// 「附加为上下文」末端:把文件路径以 dsh `@` 引用芯片插入当前会话输入框。
+		// 契约:函数存在且返回 true ⇒ 芯片已插入/重试中;返回 false ⇒ 调用方回退纯文本注入。
+		// 依据 specs/dsh-file-context-insert/PLAN-file-reference-chip.md(dsh 0.1.2-rc.1)。
+		function installFileReferenceInjection(rootCtx, sessions) {
+			if (window.__zapInsertFileReference) return;
+			// dsh-file-reference formatFileMention 的等价移植:
+			// 含引号/控制字符 → 无法表示;含空白 → @"path";否则 @path。
+			function mentionFor(clean, isDir) {
+				const path = isDir ? clean + "/" : clean;
+				if (/[\u0000-\u001f\u007f-\u009f"]/.test(path)) return null;
+				if (!/\s/.test(path)) return "@" + path;
+				return isDir ? '@"' + path : '@"' + path + '"';
+			}
+			// @ 引用的规范形态是 workspace-root 相对(dsh FILE_REFERENCE_PROMPT);
+			// 文件不在会话 cwd 下时保留绝对路径(模型仍可 read)。
+			function relativeUnder(dir, fullPath) {
+				if (!dir) return undefined;
+				const norm = (s) => String(s).replace(/\\/g, "/").replace(/\/+$/, "");
+				const d = norm(dir);
+				const f = norm(fullPath);
+				return f === d ? undefined : (f.startsWith(d + "/") ? f.slice(d.length + 1) : undefined);
+			}
+			window.__zapInsertFileReference = function (fullPath, isDir) {
+				try {
+					const snap = sessions.list.getSnapshot();
+					if (snap.phase !== "ready" || !snap.current) return false;
+					const sessionId = snap.current;
+					const conversation = rootCtx.get("conversation");
+					const input = conversation && conversation.input;
+					if (!input) return false;
+					const shell = input.shell(sessionId); // binding 缺失时 throw → 落入 catch
+					const cwd = snap.byId[sessionId] && snap.byId[sessionId].cwd;
+					const clean = relativeUnder(cwd, fullPath) || String(fullPath).replace(/[\\/]+$/, "");
+					const mention = mentionFor(clean, isDir === true);
+					if (!mention) return false;
+					const label = (clean.split(/[\\/]/).pop() || clean) + (isDir === true ? "/" : "");
+					const reference = {
+						source: "reference",
+						ref: mention,
+						label: label,
+						appearance: isDir === true ? "folder" : "file",
+						clipboardText: mention
+					};
+					// insertReference 要求 phase ∈ {plain, claimed} 且 span.draftRev === shell.rev;
+					// span 必须是 detect 坐标(caretSpan 产物),不能拿 compose().draft(clipboard 坐标)当 span。
+					// 返回 false ⇒ 提交窗口期(phase busy),逐帧重试;耗尽仅告警,本次放弃。
+					let tries = 0;
+					const attempt = () => {
+						try {
+							const st = shell.compose();
+							const caret = shell.caretSpan();
+							const span = { start: caret.start, end: caret.end, draftRev: st.draftRev };
+							if (shell.insertReference(reference, span)) return true;
+						} catch (err) {
+							console.error("[zap-bridge-client] insertFileReference failed:", err);
+							return false;
+						}
+						if (++tries > 8) {
+							console.warn("[zap-bridge-client] insertFileReference: composer busy, giving up");
+							return false;
+						}
+						requestAnimationFrame(attempt);
+						return true; // 重试中:对外仍视为已受理,不触发 Rust 回退
+					};
+					return attempt();
+				} catch (err) {
+					console.error("[zap-bridge-client] insertFileReference failed:", err);
+					return false;
+				}
+			};
+		}
+
 		function apply(ctx) {
 			// 非 Zap 环境:不注册任何能力,直接退出。
 			if (!window.__ZAP_BRIDGE__) {
@@ -299,6 +373,8 @@ window.__ModuleLoader__.load({
 			}
 			sessionsRef = sessions;
 			workspacesRef = workspaces;
+			// 「附加为上下文」末端:暴露结构化 @ 引用芯片插入,供 Rust 侧 evaluate_script 调用。
+			installFileReferenceInjection(ctx, sessions);
 
 			const unsubSessions = sessions.list.subscribe(reportCurrentPath);
 			const unsubWorkspaces = workspaces.list.subscribe(reportCurrentPath);
@@ -320,6 +396,7 @@ window.__ModuleLoader__.load({
 					observer.disconnect();
 					document.querySelectorAll('[data-zap-file-explorer]').forEach(el => el.remove());
 					delete window.__onZapResponse;
+					delete window.__zapInsertFileReference;
 				};
 			});
 		}

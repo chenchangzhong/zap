@@ -7284,11 +7284,18 @@ impl Workspace {
             return;
         };
 
-        // JS 策略（按优先级）: textarea → contenteditable → ProseMirror/CodeMirror
+        // 优先走插件的芯片插入(zap-bridge-client 暴露的 __zapInsertFileReference,以 dsh
+        // @ 引用芯片形态落进输入框);返回 false(插件未就绪/路径不可表示)时回退纯文本注入。
+        let is_dir = path.is_dir();
         let js = format!(
             r#"
             (function() {{
-                var text = {escaped};
+                var p = {escaped};
+                var isDir = {is_dir};
+                if (window.__zapInsertFileReference && window.__zapInsertFileReference(p, isDir)) {{
+                    return;
+                }}
+                // 回退:插件能力未就绪时,插入 @路径 纯文本(textarea → contenteditable 兜底)
                 var el = document.querySelector('textarea[data-testid="dsh-input"]')
                          || document.querySelector('textarea[placeholder]')
                          || document.querySelector('div[contenteditable="true"][role="textbox"]')
@@ -7299,11 +7306,11 @@ impl Workspace {
                     el.focus();
                     var start = el.selectionStart || el.value.length;
                     var end = el.selectionEnd || el.value.length;
-                    el.setRangeText(text, start, end, 'end');
+                    el.setRangeText('@' + p, start, end, 'end');
                     el.dispatchEvent(new InputEvent('input', {{ bubbles: true, cancelable: true }}));
                 }} else {{
                     el.focus();
-                    document.execCommand('insertText', false, text);
+                    document.execCommand('insertText', false, '@' + p);
                 }}
             }})()
             "#
