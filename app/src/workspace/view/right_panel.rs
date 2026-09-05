@@ -1184,6 +1184,16 @@ impl RightPanelView {
             );
         });
 
+        // 面板已处于最大化时才创建的 code review 视图(应用重启恢复、切换 repo 等),
+        // 错过了之前的 set_maximized 同步(那时视图尚不存在),diff_layout 会停留在默认
+        // Inline,表现为"面板全屏但 diff 单列"。这里对新视图补齐最大化状态:
+        // 打开文件侧栏 + 切到 SideBySide;diffs 加载后会自动补建双列 editor pair。
+        if self.is_maximized(ctx) {
+            code_review_view.update(ctx, |view, ctx| {
+                view.handle_maximization_toggle(true, ctx);
+            });
+        }
+
         ctx.subscribe_to_model(&diff_state_model, |_me, _, _event, ctx| {
             ctx.notify();
         });
