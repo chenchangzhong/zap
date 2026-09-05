@@ -3438,7 +3438,7 @@ impl CodeReviewView {
             .file_states
             .values()
             .filter_map(|file_state| file_state.editor_state.as_ref())
-            .all(|editor_state| editor_state.is_loaded())
+            .all(|editor_state| editor_state.load_finished())
     }
 
     fn apply_diff_to_code_editor(
@@ -5303,6 +5303,22 @@ impl CodeReviewView {
             return Self::styled_file_content_container(
                 Text::new(
                     "Diff is too large to render",
+                    appearance.monospace_font_family(),
+                    appearance.monospace_font_size(),
+                )
+                .with_color(remove_color(appearance))
+                .finish(),
+                theme,
+            );
+        }
+        if let Some(error) = file
+            .editor_state
+            .as_ref()
+            .and_then(CodeReviewEditorState::load_error)
+        {
+            return Self::styled_file_content_container(
+                Text::new(
+                    file_load_error_message(error),
                     appearance.monospace_font_family(),
                     appearance.monospace_font_size(),
                 )

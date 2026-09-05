@@ -2,7 +2,7 @@ use pathfinder_geometry::rect::RectF;
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::AddAssign;
-use warp_util::file::FileSaveError;
+use warp_util::file::{FileLoadError, FileSaveError};
 use warpui::elements::DropTargetData;
 use warpui::AppContext;
 
@@ -25,6 +25,42 @@ pub enum ImmediateSaveError {
     FailedToSave(#[from] FileSaveError),
     #[error("There is no file tab currently selected")]
     NoActiveFileTab,
+}
+
+pub(crate) fn file_load_error_message(error: &FileLoadError) -> String {
+    match error {
+        FileLoadError::TooLarge {
+            size_estimate,
+            limit_bytes,
+        } => {
+            let limit = format_file_size(*limit_bytes);
+            match size_estimate {
+                Some(size) => format!(
+                    "File is larger than the {limit} limit (reported size ~{}).",
+                    format_file_size(*size)
+                ),
+                None => format!("File is larger than the {limit} limit."),
+            }
+        }
+        FileLoadError::DoesNotExist | FileLoadError::IOError(_) => {
+            "Failed to load file.".to_string()
+        }
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{bytes} {}", UNITS[unit_index])
+    } else {
+        format!("{size:.1} {}", UNITS[unit_index])
+    }
 }
 
 /// Trait to determine whether we should show the comment editor based on state held
@@ -117,3 +153,11 @@ impl DropTargetData for EditorTabBarDropTargetData {
         self
     }
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

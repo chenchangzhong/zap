@@ -31,6 +31,7 @@ use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::icons::ICON_DIMENSIONS;
 use warp_editor::render::element::VerticalExpansionBehavior;
+use warp_util::file::FileLoadError;
 use warp_util::path::LineAndColumnArg;
 use warpui::elements::Rect;
 use warpui::fonts::Style;
@@ -708,7 +709,7 @@ impl CodeView {
                     return;
                 }
                 log::warn!("Failed to load file. {err:?}");
-                CodeView::display_load_failure(ctx.window_id(), ctx);
+                CodeView::display_load_failure(ctx.window_id(), err, ctx);
                 // 加载失败后,关闭这个出错的文件 tab —— 避免留下一个无法加载的空 pane/tab。
                 // 通过事件发出者(LocalCodeEditorView 句柄)定位是哪个 tab 失败,
                 // 复用用户手动关闭 tab 的路径 `remove_tab_data_index`:
@@ -1118,9 +1119,17 @@ impl CodeView {
         }
     }
 
-    fn display_load_failure(window_id: WindowId, ctx: &mut ViewContext<Self>) {
+    fn display_load_failure(
+        window_id: WindowId,
+        error: &FileLoadError,
+        ctx: &mut ViewContext<Self>,
+    ) {
         ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
-            let toast = DismissibleToast::error(crate::t!("code-failed-to-load-file-toast"))
+            let message = match error {
+                FileLoadError::TooLarge { .. } => file_load_error_message(error),
+                _ => crate::t!("code-failed-to-load-file-toast"),
+            };
+            let toast = DismissibleToast::error(message)
                 .with_object_id("failed_to_load_file".to_string());
             toast_stack.add_ephemeral_toast(toast, window_id, ctx);
         });
