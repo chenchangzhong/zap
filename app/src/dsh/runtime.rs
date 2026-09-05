@@ -574,6 +574,9 @@ impl DshRuntime {
         // patch 行 name 必须是包名:client-modules 用
         // `require.resolve('<name>/package.json')` 解析 client 声明,
         // 文件路径无法解析会导致 entry 静默不入表、客户端插件永不加载。
+        // 且包名须与 package.json 的 name 一致(client-modules 的
+        // nearestPackage 按请求 specifier 严格匹配 manifest name,不一致
+        // 同样静默不入表,如 name 写成无 scope 的 'zap-bridge-client')。
         const INSERT_ENTRY: &str =
             "- insert:\n    - id: zap-bridge-client\n      name: '@zap/zap-bridge-client'\n";
         let patch_path = patch_dir.join("cordis.patch.yml");
