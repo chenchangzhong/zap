@@ -50,10 +50,12 @@ window.__ModuleLoader__.load({
 		/// 供上报的 sessions/workspaces 引用(apply 时赋值)。
 		let sessionsRef = undefined;
 		let workspacesRef = undefined;
-		/// 终态去重:lastNotifiedKey = sessionId + ":" + status。
-		let lastNotifiedKeys = new Map();
 		/// 上一次 running 状态(检测 running:true -> false 边沿)。
 		let prevRunning = new Map();
+		/// 上一次 completed 状态(检测 completed:false -> true 边沿;undefined=未观察)。
+		let lastCompleted = new Map();
+		/// confirm 去重:同一会话同一文案仅提示一次。
+		let lastNotifiedKeys = new Map();
 
 		/// 发送 RPC 请求到 Zap(经 webview IPC)。
 		/// 返回 Promise,resolve 时携带 result。
@@ -145,7 +147,11 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		/// 检测会话终态并上报(去重:同一 session 同一 status 仅发一次)。
+		/// 检测会话终态并上报。
+		/// confirm:同一会话同一文案仅发一次(lastNotifiedKeys)。
+		/// complete:按 turn 触发——running true→false 边沿、completed false→true
+		/// 边沿、或首次观察到已完成(兜底补发,每会话一次)。旧逻辑按
+		/// sessionId+status 去重,同一会话第二次完成任务会被永久吞掉,已废弃。
 		function checkNotify() {
 			if (!sessionsRef) return;
 			const snap = sessionsRef.list.getSnapshot();
@@ -156,38 +162,37 @@ window.__ModuleLoader__.load({
 				if (!entry) continue;
 				if (entry.blank) {
 					prevRunning.set(sid, entry.running);
+					lastCompleted.set(sid, !!entry.completed);
 					continue;
 				}
-				let status;
-				let category;
-				if (entry.pendingInteraction) {
-					status = "confirm";
-					category = "confirm";
-				} else if (entry.completed) {
-					status = "complete";
-					category = "complete";
-				} else {
-					const prev = prevRunning.get(sid);
-					const curr = entry.running;
-					if (prev === true && curr === false) {
-						status = "complete";
-						category = "complete";
-					} else {
-						prevRunning.set(sid, curr);
-						continue;
-					}
-				}
+				const prevRun = prevRunning.get(sid);
+				const prevDone = lastCompleted.get(sid);
 				prevRunning.set(sid, entry.running);
-				const bodyText = entry.pendingInteraction ? pendingText(entry.pendingInteraction) : (entry.title ? "" : (entry.cwd || ""));
-				const key = status === "confirm" ? (sid + ":" + status + ":" + bodyText) : (sid + ":" + status);
-				if (lastNotifiedKeys.get(sid) === key) continue;
-				lastNotifiedKeys.set(sid, key);
-				const title = entry.title || cwdBasename(entry.cwd) || "DSH task";
-				reportNotify(title, bodyText, category);
+				lastCompleted.set(sid, !!entry.completed);
+
+				if (entry.pendingInteraction) {
+					const bodyText = pendingText(entry.pendingInteraction);
+					const key = sid + ":confirm:" + bodyText;
+					if (lastNotifiedKeys.get(sid) === key) continue;
+					lastNotifiedKeys.set(sid, key);
+					const title = entry.title || cwdBasename(entry.cwd) || "DSH task";
+					reportNotify(title, bodyText, "confirm");
+					continue;
+				}
+
+				const runningEdge = prevRun === true && entry.running === false;
+				const completedEdge = !!entry.completed && prevDone === false;
+				const catchUp = !!entry.completed && prevDone === undefined;
+				if (runningEdge || completedEdge || catchUp) {
+					const title = entry.title || cwdBasename(entry.cwd) || "DSH task";
+					const bodyText = entry.title ? "" : (entry.cwd || "");
+					reportNotify(title, bodyText, "complete");
+				}
 			}
 			for (const sid of [...prevRunning.keys()]) {
 				if (!byId[sid]) {
 					prevRunning.delete(sid);
+					lastCompleted.delete(sid);
 					lastNotifiedKeys.delete(sid);
 				}
 			}

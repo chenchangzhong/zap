@@ -2661,6 +2661,15 @@ impl Workspace {
                                     })
                                 })
                                 .unwrap_or_else(EntityId::new);
+                            // dsh pane 所在 tab 激活(用户正看着 dsh 页面)时,
+                            // 通知入列即标记已读,不弹应用内 toast,行为对齐
+                            // 终端 agent 通知的可见性判断。
+                            let dsh_pane_visible = me
+                                .active_tab_pane_group()
+                                .as_ref(ctx)
+                                .dsh_panes()
+                                .next()
+                                .is_some();
                             let added =
                                 NotificationsModel::handle(ctx).update(ctx, |model, ctx| {
                                     model.add_dsh_notification(
@@ -2668,6 +2677,7 @@ impl Workspace {
                                         body.clone(),
                                         *category,
                                         dsh_view_id,
+                                        dsh_pane_visible,
                                         ctx,
                                     )
                                 });
@@ -4962,6 +4972,35 @@ impl Workspace {
             let pane_group = pane_group_handle.as_ref(ctx);
             if let Some(pane_id) = pane_group.find_pane_id_for_terminal_view(terminal_view_id, ctx)
             {
+                self.focus_pane(
+                    PaneViewLocator {
+                        pane_group_id: pane_group_handle.id(),
+                        pane_id,
+                    },
+                    ctx,
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Searches this workspace's tabs for the dsh pane whose PaneId creation id
+    /// matches `view_id` and focuses it. Returns true if found and focused.
+    ///
+    /// dsh 通知(toast / mailbox)携带的是 dsh pane 的 creation_order_id,
+    /// `find_pane_id_for_terminal_view` 只匹配 TerminalPane,点击通知本会静默
+    /// 失效;这里兜底让点击 dsh 通知能切到对应 tab 并聚焦 dsh pane。
+    fn focus_dsh_pane_locally(&mut self, view_id: EntityId, ctx: &mut ViewContext<Self>) -> bool {
+        use crate::pane_group::pane::PaneContent;
+        for tab in self.tabs.iter() {
+            let pane_group_handle = &tab.pane_group;
+            let pane_id = pane_group_handle
+                .as_ref(ctx)
+                .dsh_panes()
+                .map(|dsh_pane| dsh_pane.id())
+                .find(|pane_id| pane_id.creation_order_id() == view_id);
+            if let Some(pane_id) = pane_id {
                 self.focus_pane(
                     PaneViewLocator {
                         pane_group_id: pane_group_handle.id(),
@@ -20652,7 +20691,9 @@ impl TypedActionView for Workspace {
                 ctx.notify();
             }
             FocusTerminalViewInWorkspace { terminal_view_id } => {
-                if !self.focus_terminal_view_locally(*terminal_view_id, ctx) {
+                if !self.focus_terminal_view_locally(*terminal_view_id, ctx)
+                    && !self.focus_dsh_pane_locally(*terminal_view_id, ctx)
+                {
                     self.focus_terminal_view_in_other_window(*terminal_view_id, ctx);
                 }
             }

@@ -420,12 +420,15 @@ impl NotificationsModel {
 
     /// 添加 DSH 插件通知(任务完成/出错/需确认)。
     /// 返回 false 表示通知被设置项拦截、未入列,调用方不应再发系统通知。
+    /// `is_visible`:用户当前可见 dsh pane(所在 tab 激活)时传 true,
+    /// 通知入列即标记已读、不弹应用内 toast,行为对齐终端 agent 通知。
     pub fn add_dsh_notification(
         &mut self,
         title: String,
         message: String,
         category: NotificationCategory,
         origin_id: EntityId,
+        is_visible: bool,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
         if !*AISettings::as_ref(ctx).show_agent_notifications {
@@ -438,7 +441,7 @@ impl NotificationsModel {
             category,
             NotificationSourceAgent::Dsh,
             NotificationOrigin::DshSession(origin_id),
-            false, // is_visible: 初始不可见，用户看到时标记已读
+            is_visible, // dsh pane 可见时直接视为已读,不再弹 toast
             origin_id,
             vec![], // artifacts: DSH 不是终端 agent，无此上下文
             None,   // branch: 同上
