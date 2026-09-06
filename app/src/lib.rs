@@ -2456,8 +2456,6 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::BlockToolbeltSaveAsWorkflow,
         // Zap Wave 7-2:`CloudEnvironments` FeatureFlag 随 cloud ambient agent 主体子系统
         // 物理删 —— `warp environment` 子命令 + `--environment` 参数同步下线。
-        #[cfg(all(feature = "simulate_github_unauthed", debug_assertions))]
-        FeatureFlag::SimulateGithubUnauthed,
         #[cfg(feature = "full_screen_zen_mode")]
         FeatureFlag::FullScreenZenMode,
         #[cfg(feature = "minimalist_ui")]
@@ -2552,8 +2550,6 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::AgentDecidesCommandExecution,
         #[cfg(feature = "context_line_review_comments")]
         FeatureFlag::ContextLineReviewComments,
-        #[cfg(feature = "nld_fasttext_model")]
-        FeatureFlag::NLDClassifierModelEnabled,
         #[cfg(feature = "fast_forward_autoexecute_button")]
         FeatureFlag::FastForwardAutoexecuteButton,
         #[cfg(feature = "code_find_replace")]

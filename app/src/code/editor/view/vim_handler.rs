@@ -434,7 +434,7 @@ impl VimHandler for CodeEditorView {
         &mut self,
         c: char,
         char_count: u32,
-        advance: bool,
+        _advance: bool,
         ctx: &mut ViewContext<Self>,
     ) {
         self.model.update(ctx, |model, ctx| {

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::OsString, path::PathBuf};
+use std::{collections::HashMap, ffi::OsString};
 
 use shell_words::quote as shell_quote;
 use uuid::Uuid;
@@ -6,7 +6,7 @@ use warp_cli::agent::Harness;
 
 use crate::ai::{
     agent_sdk::{driver::AgentDriverError, task_env_vars, validate_cli_installed},
-    ambient_agents::{task::HarnessConfig, AgentConfigSnapshot, AmbientAgentTaskId},
+    ambient_agents::{AgentConfigSnapshot, AmbientAgentTaskId},
 };
 use crate::terminal::cli_agent_sessions::plugin_manager::plugin_manager_for;
 use crate::terminal::shell::ShellType;
@@ -63,7 +63,6 @@ pub(super) async fn prepare_local_harness_child_launch(
     harness_type: String,
     parent_run_id: Option<String>,
     shell_type: Option<ShellType>,
-    startup_directory: Option<PathBuf>,
 ) -> Result<PreparedLocalHarnessLaunch, String> {
     let Some(harness) = normalize_local_child_harness(&harness_type) else {
         let harness_name = harness_type.trim();

@@ -727,7 +727,6 @@ impl View for QueuedPromptsPanelView {
             return Empty::new().finish();
         };
 
-        let appearance = Appearance::as_ref(app);
         let queue_model = QueuedQueryModel::as_ref(app);
         let queue: Vec<_> = queue_model.queue(conv_id).to_vec();
         let editing_row_id = queue_model.editing_row(conv_id);

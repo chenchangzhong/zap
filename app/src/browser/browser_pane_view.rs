@@ -12,7 +12,7 @@ use warpui::{
     },
     platform::Cursor,
     ui_components::components::UiComponent,
-    AppContext, BlurContext, Element, Entity, FocusContext, ModelHandle, SingletonEntity,
+    AppContext, Element, Entity, FocusContext, ModelHandle, SingletonEntity,
     TypedActionView, View, ViewContext, ViewHandle, WindowId,
 };
 

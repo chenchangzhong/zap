@@ -536,9 +536,10 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
         // locally, though it is unclear why. This breaks the right-click context menu for tabs on
         // local builds, so we propagate the RightMouseDown event manually.
         // 例外:鼠标落在嵌入的 webview 上时走默认分发,让 webview 的右键菜单可用。
-        case NSEventTypeRightMouseDown:
+        case NSEventTypeRightMouseDown: {
             // 不用 _leftMouseDownTarget(属于上一次左键序列,可能已失效),
             // 独立命中测试当前点是否落在嵌入的 webview 上。
+            // (case 标号后直接跟声明属 C23 扩展,花括号成块以兼容 C17。)
             NSPoint rightPoint = [self.contentView convertPoint:event.locationInWindow fromView:nil];
             NSView *rightTarget = [self.contentView hitTest:rightPoint];
             if ([rightTarget isKindOfClass:NSClassFromString(@"WKWebView")]) {
@@ -547,6 +548,7 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
                 [self.contentView rightMouseDown:event];
             }
             break;
+        }
         default:
             [super sendEvent:event];
             break;

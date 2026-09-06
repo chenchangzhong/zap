@@ -18,7 +18,7 @@ pub fn run(
     let runner = ctx.add_singleton_model(|_ctx| ProviderCommandRunner);
     match command {
         ProviderCommand::Setup(args) => runner.update(ctx, |runner, ctx| {
-            runner.setup(args.provider_type, args.team, args.personal, ctx)
+            runner.setup(args.provider_type, args.team, ctx)
         }),
         ProviderCommand::List => runner.update(ctx, |runner, ctx| runner.list(global_options, ctx)),
     }
@@ -33,7 +33,6 @@ impl ProviderCommandRunner {
         &self,
         provider_type: ProviderType,
         team: bool,
-        personal: bool,
         ctx: &mut ModelContext<Self>,
     ) -> anyhow::Result<()> {
         if team {

@@ -5708,6 +5708,7 @@ impl TerminalView {
         }
     }
 
+    #[cfg_attr(not(windows), allow(unused_variables))]
     fn handle_cli_subagent_view_event(
         &mut self,
         cli_subagent_view_id: EntityId,

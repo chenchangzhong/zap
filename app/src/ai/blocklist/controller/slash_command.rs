@@ -107,7 +107,7 @@ impl SlashCommandRequest {
             vec![]
         };
         // 拆成 inline context(图片 + 本地 inline 文件内容)与文件路径引用。
-        let mut attachment_context =
+        let attachment_context =
             BlocklistAIContextModel::attachment_context_for(&prompt_attachments);
         let mut prompt_files = Vec::new();
         for attachment in prompt_attachments {

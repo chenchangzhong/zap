@@ -17,18 +17,11 @@ use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::ai::mcp::MCPServerState;
 
 use crate::ai::agent_sdk::driver::harness::task_env_vars;
-use crate::terminal::cli_agent_sessions::plugin_manager::{
-    plugin_manager_for, CliAgentPluginManager,
-};
-use crate::terminal::cli_agent_sessions::{
-    CLIAgentSessionStatus, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
-};
 use crate::{
     ai::{
         agent::{
             AIAgentExchange, AIAgentInput, AIAgentOutput, CancellationReason, RenderableAIError,
         },
-        agent_events::DisabledAgentEventStreamClient,
         ambient_agents::{
             conversation_output_status_from_conversation, AmbientAgentTaskId,
             AmbientConversationStatus,
@@ -47,11 +40,15 @@ use crate::{
     auth::AuthStateProvider,
     server::ids::{ServerId, SyncId},
 };
+
+// RTC 已禁用:该 client 在非 test 构建无注入点。保留 import 以维持
+// agent_events::DisabledAgentEventStreamClient 的存活边,删除会级联 dead_code。
+#[allow(unused_imports)]
+use crate::ai::agent_events::DisabledAgentEventStreamClient;
 use anyhow::Context as _;
 use futures::{
     channel::oneshot,
     future::{self, Either},
-    FutureExt as _,
 };
 use oneshot::{Canceled, Receiver, Sender};
 use uuid::Uuid;

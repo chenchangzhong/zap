@@ -4130,8 +4130,7 @@ fn input_for_query(
     // Split the resolved attachment set into inline context (images + Zap-local inline file
     // content, mirroring the old `pending_context` attachment behavior) and file path
     // references (sent via `referenced_attachments`, mirroring `parse_context_attachments`).
-    let mut attachment_context =
-        BlocklistAIContextModel::attachment_context_for(&prompt_attachments);
+    let attachment_context = BlocklistAIContextModel::attachment_context_for(&prompt_attachments);
     let mut file_attachments = Vec::new();
     for attachment in prompt_attachments {
         if let PendingAttachment::File(file) = attachment {

@@ -161,9 +161,7 @@ impl ObjectStoreModel {
         // TODO(ben): Update as sharing+moving is supported in more cases.
 
         if let Some(object) = self.objects_by_id.get(hashed_id) {
-            let object_space = object.space(app);
             if let StoredObjectLocation::Space(space) = new_location {
-
                 if !object.can_move_to_space(space, app) {
                     return false;
                 }

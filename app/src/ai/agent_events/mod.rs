@@ -12,10 +12,15 @@ pub(crate) use driver::{
     DEFAULT_AGENT_EVENT_FAILURES_BEFORE_ERROR_LOG, DEFAULT_AGENT_EVENT_RECONNECT_BACKOFF_STEPS,
     DEFAULT_PERMANENT_ERROR_BACKOFF_STEPS,
 };
+// Zap 保留的 harness-bridge 接口重导出:非 test 构建暂无消费者(测试经 super::*
+// 直接访问 driver 内部项),但该重导出边同时是这些项在非 test 构建的存活依据,
+// 删除会级联 dead_code,故以 allow 压制 unused 警告而非删除。
+#[allow(unused_imports)]
 pub(crate) use driver::{
     run_agent_event_driver, AgentEventConsumer, AgentEventConsumerControlFlow,
     AgentEventDriverConfig, AgentEventSource, AgentEventSourceItem,
 };
+#[allow(unused_imports)]
 pub(crate) use message_hydrator::MessageHydrator;
 
 /// 本地 agent 事件流入口。Zap 保留接口以支持本地 driver 注入,默认实现禁用云端 RTC。

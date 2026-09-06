@@ -1480,7 +1480,7 @@ impl<V: EditorView> Element for EditorWrapper<V> {
                         ctx.scene
                             .draw_rect_without_hit_recording(RectF::new(
                                 content_origin
-                                    + vec2f(0., (seg_start - y_adjustment.as_f32())),
+                                    + vec2f(0., seg_start - y_adjustment.as_f32()),
                                 vec2f(content_width, seg_end - seg_start),
                             ))
                             .with_background(decoration.overlay);

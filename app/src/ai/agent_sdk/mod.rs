@@ -6,7 +6,6 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
-use crate::ai::agent_sdk::driver::harness;
 use crate::ai::agent_sdk::driver::{AgentDriverOptions, AgentRunPrompt, Task};
 use crate::ai::agent_sdk::mcp_config::build_mcp_servers_from_specs;
 #[cfg(not(target_family = "wasm"))]
