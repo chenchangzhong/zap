@@ -371,6 +371,9 @@ impl DshRuntime {
     async fn installed_version(dsh_bin: &Path) -> Result<String> {
         let mut cmd = Command::new(dsh_bin);
         cmd.arg("--version");
+        // 与 start_inner 同因:`dsh` 的 shebang 需要 PATH 中的 node,GUI
+        // 环境缺失时更新检查会静默失效。
+        Self::apply_shebang_path_env(&mut cmd);
         let output = cmd.output().await.context("Failed to run dsh --version")?;
         if !output.status.success() {
             bail!("dsh --version exited with {}", output.status);
@@ -499,6 +502,7 @@ impl DshRuntime {
             cmd.env("DSH_CWD", &dir);
             log::info!("[dsh] workspace cwd set to {}", dir.display());
         }
+        Self::apply_shebang_path_env(&mut cmd);
         let mut child = cmd.spawn().context("Failed to spawn dsh web")?;
 
         // 4. 就绪探测:dsh 启动成功后会把最终 URL(含随机端口与访问 token)
@@ -546,9 +550,36 @@ impl DshRuntime {
 
     /// 在冒号分隔的 PATH 字符串中查找可执行的 `dsh`,返回首个命中目录下的路径。
     fn find_dsh_in_path(path_env: &str) -> Option<PathBuf> {
+        Self::find_executable_in_path(path_env, "dsh")
+    }
+
+    /// 在冒号分隔的 PATH 字符串中查找可执行文件,返回首个命中目录下的路径。
+    fn find_executable_in_path(path_env: &str, name: &str) -> Option<PathBuf> {
         std::env::split_paths(path_env)
-            .map(|dir| dir.join("dsh"))
+            .map(|dir| dir.join(name))
             .find(|candidate| Self::is_executable_file(candidate))
+    }
+
+    /// 为 dsh 子进程注入能解析其 shebang(`#!/usr/bin/env node`)的 PATH。
+    ///
+    /// Finder/Dock 启动的 GUI 进程 PATH 不含 nvm/homebrew 的 node:dsh 定位
+    /// 虽可经登录 shell 回退(`find_global_dsh`),但即便定位成功,shebang 的
+    /// `env node` 解析失败仍会让 dsh 启动即死(dsh-web.log 首行
+    /// `env: node: No such file or directory`),`wait_until_ready` 空转到
+    /// 120s 超时,面板永远停在"启动中"。当前进程 PATH 已含 node 时(终端
+    /// 启动)不覆盖,保留完整原环境。
+    fn apply_shebang_path_env(cmd: &mut Command) {
+        let own = std::env::var("PATH").unwrap_or_default();
+        if Self::find_executable_in_path(&own, "node").is_some() {
+            return;
+        }
+        for (key, val) in get_user_env() {
+            if key == "PATH" && Self::find_executable_in_path(&val, "node").is_some() {
+                log::info!("[dsh] injecting login-shell PATH (node absent from GUI PATH)");
+                cmd.env("PATH", val);
+                return;
+            }
+        }
     }
 
     /// 路径存在且为可执行文件。
@@ -837,6 +868,32 @@ mod tests {
 
         std::fs::remove_file(&dsh).unwrap();
         assert_eq!(DshRuntime::find_dsh_in_path(&path_env), None);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 通用可执行查找(参数化名称):dsh shebang 修复用它探测 PATH 中的
+    /// `node`;同源逻辑命中首个含该可执行文件的目录。
+    #[cfg(unix)]
+    #[test]
+    fn find_executable_in_path_by_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("zap-dsh-node-{}", std::process::id()));
+        let dir_a = root.join("a");
+        let dir_b = root.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let node = dir_b.join("node");
+        std::fs::write(&node, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path_env = format!("{}:{}", dir_a.display(), dir_b.display());
+        assert_eq!(
+            DshRuntime::find_executable_in_path(&path_env, "node"),
+            Some(node.clone())
+        );
+        assert_eq!(DshRuntime::find_executable_in_path(&path_env, "dsh"), None);
 
         std::fs::remove_dir_all(&root).unwrap();
     }
