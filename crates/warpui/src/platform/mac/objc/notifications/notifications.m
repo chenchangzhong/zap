@@ -5,6 +5,14 @@
 
 void requestNotificationPermissionsWithCompletionHandler(
     void (^completion_handler)(NSUInteger outcome_type, id outcome_msg)) {
+    // 非 bundle 进程（如 `cargo run` 裸跑）访问 UNUserNotificationCenter 会抛出
+    // 经 dispatch_once 无法被 @try 捕获的异常，直接以错误回调退出而不是崩溃。
+    // outcome_type 2 对应 Rust 侧 OtherError，避免误报为权限被拒。
+    if ([NSBundle mainBundle].bundleIdentifier == nil) {
+        completion_handler(2, @"Cannot request notifications from a non-bundled process.");
+        return;
+    }
+
     UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
 
     [center
@@ -46,6 +54,13 @@ void requestNotificationPermissions(void *on_completion_callback) {
 void sendNotificationWithErrorHandler(NSString *title, NSString *body, NSString *data,
                                       void (^error_handler)(NSUInteger error_type, id error_msg),
                                       BOOL playSound) {
+    // 非 bundle 进程（如 `cargo run` 裸跑）访问 UNUserNotificationCenter 会抛出
+    // 经 dispatch_once 无法被 @try 捕获的异常，直接以错误回调退出而不是崩溃。
+    if ([NSBundle mainBundle].bundleIdentifier == nil) {
+        error_handler(1, @"Cannot send notifications from a non-bundled process.");
+        return;
+    }
+
     UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
     [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
       if (settings.authorizationStatus == UNAuthorizationStatusDenied) {

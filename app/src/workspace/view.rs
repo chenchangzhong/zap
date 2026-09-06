@@ -2661,15 +2661,34 @@ impl Workspace {
                                     })
                                 })
                                 .unwrap_or_else(EntityId::new);
-                            NotificationsModel::handle(ctx).update(ctx, |model, ctx| {
-                                model.add_dsh_notification(
-                                    title.clone(),
-                                    body.clone(),
-                                    *category,
-                                    dsh_view_id,
-                                    ctx,
+                            let added =
+                                NotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                                    model.add_dsh_notification(
+                                        title.clone(),
+                                        body.clone(),
+                                        *category,
+                                        dsh_view_id,
+                                        ctx,
+                                    )
+                                });
+                            // 用户离开窗口时应用内 toast 不弹（toast_stack 只在窗口
+                            // 活跃时显示），补发系统通知，行为对齐终端 block 通知。
+                            if added && ctx.windows().active_window() != Some(ctx.window_id()) {
+                                let play_sound = SessionSettings::as_ref(ctx)
+                                    .notifications
+                                    .play_notification_sound;
+                                ctx.send_desktop_notification(
+                                    UserNotification::new_with_sound(
+                                        title.clone(),
+                                        body.clone(),
+                                        None,
+                                        play_sound,
+                                    ),
+                                    |_, error, _| {
+                                        log::error!("[dsh] desktop notification failed: {error:?}");
+                                    },
                                 );
-                            });
+                            }
                         }
                     }
                     _ => {}

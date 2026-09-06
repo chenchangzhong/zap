@@ -419,6 +419,7 @@ impl NotificationsModel {
     }
 
     /// 添加 DSH 插件通知(任务完成/出错/需确认)。
+    /// 返回 false 表示通知被设置项拦截、未入列,调用方不应再发系统通知。
     pub fn add_dsh_notification(
         &mut self,
         title: String,
@@ -426,9 +427,9 @@ impl NotificationsModel {
         category: NotificationCategory,
         origin_id: EntityId,
         ctx: &mut ModelContext<Self>,
-    ) {
+    ) -> bool {
         if !*AISettings::as_ref(ctx).show_agent_notifications {
-            return;
+            return false;
         }
 
         let item = NotificationItem::new(
@@ -453,6 +454,7 @@ impl NotificationsModel {
         let id = item.id;
         self.notifications.push(item);
         ctx.emit(NotificationsEvent::NotificationAdded { id });
+        true
     }
 }
 
