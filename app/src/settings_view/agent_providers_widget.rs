@@ -27,8 +27,8 @@ use std::collections::{HashMap, HashSet};
 
 use settings::Setting;
 use warpui::elements::{
-    ChildView, Container, CornerRadius, CrossAxisAlignment, Expanded, Flex, MainAxisAlignment,
-    MouseStateHandle, ParentElement, Radius, Text, Wrap,
+    ChildView, Clipped, Container, CornerRadius, CrossAxisAlignment, Expanded, Flex,
+    MainAxisAlignment, MouseStateHandle, ParentElement, Radius, Text, Wrap,
 };
 use warpui::ui_components::{
     button::ButtonVariant,
@@ -792,9 +792,10 @@ impl AgentProvidersWidget {
             .finish();
 
         let cell = |flex: f32, view: &ViewHandle<EditorView>| -> Box<dyn Element> {
+            // 同 field_block:Clipped 防止超宽文本从单元格左侧溢出到相邻单元格。
             Expanded::new(
                 flex,
-                Container::new(ChildView::new(view).finish())
+                Container::new(Clipped::new(ChildView::new(view).finish()).finish())
                     .with_margin_right(MODEL_ROW_GAP)
                     .finish(),
             )
@@ -1106,18 +1107,23 @@ impl AgentProvidersWidget {
                 .with_child(
                     Expanded::new(
                         1.,
-                        Container::new(ChildView::new(&h_row.key_editor).finish())
-                            .with_margin_right(MODEL_ROW_GAP)
-                            .finish(),
+                        // 同 field_block:Clipped 防止超宽文本从输入框左侧溢出。
+                        Container::new(
+                            Clipped::new(ChildView::new(&h_row.key_editor).finish()).finish(),
+                        )
+                        .with_margin_right(MODEL_ROW_GAP)
+                        .finish(),
                     )
                     .finish(),
                 )
                 .with_child(
                     Expanded::new(
                         1.,
-                        Container::new(ChildView::new(&h_row.val_editor).finish())
-                            .with_margin_right(MODEL_ROW_GAP)
-                            .finish(),
+                        Container::new(
+                            Clipped::new(ChildView::new(&h_row.val_editor).finish()).finish(),
+                        )
+                        .with_margin_right(MODEL_ROW_GAP)
+                        .finish(),
                     )
                     .finish(),
                 )
@@ -1515,10 +1521,14 @@ fn field_block(
     .with_margin_bottom(FIELD_LABEL_MARGIN_BOTTOM)
     .finish();
 
+    // 单行编辑器文本超宽进入水平滚动后,字形会从输入框左侧溢出:编辑器 paint
+    // 只在右缘截断字形(EditorElement::paint_lines 的 remaining_width 逻辑),
+    // 滚动偏移会把整行画到输入框左缘之外。用 Clipped 把绘制裁到输入框边界,
+    // 与主终端输入框 / 设置搜索框的做法一致。
     Flex::column()
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
         .with_child(label_text)
-        .with_child(editor_element)
+        .with_child(Clipped::new(editor_element).finish())
         .finish()
 }
 
@@ -1552,10 +1562,12 @@ impl AgentProvidersWidget {
             appearance,
         );
 
-        let search_box = Container::new(ChildView::new(&self.search_editor).finish())
-            .with_margin_left(8.)
-            .with_margin_right(8.)
-            .finish();
+        // 同 field_block:Clipped 防止长搜索词溢出到两侧按钮下方。
+        let search_box =
+            Container::new(Clipped::new(ChildView::new(&self.search_editor).finish()).finish())
+                .with_margin_left(8.)
+                .with_margin_right(8.)
+                .finish();
 
         let header_row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
