@@ -23,6 +23,8 @@ use command::r#async::Command;
 use parking_lot::Mutex;
 use warpui::{Entity, ModelContext, SingletonEntity, WindowId};
 
+use crate::terminal::omp_models::get_user_env;
+
 /// Zap 专属 dsh profile 名(`$DSH_HOME/profiles/<name>`;由 desktop profile
 /// 复制而来,与用户终端自用的 web profile、DSH Desktop 的 desktop profile
 /// 互不干扰,插件/配置各自独立)。
@@ -524,16 +526,29 @@ impl DshRuntime {
     /// dsh 位置,且找不到时能给出行 actionable 的错误信息。
     fn find_global_dsh() -> Result<PathBuf> {
         let path_env = std::env::var("PATH").unwrap_or_default();
-        for dir in std::env::split_paths(&path_env) {
-            let candidate = dir.join("dsh");
-            if Self::is_executable_file(&candidate) {
-                return Ok(candidate);
+        if let Some(path) = Self::find_dsh_in_path(&path_env) {
+            return Ok(path);
+        }
+        // Finder/Dock 启动的 GUI app 不继承 shell 配置的 PATH(nvm、homebrew
+        // 等),回退到登录 shell 抓取的环境变量里再查一次(对齐 omp 的做法)。
+        for (key, val) in get_user_env() {
+            if key == "PATH" {
+                if let Some(path) = Self::find_dsh_in_path(&val) {
+                    return Ok(path);
+                }
             }
         }
         bail!(
             "dsh command not found in PATH; install it globally first, \
              e.g. `npm install -g @deepseek-ai/dsh`"
         )
+    }
+
+    /// 在冒号分隔的 PATH 字符串中查找可执行的 `dsh`,返回首个命中目录下的路径。
+    fn find_dsh_in_path(path_env: &str) -> Option<PathBuf> {
+        std::env::split_paths(path_env)
+            .map(|dir| dir.join("dsh"))
+            .find(|candidate| Self::is_executable_file(candidate))
     }
 
     /// 路径存在且为可执行文件。
@@ -800,6 +815,31 @@ impl SingletonEntity for DshRuntime {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PATH 查找:命中首个含可执行 `dsh` 的目录;无可执行时返回 None。
+    /// 仅 unix:is_executable_file 的可执行判定按 unix 权限位实现。
+    #[cfg(unix)]
+    #[test]
+    fn find_dsh_in_path_hits_first_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("zap-dsh-test-{}", std::process::id()));
+        let dir_a = root.join("a");
+        let dir_b = root.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let dsh = dir_b.join("dsh");
+        std::fs::write(&dsh, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&dsh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path_env = format!("{}:{}", dir_a.display(), dir_b.display());
+        assert_eq!(DshRuntime::find_dsh_in_path(&path_env), Some(dsh.clone()));
+
+        std::fs::remove_file(&dsh).unwrap();
+        assert_eq!(DshRuntime::find_dsh_in_path(&path_env), None);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     /// 验证就绪 URL 解析:锚定启动器的 `dsh web: ` 行,忽略插件先输出的
     /// 其他 127.0.0.1 URL。
