@@ -23,7 +23,7 @@ use warpui::{
     fonts::{Properties, Style, Weight},
     image_cache::ImageType,
     text::point::Point,
-    text_layout::{LayoutCache, StyleAndFont, TextStyle},
+    text_layout::{StyleAndFont, TextStyle},
 };
 
 #[test]

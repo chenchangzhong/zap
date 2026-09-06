@@ -1837,13 +1837,13 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 
 ---
 
-## 34. 2026-09 批次拣入（2026-09-06）：两上游开放 PR 逐个评估后 14 项落地
+## 34. 2026-09 批次拣入（2026-09-06）：两上游开放 PR 逐个评估后 15 项落地
 
 > 触发：用户要求评估两个上游（直接父仓库 `zerx-lab/zap`、根上游 `warpdotdev/warp`）的开放 PR。
 > 评估记录见 `specs/upstream-merge-plan-2026-09.md`；执行在独立 worktree
 > `.worktrees/upstream-sync-2026-09`（分支同名）完成，每 PR 一个 commit。
 
-### 34.1 来自 warpdotdev/warp（10 个 PR）
+### 34.1 来自 warpdotdev/warp（13 个 PR）
 
 | PR | 内容 | 关键适配/偏差 |
 |----|------|--------------|
@@ -1857,6 +1857,9 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 | #15810 | EditDelta.precise_deltas Arc 化（APP-5810） | cherry-pick + 补本地 edit.rs/core.rs 的 `use std::sync::Arc`（上游因 APP-4844 已有）；测试文件名 buffer_test.rs 靠 git 重命名检测自动映射；上游 APP-4844 测试未带 |
 | #15835 | Code editor 文件读 100MiB 守卫 | 混合：warp_files 守卫 + code/view.rs 融合（保留 Zap 关闭失败 tab 定制；TooLarge 显示 file_load_error_message 详情，其余保持 Zap i18n toast）；**code_review 侧本地 API 保留**（editor_state 增 load_error 跟踪但不改 is_loaded/set_loaded 结构）；上游 lib_tests.rs 可编译，保留（30 测试过） |
 | #15831 | 编辑器文本绕过 LayoutCache（APP-5825） | 拣 3/8 提交（跳过 4 个 Criterion bench + 1 测试提交）；本地已有 for_render_state/uncached 函数（早期同步），主路径 layout_text 切换至 uncached；上游 layout_text_uncached 的 truncate_text_for_layout/clamp_style_runs_for_layout 属其他未同步 PR，未带；element 文件仅 ctx→_ctx |
+| #15724 | rich input 打开时光标下字形丢失 | 拣 3 提交；thread_local cell-map 捕获被第 3 提交移除（本地按最终态落地）；测试尾部取上游最终版 + Zap 品牌；font_cache 的 layout_line_uncached hunk 未自动落地，手工补入 warpui_core text_layout_system.rs |
+| #15757 | 启动 block 恢复 SQL LIMIT（APP-5757） | 直拣 2 提交；migration `2026-09-03-004900_add_blocks_restore_order_index`（up: 索引 / down: DROP）；上游 block_list_tests.rs 按惯例未带；**migration 未在真实库上执行过，合回 main 前需验证 up 耗时** |
+| #15670 | 后台 pane SSH 提示抢焦点 | 手工移植生产代码（clear_ssh_blocks 门控 + choice block 改 redetermine_terminal_focus）；上游测试依赖本地缺失的 mock_pane_group 脚手架，未带；本地事件名 ZapifySettings 无需适配 |
 
 ### 34.2 来自 zerx-lab/zap（2 个 PR + 2 个确认已有）
 
