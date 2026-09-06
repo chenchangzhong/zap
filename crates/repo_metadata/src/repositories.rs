@@ -22,6 +22,8 @@ pub enum RepoDetectionSource {
     ProjectRulesIndexing,
     /// Repo was detected for code review/diff state initialization.
     CodeReviewInitialization,
+    /// Repo was detected on behalf of the dsh workspace (badge / file explorer).
+    DshProject,
 }
 
 pub enum DetectedRepositoriesEvent {

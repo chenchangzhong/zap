@@ -344,7 +344,7 @@ use futures::Future;
 use itertools::Itertools;
 use parking_lot::FairMutex;
 use pathfinder_geometry::rect::RectF;
-use repo_metadata::repositories::DetectedRepositories;
+use repo_metadata::repositories::{DetectedRepositories, RepoDetectionSource};
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "local_fs")]
 use std::convert::TryFrom;
@@ -19405,6 +19405,26 @@ impl Workspace {
             return;
         };
         log::info!("[dsh-badge] update_dsh_git_status dir={}", dir.display());
+        // GitStatusUpdateModel::subscribe 只查 DetectedRepositories 缓存,从不触发
+        // 检测;纯 dsh 工作区(从未作为 Zap 终端 CWD 打开过)缓存未命中,直接订阅
+        // 必然失败且无重试,badge 永久消失。先对目录跑一次仓库检测(缓存命中时
+        // 近零开销),完成后再订阅;检测结果为 None(非 git 仓库)才清 badge。
+        let dir_for_detect = dir.to_string_lossy().into_owned();
+        let fut = DetectedRepositories::handle(ctx).update(ctx, |model, ctx| {
+            model.detect_possible_git_repo(&dir_for_detect, RepoDetectionSource::DshProject, ctx)
+        });
+        ctx.spawn(fut, move |me, repo_path_opt, ctx| {
+            if repo_path_opt.is_none() {
+                log::info!("[dsh-badge] no git repo at {}, clearing badge", dir.display());
+                me.clear_dsh_git_status(ctx);
+                return;
+            }
+            me.subscribe_dsh_git_status(dir, ctx);
+        });
+    }
+
+    /// 订阅 dsh 当前目录的 git status(须在仓库检测完成后调用)。
+    fn subscribe_dsh_git_status(&mut self, dir: PathBuf, ctx: &mut ViewContext<Self>) {
         let dir_for_subscribe = dir.clone();
         let result = crate::code_review::git_status_update::GitStatusUpdateModel::handle(ctx)
             .update(ctx, |model, ctx| model.subscribe(&dir_for_subscribe, ctx));
