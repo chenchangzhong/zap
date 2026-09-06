@@ -10,6 +10,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
@@ -170,6 +171,13 @@ document.addEventListener('click', (e) => {
   } catch {
     return;
   }
+  // <a download>(如 dsh Session 日志导出的 JS 合成下载链接):不拦。
+  // WKWebView 的原生下载管道(WKDownloadDelegate,wry 已接 download
+  // handler)会继承页面的会话 cookie 完成下载(Electron/Chromium 同款,
+  // 默认 ~/Downloads,Zap 侧另弹保存面板);若在此 preventDefault 转系统
+  // 浏览器,裸 URL 缺 dsh 的 cookie(登录 token 只在 GET / 种 cookie)
+  // 只会拿到 401。
+  if (el.hasAttribute('download')) return;
   window.webkit?.messageHandlers?.ipc?.postMessage('warp:open-external:' + target);
 });
 // window.open():同样交给系统默认浏览器,不创建新窗口也不在当前 webview 导航。
@@ -279,6 +287,31 @@ setInterval(() => {
                 *handler_url.lock() = Some(target_url);
                 true
             })
+            // 下载:dsh 的 <a download>(如 Session 日志导出)由 WKWebView
+            // 原生下载管道处理。wry 仅在配置了 download handler 后才挂
+            // WKDownloadDelegate,否则下载请求无人应答、静默失败。下载继承
+            // 页面的会话 cookie(dsh 的登录 token 只在 GET / 种 cookie,裸
+            // URL 转系统浏览器只会 401)。
+            .with_download_started_handler(|url, path| {
+                log::info!("[browser] download started: {url} -> {}", path.display());
+                // 对齐 Electron(未设 setSavePath 的默认例程):弹原生保存
+                // 对话框让用户选位置,取消则拒绝本次下载。
+                match Self::run_download_save_panel(path) {
+                    Some(chosen) => {
+                        *path = chosen;
+                        true
+                    }
+                    None => false,
+                }
+            })
+            .with_download_completed_handler(|url, _result, success| {
+                // macOS 上 result 恒为 None(wry 的 API 限制),成败以第三个参数为准。
+                if success {
+                    log::info!("[browser] download completed: {url}");
+                } else {
+                    log::error!("[browser] download failed: {url}");
+                }
+            })
             .with_bounds(Self::to_wry_rect(rect))
             .build_as_child(window)
         {
@@ -312,6 +345,37 @@ setInterval(() => {
         _rect: RectF,
         _window_id: WindowId,
     ) {
+    }
+
+    /// 下载前的同步保存面板:预填 wry 计算的默认路径(~/Downloads + 建议
+    /// 文件名),用户确认后返回选中路径,取消返回 None(调用方拒绝下载)。
+    /// 须在主线程调用——WKDownloadDelegate 回调即主线程,同步 runModal
+    /// 与 NSAlert 的 modal 用法同理。
+    #[cfg(target_os = "macos")]
+    fn run_download_save_panel(default_path: &Path) -> Option<PathBuf> {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSApplication, NSModalResponseOK, NSSavePanel};
+        use objc2_foundation::{NSString, NSURL};
+
+        let mtm = MainThreadMarker::new().expect("download handler must run on main thread");
+        let panel = NSSavePanel::savePanel(mtm);
+        if let Some(name) = default_path.file_name() {
+            panel.setNameFieldStringValue(&NSString::from_str(&name.to_string_lossy()));
+        }
+        if let Some(dir) = default_path.parent() {
+            let dir = NSString::from_str(&dir.to_string_lossy());
+            panel.setDirectoryURL(Some(&NSURL::fileURLWithPath_isDirectory(&dir, true)));
+        }
+        // 面板若被压到其他 app 后面会不可见,先激活(对齐 alert 的做法)。
+        NSApplication::sharedApplication(mtm).activate();
+        if panel.runModal() == NSModalResponseOK {
+            panel
+                .URL()
+                .and_then(|url| url.path())
+                .map(|path| PathBuf::from(path.to_string()))
+        } else {
+            None
+        }
     }
     /// 让 id 对应的 webview 跳转到 `url`。
     pub fn navigate(&self, id: u64, url: &str) {
