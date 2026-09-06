@@ -2983,6 +2983,14 @@ impl Workspace {
                         );
                         me.handle_dsh_open_file_explorer(path.clone(), ctx);
                     }
+                    crate::dsh::bridge::BridgeEvent::OpenFile { path } => {
+                        log::info!(
+                            "[dsh-open-file] OpenFile path={}, has_dsh={}",
+                            path.display(),
+                            me.has_dsh_pane(ctx)
+                        );
+                        me.handle_dsh_open_file(path.clone(), ctx);
+                    }
                     _ => {
                         log::debug!("[dsh] unhandled BridgeEvent: {:?}", event);
                     }
@@ -19327,6 +19335,13 @@ impl Workspace {
             lp.handle_action_with_force_open(&LeftPanelAction::ProjectExplorer, true, ctx);
         });
         ctx.notify();
+    }
+
+    /// dsh 内文件链接点击 → 在 Zap 内打开(文件链接拦截)。
+    /// 复用 `uri::open_file` 的分类:Markdown → notebook、可编辑文件 → editor、
+    /// 目录/其他 → 在目录路径开 session(可执行文件排队执行)。
+    fn handle_dsh_open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        crate::uri::open_file(Some(ctx.window_id()), path, &mut *ctx);
     }
 
     /// 清除 dsh git status 订阅与右侧面板状态：解绑旧 handle 订阅（防止

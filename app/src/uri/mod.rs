@@ -777,7 +777,7 @@ fn classify_open_file_action(path: &Path) -> OpenFileAction {
 /// * For directories, open a new session at the directory path.
 /// * For other files, open a new session at the parent directory path, then possibly execute the
 ///   file.
-fn open_file(window_id: Option<WindowId>, path: PathBuf, ctx: &mut AppContext) {
+pub(crate) fn open_file(window_id: Option<WindowId>, path: PathBuf, ctx: &mut AppContext) {
     let primary_window_and_view = window_id.and_then(|window_id| {
         ctx.root_view_id(window_id)
             .map(|view_id| (window_id, view_id))

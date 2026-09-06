@@ -163,3 +163,76 @@ fn switch_project_non_string_path_rejected() {
     assert!(handle_zap_ipc("zap.switch_project\n1\n{\"path\":123}").is_none());
     assert!(PENDING_EVENTS.lock().is_empty());
 }
+
+/// 构造 `zap.open_file` 的 IPC payload(与 zap-bridge-client.js 一致)。
+fn open_file_payload(path: &str, id: u64) -> String {
+    format!(
+        "zap.open_file\n{id}\n{{\"path\":{}}}",
+        serde_json::to_string(path).unwrap()
+    )
+}
+
+/// zap.open_file:存在的文件 → OpenFile 事件(canonical 后,允许文件)。
+#[test]
+fn open_file_ok() {
+    let file = std::env::temp_dir().join(format!("zap-openfile-ok-{}", std::process::id()));
+    std::fs::write(&file, "x").unwrap();
+    PENDING_EVENTS.lock().clear();
+
+    let event = handle_zap_ipc(&open_file_payload(file.to_str().unwrap(), 1)).unwrap();
+    match event {
+        BridgeEvent::OpenFile { path } => {
+            assert_eq!(path, file.canonicalize().unwrap());
+        }
+        other => panic!("expected OpenFile, got {other:?}"),
+    }
+    let events = PENDING_EVENTS.lock().clone();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], BridgeEvent::OpenFile { .. }));
+
+    std::fs::remove_file(&file).unwrap();
+}
+
+/// zap.open_file:存在的目录 → 同样产生 OpenFile 事件(目录开 session)。
+#[test]
+fn open_file_directory_ok() {
+    let dir = std::env::temp_dir().join(format!("zap-openfile-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    PENDING_EVENTS.lock().clear();
+
+    let event = handle_zap_ipc(&open_file_payload(dir.to_str().unwrap(), 1)).unwrap();
+    match event {
+        BridgeEvent::OpenFile { path } => {
+            assert_eq!(path, dir.canonicalize().unwrap());
+        }
+        other => panic!("expected OpenFile, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.open_file:路径不存在 → None(canonicalize 失败)。
+#[test]
+fn open_file_nonexistent_path_rejected() {
+    let missing = std::env::temp_dir().join(format!(
+        "zap-openfile-missing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    PENDING_EVENTS.lock().clear();
+    assert!(handle_zap_ipc(&open_file_payload(missing.to_str().unwrap(), 1)).is_none());
+    assert!(PENDING_EVENTS.lock().is_empty());
+}
+
+/// zap.open_file:path 字段缺失/非字符串 → None。
+#[test]
+fn open_file_malformed_params_rejected() {
+    PENDING_EVENTS.lock().clear();
+    assert!(handle_zap_ipc("zap.open_file\n1\n").is_none());
+    assert!(handle_zap_ipc("zap.open_file\n1\n{}").is_none());
+    assert!(handle_zap_ipc("zap.open_file\n1\n{\"path\":123}").is_none());
+    assert!(PENDING_EVENTS.lock().is_empty());
+}

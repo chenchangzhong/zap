@@ -35,8 +35,11 @@ window.__ModuleLoader__.load({
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
 		// 依赖 sessions/workspaces 服务(dsh-client-runtime 用 reflect.provide
-		// 注册;框架保证 apply 时已就绪)。
-		const inject = ["sessions", "workspaces"];
+		// 注册;框架保证 apply 时已就绪)。remote / remote.session 是 dsh 官方
+		// remote 代理(dsh-api-remotes),文件链接拦截器 patch 其上的
+		// openWorkspacePath/canOpenWorkspacePath;未声明 inject 直接访问会
+		// 报 "cannot get property ... without inject" 并使整个 apply 失败。
+		const inject = ["sessions", "workspaces", "remote", "remote.session"];
 
 		/// 最近上报的 workspace path(去重:同 path 不重复上报)。
 		let lastReportedPath = undefined;
@@ -360,6 +363,49 @@ window.__ModuleLoader__.load({
 			};
 		}
 
+		// ── 文件链接拦截:统一改在 Zap 内打开 ──
+		// dsh 聊天 UI 的所有文件入口(工具卡片 fileLink、ProducedFiles chips、
+		// markdown file mention 按钮、deliverables 提及)都收敛到
+		// `ctx.remote.session.openWorkspacePath`(默认发给 host native opener,
+		// 即系统默认应用)。Zap 内嵌场景 patch 此方法改发 `zap.open_file` IPC,
+		// 由 Zap 按 Notebook/Editor/Session 分类在 Zap 内打开。
+		// `canOpenWorkspacePath` 是 ProducedFiles 行的渲染门控,一并放行。
+		function installOpenFileInterceptor(ctx) {
+			const session = ctx.remote && ctx.remote.session;
+			if (!session) {
+				console.error("[zap-bridge-client] ctx.remote.session unavailable; file links stay native");
+				return;
+			}
+			function patch(name, replacement) {
+				const original = session[name];
+				if (typeof original !== "function") {
+					console.error(`[zap-bridge-client] remote.session.${name} is not a function; skip`);
+					return undefined;
+				}
+				session[name] = replacement;
+				return original;
+			}
+			const origOpen = patch("openWorkspacePath", async (request) => {
+				const path = request && request.path;
+				if (typeof path === "string" && path !== "") {
+					zapRpc('zap.open_file', { path }).catch((err) => {
+						console.error("[zap-bridge-client] open_file failed:", err);
+					});
+					// remote 信封形状:{ ok, value };与 zap-bridge 现有通知类 IPC 一致,
+					// 不等 Zap ack(点击即时生效,失败仅记日志)。
+					return { ok: true, value: { opened: true } };
+				}
+				return origOpen(request);
+			});
+			const origCanOpen = patch("canOpenWorkspacePath", () =>
+				Promise.resolve({ ok: true, value: true })
+			);
+			ctx.effect(() => () => {
+				if (origOpen) session.openWorkspacePath = origOpen;
+				if (origCanOpen) session.canOpenWorkspacePath = origCanOpen;
+			}, "zap-bridge-client: open-file interceptor");
+		}
+
 		function apply(ctx) {
 			// 非 Zap 环境:不注册任何能力,直接退出。
 			if (!window.__ZAP_BRIDGE__) {
@@ -375,6 +421,8 @@ window.__ModuleLoader__.load({
 			workspacesRef = workspaces;
 			// 「附加为上下文」末端:暴露结构化 @ 引用芯片插入,供 Rust 侧 evaluate_script 调用。
 			installFileReferenceInjection(ctx, sessions);
+			// 文件链接拦截:openWorkspacePath → Zap 内打开。
+			installOpenFileInterceptor(ctx);
 
 			const unsubSessions = sessions.list.subscribe(reportCurrentPath);
 			const unsubWorkspaces = workspaces.list.subscribe(reportCurrentPath);

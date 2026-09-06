@@ -29,6 +29,8 @@ pub enum BridgeEvent {
     SwitchProject { path: PathBuf },
     /// dsh 侧请求在 Zap 打开文件浏览器到指定项目目录。
     OpenFileExplorer { path: PathBuf },
+    /// dsh 侧请求在 Zap 内打开一个文件/目录(文件链接拦截)。
+    OpenFile { path: PathBuf },
     /// runtime 就绪,`url` 为 dsh Web UI 地址。
     Ready { url: String },
     /// 崩溃后自动重启完成。
@@ -105,6 +107,20 @@ pub(crate) fn handle_zap_ipc(payload: &str) -> Option<BridgeEvent> {
             );
             super::runtime::set_workspace_dir(canonical.clone());
             Some(push_event(BridgeEvent::OpenFileExplorer { path: canonical }))
+        }
+        "zap.open_file" => {
+            let raw = params.get("path")?.as_str()?;
+            let path = PathBuf::from(raw);
+            // canonicalize 同时完成存在性校验(文件/目录均放行);不存在则忽略。
+            let canonical = match path.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[dsh-bridge] IPC {method} canonicalize failed: {e}");
+                    return None;
+                }
+            };
+            log::info!("[dsh-bridge] IPC OpenFile path={}", canonical.display());
+            Some(push_event(BridgeEvent::OpenFile { path: canonical }))
         }
         "zap.notify" => {
             let title = params
