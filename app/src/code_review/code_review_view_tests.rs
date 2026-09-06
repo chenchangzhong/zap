@@ -25,8 +25,10 @@ use crate::NotebookKeybindings;
 use ai::agent::action::InsertReviewComment;
 use chrono::Local;
 use repo_metadata::repositories::DetectedRepositories;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use string_offset::CharOffset;
 use warp_core::ui::appearance::Appearance;
 use warp_editor::content::buffer::InitialBufferState;
 use warp_editor::render::element::VerticalExpansionBehavior;
@@ -254,6 +256,7 @@ impl TestContext {
                 diff_state_model,
                 code_review_comment_batch,
                 None,
+                false,
                 ctx,
             )
         });
@@ -282,6 +285,8 @@ fn create_loaded_state_with_editors(
             let discard_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
             let add_context_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
             let copy_path_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
+            let prev_hunk_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
+            let next_hunk_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
 
             let state = FileState {
                 file_diff: FileDiff {
@@ -303,6 +308,12 @@ fn create_loaded_state_with_editors(
                 discard_button,
                 add_context_button,
                 copy_path_button,
+                prev_hunk_button,
+                next_hunk_button,
+                side_by_side_state: None,
+                content_at_head: None,
+                side_by_side_diff_token: 0,
+                pending_diff_abort: None,
             };
             (file_path, state)
         })
@@ -313,6 +324,7 @@ fn create_loaded_state_with_editors(
         total_additions: 0,
         total_deletions: 0,
         files_changed: 0,
+        side_by_side_diff_cache: HashMap::new(),
     }
 }
 
@@ -947,4 +959,172 @@ fn test_active_comments_not_marked_outdated() {
             );
         });
     });
+}
+
+// ---------------------------------------------------------------------------
+// H-B 优化:word diff 字节 range → CharOffset 的顺序递增游标转换
+// ---------------------------------------------------------------------------
+
+/// 顺序推进的游标计数必须与旧实现 `text[..target].chars().count()` 完全一致,
+/// 且包含多字节 UTF-8 字符(证明是字符偏移而非字节偏移)。
+#[test]
+fn test_advance_char_cursor_matches_full_prefix_count() {
+    // "héllo 日本語 world":字节边界与字符边界不一致(é 占 2 字节、每个汉字占 3 字节),
+    // 目标字节全部落在字符边界上,且单调递增。
+    let text = "héllo 日本語 world";
+    let boundaries = [1usize, 3, 7, 10, 16, 22];
+    let mut byte_cursor = 0usize;
+    let mut char_cursor = CharOffset::zero();
+    for &target in &boundaries {
+        let off = CodeReviewView::advance_char_cursor(text, &mut byte_cursor, char_cursor, target);
+        assert_eq!(off, CharOffset::from(text[..target].chars().count()));
+        assert_eq!(byte_cursor, target, "游标字节位置应推进到 target");
+        char_cursor = off;
+    }
+    // 推进到文本末尾后,游标等于整串字符数(15,远小于字节数 22)。
+    assert_eq!(char_cursor, CharOffset::from(text.chars().count()));
+    assert!(char_cursor.as_usize() < text.len(), "多字节字符使字节数大于字符数");
+}
+
+/// 多 hunk + 每侧多个 range + 多字节 UTF-8 字符场景:游标增量转换(H-B 优化)的产出
+/// 必须与旧实现(逐 range 从文本头 `chars().count()`)完全一致。
+#[test]
+fn test_side_by_side_word_diff_char_offsets_match_naive_reference() {
+    // 两个修改 hunk,每侧多个 range;首处修改 "foo"→"bar" 之前有 `café`(4 字符 5 字节),
+    // 用于区分字符偏移与字节偏移。
+    let old_content = "\
+let x = café + foo;
+let same_1 = 1;
+let a = alpha + beta;
+let b = gamma + delta;
+let same_2 = 2;
+let z = tail;
+";
+    let new_content = "\
+let x = café + bar;
+let same_1 = 1;
+let a = alpha + bata;
+let b = gamma + delt;
+let same_2 = 2;
+let z = tail;
+";
+    let appearance = Appearance::mock();
+    let data = build_side_by_side_diff_data(
+        remove_overlay_color(&appearance),
+        add_overlay_color(&appearance),
+        remove_inline_overlay_color(&appearance),
+        add_inline_overlay_color(&appearance),
+        old_content,
+        new_content,
+    );
+
+    // 参考实现:与旧代码完全相同的 O(ranges × len) 转换(只比对 CharOffset 区间,
+    // background 颜色与本次优化无关)。
+    let diff_hunks = warp_editor::content::diff::diff_lines(old_content, new_content);
+    let mut left_ref: Vec<(CharOffset, CharOffset)> = Vec::new();
+    let mut right_ref: Vec<(CharOffset, CharOffset)> = Vec::new();
+    for hunk in &diff_hunks {
+        for r in &hunk.old_word_diffs {
+            left_ref.push((
+                CharOffset::from(old_content[..r.start].chars().count()),
+                CharOffset::from(old_content[..r.end].chars().count()),
+            ));
+        }
+        for r in &hunk.new_word_diffs {
+            right_ref.push((
+                CharOffset::from(new_content[..r.start].chars().count()),
+                CharOffset::from(new_content[..r.end].chars().count()),
+            ));
+        }
+    }
+
+    let left_actual: Vec<(CharOffset, CharOffset)> =
+        data.left_text_decorations.iter().map(|d| (d.start, d.end)).collect();
+    let right_actual: Vec<(CharOffset, CharOffset)> =
+        data.right_text_decorations.iter().map(|d| (d.start, d.end)).collect();
+
+    // 场景必须真实产生 word diff(多 hunk、多 range),否则测试无意义。
+    assert!(!left_ref.is_empty() && !right_ref.is_empty(), "场景应产生 word diff range");
+    assert!(
+        diff_hunks
+            .iter()
+            .filter(|h| !h.old_word_diffs.is_empty() || !h.new_word_diffs.is_empty())
+            .count()
+            >= 2,
+        "场景应覆盖至少两个含 word diff 的 hunk"
+    );
+    assert_eq!(left_actual, left_ref, "左列 CharOffset 必须与旧实现逐值一致");
+    assert_eq!(right_actual, right_ref, "右列 CharOffset 必须与旧实现逐值一致");
+
+    // 多字节校验:首处修改的旧侧 range 之前有 `café`,其字符偏移必须小于字节偏移,
+    // 证明输出按字符计数而非字节计数。
+    let first_old_range = diff_hunks
+        .iter()
+        .flat_map(|h| &h.old_word_diffs)
+        .next()
+        .expect("应有 old word diff range");
+    let first_char = old_content[..first_old_range.start].chars().count();
+    assert!(first_char < first_old_range.start, "café 使该处字符偏移小于字节偏移");
+    assert_eq!(
+        left_actual[0].0,
+        CharOffset::from(first_char),
+        "首个 decoration 起点必须是字符偏移"
+    );
+}
+
+/// 回归:spacer 不能按"总行数"截断。两侧 spacer 总高必须满足
+/// left − right = 新旧行数差(高度不变量),否则同一 scroll_top 下两列错位。
+/// 旧实现(limit_spacers)在 spacer 总行数 > 2000 时把超出部分折叠成 1 行
+/// 占位块,两侧被折叠高度不同——大 diff 文件(如 3000+ 行、超 2000 spacer 行)
+/// 在首个被截断 hunk 之下整体错位。本测试构造超过旧预算的场景锁死不变量。
+#[test]
+fn test_side_by_side_spacers_keep_height_invariant_beyond_old_line_budget() {
+    // 混合 diff:每 3 行一组插入 2 行(左侧 spacer),每 9 行删 1 行(右侧 spacer),
+    // spacer 总行数约 2000 + 333 > 旧预算 2000。
+    let old_lines: Vec<String> = (0..3000).map(|i| format!("line {i}")).collect();
+    let mut new_lines: Vec<String> = Vec::with_capacity(old_lines.len() + 3000);
+    for (i, line) in old_lines.iter().enumerate() {
+        match i % 3 {
+            0 => {
+                new_lines.push(format!("head-a-{i}"));
+                new_lines.push(format!("head-b-{i}"));
+                new_lines.push(line.clone());
+            }
+            1 if i % 9 == 1 => {}
+            _ => new_lines.push(line.clone()),
+        }
+    }
+    let old_content = old_lines.join("\n") + "\n";
+    let new_content = new_lines.join("\n") + "\n";
+
+    let appearance = Appearance::mock();
+    let data = build_side_by_side_diff_data(
+        remove_overlay_color(&appearance),
+        add_overlay_color(&appearance),
+        remove_inline_overlay_color(&appearance),
+        add_inline_overlay_color(&appearance),
+        &old_content,
+        &new_content,
+    );
+
+    let spacer_lines = |blocks: &[warp_editor::content::edit::TemporaryBlock]| -> usize {
+        blocks
+            .iter()
+            .map(|b| b.content.lines().count().max(1))
+            .sum()
+    };
+    let left = spacer_lines(&data.left_spacers);
+    let right = spacer_lines(&data.right_spacers);
+
+    // 场景必须超过旧 2000 行预算,否则测试没有覆盖被截断的路径。
+    assert!(
+        left + right > 2000,
+        "场景 spacer 总行数应超过旧预算 2000,实际 left={left} right={right}"
+    );
+    // 高度不变量:两侧 spacer 行数差 == 新旧行数差。
+    assert_eq!(
+        left as isize - right as isize,
+        new_lines.len() as isize - old_lines.len() as isize,
+        "两侧 spacer 行数差必须等于新旧行数差(左={left} 右={right})"
+    );
 }

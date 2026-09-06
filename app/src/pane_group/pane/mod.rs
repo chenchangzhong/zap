@@ -151,6 +151,7 @@ pub(crate) enum IPaneType {
     SshServer,
     Sftp,
     Browser,
+    DeepSeek,
     DeferredPlaceholder,
     /// A pane type only for tests.
     #[cfg(test)]
@@ -177,6 +178,7 @@ impl Display for IPaneType {
             IPaneType::SshServer => write!(f, "SSH Server"),
             IPaneType::Sftp => write!(f, "SFTP"),
             IPaneType::Browser => write!(f, "Browser"),
+            IPaneType::DeepSeek => write!(f, "DeepSeek Harness"),
             IPaneType::DeferredPlaceholder => write!(f, "Placeholder"),
             #[cfg(test)]
             IPaneType::Dummy => write!(f, "Dummy"),
@@ -185,14 +187,22 @@ impl Display for IPaneType {
 }
 
 impl PaneId {
-    fn new<T: BackingView>(pane_type: IPaneType, pane_view: &ViewHandle<PaneView<T>>) -> Self {
+    /// Creates a [`PaneId`] for a [`PaneView<T>`] with given type and view handle.
+    pub(crate) fn new<T: BackingView>(
+        pane_type: IPaneType,
+        pane_view: &ViewHandle<PaneView<T>>,
+    ) -> Self {
         Self(IPaneId {
             pane_type,
             pane_view_id: pane_view.id(),
         })
     }
 
-    fn new_from_ctx<T: BackingView>(pane_type: IPaneType, ctx: &ViewContext<PaneView<T>>) -> Self {
+    /// Creates a [`PaneId`] for a [`PaneView<T>`] with given type and context.
+    pub(crate) fn new_from_ctx<T: BackingView>(
+        pane_type: IPaneType,
+        ctx: &ViewContext<PaneView<T>>,
+    ) -> Self {
         Self(IPaneId {
             pane_type,
             pane_view_id: ctx.view_id(),
@@ -444,6 +454,10 @@ impl PaneId {
         matches!(self.0.pane_type, IPaneType::CodeDiff)
     }
 
+    pub fn is_dsh_pane(&self) -> bool {
+        matches!(self.0.pane_type, IPaneType::DeepSeek)
+    }
+
     pub fn is_environment_management_pane(&self) -> bool {
         // Zap Wave 7-3:ambient-agent UI 子系统物理删,任意 pane 都不是
         // environment management pane。调用者为渐进式清理保留、返回 false。
@@ -513,6 +527,10 @@ impl PaneId {
             }
             IPaneType::Browser => {
                 ChildView::<PaneView<BrowserPaneView>>::with_id(self.0.pane_view_id).finish()
+            }
+            IPaneType::DeepSeek => {
+                ChildView::<PaneView<crate::dsh::pane::DshPaneView>>::with_id(self.0.pane_view_id)
+                    .finish()
             }
             IPaneType::DeferredPlaceholder => warpui::elements::Empty::new().finish(),
             #[cfg(test)]

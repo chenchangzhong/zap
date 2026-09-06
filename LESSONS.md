@@ -79,4 +79,22 @@ macOS 27 上 `[button convertPoint:event.locationInWindow fromView:nil]` 对 tit
 ## 13. 合并冲突在测试文件中
 
 `app/src/ai/agent/task_store_tests.rs` 有残留的 `>>>>>>>` 合并冲突标记，导致 `cargo test` build 失败（非首次遇到）。  
-**教训**：merge 后检查冲突标记。有问题的文件在 `rg '<<<<<<|======|>>>>>>' --type rust`。
+**教训**：merge 后检查冲突标记。有问题的文件在 `rg '<<<<<||======|>>>>>>' --type rust`。
+
+## 14. `cargo clean` 全清是重编慢 + 磁盘爆的根因，别用
+
+debug 默认开增量编译，会让 sccache 对绝大多数 crate 判定为 `non-cacheable`（incremental 与 sccache 缓存单元冲突）。
+结果 `target/` 滚到 90G+，sccache 那 10G 上限空着没用，全清后还要把 1500+ 包全重编。
+
+**做法**：
+- 关增量编译必须走环境变量，**不能写在 `.cargo/config.toml` 的 `[env]` 段**——
+  `CARGO_INCREMENTAL` 是 cargo 特殊变量，`[env]` 设置对它无效，写在里面会造成"已配置"假象，
+  但增量编译实际仍开着、`incremental` 目录持续累加（已踩过这个坑：`target/` 又涨回 59G）。
+- 正确做法：在 `~/.zshrc` 写 `export CARGO_INCREMENTAL=0`，新开终端自动生效；
+  临时单步调试用 `CARGO_INCREMENTAL=1 cargo build ...` 覆盖。
+- 回收空间用 `rm -rf target/debug/incremental`，别 `cargo clean` 全清。
+- sccache 本地缓存 `10 GiB` 上限按 LRU 自动淘汰旧的，不用手动管。
+- 实测：清 `deps` 后二次 `cargo build --bin zap-oss` 比首次快约 1 分钟（sccache 命中）；
+  且 `CARGO_INCREMENTAL=0` 经环境变量设好后，`incremental` 目录验证不再生成。
+- 坑：`sccache --show-stats` 在本机偶尔卡死（0.17.0 客户端/守护交互问题），验证缓存改看
+  `~/Library/Caches/Mozilla.sccache` 的文件数与占用即可。

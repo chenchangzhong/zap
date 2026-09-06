@@ -180,6 +180,7 @@ fn create_find_model_with_query(
             diff_state_model,
             code_review_comment_batch,
             None,
+            false,
             ctx,
         )
     });

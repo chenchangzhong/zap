@@ -2,10 +2,12 @@ use core::slice;
 use std::{
     any::Any,
     cell::{Cell, Ref, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt, mem,
     ops::{Add, AddAssign, Range, Sub, SubAssign},
+    rc::Rc,
     sync::Arc,
+    time::Instant,
 };
 
 use parking_lot::Mutex;
@@ -395,6 +397,19 @@ impl<'a> RenderContentTreeRef<'a> {
         cursor.seek_clamped(&line, SeekBias::Right);
         (cursor.start().height as f32).into_pixels()
     }
+
+    /// 返回内容高度 y(像素)所在的树行号(不计零行临时块)。
+    ///
+    /// y 超出树末尾时返回总行数;仅供诊断探针(行配对校验)使用,不参与布局。
+    pub fn line_at_height(&self, y: f32) -> usize {
+        let summary = self.0.summary();
+        if y as f64 >= summary.height {
+            return summary.lines.as_u32() as usize;
+        }
+        let mut cursor = self.0.cursor::<Height, LayoutSummary>();
+        cursor.seek(&Height(OrderedFloat(y as f64)), SeekBias::Right);
+        cursor.start().lines.as_u32() as usize
+    }
 }
 
 /// Model for rendering rich text.
@@ -402,6 +417,15 @@ pub struct RenderState {
     /// Content is wrapped in a RefCell so we could mutate it when we are laying out the editor element.
     /// We know this is safe because there is a one-to-one relationship between element and model.
     content: RefCell<SumTree<BlockItem>>,
+
+    /// 缓存 [`Self::spacer_y_ranges`] 的结果,避免每个 paint 帧都全树遍历 O(N)。
+    /// 任何内容树变更(临时块替换 / 文本编辑 / 末尾换行切换)都必须通过
+    /// [`Self::invalidate_spacer_y_ranges_cache`] 使缓存失效。
+    spacer_y_ranges_cache: RefCell<Option<Rc<Vec<Range<f32>>>>>,
+
+    /// 测试专用:统计 spacer_y_ranges 实际重算次数(经缓存直接返回不计数)。
+    #[cfg(any(test, feature = "test-util"))]
+    spacer_y_ranges_recompute_count: Cell<usize>,
 
     selections: RefCell<RenderedSelectionSet>,
     decorations: RenderDecoration,
@@ -430,6 +454,10 @@ pub struct RenderState {
     /// this channel, along with updates that must be ordered with respect to text layout (like
     /// cursor movement).
     layout_tx: async_channel::Sender<LayoutAction>,
+    /// Backing receiver for [`Self::layout_tx`], drained synchronously during
+    /// [`Self::preload_pending_edits`] to ensure pending edits are flushed before the
+    /// first layout frame.
+    layout_rx: async_channel::Receiver<LayoutAction>,
 
     /// A count of outstanding layouts.
     #[cfg(any(test, feature = "test-util"))]
@@ -440,6 +468,18 @@ pub struct RenderState {
 
     /// Whether we are performing a lazy layout.
     lazy_layout: bool,
+
+    /// 滚动钳制上限的覆盖值(非 None 时替代当前树高作为 scroll clamp 上限)。
+    ///
+    /// 懒加载期间树高逐帧增长,若以「当前树高」为钳制上限,滚动意图会被
+    /// 截断(`min(S, 树高−vp)`),且 `update_content_height` 每帧重钳导致
+    /// 「卡树尾」的值永不恢复 —— side-by-side 双列各自卡在各自树尾即表现为
+    /// 滚动错位。双列创建时我们已知**理论总行数 = max(旧行数, 新行数)**
+    /// (spacer 把短板补齐到长板,数据层不变量),因此把两列的钳制上限统一
+    /// 固定为「理论总行数 × 行高」:两列上限相等、且不随排空进度变化,
+    /// 绝对拷贝的 scroll_top 永不被树高截断;未排空区域由 viewport 迭代器
+    /// `seek_clamped` 显示树尾占位,树长到后自动补位。
+    scroll_clamp_height_override: Cell<Option<Pixels>>,
 
     pending_edits: Mutex<Vec<PendingLayout>>,
     pending_selection_change: Mutex<Option<PendingSelectionUpdate>>,
@@ -1036,6 +1076,19 @@ impl Paragraph {
     /// The height of this paragraph.
     pub fn height(&self) -> Pixels {
         self.height
+    }
+
+    /// 临时块按「内容行」等高占位时的行框高:max(原始行高, 段最小高)。
+    ///
+    /// 内容行([`BlockItem::Paragraph`])的高度是 max(行高, 最小段高) + 项级 y 间距;
+    /// 临时块(双列 spacer / 内联展开的删除行)必须逐行复刻同一占位,
+    /// 否则 k 行临时块比 k 行内容矮,side-by-side 两列随 spacer 数量累积漂移。
+    pub(crate) fn row_frame_height(&self) -> Pixels {
+        let mut height = self.height;
+        if let Some(minimum_height) = self.minimum_height {
+            height = height.max(minimum_height);
+        }
+        height
     }
 
     pub fn width(&self) -> Pixels {
@@ -1706,12 +1759,14 @@ impl RenderState {
         ctx.spawn_stream_local(element_rx, Self::apply_element_update, |_, _| {});
 
         let (layout_tx, layout_rx) = async_channel::unbounded();
+        let layout_rx_clone = layout_rx.clone();
         ctx.spawn_stream_local(layout_rx, Self::handle_layout_action, |_, _| {});
 
         Self::new_internal(
             ctx.model_id(),
             element_tx,
             layout_tx,
+            layout_rx_clone,
             styles,
             lazy_layout,
             Pixels::zero(),
@@ -1729,11 +1784,12 @@ impl RenderState {
         viewport_height: Pixels,
     ) -> Self {
         let (element_tx, _) = async_channel::unbounded();
-        let (layout_tx, _) = async_channel::unbounded();
+        let (layout_tx, layout_rx) = async_channel::unbounded();
         Self::new_internal(
             EntityId::new(),
             element_tx,
             layout_tx,
+            layout_rx,
             styles,
             false,
             viewport_width,
@@ -1749,6 +1805,7 @@ impl RenderState {
         entity_id: EntityId,
         element_tx: async_channel::Sender<ElementUpdate>,
         layout_tx: async_channel::Sender<LayoutAction>,
+        layout_rx: async_channel::Receiver<LayoutAction>,
         styles: RichTextStyles,
         lazy_layout: bool,
         viewport_width: Pixels,
@@ -1764,12 +1821,17 @@ impl RenderState {
             selections: Default::default(),
             decorations: Default::default(),
             content: RefCell::new(content),
+            spacer_y_ranges_cache: RefCell::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            spacer_y_ranges_recompute_count: Cell::new(0),
             element_tx,
             layout_tx,
+            layout_rx,
             width_setting: Default::default(),
             saved_positions: SavedPositions::new(entity_id),
             buffer_version: RefCell::new(Default::default()),
             lazy_layout,
+            scroll_clamp_height_override: Cell::new(None),
             pending_edits: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-util"))]
             outstanding_layouts: Default::default(),
@@ -1824,6 +1886,7 @@ impl RenderState {
 
         *content = new_tree;
         self.has_final_trailing_newline.set(false);
+        self.invalidate_spacer_y_ranges_cache();
     }
 
     fn add_final_trailing_newline_if_missing(&mut self) {
@@ -1835,11 +1898,61 @@ impl RenderState {
             .get_mut()
             .push(Self::final_trailing_newline_cursor(&self.styles));
         self.has_final_trailing_newline.set(true);
+        self.invalidate_spacer_y_ranges_cache();
     }
 
     /// Returns reference to the underlying content tree.
     pub fn content(&self) -> RenderContentTreeRef<'_> {
         RenderContentTreeRef(self.content.borrow())
+    }
+
+    /// Y ranges (content coordinates) occupied by blank temporary blocks
+    /// (side-by-side alignment spacers). Diff line decorations must not paint
+    /// over these ranges.
+    ///
+    /// 结果缓存在 [`Self::spacer_y_ranges_cache`],只有内容树变更(临时块替换 /
+    /// 文本编辑 / 末尾换行切换)时才重新全树遍历,否则每次 paint 调用都是 O(1)。
+    pub fn spacer_y_ranges(&self) -> Vec<Range<f32>> {
+        if let Some(cached) = self.spacer_y_ranges_cache.borrow().as_ref() {
+            return (**cached).clone();
+        }
+
+        let ranges = {
+            let content = self.content.borrow();
+            let mut ranges = Vec::new();
+            let mut cursor = content.cursor::<(), Height>();
+            cursor.descend_to_first_item(&content, |_| true);
+            while let Some(item) = cursor.item() {
+                if let BlockItem::TemporaryBlock {
+                    decoration,
+                    paragraph_block,
+                    ..
+                } = item
+                {
+                    if decoration.is_none() {
+                        let y = cursor.start().0 .0 as f32;
+                        ranges.push(y..y + paragraph_block.content_size().y());
+                    }
+                }
+                cursor.next();
+            }
+            ranges
+        };
+
+        #[cfg(any(test, feature = "test-util"))]
+        self.spacer_y_ranges_recompute_count
+            .set(self.spacer_y_ranges_recompute_count.get() + 1);
+
+        let ranges = Rc::new(ranges);
+        let result = (*ranges).clone();
+        *self.spacer_y_ranges_cache.borrow_mut() = Some(ranges);
+        result
+    }
+
+    /// 清除 spacer_y_ranges 缓存。内容树发生任何变更(临时块替换、文本编辑、
+    /// 末尾换行切换)后都必须调用,否则下一次 paint 会拿到过期的 Y 范围。
+    fn invalidate_spacer_y_ranges_cache(&self) {
+        *self.spacer_y_ranges_cache.borrow_mut() = None;
     }
 
     pub fn with_width_setting(mut self, setting: WidthSetting) -> Self {
@@ -2101,6 +2214,15 @@ impl RenderState {
             if let Some(positioned_item) = item {
                 // Stop if we've gone past the viewport
                 if positioned_item.start_y_offset > viewport_end_height {
+                    // Close the open range at this item's start — the visible region ends
+                    // here. Previously the range was left open and closed at `max_offset()`
+                    // below, which made this function return the whole file for large
+                    // documents and forced syntax highlighting to query the entire tree.
+                    if let Some(range_start) = current_range_start.take()
+                        && range_start < positioned_item.start_char_offset
+                    {
+                        range_set.insert(range_start..positioned_item.start_char_offset);
+                    }
                     break;
                 }
 
@@ -2150,7 +2272,7 @@ impl RenderState {
             .approx_ne(self.viewport.height().as_f32(), UNIT_MARGIN);
 
         self.viewport
-            .set_size(size_info.viewport_size, self.width(), self.height());
+            .set_size(size_info.viewport_size, self.width(), self.scroll_clamp_height());
 
         // TODO(CLD-85): re-layout according to the high-level design (async, debounced, avoid
         // where possible).
@@ -2170,9 +2292,22 @@ impl RenderState {
     /// Scroll the viewport by the given number of lines. Even with precise
     /// trackpad scrolling, all scroll events are reported in lines.
     pub fn scroll(&mut self, delta: Pixels, ctx: &mut ModelContext<Self>) {
-        if self.viewport.scroll(delta, self.height()) {
+        if self.viewport.scroll(delta, self.scroll_clamp_height()) {
             ctx.notify();
         }
+    }
+
+    /// 设置滚动钳制上限的覆盖值(见 [`Self::scroll_clamp_height_override`] 的
+    /// 说明)。side-by-side 双列创建时用它把两列的钳制上限统一固定为理论总高。
+    pub fn set_scroll_clamp_height(&self, height: Pixels) {
+        self.scroll_clamp_height_override.set(Some(height));
+    }
+
+    /// 滚动钳制上限:有覆盖值用覆盖值,否则用当前树高。
+    fn scroll_clamp_height(&self) -> Pixels {
+        self.scroll_clamp_height_override
+            .get()
+            .unwrap_or(self.height())
     }
 
     pub fn scroll_horizontal(&mut self, delta: Pixels, ctx: &mut ModelContext<Self>) {
@@ -2381,20 +2516,25 @@ impl RenderState {
             LayoutAction::ScrollTo(position) => {
                 if self
                     .viewport
-                    .scroll_to(position.to_scroll_top(self), self.height())
+                    .scroll_to(position.to_scroll_top(self), self.scroll_clamp_height())
                 {
                     ctx.notify();
                 }
             }
-            LayoutAction::LayoutTemporaryBlock(blocks) => {
+            LayoutAction::LayoutTemporaryBlock {
+                blocks,
+                replace_existing,
+            } => {
                 // If we are performing layout lazily, push the temporary blocks to the pending edits queue which is flushed
                 // at editor element layout time
                 if self.lazy_layout {
-                    self.pending_edits
-                        .lock()
-                        .push(PendingLayout::TemporaryBlocks(blocks));
+                    self.pending_edits.lock().push(PendingLayout::TemporaryBlocks {
+                        blocks,
+                        replace_existing,
+                    });
                 } else {
-                    self.layout_temporary_blocks(blocks, ctx);
+                    // 非 lazy 模式树与 buffer 同步完整,按调用方语义整体插入。
+                    self.layout_temporary_blocks(blocks, replace_existing, ctx);
                     self.update_content_sizing();
                 }
 
@@ -2450,10 +2590,46 @@ impl RenderState {
         }
     }
 
-    fn layout_temporary_blocks(&self, blocks: Vec<TemporaryBlock>, app: &AppContext) {
+    fn layout_temporary_blocks(
+        &self,
+        blocks: Vec<TemporaryBlock>,
+        replace_existing: bool,
+        app: &AppContext,
+    ) {
+        // 装饰数据永不因瞬态树状态而丢失(对标 Zed block map:装饰层独立于
+        // 布局瞬态,以 anchor 寻址,渲染时与 buffer 快照 join)。
+        //
+        // 分批(split-delta)布局下,初次打开时树可能还没长起来——实测曾出现
+        // 「树 1 行时 reset 收到 21 块,第一个边界越树尾即 break,整批静默销毁」
+        // (pending_side_by_side_blocks 已消费,数据无副本可恢复 → 该列空行
+        // 永久不渲染,直到重新创建 view)。所以这里不能把整批直接交给
+        // reset_temporary_block:它对「边界越过树尾」的键是销毁语义。
+        //
+        // 无损分区:已覆盖当前树行数的边界按调用方语义立即插入(replace=true
+        // 清全部旧 spacer 后插入本批;false 增量保留旧块——同批分段两批互清
+        // 曾导致右列 2 块变 1 块、文件头部空行永久缺失);未覆盖的作为增量
+        // 条目放回队列,由逐帧 flush 在树长到后补齐。三种状态全部有出路:
+        // 立即插入 / 留在队列 / 已在树上,不存在丢弃。
+        let tree_rows = self.tree_row_count();
+        let (coverable, deferred_blocks): (Vec<_>, Vec<_>) = blocks
+            .into_iter()
+            .partition(|block| block.insert_before.as_usize() <= tree_rows);
+        if !deferred_blocks.is_empty() {
+            self.pending_edits.lock().push(PendingLayout::TemporaryBlocks {
+                blocks: deferred_blocks,
+                replace_existing: false,
+            });
+        }
+        if coverable.is_empty() {
+            return;
+        }
         let layout_context = self.layout_context(app);
-        let laid_out_blocks = layout_temporary_blocks(blocks, &layout_context);
-        self.reset_temporary_block(laid_out_blocks);
+        let laid_out_blocks = layout_temporary_blocks(coverable, &layout_context);
+        if replace_existing {
+            self.reset_temporary_block(laid_out_blocks);
+        } else {
+            self.insert_temporary_blocks_incremental(laid_out_blocks);
+        }
     }
 
     pub fn layout_edit_delta(
@@ -2462,15 +2638,121 @@ impl RenderState {
         hidden_ranges: Option<RangeSet<CharOffset>>,
         app: &AppContext,
     ) {
+        // 分批（split-delta append）：大文件初次加载时（old_offset 替换范围极小，即
+        // ReplaceWith 全文场景），把 delta 按 ROWS_PER_FLUSH 行拆块：首块立即真实
+        // 测量并应用（打开即见首屏内容），其余块以「追加」坐标（extent+1..extent+1）
+        // 放回 pending 队列，由 try_layout_pending_edits 按帧预算逐帧排空。
+        //
+        // 追加语义保证已插入的行号永不改变 —— side-by-side spacer 与 diff 行对齐稳定，
+        // 不会像「占位替换」那样在滚动时累积错位。
+        const ROWS_PER_FLUSH: usize = 300;
+
+        // Note: code-review editors always carry a hidden-lines model, so hidden_ranges is
+        // `Some(empty)` even when nothing is folded — only actual hidden rows block this path.
+        let has_hidden_lines = hidden_ranges
+            .as_ref()
+            .is_some_and(|hidden_ranges| !hidden_ranges.is_empty());
+
+        if self.lazy_layout && !has_hidden_lines && delta.new_lines.len() > ROWS_PER_FLUSH {
+            let chunk_start = Instant::now();
+            let EditDelta {
+                old_offset, new_lines, ..
+            } = delta;
+            let mut new_lines = new_lines.into_iter();
+            let first_rows: Vec<_> = new_lines.by_ref().take(ROWS_PER_FLUSH).collect();
+            let rest_rows: Vec<_> = new_lines.collect();
+            let chunk_count = 1 + rest_rows.len().div_ceil(ROWS_PER_FLUSH);
+
+            let first_chunk = EditDelta {
+                // 丢弃 precise_deltas 是安全的:该字段只被 model 层消费(语法树
+                // 增量更新 / 远端同步 TextEdit,见 app/src/code/editor/model.rs),
+                // 且在入渲染队列之前;渲染侧的 layout_delta 从不读它。
+                precise_deltas: Arc::new(Vec::new()),
+                old_offset: old_offset.clone(),
+                new_lines: first_rows,
+            };
+            let layout_context = self.layout_context(app);
+            let (mut laid_out, collect_dur, build_dur, parallel_dur, fold_dur) =
+                first_chunk.layout_delta(
+                    &layout_context,
+                    self.document_path.as_deref(),
+                    self.layout_options,
+                    hidden_ranges.clone(),
+                    app,
+                );
+            // The chunk ends in the middle of the file, so it never carries the file's
+            // trailing newline (that belongs to the last chunk, if any).
+            laid_out.trailing_newline = None;
+
+            let apply_start = Instant::now();
+            self.layout_pending_edit(laid_out, hidden_ranges.clone());
+            let apply_dur = apply_start.elapsed();
+
+            let total = collect_dur + build_dur + parallel_dur + fold_dur + apply_dur;
+            log::debug!(
+                "[perf] layout_edit_delta chunk 1/{chunk_count} ({} rows) collect_edits {:.3} ms | build_layout_tasks {:.3} ms | parallel_layout {:.3} ms | fold_collapse {:.3} ms | apply_tree {:.3} ms | total {:.3} ms",
+                chunk_start.elapsed().as_secs_f64() * 1000.0,
+                collect_dur.as_secs_f64() * 1000.0,
+                build_dur.as_secs_f64() * 1000.0,
+                parallel_dur.as_secs_f64() * 1000.0,
+                fold_dur.as_secs_f64() * 1000.0,
+                apply_dur.as_secs_f64() * 1000.0,
+                total.as_secs_f64() * 1000.0,
+            );
+
+            // Queue the remaining rows as append-only chunks: the content tree now ends at
+            // the last row of the first chunk, so each subsequent chunk appends at
+            // extent+1 (CharOffset space). Append-only means existing row numbers never
+            // change — side-by-side spacer alignment stays stable. Chunks larger than
+            // ROWS_PER_FLUSH are re-split on the next layout_edit_delta call.
+            if !rest_rows.is_empty() {
+                let tree_extent = self.content.borrow().extent::<CharOffset>();
+                let at = tree_extent + CharOffset::from(1);
+                let rest = EditDelta {
+                    precise_deltas: Arc::new(Vec::new()),
+                    old_offset: at..at,
+                    new_lines: rest_rows,
+                };
+                self.pending_edits
+                    .lock()
+                    .push(PendingLayout::Edit { delta: rest, hidden_ranges });
+            }
+            return;
+        }
+
+        self.layout_edit_delta_single(delta, hidden_ranges, app);
+    }
+
+    /// Lay out a single (already bounded) EditDelta and apply it to the content tree.
+    fn layout_edit_delta_single(
+        &self,
+        delta: EditDelta,
+        hidden_ranges: Option<RangeSet<CharOffset>>,
+        app: &AppContext,
+    ) {
         let layout_context = self.layout_context(app);
-        let laid_out_edit = delta.layout_delta(
+        let (laid_out, collect_dur, build_dur, parallel_dur, fold_dur) = delta.layout_delta(
             &layout_context,
             self.document_path.as_deref(),
             self.layout_options,
             hidden_ranges.clone(),
             app,
         );
-        self.layout_pending_edit(laid_out_edit, hidden_ranges);
+
+        let apply_start = Instant::now();
+        self.layout_pending_edit(laid_out, hidden_ranges.clone());
+        let apply_dur = apply_start.elapsed();
+
+        let total = collect_dur + build_dur + parallel_dur + fold_dur + apply_dur;
+        log::debug!(
+            "[perf] layout_edit_delta collect_edits {:.3} ms | build_layout_tasks {:.3} ms | parallel_layout {:.3} ms | fold_collapse {:.3} ms | apply_tree {:.3} ms | end total {:.3} ms",
+            collect_dur.as_secs_f64() * 1000.0,
+            build_dur.as_secs_f64() * 1000.0,
+            parallel_dur.as_secs_f64() * 1000.0,
+            fold_dur.as_secs_f64() * 1000.0,
+            apply_dur.as_secs_f64() * 1000.0,
+            total.as_secs_f64() * 1000.0,
+        );
     }
 
     fn layout_context<'a>(&'a self, ctx: &'a AppContext) -> TextLayout<'a> {
@@ -2485,32 +2767,474 @@ impl RenderState {
         .with_container_scrolls_horizontally(self.container_scrolls_horizontally())
     }
 
+    /// 把队列中的 TemporaryBlocks 条目稳定地移到队首。
+    ///
+    /// spacer 的「覆盖即插」要求它每帧 flush 时先于内容 chunk 被处理:
+    /// mark_lazy / 装饰重算把 spacer 作为**一条整批条目**追加在 pending 队列
+    /// 尾部,而逐帧 flush 每帧只推进 300 行内容——若不前置,spacer 要等整棵
+    /// 树排空才轮到,期间已排空区域没有对齐空行(视觉即「空行不渲染」,
+    /// 树排空后又一次性出现)。前置后,flush 的拆分提交逻辑每帧把「当前树
+    /// 已覆盖」的 spacer 插入,未覆盖部分留在队列里等树继续生长。
+    fn move_temporary_block_entries_front(queue: &mut VecDeque<PendingLayout>) {
+        let mut spacers = Vec::new();
+        let mut others = VecDeque::with_capacity(queue.len());
+        while let Some(entry) = queue.pop_front() {
+            if matches!(entry, PendingLayout::TemporaryBlocks { .. }) {
+                spacers.push(entry);
+            } else {
+                others.push_back(entry);
+            }
+        }
+        *queue = others;
+        // 反向 push_front,保持 spacers 的原相对顺序。
+        for entry in spacers.into_iter().rev() {
+            queue.push_front(entry);
+        }
+    }
+
     /// If we are performing layout lazily, call this to flush the pending edits and selection changes
     /// at layout time in the UI framework element cycle.
+    ///
+    /// Edits are flushed with a **frame budget** (8ms per call) to avoid blocking the UI thread.
+    /// Remaining pending edits are left in the queue and flushed on the next layout frame.
+    ///
+    /// If [`Self::preload_pending_edits`] was called (e.g. after content was set during
+    /// editor initialization), this returns `false` immediately since the queue is already empty.
     pub fn try_layout_pending_edits(&self, app: &AppContext) -> bool {
-        let mut pending_edits = self.pending_edits.lock();
-        let last_rendered_version = self.buffer_version.borrow_mut().start_layout();
-        let pending_edits_flushed = self.lazy_layout && !pending_edits.is_empty();
+        if !self.lazy_layout {
+            return false;
+        }
 
-        if pending_edits_flushed {
-            for edit in mem::take(&mut *pending_edits) {
-                match edit {
-                    PendingLayout::Edit {
-                        delta,
-                        hidden_ranges,
-                    } => {
-                        self.layout_edit_delta(delta, hidden_ranges, app);
+        let last_rendered_version = self.buffer_version.borrow_mut().start_layout();
+
+        // 行数预算:每帧推进 `ROWS_PER_FRAME_BUDGET` 行内容(含其间已覆盖的
+        // spacer)。用「行数」而非「时间」做预算,是为了让 side-by-side 双列
+        // 的排空进度**按行对齐**:两列在同一元素帧内先后执行本函数、各推同样
+        // 行数 → 任意时刻两列树行数一致 → 同一 scroll_top 显示同一文件行,
+        // 滚动即对齐(旧行时间预算:8ms,拆分不同耗时导致两列进度漂移)。
+        //
+        // 300 行/帧与 split-delta 的 chunk 行数一致(≈4ms < 旧 8ms 预算);
+        // 时间上限 `MAX_FLUSH_MS` 仅作保护,防极端长行阻塞首帧。
+        const ROWS_PER_FRAME_BUDGET: usize = 300;
+        const MAX_FLUSH_MS: u64 = 12;
+        let flush_start = Instant::now();
+        let start_rows = self.tree_row_count();
+        let mut rows_grown: usize = 0;
+
+        let mut queue: VecDeque<PendingLayout> = mem::take(&mut *self.pending_edits.lock()).into();
+        // spacer 条目前置:让「覆盖即插」逐帧生效(见函数文档)。
+        Self::move_temporary_block_entries_front(&mut queue);
+        let had_pending_edits = !queue.is_empty();
+        let mut deferred: Vec<PendingLayout> = Vec::new();
+        let mut parked_blocks: Vec<TemporaryBlock> = Vec::new();
+
+        while let Some(edit) = queue.pop_front() {
+            // 预算保护:时间超限(极端长行)或行数达标 → 余量交回下帧。
+            if flush_start.elapsed().as_millis() as u64 >= MAX_FLUSH_MS
+                || (rows_grown >= ROWS_PER_FRAME_BUDGET && !parked_blocks.is_empty())
+            {
+                deferred.push(edit);
+                deferred.extend(queue.drain(..));
+                break;
+            }
+            match edit {
+                PendingLayout::Edit {
+                    delta,
+                    hidden_ranges,
+                } => {
+                    self.layout_edit_delta(delta, hidden_ranges, app);
+                    // split-delta 的余量 chunk 被推回 pending 队列;取回本地队首,
+                    // 先于后续条目处理,保持 FIFO 语义(与 head 预渲染一致)。
+                    let mut remainder = mem::take(&mut *self.pending_edits.lock());
+                    while let Some(item) = remainder.pop() {
+                        queue.push_front(item);
                     }
-                    PendingLayout::TemporaryBlocks(blocks) => {
-                        self.layout_temporary_blocks(blocks, app);
+                }
+                PendingLayout::TemporaryBlocks {
+                    blocks,
+                    replace_existing,
+                } => {
+                    let tree_rows = self.tree_row_count();
+                    // 按当前树行数拆分:已覆盖部分立即提交,未覆盖部分押后。
+                    let (coverable, rest): (Vec<_>, Vec<_>) = blocks
+                        .into_iter()
+                        .partition(|block| block.insert_before.as_usize() <= tree_rows);
+                    if replace_existing {
+                        // 装饰重算(回填/revert/重设):全量替换语义,但按覆盖
+                        // 拆分提交——树中的旧临时块全部位于已覆盖区内(reset
+                        // 清掉后,新 diff 不再需要的边界被正确移除,仍需要的由
+                        // 已覆盖新块补位);未覆盖新块位于树尾之后、与旧块无
+                        // 重叠,押后为增量语义等树长后插入。整批押后会让懒加载
+                        // 期间已覆盖区(含首屏)的 spacer 一起缺席,直到整棵
+                        // 树排空才一次性出现。
+                        if !coverable.is_empty() {
+                            let layout_context = self.layout_context(app);
+                            let laid_out_blocks =
+                                layout_temporary_blocks(coverable, &layout_context);
+                            self.reset_temporary_block(laid_out_blocks);
+                        }
+                        if !rest.is_empty() {
+                            deferred.push(PendingLayout::TemporaryBlocks {
+                                blocks: rest,
+                                replace_existing: false,
+                            });
+                        }
+                    } else {
+                        // 懒加载分批「覆盖即插」:增量插入(保留旧块)。覆盖的
+                        // 立即插,未覆盖的押下等内容增长后重试。
+                        if !coverable.is_empty() {
+                            let layout_context = self.layout_context(app);
+                            let laid_out_blocks =
+                                layout_temporary_blocks(coverable, &layout_context);
+                            self.insert_temporary_blocks_incremental(laid_out_blocks);
+                        }
+                        parked_blocks.extend(rest);
                     }
-                };
+                }
+            }
+            // 内容增长后,重试挂起 spacer 中位置已被覆盖的部分(增量插入)。
+            let tree_rows = self.tree_row_count();
+            if !parked_blocks.is_empty() {
+                let (coverable, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut parked_blocks)
+                    .into_iter()
+                    .partition(|block| block.insert_before.as_usize() <= tree_rows);
+                if !coverable.is_empty() {
+                    let layout_context = self.layout_context(app);
+                    let laid_out_blocks = layout_temporary_blocks(coverable, &layout_context);
+                    self.insert_temporary_blocks_incremental(laid_out_blocks);
+                }
+                parked_blocks = rest;
+            }
+            rows_grown = self.tree_row_count().saturating_sub(start_rows);
+            // 行数预算已满(且无可立即插入的挂起 spacer) → 本帧到此为止。
+            if rows_grown >= ROWS_PER_FRAME_BUDGET && parked_blocks.is_empty() {
+                deferred.extend(queue.drain(..));
+                break;
             }
         }
 
+        // 放回:内容 chunk 在前、未覆盖 spacer 在后(逐帧路径的 FIFO 语义;
+        // spacer 条目下次遇到时依旧走覆盖即插 — 增量)。
+        if !parked_blocks.is_empty() {
+            deferred.push(PendingLayout::TemporaryBlocks {
+                blocks: parked_blocks,
+                replace_existing: false,
+            });
+        }
+        self.pending_edits.lock().extend(deferred);
+
         // Flush the pending selection changes.
         self.flush_pending_selection_update(last_rendered_version);
-        pending_edits_flushed
+        // Return true if we flushed any edits this frame (regardless of whether more remain).
+        had_pending_edits
+    }
+
+    /// Flush all pending edits **without** any frame budget. Call this after the editor's
+    /// content has been set (e.g., after a file is loaded during initialization) but **before**
+    /// the first UI layout frame is dispatched by the framework.
+    ///
+    /// This avoids the ~134ms first-frame blocking that would otherwise occur when a large
+    /// batch of pending edits (e.g., from loading a file with thousands of lines) is flushed
+    /// inside the first `try_layout_pending_edits` call.
+    ///
+    /// Safe to call multiple times; subsequent calls are no-ops after the first.
+    pub fn preload_pending_edits(&mut self, app: &AppContext) {
+        if !self.lazy_layout {
+            return;
+        }
+
+        // Drain the async layout channel synchronously so any pending edits queued
+        // during setup (e.g. from BufferEvent::ContentChanged) are available to flush.
+        // 其余动作(SelectionChanged / DecorationChanged / Autoscroll / ScrollTo)
+        // 不属于本次同步排空的布局数据,不能静默丢弃:先收集,排空结束后回投
+        // channel 交还异步布局 actor 按原语义处理(不能在循环内回投——回投的
+        // 动作会被本循环再次收到,永不清空)。
+        let mut deferred_actions = Vec::new();
+        while let Ok(action) = self.layout_rx.try_recv() {
+            match action {
+                LayoutAction::BufferEdit {
+                    delta,
+                    buffer_version,
+                } => {
+                    let hidden_ranges = self
+                        .hidden_lines
+                        .as_ref()
+                        .map(|hl| hl.as_ref(app).hidden_ranges_at_version(buffer_version));
+                    self.pending_edits.lock().push(PendingLayout::Edit {
+                        delta,
+                        hidden_ranges,
+                    });
+                }
+                LayoutAction::LayoutTemporaryBlock {
+                    blocks,
+                    replace_existing,
+                } => {
+                    self.pending_edits.lock().push(PendingLayout::TemporaryBlocks {
+                        blocks,
+                        replace_existing,
+                    });
+                }
+                other => deferred_actions.push(other),
+            }
+        }
+        for action in deferred_actions {
+            self.submit_layout_action(action);
+        }
+
+        let all_edits = mem::take(&mut *self.pending_edits.lock());
+        if all_edits.is_empty() {
+            return;
+        }
+        log::debug!(
+            "[perf] preload_pending_edits: flushing {} pending edits",
+            all_edits.len()
+        );
+
+        // Sequential layout computation (font system is not thread-safe, so we
+        // must run on the main thread). This still avoids blocking the FIRST render
+        // frame: preload_pending_edits is called in a separate model.update() AFTER
+        // the first ContentChanged event flushes, so the 140ms computation here
+        // happens before the second frame paints instead of during it.
+        //
+        // Items are processed in FIFO order. Once a split-delta layout pushes its
+        // remainder chunk back onto the queue, the content tree is incomplete: later
+        // edits' CharOffsets assume the full earlier edit is applied, so they (and any
+        // TemporaryBlocks after them) must stay queued behind the remainder — same rule
+        // as [`Self::try_layout_pending_edits`].
+        let edit_count = all_edits
+            .iter()
+            .filter(|edit| matches!(edit, PendingLayout::Edit { .. }))
+            .count();
+        let preload_start = Instant::now();
+        let mut deferred = Vec::new();
+        let mut edits_iter = all_edits.into_iter();
+        while let Some(edit) = edits_iter.next() {
+            match edit {
+                PendingLayout::Edit {
+                    delta,
+                    hidden_ranges,
+                } => {
+                    self.layout_edit_delta(delta, hidden_ranges, app);
+                    if !self.pending_edits.lock().is_empty() {
+                        deferred.extend(edits_iter);
+                        break;
+                    }
+                }
+                PendingLayout::TemporaryBlocks {
+                    blocks,
+                    replace_existing,
+                } => {
+                    // 排空路径:块语义(replace=重算清旧 / incremental=分段
+                    // 保留旧块)透传给 layout_temporary_blocks,由其按树覆盖
+                    // 分区——越树尾的部分放回队列等树增长,绝不销毁。
+                    self.layout_temporary_blocks(blocks, replace_existing, app);
+                }
+            }
+        }
+        if !deferred.is_empty() {
+            self.pending_edits.lock().extend(deferred);
+        }
+        if edit_count > 0 {
+            log::debug!(
+                "[perf] preload_pending_edits: total {:.1}ms for {} layout edits",
+                preload_start.elapsed().as_secs_f64() * 1000.0,
+                edit_count
+            );
+        }
+
+        self.update_content_sizing();
+    }
+
+    /// 当前内容树的行数(不含零行 TemporaryBlock)。
+    pub fn content_row_count(&self) -> usize {
+        self.content.borrow().summary().lines.as_u32() as usize
+    }
+
+    /// 树中是否已存在 spacer(TemporaryBlock)。同步补排空把 spacer 插入树后,
+    /// 调用方据此决定是否通知 view 重渲染(否则视口快照停留在旧树)。
+    pub fn has_content_spacers(&self) -> bool {
+        let content = self.content.borrow();
+        let mut cursor = content.cursor::<LineCount, CharOffset>();
+        cursor.descend_to_first_item(&content, |_| true);
+        while let Some(item) = cursor.item() {
+            if matches!(item, BlockItem::TemporaryBlock { .. }) {
+                return true;
+            }
+            cursor.next();
+        }
+        false
+    }
+
+    /// 树中 spacer(TemporaryBlock)块数与总高;回归测试用于断言
+    /// 「无销毁/全部上树」,生产路径不使用。
+    #[cfg(test)]
+    pub(crate) fn spacer_stats(&self) -> (usize, f64) {
+        let content = self.content.borrow();
+        let mut cursor = content.cursor::<LineCount, CharOffset>();
+        cursor.descend_to_first_item(&content, |_| true);
+        let (mut n, mut h) = (0usize, 0.0f64);
+        while let Some(item) = cursor.item() {
+            if matches!(item, BlockItem::TemporaryBlock { .. }) {
+                n += 1;
+                h += item.height().as_f32() as f64;
+            }
+            cursor.next();
+        }
+        (n, h)
+    }
+
+    /// 首次加载只同步渲染前 `max_rows` 行内容(含其间 spacer),其余条目留在
+    /// pending 队列,由 [`Self::try_layout_pending_edits`] 按帧预算(8ms)分批
+    /// 排空。
+    ///
+    /// 用于 side-by-side 双列打开路径:两列在创建时同步完成「前 `max_rows` 行 +
+    /// 其间已覆盖的 spacer」,首屏(含锚行跳转目标)立即完整且两列对称;
+    /// 其余行继续懒加载。
+    ///
+    /// spacer 的插入按 `insert_before` 是否已被当前树行数覆盖拆分——覆盖的
+    /// 立即插入(否则首屏 diff 配对错误),未覆盖的留在队列交回逐帧路径,
+    /// 任何情况下不销毁。
+    pub fn preload_pending_edits_head(&mut self, app: &AppContext, max_rows: usize) {
+        if !self.lazy_layout {
+            return;
+        }
+
+        // 与 [`Self::preload_pending_edits`] 相同:先把异步通道里的动作收进
+        // 队列。创建同步路径上内容/装饰可能还在 channel 里(布局 actor 尚未
+        // 转发),不排空的话头部预渲染会扑空。
+        // 其余动作先收集、排空结束后回投 channel 交还异步布局 actor,不静默
+        // 丢弃(循环内回投会被本循环再次收到)。
+        let mut deferred_actions = Vec::new();
+        while let Ok(action) = self.layout_rx.try_recv() {
+            match action {
+                LayoutAction::BufferEdit {
+                    delta,
+                    buffer_version,
+                } => {
+                    let hidden_ranges = self
+                        .hidden_lines
+                        .as_ref()
+                        .map(|hl| hl.as_ref(app).hidden_ranges_at_version(buffer_version));
+                    self.pending_edits.lock().push(PendingLayout::Edit {
+                        delta,
+                        hidden_ranges,
+                    });
+                }
+                LayoutAction::LayoutTemporaryBlock {
+                    blocks,
+                    replace_existing,
+                } => {
+                    self.pending_edits.lock().push(PendingLayout::TemporaryBlocks {
+                        blocks,
+                        replace_existing,
+                    });
+                }
+                other => deferred_actions.push(other),
+            }
+        }
+        for action in deferred_actions {
+            self.submit_layout_action(action);
+        }
+
+        let preload_start = Instant::now();
+        let mut queue: VecDeque<PendingLayout> = mem::take(&mut *self.pending_edits.lock()).into();
+        // spacer 条目前置:与逐帧路径一致,让「覆盖即插」逐帧生效。
+        Self::move_temporary_block_entries_front(&mut queue);
+        let mut deferred: Vec<PendingLayout> = Vec::new();
+        let mut parked_blocks: Vec<TemporaryBlock> = Vec::new();
+
+        while let Some(edit) = queue.pop_front() {
+            match edit {
+                PendingLayout::Edit { delta, hidden_ranges } => {
+                    if self.tree_row_count() >= max_rows {
+                        // 行数预算已满:本条与其余条目按 FIFO 放回,交给逐帧路径。
+                        deferred.push(PendingLayout::Edit { delta, hidden_ranges });
+                        deferred.extend(queue.drain(..));
+                        break;
+                    }
+                    self.layout_edit_delta(delta, hidden_ranges, app);
+                    // split-delta 的余量 chunk 被推回 pending 队列;取回本地队首,
+                    // 先于后续条目处理,保持与逐帧路径相同的 FIFO 语义。
+                    let mut remainder = mem::take(&mut *self.pending_edits.lock());
+                    while let Some(item) = remainder.pop() {
+                        queue.push_front(item);
+                    }
+                }
+                PendingLayout::TemporaryBlocks {
+                    blocks,
+                    replace_existing,
+                } => {
+                    let tree_rows = self.tree_row_count();
+                    // 按当前树行数拆分:已覆盖部分立即提交,未覆盖部分押后。
+                    let (coverable, rest): (Vec<_>, Vec<_>) = blocks
+                        .into_iter()
+                        .partition(|block| block.insert_before.as_usize() <= tree_rows);
+                    if replace_existing {
+                        // 装饰重算:按覆盖拆分提交(与逐帧路径一致)——旧临时块
+                        // 全部位于已覆盖区内(reset 清掉后,新 diff 不再需要的
+                        // 边界被正确移除,仍需要的由已覆盖新块补位);未覆盖
+                        // 新块位于树尾之后、与旧块无重叠,押后为增量语义。
+                        if !coverable.is_empty() {
+                            let layout_context = self.layout_context(app);
+                            let laid_out_blocks =
+                                layout_temporary_blocks(coverable, &layout_context);
+                            self.reset_temporary_block(laid_out_blocks);
+                        }
+                        if !rest.is_empty() {
+                            deferred.push(PendingLayout::TemporaryBlocks {
+                                blocks: rest,
+                                replace_existing: false,
+                            });
+                        }
+                    } else {
+                        // 懒加载分批:覆盖即插(增量)。
+                        if !coverable.is_empty() {
+                            let layout_context = self.layout_context(app);
+                            let laid_out_blocks =
+                                layout_temporary_blocks(coverable, &layout_context);
+                            self.insert_temporary_blocks_incremental(laid_out_blocks);
+                        }
+                        parked_blocks.extend(rest);
+                    }
+                }
+            }
+            // 内容增长后,重试挂起 spacer 中位置已被覆盖的部分(增量插入)。
+            if !parked_blocks.is_empty() {
+                let tree_rows = self.tree_row_count();
+                let (coverable, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut parked_blocks)
+                    .into_iter()
+                    .partition(|block| block.insert_before.as_usize() <= tree_rows);
+                if !coverable.is_empty() {
+                    let layout_context = self.layout_context(app);
+                    let laid_out_blocks = layout_temporary_blocks(coverable, &layout_context);
+                    self.insert_temporary_blocks_incremental(laid_out_blocks);
+                }
+                parked_blocks = rest;
+            }
+        }
+
+        // 放回:内容 chunk 在前、未覆盖 spacer 在后(与逐帧路径的原 FIFO 语义
+        // 一致,spacer 由 layout_temporary_blocks 的队尾规则在排空完成后插入)。
+        let deferred_count = deferred.len();
+        if !parked_blocks.is_empty() {
+            deferred.push(PendingLayout::TemporaryBlocks {
+                blocks: parked_blocks,
+                replace_existing: false,
+            });
+        }
+        self.pending_edits.lock().extend(deferred);
+
+        log::debug!(
+            "[perf] preload_pending_edits_head: tree_rows={} (max={max_rows}) in {:.1} ms, {} items deferred",
+            self.tree_row_count(),
+            preload_start.elapsed().as_secs_f64() * 1000.0,
+            deferred_count
+        );
+        self.update_content_sizing();
+    }
+
+    fn tree_row_count(&self) -> usize {
+        self.content.borrow().summary().lines.as_u32() as usize
     }
 
     /// Updates the model with the results of laying out its element.
@@ -2552,8 +3276,15 @@ impl RenderState {
         });
     }
 
-    pub fn add_temporary_blocks(&mut self, temporary_blocks: Vec<TemporaryBlock>) {
-        self.submit_layout_action(LayoutAction::LayoutTemporaryBlock(temporary_blocks));
+    pub fn add_temporary_blocks(
+        &mut self,
+        temporary_blocks: Vec<TemporaryBlock>,
+        replace_existing: bool,
+    ) {
+        self.submit_layout_action(LayoutAction::LayoutTemporaryBlock {
+            blocks: temporary_blocks,
+            replace_existing,
+        });
     }
 
     /// Replace all temporary blocks in the BlockItem cache with a new set of temporary
@@ -2570,23 +3301,135 @@ impl RenderState {
             }
 
             cursor.descend_to_first_item(&content, |_| true);
+
+            // 旧临时块不贡献行数(lines == 0),只能落在内容项的边界上;而整段
+            // push_tree 保留的区间里不能夹带旧临时块(它们必须被替换掉)。所以先
+            // 轻量扫描一遍(不克隆任何 item),收集所有旧临时块所在的边界行号,
+            // 与本次要插入的 blocks 键合并成「必须逐项处理」的边界集合。
+            let mut boundaries: Vec<LineCount> = blocks.keys().copied().collect();
             while let Some(item) = cursor.item() {
+                if matches!(item, BlockItem::TemporaryBlock { .. }) {
+                    boundaries.push(cursor.end_seek_position());
+                }
+                cursor.next();
+            }
+            boundaries.sort_unstable();
+            boundaries.dedup();
+
+            // 重新从树首开始,按边界逐个切割:未变化的区间整体搬入 new_tree,
+            // 只在有旧临时块 / 需要插入新块的边界上逐项处理,把 O(全量行数) 的
+            // 逐项克隆降为 O(#临时块 + 受影响片段)。
+            let mut cursor = content.cursor::<LineCount, CharOffset>();
+            cursor.descend_to_first_item(&content, |_| true);
+            for boundary in boundaries {
+                // 当前游标位置起、严格位于该边界之前的内容整段保留(zero item 克隆)。
+                new_tree.push_tree(cursor.slice(&boundary, SeekBias::Left));
+
+                let Some(item) = cursor.item() else {
+                    // 边界已越过树尾:原实现中这些键同样不会命中任何 item,直接丢弃。
+                    break;
+                };
+
+                // 边界落在某个跨行项的中间:该键不会命中任何 item 的
+                // end_seek_position(与原实现行为一致),丢弃该键。
+                if cursor.end_seek_position() != boundary {
+                    blocks.remove(&boundary);
+                    continue;
+                }
+
+                // 第一个以该边界结束的项:非临时块则保留,随后插入挂在该插入点的新块。
                 if !matches!(item, BlockItem::TemporaryBlock { .. }) {
                     new_tree.push(item.clone());
                 }
-
-                if let Some(items) = blocks.remove(&cursor.end_seek_position()) {
+                if let Some(items) = blocks.remove(&boundary) {
                     for item in items {
                         new_tree.push(item);
                     }
                 }
-
                 cursor.next();
+
+                // 边界上可能还叠着多个零行 item:旧的临时块要被替换掉,其他零行
+                // 内容项继续保留,逐项处理直到越过该边界。
+                while let Some(item) = cursor.item() {
+                    if cursor.end_seek_position() != boundary {
+                        break;
+                    }
+                    if !matches!(item, BlockItem::TemporaryBlock { .. }) {
+                        new_tree.push(item.clone());
+                    }
+                    cursor.next();
+                }
             }
+
+            // 最后一个边界之后的内容全部未受影响,直接整体保留。
+            new_tree.push_tree(cursor.suffix());
         }
         self.has_final_trailing_newline
             .set(Self::tree_ends_with_trailing_newline(&new_tree));
         *self.content.borrow_mut() = new_tree;
+        self.invalidate_spacer_y_ranges_cache();
+    }
+
+    /// 增量插入临时块:**保留树上已有的 TemporaryBlock**,只在目标边界追加新块。
+    ///
+    /// 与 [`Self::reset_temporary_block`] 的「全量替换」语义相反:懒加载分批
+    /// 「覆盖即插」若用 reset,后一批会清掉先一批已就位的 spacer(每次调用
+    /// 移除树中所有旧临时块),该列 spacer 永久丢失 → 两侧总高不等(实测
+    /// 左 185553.2px / 右 189845.61px,差 219 行)。此方法供分批路径使用,
+    /// 由调用方保证每个边界只成功插入一次(插过即不再提交同一块)。
+    fn insert_temporary_blocks_incremental(
+        &self,
+        mut blocks: HashMap<LineCount, Vec<BlockItem>>,
+    ) {
+        if blocks.is_empty() {
+            return;
+        }
+        let mut new_tree = SumTree::new();
+        {
+            let content = self.content.borrow();
+            let mut boundaries: Vec<LineCount> = blocks.keys().copied().collect();
+            boundaries.sort_unstable();
+            boundaries.dedup();
+
+            let mut cursor = content.cursor::<LineCount, CharOffset>();
+            cursor.descend_to_first_item(&content, |_| true);
+            for boundary in boundaries {
+                // 边界之前的内容整段保留。
+                new_tree.push_tree(cursor.slice(&boundary, SeekBias::Left));
+
+                let Some(item) = cursor.item() else {
+                    // 边界已越过树尾:该键尚未被覆盖,丢弃等调用方重试。
+                    break;
+                };
+                if cursor.end_seek_position() != boundary {
+                    // 边界落在跨行项中间:与 reset 行为一致,丢弃该键。
+                    continue;
+                }
+
+                // 与 reset 不同:保留边界上的原 item(含旧 TemporaryBlock),
+                // 新块追加在其后 —— 增量语义,不清旧块。
+                new_tree.push(item.clone());
+                if let Some(items) = blocks.remove(&boundary) {
+                    for item in items {
+                        new_tree.push(item);
+                    }
+                }
+                cursor.next();
+                while let Some(item) = cursor.item() {
+                    if cursor.end_seek_position() != boundary {
+                        break;
+                    }
+                    new_tree.push(item.clone());
+                    cursor.next();
+                }
+            }
+
+            new_tree.push_tree(cursor.suffix());
+        }
+        self.has_final_trailing_newline
+            .set(Self::tree_ends_with_trailing_newline(&new_tree));
+        *self.content.borrow_mut() = new_tree;
+        self.invalidate_spacer_y_ranges_cache();
     }
 
     /// Update the render state with laid out new edits.
@@ -2731,6 +3574,7 @@ impl RenderState {
             .set(Self::tree_ends_with_trailing_newline(&new_tree));
         let mut content_mut = self.content.borrow_mut();
         *content_mut = new_tree;
+        self.invalidate_spacer_y_ranges_cache();
     }
 
     /// Dedupe adjacent hidden ranges into one.
@@ -2803,7 +3647,8 @@ impl RenderState {
     }
 
     fn update_content_sizing(&mut self) {
-        self.viewport.update_content_height(self.height());
+        self.viewport
+            .update_content_height(self.scroll_clamp_height());
         self.viewport.update_content_width(self.width());
     }
 
@@ -2824,7 +3669,10 @@ impl RenderState {
                     let (start, _) = self.character_width_height_range(character_offset);
                     if self
                         .viewport
-                        .scroll_to(start.y().into_pixels() + pixel_delta, self.height())
+                        .scroll_to(
+                            start.y().into_pixels() + pixel_delta,
+                            self.scroll_clamp_height(),
+                        )
                         || table_scroll_changed
                     {
                         ctx.notify();
@@ -3210,6 +4058,7 @@ impl RenderState {
         self.has_final_trailing_newline
             .set(Self::tree_ends_with_trailing_newline(&content));
         self.content = content.into();
+        self.invalidate_spacer_y_ranges_cache();
     }
 
     /// Scroll to the start of a given block, possibly adjusted.
@@ -3220,6 +4069,12 @@ impl RenderState {
         cursor.seek(&offset, SeekBias::Right);
         self.viewport
             .set_scroll_top(cursor.start().into_pixels() + adjustment.into_pixels());
+    }
+
+    /// Set an exact vertical scroll offset, for scroll-simulation benchmarks.
+    #[cfg(test)]
+    pub fn set_scroll_top_for_test(&mut self, scroll_top: Pixels) {
+        self.viewport.set_scroll_top(scroll_top);
     }
 
     /// Line number of the first line in the block.
@@ -3296,7 +4151,22 @@ enum PendingLayout {
         delta: EditDelta,
         hidden_ranges: Option<RangeSet<CharOffset>>,
     },
-    TemporaryBlocks(Vec<TemporaryBlock>),
+    /// 一批临时块(spacer)。
+    ///
+    /// `replace_existing = true`:装饰重算(回填/revert/重设)。按当前树覆盖
+    /// 范围**拆分提交**:边界已被树覆盖的部分立即走 `reset_temporary_block`
+    /// 全量替换(树中旧临时块的边界必然 ≤ 当前树行数,全部落在被替换区内,
+    /// 清掉后新 diff 不再需要的边界被正确移除);未覆盖的部分以增量语义押后
+    /// 等树长后再插,不会销毁。
+    ///
+    /// `replace_existing = false`:懒加载分批「覆盖即插」,语义为**增量**——
+    /// 树覆盖一个边界就插一个块,`reset_temporary_block` 的全量替换语义会
+    /// 把先前已就位的块抹掉(后一批清掉先一批 → 该列 spacer 永久丢失、两列
+    /// 总高不等),因此必须走 `insert_temporary_blocks_incremental` 保留旧块。
+    TemporaryBlocks {
+        blocks: Vec<TemporaryBlock>,
+        replace_existing: bool,
+    },
 }
 
 struct PendingSelectionUpdate {
@@ -3319,7 +4189,12 @@ enum LayoutAction {
         delta: EditDelta,
         buffer_version: BufferVersion,
     },
-    LayoutTemporaryBlock(Vec<TemporaryBlock>),
+    LayoutTemporaryBlock {
+        blocks: Vec<TemporaryBlock>,
+        /// true = 装饰重算(清掉树中全部旧 spacer 后插入本批);false = 同批
+        /// 分段/懒加载补插(保留旧块,增量插入)。见 PendingLayout 文档。
+        replace_existing: bool,
+    },
     /// Autoscroll, to the specified range if `Some` or to the cursor location if `None`.
     Autoscroll {
         mode: AutoScrollMode,
@@ -3493,10 +4368,14 @@ impl BlockItem {
             BlockItem::TextBlock { paragraph_block } => paragraph_block.spacing(),
             BlockItem::RunnableCodeBlock {
                 paragraph_block, ..
-            }
-            | BlockItem::TemporaryBlock {
-                paragraph_block, ..
             } => paragraph_block.spacing(),
+            BlockItem::TemporaryBlock {
+                paragraph_block, ..
+            } => {
+                // 每段的 y 间距已在 content_height 中逐段计入,项级只保留 x 轴,
+                // 避免 y 间距被重复累加(见 content_height 的 TemporaryBlock 分支)。
+                paragraph_block.spacing().without_y_axis_offsets()
+            }
             BlockItem::MermaidDiagram { config, .. } => config.spacing,
             BlockItem::TrailingNewLine(cursor) => cursor.spacing(),
             BlockItem::HorizontalRule(config) => config.spacing,
@@ -3523,10 +4402,25 @@ impl BlockItem {
             | BlockItem::TaskList { paragraph, .. } => paragraph.height(),
             BlockItem::RunnableCodeBlock {
                 paragraph_block, ..
-            }
-            | BlockItem::TemporaryBlock {
-                paragraph_block, ..
             } => paragraph_block.height(),
+            BlockItem::TemporaryBlock {
+                paragraph_block, ..
+            } => {
+                // 临时块(双列 spacer / 内联展开的删除行)的每一行都必须与内容行
+                // (BlockItem::Paragraph)等高占位:内容行 = max(行高, 段最小高) + 项级
+                // y 间距。临时块若只按原始行高求和(旧行为),spacer 每行都矮一截,
+                // side-by-side 两列会随 spacer 数量累积漂移(列对不上)。
+                // 对应地,[`BlockItem::spacing`] 对临时块只保留 x 轴。
+                paragraph_block
+                    .paragraphs()
+                    .iter()
+                    .fold(0f32, |acc, paragraph| {
+                        acc + (paragraph.row_frame_height()
+                            + paragraph.spacing.y_axis_offset())
+                        .as_f32()
+                    })
+                    .into_pixels()
+            }
             BlockItem::MermaidDiagram { config, .. } => config.height,
             BlockItem::TrailingNewLine(cursor) => {
                 let mut height = cursor.height;
@@ -4457,6 +5351,34 @@ impl<'a> Positioned<'a, ParagraphBlock> {
                 });
                 *char_offset_acc += paragraph.content_length;
                 *y_offset_acc += paragraph.height;
+                *line_acc += paragraph.lines();
+                positioned
+            },
+        )
+    }
+
+    /// TemporaryBlock 专用:每段按「内容行」占位 —— 行框高
+    /// max(行高, 段最小高) 且行内垂直居中(与 [`BlockItem::Paragraph`] 的
+    /// `position_centered` 摆放一致),推进量 = 行框高 + 段自身 y 间距。
+    /// 使 k 行临时块(双列 spacer / 内联展开的删除行)的文本与背景落点
+    /// 和 k 个内容行逐行完全一致。文本块([`BlockItem::TextBlock`])仍用
+    /// 紧凑堆叠的 [`Self::paragraphs`]。
+    pub(super) fn row_pitched_paragraphs(
+        &self,
+    ) -> impl Iterator<Item = Positioned<'a, Paragraph>> + '_ {
+        self.item.paragraphs.iter().scan(
+            (self.start_char_offset, self.start_y_offset, self.start_line),
+            |(char_offset_acc, y_offset_acc, line_acc), paragraph| {
+                let frame = paragraph.row_frame_height();
+                let positioned = Some(Positioned {
+                    start_y_offset: *y_offset_acc + (frame - paragraph.height) / 2.0.into_pixels(),
+                    start_char_offset: *char_offset_acc,
+                    start_line: *line_acc,
+                    style: paragraph.spacing,
+                    item: paragraph,
+                });
+                *char_offset_acc += paragraph.content_length;
+                *y_offset_acc += frame + paragraph.spacing.y_axis_offset();
                 *line_acc += paragraph.lines();
                 positioned
             },

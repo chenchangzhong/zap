@@ -139,6 +139,12 @@ impl WindowManager {
         self.platform.set_window_title(window_id, title)
     }
 
+    /// Sets the background color of a window (shown where the renderer punches
+    /// holes for transparent embedded webviews). Forwarded to the platform.
+    pub fn set_window_background_color(&self, window_id: WindowId, color: pathfinder_color::ColorU) {
+        self.platform.set_window_background_color(window_id, color)
+    }
+
     pub fn key_window_is_modal_panel(&self) -> bool {
         self.platform.key_window_is_modal_panel()
     }

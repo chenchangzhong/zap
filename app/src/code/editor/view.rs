@@ -16,6 +16,7 @@ use crate::code::editor::{
     nav_bar::{NavBar, NavBarBehavior, NavBarEvent},
     scroll::{ScrollPosition, ScrollTrigger, ScrollWheelBehavior},
 };
+use warp_editor::content::edit::TemporaryBlock;
 use crate::code::{
     editor::EditorReviewComment, DiffResult, NoopCommentEditorProvider, ShowCommentEditorProvider,
 };
@@ -57,8 +58,8 @@ use warp_editor::{
             VerticalExpansionBehavior,
         },
         model::{
-            AutoScrollMode, BlockSpacing, Decoration, ExpansionType, LineCount, ParagraphStyles,
-            RichTextStyles, CODE_EDITOR_HIDDEN_SECTION_EXPANSION_LINES,
+            AutoScrollMode, BlockSpacing, Decoration, ExpansionType, LineCount, LineDecoration,
+            ParagraphStyles, RichTextStyles, CODE_EDITOR_HIDDEN_SECTION_EXPANSION_LINES,
         },
     },
     search::{SearchEvent, Searcher, MATCH_FILL, SELECTED_MATCH_FILL},
@@ -122,6 +123,10 @@ pub enum CodeEditorEvent {
     },
     /// Emitted when a diff hunk is reverted
     DiffReverted,
+    /// Emitted when the (read-only, left/baseline) column of a side-by-side diff requests a
+    /// revert. The baseline column must not reverse its own buffer (it is read-only reference
+    /// content with a reversed base), so it delegates to the editable (right/modified) column.
+    RevertDiffRequested { hunk_index: usize },
     HiddenSectionExpanded,
     /// Emitted when a comment is saved. This gets propagated up so that it
     /// can be augmented with the file and repo paths and saved to the comment model.
@@ -131,6 +136,14 @@ pub enum CodeEditorEvent {
     RequestOpenComment(CommentId),
     /// Emitted when the viewport is updated after layout
     ViewportUpdated,
+    /// Emitted synchronously when the user scrolls the editor (wheel / scrollbar),
+    /// before layout runs. Used for side-by-side diff scroll sync so the other
+    /// column can be scrolled in the same frame (no async layout round-trip).
+    Scrolled,
+    /// Emitted synchronously when diff-nav navigation (nav-bar up/down/revert) moved
+    /// the editor. Side-by-side sync uses this to jump the other column to the SAME
+    /// hunk instead of doing a proportional scroll.
+    NavScrolled,
     DelayedRenderingFlushed,
     /// Emitted when the render state layout has been updated.
     LayoutInvalidated,
@@ -175,6 +188,9 @@ struct CodeEditorViewDisplayOptions {
     diff_hunk_as_context: Option<AddAsContextButton>,
     /// The revert diff button, or `None` if it is not currently visible.
     revert_diff_hunk: Option<RevertHunkButton>,
+    /// Marks the left/baseline (read-only reference) column of a side-by-side diff. Its revert
+    /// button delegates to the editable right/modified column instead of reversing its own buffer.
+    is_side_by_side_baseline: bool,
     /// The add comment button, or `None` if it is not currently visible.
     comment_button: Option<CommentButton>,
     /// Whether to expand the width of the diff indicator in the gutter on hover.
@@ -329,6 +345,11 @@ impl CodeEditorView {
                 me.toggle_diff_nav(None, ctx);
                 ctx.notify();
             }
+            NavBarEvent::Scrolled => {
+                // Reuse the synchronous scroll event so side-by-side diff sync follows
+                // diff-navigation jumps (autoscroll does not go through ScrollVertical).
+                ctx.emit(CodeEditorEvent::NavScrolled);
+            }
         });
 
         // If feature flag is enabled, enable vim mode.
@@ -376,6 +397,7 @@ impl CodeEditorView {
                 show_nav_bar: true,
                 diff_hunk_as_context: Default::default(),
                 revert_diff_hunk: Default::default(),
+                is_side_by_side_baseline: false,
                 comment_button: Default::default(),
                 // By default expand diff indicators on hover.
                 expand_diff_indicator_width_on_hover: true,
@@ -429,6 +451,14 @@ impl CodeEditorView {
     pub fn with_revert_diff_hunk_button(mut self) -> Self {
         self.display_options.revert_diff_hunk =
             Some(RevertHunkButton::new(true /* is_enabled */));
+        self
+    }
+
+    /// Marks this editor as the read-only, left/baseline column of a side-by-side diff. Its
+    /// revert button delegates to the editable right/modified column instead of reversing its own
+    /// (read-only reference) buffer.
+    pub fn with_side_by_side_baseline(mut self) -> Self {
+        self.display_options.is_side_by_side_baseline = true;
         self
     }
 
@@ -546,6 +576,27 @@ impl CodeEditorView {
     pub fn set_base(&self, base: &str, recompute_diff: bool, ctx: &mut ViewContext<Self>) {
         self.model
             .update(ctx, |model, ctx| model.set_base(base, recompute_diff, ctx));
+    }
+
+    /// Set git diff decorations directly (bypasses diff engine). Used by side-by-side view.
+    pub fn set_git_diff_decorations(
+        &self,
+        line_decorations: Vec<LineDecoration>,
+        text_decorations: Vec<Decoration>,
+        temporary_blocks: Vec<TemporaryBlock>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.model.update(ctx, |model, ctx| {
+            model.set_git_diff_decorations(line_decorations, text_decorations, temporary_blocks, ctx);
+        });
+    }
+
+    /// Replace the diff status directly (bypasses the diff engine). Used by the
+    /// side-by-side view so the gutter hover buttons work without the engine's
+    /// spacer-row mappings.
+    pub fn set_diff_status(&self, status: DiffStatus, ctx: &mut ViewContext<Self>) {
+        self.model
+            .update(ctx, |model, ctx| model.set_diff_status(status, ctx));
     }
 
     pub fn lens_for_line_range(
@@ -1259,6 +1310,32 @@ impl CodeEditorView {
         }
     }
 
+    /// 仅激活 diff 导航(Focused(0)),不触发 nav bar 的按列自动滚动。
+    ///
+    /// side-by-side 双列打开时专用:nav bar 的 autoscroll 按各列自己的 hunk 起始行
+    /// 解析滚动目标,而该行之上恰有单侧 spacer(纯增行 hunk 在左列、纯删行 hunk 在
+    /// 右列),两列解析出的 y 相差 spacer 高度,打开即错位、滚动一次才对齐。
+    /// 双列改用 [`CodeReviewView`] 的对齐锚行跳转(两列同一 scroll_top)。
+    pub fn activate_diff_nav_without_autoscroll(&self, ctx: &mut ViewContext<Self>) {
+        if !self.display_options.can_show_diff_ui {
+            return;
+        }
+
+        self.model
+            .update(ctx, |model, ctx| model.toggle_diff_nav(None, ctx));
+    }
+
+    /// Focus a specific diff hunk index without toggling navigation off. Used when refreshing
+    /// side-by-side diff status after a revert, where the nav bar must stay active.
+    pub fn focus_diff_hunk_index(&self, index: usize, ctx: &mut ViewContext<Self>) {
+        if !self.display_options.can_show_diff_ui {
+            return;
+        }
+        self.model.update(ctx, |model, ctx| {
+            model.focus_diff_index(index, ctx);
+        });
+    }
+
     /// Expands all diff hunks without focusing any specific diff hunk.
     /// All diff hunks will be shown expanded with normal highlighting.
     pub fn expand_diffs(&self, ctx: &mut ViewContext<Self>) {
@@ -1268,6 +1345,15 @@ impl CodeEditorView {
 
         self.model.update(ctx, |model, ctx| {
             model.expand_diffs(ctx);
+        });
+    }
+
+    /// Pre-load all pending edits synchronously to avoid blocking the first UI layout frame.
+    ///
+    /// Call after the editor content has been set but before the first layout frame is dispatched.
+    pub fn preload_pending_edits(&self, ctx: &mut ViewContext<Self>) {
+        self.model.update(ctx, |model, ctx| {
+            model.preload_pending_edits(ctx);
         });
     }
 
@@ -1391,9 +1477,32 @@ impl CodeEditorView {
     /// Reset editor content using InitialBufferState.
     /// This is the preferred method for resetting editor content as it consolidates all parameters.
     pub fn reset(&self, state: InitialBufferState, ctx: &mut ViewContext<Self>) {
+        // First update: set content and emit ContentChanged event.
+        // The event is queued in pending_effects and NOT processed until the
+        // closure returns (flush_effects runs after all update closures).
         self.model.update(ctx, |model, ctx| {
             model.reset_content(state, ctx);
         });
+        // Second update: after flush_effects() has processed ContentChanged →
+        // handle_content_model_event → add_pending_edit → layout_rx → pending_edits,
+        // drain all pending edits synchronously to avoid first-frame blocking.
+        self.model.update(ctx, |model, ctx| {
+            model.preload_pending_edits(ctx);
+        });
+    }
+
+    /// Revert the diff hunk at `index` by reversing it in the buffer, then emit `DiffReverted`
+    /// for the parent to handle (toast, refresh, undo). Used by the side-by-side diff view's
+    /// baseline (left) column, which delegates its revert to the editable (right) column.
+    pub fn revert_diff_hunk_by_index(&self, index: usize, ctx: &mut ViewContext<Self>) {
+        if !FeatureFlag::RevertDiffHunk.is_enabled() {
+            return;
+        }
+        self.model.update(ctx, |model, ctx| {
+            model.reverse_diff_by_index(index, ctx);
+        });
+        ctx.emit(CodeEditorEvent::DiffReverted);
+        ctx.notify();
     }
 
     pub fn apply_diffs(&self, diffs: Vec<DiffDelta>, ctx: &mut ViewContext<Self>) {

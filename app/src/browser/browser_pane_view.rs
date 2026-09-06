@@ -48,6 +48,8 @@ pub struct BrowserPaneView {
     /// which destroys the old window's webview. On re-attach the webview is
     /// recreated and the platform-view handler re-registered for the new window.
     needs_recreate: bool,
+    /// 是否渲染地址栏+导航按钮(后退/前进/刷新)。DshPane 等内嵌场景设为 false。
+    show_address_bar: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,20 +73,29 @@ pub enum BrowserPaneAction {
     Close,
 }
 
-fn is_http_url(input: &str) -> bool {
-    Url::parse(input).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+fn is_navigation_url(input: &str) -> bool {
+    Url::parse(input).is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "about" | "data"))
 }
-
 impl BrowserPaneView {
     /// Create a new web preview pane, opening `url` in an embedded webview.
+    /// 默认显示地址栏。
     pub fn new(url: String, ctx: &mut ViewContext<Self>) -> Self {
+        Self::new_with_options(url, true, ctx)
+    }
+
+    /// 创建 webview pane,可控制是否显示地址栏。
+    pub fn new_with_options(
+        url: String,
+        show_address_bar: bool,
+        ctx: &mut ViewContext<Self>,
+    ) -> Self {
         let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new("Browser"));
         let platform_view_id = BrowserWebViewManager::as_ref(ctx).allocate_id();
         let window_id = ctx.window_id();
 
         let address_bar = ctx.add_typed_action_view(|ctx| {
             let mut input = SubmittableTextInput::new(ctx)
-                .validate_on_submit(is_http_url)
+                .validate_on_submit(is_navigation_url)
                 .with_border(false)
                 .with_on_focus_callback({
                     let id = platform_view_id;
@@ -111,6 +122,7 @@ impl BrowserPaneView {
             pane_configuration,
             window_id,
             needs_recreate: false,
+            show_address_bar,
         };
 
         ctx.subscribe_to_view(&view.address_bar, Self::handle_address_bar_event);
@@ -183,7 +195,7 @@ impl BrowserPaneView {
     /// - `Closed`:永久关闭,销毁 webview(避免幽灵视图与泄漏)。
     /// - `HiddenForClose`:undo 宽限期,隐藏 webview(保留以便恢复)。
     /// - `Moved`:跨窗口移动,销毁源窗口 webview,待 attach 到新窗口时重建。
-    fn handle_detach(&mut self, detach_type: DetachType, ctx: &mut ViewContext<Self>) {
+    pub(crate) fn handle_detach(&mut self, detach_type: DetachType, ctx: &mut ViewContext<Self>) {
         let manager = BrowserWebViewManager::as_ref(ctx);
         match detach_type {
             DetachType::Closed => manager.destroy(self.model.platform_view_id),
@@ -197,8 +209,21 @@ impl BrowserPaneView {
 
     /// Pane 附加(首次或恢复):跨窗口移动后在新窗口重建 webview 并重新注册
     /// handler;undo 恢复(HiddenForClose)时重新显示 webview。若 webview 已被
-    /// 窗口关闭时的 cleanup 销毁,同样重建。
-    fn handle_attach(&mut self, ctx: &mut ViewContext<Self>) {
+    /// 窗口关闭时的 cleanup 销毁,同样重建。附加完成后把焦点切到 webview。
+    pub fn handle_attach(&mut self, ctx: &mut ViewContext<Self>) {
+        self.handle_attach_inner(true, ctx);
+    }
+
+    /// 同 [`Self::handle_attach`],但不抢占 AppKit first responder。
+    ///
+    /// DshPane 等 Loading 场景使用:runtime 就绪时 webview 刚创建、尚未
+    /// 定位且 spinner 仍在显示,此时 focus 会让按键进不可见 webview;webview
+    /// 焦点改由 pane 获得焦点时(on_focus)正常切换。
+    pub(crate) fn handle_attach_without_focus(&mut self, ctx: &mut ViewContext<Self>) {
+        self.handle_attach_inner(false, ctx);
+    }
+
+    fn handle_attach_inner(&mut self, focus: bool, ctx: &mut ViewContext<Self>) {
         let manager = BrowserWebViewManager::as_ref(ctx);
         let webview_exists = manager.has_webview(self.model.platform_view_id);
         if self.needs_recreate || !webview_exists {
@@ -208,8 +233,15 @@ impl BrowserPaneView {
             self.register_platform_view_handler(ctx);
         } else {
             manager.set_visible(self.model.platform_view_id, true);
+            // 重建场景后重新注册 platform-view handler:首次创建发生在
+            // `new()` 中,此时 pane 可能尚未挂载到窗口,handler 注册可能
+            // 失败(platform_window 尚不可用);attach 时幂等重注册兜底,
+            // 否则 webview 永远收不到 rect 上报,保持 0 尺寸不可见。
+            self.register_platform_view_handler(ctx);
         }
-        self.focus_webview(ctx);
+        if focus {
+            self.focus_webview(ctx);
+        }
     }
 
     /// Pane 挂载完成后的收尾:默认焦点在 webview,把 AppKit first responder
@@ -284,6 +316,7 @@ impl BrowserPaneView {
         }
     }
 }
+
 impl Entity for BrowserPaneView {
     type Event = BrowserPaneEvent;
 }
@@ -306,7 +339,6 @@ impl View for BrowserPaneView {
                 .blur_webview_page(self.model.platform_view_id);
         }
     }
-
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
@@ -352,8 +384,9 @@ impl View for BrowserPaneView {
             .with_cursor(Cursor::PointingHand)
             .finish();
 
-        Flex::column()
-            .with_child(
+        let mut column = Flex::column();
+        if self.show_address_bar {
+            column = column.with_child(
                 Flex::row()
                     .with_spacing(6.)
                     .with_cross_axis_alignment(warpui::elements::CrossAxisAlignment::Center)
@@ -372,7 +405,9 @@ impl View for BrowserPaneView {
                         .finish(),
                     )
                     .finish(),
-            )
+            );
+        }
+        column
             .with_child(
                 Expanded::new(
                     1.0,

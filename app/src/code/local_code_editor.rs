@@ -251,7 +251,10 @@ impl LocalCodeEditorView {
             | CodeEditorEvent::CopiedEmptyText
             | CodeEditorEvent::DiffHunkContextAdded { .. }
             | CodeEditorEvent::DiffReverted
-            | CodeEditorEvent::HiddenSectionExpanded => {}
+            | CodeEditorEvent::HiddenSectionExpanded
+            | CodeEditorEvent::Scrolled
+            | CodeEditorEvent::NavScrolled
+            | CodeEditorEvent::RevertDiffRequested { .. } => {}
             #[cfg(windows)]
             CodeEditorEvent::WindowsCtrlC { .. } => {}
         });
@@ -357,6 +360,24 @@ impl LocalCodeEditorView {
         self.base_content_version = Some(state.version);
         self.editor
             .update(ctx, |editor, ctx| editor.reset(state, ctx));
+    }
+
+    /// Associates this editor with an on-disk file path so it can be saved and report
+    /// unsaved-changes state, without loading content from the GlobalBuffer (the caller
+    /// has already populated the buffer). Used by the side-by-side diff view, whose
+    /// editors are built manually and would otherwise have no `FileId`/base version.
+    pub fn set_file_path(&mut self, path: &Path, ctx: &mut ViewContext<Self>) {
+        let buffer = self.editor.as_ref(ctx).model.as_ref(ctx).buffer().clone();
+        let buffer_state = GlobalBufferModel::handle(ctx).update(ctx, |model, ctx| {
+            model.register(path.to_path_buf(), buffer, ctx)
+        });
+        let file_id = buffer_state.file_id;
+        self.metadata = Some(LoadedFileMetadata::LocalFile {
+            id: file_id,
+            path: path.to_path_buf(),
+        });
+        self.base_content_version = Some(self.editor.as_ref(ctx).version(ctx));
+        Self::subscribe_to_global_buffer_events(file_id, ctx);
     }
 
     /// Whether the content of the source file this editor is based on has been loaded into the buffer.

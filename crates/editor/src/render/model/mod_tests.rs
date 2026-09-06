@@ -1,5 +1,5 @@
 use rangemap::RangeSet;
-use std::{cell::Cell, sync::Arc};
+use std::{cell::Cell, collections::HashMap, sync::Arc};
 use sum_tree::SumTree;
 use vec1::{Vec1, vec1};
 use warpui::assets::asset_cache::AssetSource;
@@ -1428,4 +1428,275 @@ fn test_link_at_offset_uses_cached_cell_links() {
     );
     assert_eq!(table.link_at_offset(CharOffset::from(0)), None);
     assert_eq!(table.link_at_offset(CharOffset::from(3)), None);
+}
+
+#[test]
+fn spacer_y_ranges_cached_until_content_mutation() {
+    let mut model = RenderState::new_for_test(TEST_STYLES, 200.0.into_pixels(), 160.0.into_pixels());
+
+    // 构造:普通段落 + 空白临时块(decoration 为 None 才会进入 spacer 范围)+ 普通段落。
+    let mut content = SumTree::new();
+    content.push(laid_out_paragraph("Before\n", &TEST_STYLES, 200.0));
+    let paragraph = layout_paragraph("\n", &TEST_STYLES, &BufferBlockStyle::PlainText, 200.0);
+    content.push(BlockItem::TemporaryBlock {
+        paragraph_block: ParagraphBlock::new(vec1![paragraph]),
+        text_decoration: Vec::new(),
+        decoration: None,
+    });
+    content.push(laid_out_paragraph("After\n", &TEST_STYLES, 200.0));
+    model.set_content(content);
+
+    let first = model.spacer_y_ranges();
+    assert_eq!(first.len(), 1, "应有一个空白临时块范围");
+    assert_eq!(
+        model.spacer_y_ranges_recompute_count.get(),
+        1,
+        "首次调用应全树遍历一次"
+    );
+
+    // 临时块未变:第二次调用直接命中缓存,不应重新遍历内容树。
+    let second = model.spacer_y_ranges();
+    assert_eq!(second, first);
+    assert_eq!(
+        model.spacer_y_ranges_recompute_count.get(),
+        1,
+        "缓存命中,不应重新遍历"
+    );
+
+    // 内容变更(移除临时块)使缓存失效,下一次调用重新计算。
+    let mut content2 = SumTree::new();
+    content2.push(laid_out_paragraph("After\n", &TEST_STYLES, 200.0));
+    model.set_content(content2);
+    assert!(model.spacer_y_ranges().is_empty());
+    assert_eq!(
+        model.spacer_y_ranges_recompute_count.get(),
+        2,
+        "内容变更后应重新遍历"
+    );
+}
+
+/// 参考实现:与旧的 `reset_temporary_block`(逐项克隆 + 逐项匹配 blocks)逻辑
+/// 完全一致,用于验证增量实现的行为等价性。
+fn reference_reset_temporary_block(
+    content: &SumTree<BlockItem>,
+    mut blocks: HashMap<LineCount, Vec<BlockItem>>,
+) -> (SumTree<BlockItem>, bool) {
+    let mut new_tree = SumTree::new();
+    {
+        let mut cursor = content.cursor::<LineCount, CharOffset>();
+
+        if let Some(items) = blocks.remove(&LineCount::zero()) {
+            for item in items {
+                new_tree.push(item);
+            }
+        }
+
+        cursor.descend_to_first_item(content, |_| true);
+        while let Some(item) = cursor.item() {
+            if !matches!(item, BlockItem::TemporaryBlock { .. }) {
+                new_tree.push(item.clone());
+            }
+
+            if let Some(items) = blocks.remove(&cursor.end_seek_position()) {
+                for item in items {
+                    new_tree.push(item);
+                }
+            }
+
+            cursor.next();
+        }
+    }
+    let has_final_trailing_newline = RenderState::tree_ends_with_trailing_newline(&new_tree);
+    (new_tree, has_final_trailing_newline)
+}
+
+/// 构造一个单行空白临时块 item(与现有临时块测试用法一致)。
+fn temporary_block_item(content: &str) -> BlockItem {
+    BlockItem::TemporaryBlock {
+        paragraph_block: ParagraphBlock::new(vec1![layout_paragraph(
+            content,
+            &TEST_STYLES,
+            &BufferBlockStyle::PlainText,
+            200.0,
+        )]),
+        text_decoration: Vec::new(),
+        decoration: None,
+    }
+}
+
+/// 断言两棵 SumTree 的 item 序列与各维度汇总完全一致(describe 输出、汇总维度、
+/// item 数量)。不比较节点结构,因为增量实现会以不同的子树形状产生同一序列。
+fn assert_trees_equivalent(actual: &SumTree<BlockItem>, expected: &SumTree<BlockItem>) {
+    assert_eq!(actual.describe().to_string(), expected.describe().to_string());
+    assert_eq!(actual.extent::<CharOffset>(), expected.extent::<CharOffset>());
+    assert_eq!(actual.extent::<LineCount>(), expected.extent::<LineCount>());
+    assert_eq!(actual.summary().item_count, expected.summary().item_count);
+}
+
+#[test]
+fn test_reset_temporary_block_matches_reference() {
+    let mut model =
+        RenderState::new_for_test(TEST_STYLES, 200.0.into_pixels(), 160.0.into_pixels());
+
+    // 内容:跨行 TextBlock(lines=2)→ 单行段 → 旧临时块 → 单行段 → 单行段 →
+    // 旧临时块 → 单行段(set_content 还会追加 TrailingNewLine)。
+    let mut content = SumTree::new();
+    content.push(BlockItem::TextBlock {
+        paragraph_block: ParagraphBlock::new(vec1![
+            layout_paragraph("alpha\n", &TEST_STYLES, &BufferBlockStyle::PlainText, 200.0),
+            layout_paragraph("beta\n", &TEST_STYLES, &BufferBlockStyle::PlainText, 200.0),
+        ]),
+    });
+    content.push(mock_paragraph(24., 1., 10));
+    content.push(temporary_block_item(" \n")); // 旧临时块,挂在边界 3
+    content.push(mock_paragraph(24., 1., 20));
+    content.push(mock_paragraph(24., 1., 30));
+    content.push(temporary_block_item(" \n")); // 旧临时块,挂在边界 5
+    content.push(mock_paragraph(24., 1., 40));
+
+    // 新块:线 0 最前、TextBlock 边界、同一边界多个、与旧临时块重合的边界、
+    // 落在跨行项中间(应被丢弃)、越过树尾(应被丢弃)。
+    let mut blocks = HashMap::new();
+    blocks.insert(LineCount::zero(), vec![temporary_block_item(" \n")]);
+    blocks.insert(
+        LineCount::from(2),
+        vec![temporary_block_item(" \n")],
+    );
+    blocks.insert(
+        LineCount::from(3),
+        vec![temporary_block_item(" \n"), temporary_block_item(" \n")],
+    );
+    blocks.insert(
+        LineCount::from(4),
+        vec![temporary_block_item(" \n")],
+    );
+    blocks.insert(
+        LineCount::from(1),
+        vec![temporary_block_item(" \n")], // TextBlock 中间 → 丢弃
+    );
+    blocks.insert(
+        LineCount::from(100),
+        vec![temporary_block_item(" \n")], // 越过树尾 → 丢弃
+    );
+    blocks.insert(
+        LineCount::from(7),
+        vec![temporary_block_item(" \n")], // 命中 TrailingNewLine 边界 → 插在其后
+    );
+
+    model.set_content(content.clone());
+    // 参考实现的输入必须与 model 的输入一致:set_content 会追加 TrailingNewLine,
+    // 所以从 model 的内容树克隆参考输入(SumTree 为 Arc,克隆代价可忽略)。
+    let reference_input = model.content.borrow().clone();
+    model.reset_temporary_block(blocks.clone());
+
+    let (reference_tree, reference_has_final) =
+        reference_reset_temporary_block(&reference_input, blocks);
+    assert_trees_equivalent(&model.content.borrow(), &reference_tree);
+    assert_eq!(model.has_final_trailing_newline.get(), reference_has_final);
+
+    // 再次 reset(替换掉上一轮插入的临时块),仍应与参考实现一致。
+    // 第二次 reset 的输入是第一次 reset 的输出(reference_tree 已验证与之一致),
+    // 因此参考实现直接基于 reference_tree 运行。
+    let mut blocks2 = HashMap::new();
+    blocks2.insert(
+        LineCount::from(5),
+        vec![temporary_block_item(" \n")],
+    );
+    model.reset_temporary_block(blocks2.clone());
+    let (reference_tree2, reference_has_final2) =
+        reference_reset_temporary_block(&reference_tree, blocks2);
+    assert_trees_equivalent(&model.content.borrow(), &reference_tree2);
+    assert_eq!(model.has_final_trailing_newline.get(), reference_has_final2);
+}
+
+#[test]
+fn test_reset_temporary_block_matches_reference_large_fixture() {
+    let mut model =
+        RenderState::new_for_test(TEST_STYLES, 200.0.into_pixels(), 160.0.into_pixels());
+
+    const N: usize = 5000;
+    let mut content = SumTree::new();
+    let mut blocks = HashMap::new();
+    for i in 0..N {
+        content.push(mock_paragraph(18.2, 0., i % 50 + 1));
+        if i % 500 == 499 {
+            // 旧临时块挂在每条内容边界上;新块键大部分与旧临时块位置重合,
+            // 也有一部分只出现在内容边界(无旧临时块)。
+            content.push(temporary_block_item(" \n"));
+        }
+        if i % 250 == 249 {
+            blocks.insert(
+                LineCount::from(i + 1),
+                vec![temporary_block_item(" \n")],
+            );
+        }
+    }
+    // 跨行项 + 两个落在无效位置的键(跨行项中间 / 越过树尾,均应被丢弃)。
+    content.push(BlockItem::TextBlock {
+        paragraph_block: ParagraphBlock::new(vec1![
+            layout_paragraph("alpha\n", &TEST_STYLES, &BufferBlockStyle::PlainText, 200.0),
+            layout_paragraph("beta\n", &TEST_STYLES, &BufferBlockStyle::PlainText, 200.0),
+        ]),
+    });
+    blocks.insert(
+        LineCount::from(N + 1),
+        vec![temporary_block_item(" \n")],
+    );
+    blocks.insert(
+        LineCount::from(N + 1000),
+        vec![temporary_block_item(" \n")],
+    );
+    blocks.insert(LineCount::zero(), vec![temporary_block_item(" \n")]);
+
+    model.set_content(content.clone());
+    // 参考实现的输入必须与 model 的输入一致(set_content 会追加 TrailingNewLine)。
+    let reference_input = model.content.borrow().clone();
+    model.reset_temporary_block(blocks.clone());
+
+    let (reference_tree, reference_has_final) =
+        reference_reset_temporary_block(&reference_input, blocks);
+    assert_trees_equivalent(&model.content.borrow(), &reference_tree);
+    assert_eq!(model.has_final_trailing_newline.get(), reference_has_final);
+}
+
+#[test]
+#[ignore = "手动基准测试(不设耗时断言,避免 flaky):cargo test -p warp_editor test_reset_temporary_block_bench -- --ignored --nocapture"]
+fn test_reset_temporary_block_bench() {
+    let mut model =
+        RenderState::new_for_test(TEST_STYLES, 200.0.into_pixels(), 160.0.into_pixels());
+
+    const N: usize = 100_000;
+    let mut content = SumTree::new();
+    let mut blocks = HashMap::new();
+    for i in 0..N {
+        content.push(mock_paragraph(18.2, 0., i % 100 + 1));
+        if i % 1000 == 999 {
+            content.push(temporary_block_item(" \n"));
+            blocks.insert(
+                LineCount::from(i + 1),
+                vec![temporary_block_item(" \n")],
+            );
+        }
+    }
+    model.set_content(content.clone());
+    // 参考实现与增量实现使用完全相同的输入(含 set_content 追加的 TrailingNewLine)。
+    let reference_input = model.content.borrow().clone();
+
+    let before = std::time::Instant::now();
+    model.reset_temporary_block(blocks.clone());
+    let after_new = std::time::Instant::now();
+
+    let (_, _) = reference_reset_temporary_block(&reference_input, blocks);
+    let after_reference = std::time::Instant::now();
+
+    println!(
+        "reset_temporary_block  增量实现: {N} 行 / {} 块 → {:?}",
+        N / 1000,
+        after_new - before
+    );
+    println!(
+        "reset_temporary_block  参考(旧)实现: {N} 行 / {} 块 → {:?}",
+        N / 1000,
+        after_reference - after_new
+    );
 }

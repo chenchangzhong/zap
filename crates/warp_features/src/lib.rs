@@ -752,6 +752,15 @@ pub enum FeatureFlag {
     /// Shows an omp model selector dropdown in the CLI agent toolbar
     /// when an OhMyPi agent session is active.
     OmpModelSelector,
+    /// Enables the embedded DeepSeek Harness web UI pane (dsh webview integration).
+    DshPane,
+
+    /// Offloads the side-by-side diff decoration computation (`diff_lines` over
+    /// the old/new buffer contents) to a background thread so opening/switching
+    /// large diffs no longer blocks the main thread. Disabled by default; enable
+    /// to validate the async path before rolling out.
+    SideBySideDiffAsync,
+
 
 }
 
@@ -820,6 +829,8 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::CloudRunners,
     FeatureFlag::McpJsonTreeView,
     FeatureFlag::BoxDrawingGlyphs,
+    // DeepSeek Harness 集成(dsh webview):阶段 0-3 已实现,dev 启用。
+    FeatureFlag::DshPane,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Zap).
@@ -847,6 +858,8 @@ pub const RELEASE_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::SshRemoteServer,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     FeatureFlag::DragTabsToWindows,
+    // 异步 diff 化:所有 release 构建默认启用。
+    FeatureFlag::SideBySideDiffAsync,
 ];
 
 /// Flags that we want to allow to switch at runtime (assuming RuntimeFeatureFlags is set)

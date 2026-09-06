@@ -424,6 +424,8 @@ pub enum WorkspaceAction {
     OpenBrowserPreview {
         url: String,
     },
+    /// Open the DeepSeek Harness web UI pane (dsh runtime + embedded webview).
+    OpenDshPane,
     OpenNotebook {
         id: SyncId,
     },
@@ -704,6 +706,7 @@ impl WorkspaceAction {
             | RunWorkflow { .. }
             | OpenFileInNewTab { .. }
             | OpenBrowserPreview { .. }
+            | OpenDshPane
             | RestoreOrNavigateToConversation { .. }
             | NewCodeFile
             | ForkAIConversation { .. }

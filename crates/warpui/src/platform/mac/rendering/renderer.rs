@@ -2,6 +2,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{NSView, NSWindow};
 use objc2_metal::MTLDevice;
+use objc2_quartz_core::CAMetalLayer;
+use warpui_core::color::ColorU;
 use warpui_core::rendering::{
     GPUBackend, GPUDeviceInfo, GPUDeviceType, GPUPowerPreference, OnGPUDeviceSelected,
 };
@@ -22,6 +24,15 @@ pub trait Renderer {
     fn render(&mut self, scene: &Scene, window: &WindowState, font_cache: &fonts::Cache);
 
     fn resize(&mut self, window: &WindowState);
+
+    /// Renders a solid `color` into `layer`, clearing the whole drawable. Used
+    /// for the full-window background layer (MetalBackgroundView) so the window
+    /// background, including the area under a transparent embedded webview,
+    /// composites the same color as the Metal-drawn UI. Default is a no-op;
+    /// only the Metal renderer implements it.
+    fn render_background(&mut self, layer: &CAMetalLayer, color: ColorU) {
+        let _ = (layer, color);
+    }
 }
 
 /// Set of available physical graphics devices that can be used to render.

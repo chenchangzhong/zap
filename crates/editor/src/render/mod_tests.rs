@@ -1,5 +1,6 @@
 //! End-to-end editor tests.
 
+use sum_tree::SumTree;
 use warp_core::features::FeatureFlag;
 use warpui::{App, ModelHandle, ReadModel};
 
@@ -589,4 +590,103 @@ fn test_markdown_table_count_counts_rendered_tables() {
             .read(&app, |render_state, _| render_state.markdown_table_count());
         assert_eq!(count, 1);
     });
+}
+
+/// Reproduces the `RichTextElement::renderable_blocks` build path (the `viewport_items`
+/// walk + the same `RenderableXxx::new(item).finish()` mapping) over a large content tree,
+/// simulating a scroll, and times how long the *build* portion of `layout` costs.
+///
+/// This isolates the prime-suspect cost (rebuilding the visible `blocks` Vec every frame)
+/// from `block.layout()` (which needs the full warpui presenter and is measured separately
+/// in the GUI via the `[perf] richtext block.layout total took` instrumentation).
+///
+/// The block mix mirrors a double-column diff: most rows are plain paragraphs / text blocks,
+/// with blank `TemporaryBlock` spacers interleaved (side-by-side alignment rows).
+#[test]
+fn bench_renderable_blocks_build_cost() {
+    init_logging();
+    use crate::render::element::{Empty, RenderableBlock, RenderableHeader, RenderableParagraph, RenderableTextBlock};
+    use crate::render::model::test_utils::mock_paragraph;
+    use instant::Instant;
+    use std::time::Duration;
+    use warpui::units::Pixels;
+
+    let line_height = 18.0_f32;
+    let width = 1200.0_f32;
+    let viewport_height = 800.0_f32;
+    let num_lines = 6300usize;
+
+    // Build a large content tree: many paragraphs (matching a large diff's visible block
+    // mix). All block `new()` constructors just store the `ViewportItem`, so the build-path
+    // cost measured here is the `viewport_items` seek + Vec allocation + Box construction,
+    // independent of which concrete block type is used.
+    let mut content = SumTree::new();
+    for i in 0..num_lines {
+        let content_length = 40 + (i % 80);
+        content.push(mock_paragraph(line_height, width, content_length));
+    }
+
+    let styles = TEST_STYLES;
+    let mut model = RenderState::new_for_test(styles, Pixels::new(width), Pixels::new(viewport_height));
+    model.set_content(content);
+
+    let visible_px = Pixels::new(viewport_height);
+    let width_px = Pixels::new(width);
+    let total_height = model.height();
+
+    // Number of scroll steps to traverse the whole document (simulating a scroll pass).
+    let steps = 400usize;
+    let step_px = (total_height.as_f32() - viewport_height) / steps as f32;
+
+    let mut build_total = Duration::ZERO;
+    let mut seek_total = Duration::ZERO;
+    let mut max_build = Duration::ZERO;
+    let mut blocks_per_frame_sum = 0usize;
+    let mut frames = 0usize;
+
+    for s in 0..=steps {
+        let scroll_top = Pixels::new((s as f32) * step_px);
+        model.set_scroll_top_for_test(scroll_top);
+
+        let content = model.content();
+
+        // (a) Isolate the `viewport_items` seek + walk cost (no Box construction).
+        let seek_start = Instant::now();
+        let mut seek_count = 0usize;
+        for (item, _block) in content.viewport_items(visible_px, width_px, scroll_top) {
+            std::hint::black_box(item);
+            seek_count += 1;
+        }
+        seek_total += seek_start.elapsed();
+
+        // (b) The full build path: same mapping `renderable_blocks` uses.
+        let build_start = Instant::now();
+        let blocks: Vec<Box<dyn RenderableBlock>> = content
+            .viewport_items(visible_px, width_px, scroll_top)
+            .map(|(item, block)| match block {
+                BlockItem::Paragraph(_) => RenderableParagraph::new(item).finish(),
+                BlockItem::TextBlock { .. } => RenderableTextBlock::new(item).finish(),
+                BlockItem::Header { .. } => RenderableHeader::new(item).finish(),
+                BlockItem::TrailingNewLine(_) => Empty::new(item).finish(),
+                other => panic!("unexpected block type in diff benchmark: {other:?}"),
+            })
+            .collect();
+        let build_elapsed = build_start.elapsed();
+        build_total += build_elapsed;
+        max_build = build_elapsed.max(max_build);
+        blocks_per_frame_sum += blocks.len();
+        frames += 1;
+        std::hint::black_box(&blocks);
+        std::hint::black_box(seek_count);
+    }
+
+    let avg_build_ms = build_total.as_secs_f64() * 1000.0 / frames as f64;
+    let avg_seek_ms = seek_total.as_secs_f64() * 1000.0 / frames as f64;
+    let max_build_ms = max_build.as_secs_f64() * 1000.0;
+    let avg_blocks = blocks_per_frame_sum as f64 / frames as f64;
+
+    eprintln!(
+        "[bench] renderable_blocks build: avg {:.3}ms/frame, max {:.3}ms, seek-only avg {:.3}ms/frame, ~{:.0} blocks/frame, {} frames ({} lines, {:.0}px content)",
+        avg_build_ms, max_build_ms, avg_seek_ms, avg_blocks, frames, num_lines, total_height.as_f32(),
+    );
 }

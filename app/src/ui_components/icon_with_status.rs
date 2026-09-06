@@ -80,6 +80,10 @@ pub(crate) enum IconWithStatusVariant {
         agent: CLIAgent,
         status: Option<ConversationStatus>,
     },
+    /// DSH plugin icon.
+    Dsh {
+        status: Option<ConversationStatus>,
+    },
 }
 
 /// Renders an icon inside a circle with an optional status badge overlay.
@@ -166,6 +170,31 @@ pub(crate) fn render_icon_with_status(
             let circle = Container::new(inner)
                 .with_uniform_padding(sizing.padding)
                 .with_background(background)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                    (sizing.icon_size + sizing.padding * 2.) / 2.,
+                )))
+                .finish();
+            render_with_optional_status_badge(
+                circle,
+                status.as_ref(),
+                sizing,
+                theme,
+                badge_ring_background,
+            )
+        }
+        IconWithStatusVariant::Dsh { status } => {
+            // DSH 使用通用图标。
+            let icon = WarpIcon::Terminal;
+            let inner = ConstrainedBox::new(
+                icon.to_warpui_icon(theme.main_text_color(theme.background()))
+                    .finish(),
+            )
+            .with_width(sizing.icon_size)
+            .with_height(sizing.icon_size)
+            .finish();
+            let circle = Container::new(inner)
+                .with_uniform_padding(sizing.padding)
+                .with_background(theme.background())
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
                     (sizing.icon_size + sizing.padding * 2.) / 2.,
                 )))

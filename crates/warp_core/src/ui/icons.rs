@@ -315,6 +315,8 @@ pub enum Icon {
     HeartHand,
     MessageChatSquare,
     Server01,
+    /// DeepSeek Harness 品牌 logo(鲸鱼)。
+    DeepSeek,
 }
 
 impl From<Icon> for &'static str {
@@ -627,6 +629,7 @@ impl From<Icon> for &'static str {
             Icon::HeartHand => "bundled/svg/heart-hand.svg",
             Icon::MessageChatSquare => "bundled/svg/message-chat-square.svg",
             Icon::Server01 => "bundled/svg/server-01.svg",
+            Icon::DeepSeek => "bundled/svg/deepseek.svg",
         }
     }
 }

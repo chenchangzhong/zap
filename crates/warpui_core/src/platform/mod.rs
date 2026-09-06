@@ -616,6 +616,13 @@ pub trait WindowManager {
 
     fn set_window_title(&self, window_id: WindowId, title: &str);
 
+    /// Sets the background color of a window. The renderer punches holes for
+    /// transparent embedded webviews, so this color shows through a transparent
+    /// webview's region (matching the window background), while Metal-drawn
+    /// overlay UI (menus/modals) stays above the webview. Default no-op on
+    /// platforms that don't host embedded webviews below the render surface.
+    fn set_window_background_color(&self, _window_id: WindowId, _color: pathfinder_color::ColorU) {}
+
     /// Closes a window asynchronously. This is done asynchronously solely because the UI framework
     /// incorrectly assumes that a call to platform code cannot synchronously trigger a callback
     /// back to the UI framework. For example, closing window will also synchronously trigger a

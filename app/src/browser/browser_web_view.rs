@@ -29,6 +29,12 @@ pub(crate) static PENDING_WEBVIEW_FOCUS_EVENTS: std::sync::LazyLock<
     Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
+/// DSH 插件 webview ID 集合。只有在此集合中的 webview 才允许发送 `zap:` IPC 消息。
+/// 由 DshPane 创建 webview 时注册,webview 销毁时移除。
+pub(crate) static DSH_WEBVIEW_IDS: std::sync::LazyLock<
+    Mutex<std::collections::HashSet<u64>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
 /// webview 相关事件,经 singleton model 分发给各 BrowserPane。
 #[derive(Debug, Clone)]
 pub enum BrowserWebViewEvent {
@@ -43,6 +49,13 @@ pub enum BrowserWebViewEvent {
 pub(crate) static PENDING_WEBVIEW_URL_CHANGED: std::sync::LazyLock<
     Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// 可安全交给系统默认浏览器/应用打开的 URL scheme。`javascript:` 等伪协议
+/// 一律过滤,防止把脚本串传给 NSWorkspace。
+fn is_externally_openable(url: &str) -> bool {
+    url::Url::parse(url)
+        .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "mailto" | "tel"))
+}
 
 /// 全局单例:管理所有 webview 的 create / navigate / set_bounds / destroy。
 pub struct BrowserWebViewManager {
@@ -79,6 +92,16 @@ impl BrowserWebViewManager {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// 注册 webview ID 为 DSH 插件,允许发送 `zap:` IPC 消息。
+    pub fn register_dsh_webview(id: u64) {
+        DSH_WEBVIEW_IDS.lock().insert(id);
+    }
+
+    /// 注销 DSH webview ID。
+    pub fn unregister_dsh_webview(id: u64) {
+        DSH_WEBVIEW_IDS.lock().remove(&id);
+    }
+
     /// 在 `window` 的 contentView 内创建 id 对应的 webview,初始位置 `rect`。
     #[cfg(target_os = "macos")]
     pub fn create(
@@ -96,6 +119,20 @@ impl BrowserWebViewManager {
         // 页面内元素获得焦点(focusin)时经 IPC 上报 Rust,让 Warp 释放
         // 地址栏的焦点与光标(地址栏与页面各一个光标 = 双光标)。
         let init_js = r#"
+window.__ZAP_BRIDGE__ = true;
+// JS 错误/警告转发到 Rust 日志(诊断用)。
+window.addEventListener('error', (e) => {
+  window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-js-error:' + (e.message || 'unknown'));
+});
+window.addEventListener('unhandledrejection', (e) => {
+  window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-js-error:unhandledrejection:' + String(e.reason).slice(0, 200));
+});
+const __origLog = console.error;
+console.error = function(...args) {
+  window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-js-error:console:' + args.map(String).join(' ').slice(0, 300));
+  __origLog.apply(console, args);
+};
+
 document.addEventListener('keydown', (e) => {
   if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
   // Cmd+R → 页面刷新(wry child webview 的 performKeyEquivalent 返回 NO,
@@ -115,21 +152,56 @@ document.addEventListener('mousedown', () => {
   window.focus();
   window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-mousedown');
 });
-// 处理 target=_blank 链接:在当前 webview 导航而非创建新窗口。
+// 点击链接:一律用系统默认浏览器打开,不在 webview 内导航。
+// 锚点(#...)与 javascript: 伪协议链接不拦截。兼容 HTML 与 SVG <a>。
 document.addEventListener('click', (e) => {
+  if (e.button !== 0 && e.button !== 1) return;
   let el = e.target;
   while (el && el.tagName !== 'A') el = el.parentElement;
-  if (el && el.tagName === 'A' && el.target === '_blank') {
-    e.preventDefault();
-    window.location.href = el.href;
+  if (!el || el.tagName !== 'A') return;
+  const rawHref = el.getAttribute('href');
+  if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('javascript:')) return;
+  e.preventDefault();
+  // HTML <a> 的 href 是字符串;SVG <a> 的是 SVGAnimatedString,需用
+  // baseURI 重新解析。解析失败(非法 URL)则吞掉点击,不导航不外部打开。
+  let target;
+  try {
+    target = typeof el.href === 'string' ? el.href : new URL(rawHref, document.baseURI).href;
+  } catch {
+    return;
   }
+  window.webkit?.messageHandlers?.ipc?.postMessage('warp:open-external:' + target);
 });
-// 处理 window.open():在(唯一)当前 webview 导航。
+// window.open():同样交给系统默认浏览器,不创建新窗口也不在当前 webview 导航。
 window.open = function(url) {
-  window.location.href = url;
+  window.webkit?.messageHandlers?.ipc?.postMessage('warp:open-external:' + url);
+  return null;
+};
+// 失焦时记录并 blur 页面输入框(防与 Warp 地址栏光标共存的双光标)。
+// 记录元素供重新聚焦时(__restoreFocused)恢复:WKWebView 失焦再聚焦不会自动
+// 恢复页面 activeElement,不恢复则切走再切回 tab 时输入框焦点丢失。
+window.__lastFocused = null;
+window.__restoreFocused = function() {
+  var el = window.__lastFocused;
+  if (!el || !el.isConnected) { window.__lastFocused = null; return; }
+  var attempts = 0;
+  var tryFocus = function() {
+    // makeFirstResponder 后页面 hasFocus 需等 AppKit 事件循环才变 true,
+    // 故轮询等待,有限次避免死循环。
+    if (el.isConnected && document.hasFocus()) {
+      el.focus();
+      window.__lastFocused = null;
+    } else if (el.isConnected && attempts++ < 20) {
+      setTimeout(tryFocus, 30);
+    } else {
+      window.__lastFocused = null;
+    }
+  };
+  tryFocus();
 };
 setInterval(() => {
   if (!document.hasFocus() && document.activeElement && document.activeElement !== document.body) {
+    window.__lastFocused = document.activeElement;
     document.activeElement.blur();
   }
 }, 100);
@@ -146,7 +218,10 @@ setInterval(() => {
         let holder = focus_ptr.clone();
         match wry::WebViewBuilder::new()
             .with_url(url)
-            .with_initialization_script(init_js)
+            // 透明背景:让 WebView 透出下层 WarpUI 画面(深色主题下避免白底)。
+            // 注意:页面自身背景仍需透明(如 body { background: transparent }),否则仍是白底。
+            .with_transparent(true)
+            .with_initialization_script_for_main_only(init_js, false)
             .with_on_page_load_handler(move |event, _url| {
                 if matches!(event, wry::PageLoadEvent::Finished) {
                     PENDING_WEBVIEW_URL_CHANGED.lock().insert(url_notify_id);
@@ -155,6 +230,39 @@ setInterval(() => {
             .with_ipc_handler(move |request| {
                 let body = request.body();
                 log::debug!("[browser] ipc msg: {}", body);
+                if body.starts_with("warp:webview-js-error:") {
+                    // 页面 JS 错误(诊断):转发到日志。
+                    log::warn!("[browser] webview {ipc_id} JS error: {}", &body["warp:webview-js-error:".len()..]);
+                    return;
+                }
+                if let Some(url) = body.strip_prefix("warp:open-external:") {
+                    // 页面链接点击:立即用系统默认浏览器打开。不能经每帧
+                    // drain——点击发生在 WKWebView 内不产生 Warp 渲染帧,
+                    // 帧回调不触发会把打开延迟到下次重绘(表现为切到浏览器
+                    // 后才打开)。IPC handler 在主线程,直接同步调用平台
+                    // open_url(NSWorkspace)。
+                    if is_externally_openable(url) {
+                        log::info!("[browser] webview {ipc_id} open external: {url}");
+                        warpui::platform::mac::Window::open_url(url);
+                    } else {
+                        log::warn!("[browser] webview {ipc_id} skip non-openable url: {url}");
+                    }
+                    return;
+                }
+                // dsh 插件 IPC:zap.switch_project 等通知。
+                // 仅允许已注册的 DSH webview 发送 zap: 消息。
+                if let Some(payload) = body.strip_prefix("zap:") {
+                    if DSH_WEBVIEW_IDS.lock().contains(&ipc_id) {
+                        crate::dsh::bridge::handle_zap_ipc(payload);
+                        // 推送事件后强制重绘，确保 on_frame_drawn → drain_events 执行。
+                        // IPC 在事件循环空闲期到达时，on_frame_drawn 不会自然触发。
+                        #[cfg(target_os = "macos")]
+                        warpui::platform::mac::Window::request_redraw_all_windows();
+                    } else {
+                        log::warn!("[browser] webview {ipc_id} rejected zap: IPC (not a DSH pane)");
+                    }
+                    return;
+                }
                 if matches!(
                     body.as_str(),
                     "warp:webview-focusin" | "warp:webview-mousedown"
@@ -302,6 +410,60 @@ setInterval(() => {
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             let _ = entry.webview.focus();
+            // 恢复之前被 setInterval blur 的页面输入框焦点(WKWebView 失焦再
+            // 聚焦不会自动恢复页面 activeElement)。
+            let _ = entry
+                .webview
+                .evaluate_script("window.__restoreFocused && window.__restoreFocused();");
+        }
+    }
+
+    /// 将文本插入已注册的 DSH 插件 webview 的输入框(供 code review 等视图在 DSH
+    /// 集成模式下把"添加到上下文"内容送到 DSH 会话,而非终端)。
+    /// 找到首个已注册的 DSH webview 即注入;未就绪则静默放弃(由调用方决定是否提示)。
+    pub fn insert_text_into_dsh_input(&self, text: &str) {
+        let id = DSH_WEBVIEW_IDS.lock().iter().next().copied();
+        let Some(id) = id else {
+            log::warn!("[dsh] insert_text_into_dsh_input: no registered dsh webview");
+            return;
+        };
+        // 用 serde_json 转义,避免文本含引号/换行破坏 JS 字符串字面量。
+        let Ok(escaped) = serde_json::to_string(&text.to_string()) else {
+            log::warn!("[dsh] insert_text_into_dsh_input: failed to escape text, skipping");
+            return;
+        };
+        let js = format!(
+            r#"
+            (function() {{
+                var text = {escaped};
+                var el = document.querySelector('textarea[data-testid="dsh-input"]')
+                         || document.querySelector('textarea[placeholder]')
+                         || document.querySelector('div[contenteditable="true"][role="textbox"]')
+                         || document.querySelector('div.ProseMirror')
+                         || document.querySelector('.cm-content[contenteditable]');
+                if (!el) {{ console.warn('[dsh] No input element found for attach_as_context'); return; }}
+                if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {{
+                    el.focus();
+                    var start = el.selectionStart || el.value.length;
+                    var end = el.selectionEnd || el.value.length;
+                    el.setRangeText(text, start, end, 'end');
+                    el.dispatchEvent(new InputEvent('input', {{ bubbles: true, cancelable: true }}));
+                }} else {{
+                    el.focus();
+                    document.execCommand('insertText', false, text);
+                }}
+            }})()
+            "#
+        );
+        self.evaluate_script_on(id, &js);
+        self.focus_webview(id);
+    }
+
+    /// 在指定 webview 中执行 JavaScript。
+    pub fn evaluate_script_on(&self, id: u64, script: &str) {
+        #[cfg(target_os = "macos")]
+        if let Some(entry) = self.webviews.borrow().get(&id) {
+            let _ = entry.webview.evaluate_script(script);
         }
     }
 
@@ -322,6 +484,7 @@ setInterval(() => {
             }
         }
     }
+
 
     /// 销毁 id 对应的 webview(pane 关闭时调用)。
     pub fn destroy(&self, id: u64) {
@@ -406,6 +569,7 @@ setInterval(() => {
         }
     }
     /// 消费暂存的页面 focusin 事件与 URL 变更事件,经 model emit 分发。
+    /// (外部打开请求在 IPC handler 内同步处理,不经此处。)
     pub fn drain_pending_webview_focus(&self, ctx: &mut ModelContext<Self>) {
         let focus_events: Vec<BrowserWebViewEvent> = PENDING_WEBVIEW_FOCUS_EVENTS
             .lock()

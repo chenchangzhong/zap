@@ -15,7 +15,9 @@ use objc::runtime::Object;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{AnyObject, Bool, ProtocolObject};
 use objc2::{msg_send, MainThreadMarker};
-use objc2_app_kit::{NSApplication, NSScreen, NSView, NSWindow, NSWindowButton, NSWindowStyleMask};
+use objc2_app_kit::{
+    NSApplication, NSScreen, NSView, NSWindow, NSWindowButton, NSWindowStyleMask,
+};
 use objc2_foundation::{
     NSArray, NSInteger, NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger,
 };
@@ -28,6 +30,7 @@ use raw_window_handle::{
 };
 use warpui_core::accessibility::AccessibilityContent;
 use warpui_core::actions::StandardAction;
+use warpui_core::color::ColorU;
 use warpui_core::event::ModifiersState;
 use warpui_core::platform::{
     self, file_picker, FilePickerCallback, FilePickerConfiguration, FullscreenState,
@@ -146,6 +149,10 @@ impl platform::WindowManager for WindowManager {
 
     fn set_window_alpha(&self, window_id: WindowId, alpha: f32) {
         Window::set_window_alpha(window_id, alpha)
+    }
+
+    fn set_window_background_color(&self, window_id: WindowId, color: ColorU) {
+        Window::set_window_background_color(window_id, color)
     }
 
     fn set_all_windows_background_blur_radius(&self, blur_radius_pixels: u8) {
@@ -502,6 +509,10 @@ pub struct WindowState {
     pub(super) capture_callback: RefCell<Option<FrameCaptureCallback>>,
     platform_view_handler: RefCell<Option<PlatformViewHandler>>,
     overlay_rects: RefCell<Vec<RectF>>,
+    /// Workspace background color painted into the full-window background layer
+    /// (MetalBackgroundView). Pushed from the app layer each frame; consumed by
+    /// the render loop when it clears that layer.
+    background_color: RefCell<ColorU>,
 }
 
 impl Window {
@@ -631,6 +642,7 @@ impl Window {
                 synthetic_drag_counter: Cell::new(0),
                 platform_view_handler: RefCell::new(None),
                 overlay_rects: RefCell::new(Vec::new()),
+                background_color: RefCell::new(ColorU::transparent_black()),
                 executor,
                 ime_active: Cell::new(false),
                 capture_callback: RefCell::new(None),
@@ -898,6 +910,21 @@ impl Window {
         }
     }
 
+    pub fn request_redraw_all_windows() {
+        // 供 webview IPC 等无 AppContext 的主线程路径触发重绘，
+        // 确保 on_frame_drawn → drain_pending_* 得以执行。
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let windows = NSApplication::sharedApplication(mtm).windows();
+        for i in 0..windows.count() {
+            let window = windows.objectAtIndex(i);
+            unsafe {
+                if is_warp_window(&window).as_bool() {
+                    let _: () = msg_send![&*window, setNeedsDisplayAsync];
+                }
+            }
+        }
+    }
+
     pub fn show_window_and_focus_app(window_id: WindowId, bring_to_front: bool) {
         // SAFETY: `find_window_with_id` / `show_window_and_focus_app` are FFI calls.
         unsafe {
@@ -921,6 +948,21 @@ impl Window {
         unsafe {
             if let Some(window) = Self::find_window_with_id(window_id) {
                 set_window_alpha(&window, alpha as f64)
+            }
+        }
+    }
+
+    /// Stores the workspace background color that the full-window background
+    /// layer (MetalBackgroundView) should render. The render loop reads it each
+    /// frame and clears the background layer with it, so the windows background
+    /// goes through the same Metal compositing as the UI.
+    pub fn set_window_background_color(window_id: WindowId, color: ColorU) {
+        // SAFETY: `find_window_with_id` is an FFI call.
+        unsafe {
+            if let Some(window) = Self::find_window_with_id(window_id) {
+                get_window_state(as_objc_object(&window))
+                    .background_color
+                    .replace(color);
             }
         }
     }
@@ -1172,6 +1214,24 @@ impl WindowState {
         layer
             .downcast::<CAMetalLayer>()
             .expect("MetalRenderView backing layer is a CAMetalLayer")
+    }
+
+    /// Returns the `CAMetalLayer` of the full-window background view
+    /// (MetalBackgroundView), which the render loop clears with the workspace
+    /// background color each frame.
+    pub fn metal_background_layer(&self) -> Retained<CAMetalLayer> {
+        let view = self
+            .window()
+            .contentView()
+            .expect("WarpHostView content view");
+        let background_view: Retained<NSView> =
+            unsafe { msg_send![&*view, metalBackgroundView] };
+        let layer = background_view
+            .layer()
+            .expect("MetalBackgroundView always has a backing layer");
+        layer
+            .downcast::<CAMetalLayer>()
+            .expect("MetalBackgroundView backing layer is a CAMetalLayer")
     }
 
     /// Returns the current [`Device`] for rendering. `None` if the window was configured with no
@@ -1520,6 +1580,35 @@ extern "C-unwind" fn warp_update_layer(this: &Object) {
         app::callback_dispatcher()
             .for_window(&Window(window.clone()))
             .frame_drawn();
+
+        // Paint the workspace background color into the full-window background
+        // layer (MetalBackgroundView). It clears the whole window each frame, so
+        // the background under both the Metal UI and any embedded transparent
+        // webview comes from this same layer — uniform across the window.
+        //
+        // 背景是整窗唯一窗口背景(MetalBackgroundView 铺满全窗),由 workspace
+        // 每帧把 theme.surface_2.with_opacity(窗口透明度) 推入 background_color。
+        // 无论 webview 是否可见,原生背景层都持续铺满,半透明窗口下各区域
+        // 透明度一致,不再因 webview 挖洞导致左右/各 tab 背景来源不一致。
+        let background_color = *window.background_color.borrow();
+        // SAFETY: `this` is a WarpHostView carrying the window-state ivar; the
+        // background layer lives on its MetalBackgroundView subview.
+        let view = &*(this as *const Object).cast::<NSView>();
+        let background_view: Retained<NSView> = msg_send![view, metalBackgroundView];
+
+        // 背景层铺满其父容器(WebViewContainerView,autoresize 铺满 content view),
+        // 与 workspace 主背景同域。无论 webview 是否可见都铺满 → 各 tab 一致。
+        let content_view: Retained<NSView> = msg_send![&*background_view, superview];
+        let frame: NSRect = msg_send![&*content_view, bounds];
+        let _: () = msg_send![&background_view, setFrame: frame];
+        let scale = window.backing_scale_factor();
+        let background_layer = window.metal_background_layer();
+        background_layer.setContentsScale(scale);
+        background_layer.setDrawableSize(NSSize::new(
+            frame.size.width * scale,
+            frame.size.height * scale,
+        ));
+        renderer.render_background(&background_layer, background_color);
     }
 }
 #[no_mangle]

@@ -72,7 +72,7 @@ impl<T> ListState<T> {
     /// Returns the list state and a receiver for scroll events. The list sends
     /// the current scroll offset through the channel whenever the user scrolls.
     pub fn new_with_scroll_preservation(
-        render_fn: impl Fn(usize, ScrollOffset, &AppContext) -> Box<dyn Element> + 'static,
+        render_fn: impl Fn(usize, ScrollOffset, Pixels, &AppContext) -> Box<dyn Element> + 'static,
         adjustment_fn: impl Fn(usize, &T, &AppContext) -> Option<Pixels> + 'static,
     ) -> (Self, async_channel::Receiver<ScrollOffset>) {
         let render_fn = Arc::new(render_fn);
@@ -165,14 +165,14 @@ impl<T> ListState<T> {
 
 impl ListState<()> {
     pub fn new(
-        render_fn: impl Fn(usize, ScrollOffset, &AppContext) -> Box<dyn Element> + 'static,
+        render_fn: impl Fn(usize, ScrollOffset, Pixels, &AppContext) -> Box<dyn Element> + 'static,
     ) -> Self {
         let render_fn = Arc::new(render_fn);
         Self(Rc::new(RefCell::new(ListStateInner::new(render_fn))))
     }
 }
 
-type ListItemRenderFn = dyn Fn(usize, ScrollOffset, &AppContext) -> Box<dyn Element>;
+type ListItemRenderFn = dyn Fn(usize, ScrollOffset, Pixels, &AppContext) -> Box<dyn Element>;
 
 /// An element that holds elements of various sizes and only lays out the elements that are visible in the viewport.
 /// If each element is provably the same size, consider using [`UniformList`] instead for a vastly simpler API.
@@ -250,7 +250,7 @@ impl<T: 'static> List<T> {
             }
 
             let mut element =
-                (list_state.render_fn)(index + cursor_start.0, list_state.scroll_top, app);
+                (list_state.render_fn)(index + cursor_start.0, list_state.scroll_top, list_state.viewport_height, app);
             let element_size = element.layout(child_constraint, ctx, app);
 
             measured_items.push(ListItem {
@@ -330,7 +330,7 @@ impl<T: 'static> Element for List<T> {
                         cursor.slice(&Count(start_index), sum_tree::SeekBias::Right);
                     for index in 0..(end_index - start_index) {
                         let mut element =
-                            (list_state.render_fn)(index + start_index, list_state.scroll_top, app);
+                            (list_state.render_fn)(index + start_index, list_state.scroll_top, list_state.viewport_height, app);
                         let element_size = element.layout(child_constraint, ctx, app);
                         new_items.push(ListItem {
                             height: Some(element_size.y().into_pixels()),
@@ -366,9 +366,14 @@ impl<T: 'static> Element for List<T> {
         (_, self.children) = self.render_visible_items(child_constraint, &mut list_state, ctx, app);
 
         // Ensure the scroll top never exceeds the maximum scroll position.
-        let max_scroll_top = list_state.max_scroll_offset(viewport_height.into_pixels());
-        if list_state.scroll_top > max_scroll_top {
-            list_state.scroll_top = max_scroll_top;
+        // Compare by pixel position, not (item_index, offset): with zero-height items
+        // before the scrolled item (e.g. side-by-side diff hides non-active files as
+        // empty items), the index-based comparison would wrongly pull the scroll back
+        // to item 0 even though the pixel position is unchanged.
+        if list_state.scroll_top_pixels()
+            > list_state.max_scroll_top_pixels(viewport_height.into_pixels())
+        {
+            list_state.scroll_top = list_state.max_scroll_offset(viewport_height.into_pixels());
             (_, self.children) =
                 self.render_visible_items(child_constraint, &mut list_state, ctx, app);
         }
@@ -755,9 +760,14 @@ impl<T> ListStateInner<T> {
         }
     }
 
+    /// Returns the maximum scroll top, in pixels, given the viewport height.
+    fn max_scroll_top_pixels(&self, viewport_height: Pixels) -> Pixels {
+        (self.approximate_height() - viewport_height).max(Pixels::zero())
+    }
+
     /// Returns the maximum scroll offset based on the approximate height of the list.
     fn max_scroll_offset(&self, viewport_height: Pixels) -> ScrollOffset {
-        let max_scroll_top = (self.approximate_height() - viewport_height).max(Pixels::zero());
+        let max_scroll_top = self.max_scroll_top_pixels(viewport_height);
 
         let index = {
             let mut cursor = self.content.cursor::<Height, Count>();

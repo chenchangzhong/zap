@@ -2585,6 +2585,7 @@ enum TypedPane<'a> {
     AIFact,
     AIDocument,
     ExecutionProfileEditor,
+    DeepSeek,
     Other,
 }
 
@@ -2627,6 +2628,7 @@ impl TypedPane<'_> {
             TypedPane::AIFact => SummaryPaneKind::AIFact,
             TypedPane::AIDocument => SummaryPaneKind::AIDocument,
             TypedPane::ExecutionProfileEditor => SummaryPaneKind::ExecutionProfileEditor,
+            TypedPane::DeepSeek => SummaryPaneKind::Other,
             TypedPane::Other => SummaryPaneKind::Other,
         }
     }
@@ -2658,6 +2660,7 @@ impl TypedPane<'_> {
             TypedPane::ExecutionProfileEditor => {
                 crate::t!("vertical-tabs-pane-kind-execution-profile")
             }
+            TypedPane::DeepSeek => "DeepSeek Harness".to_string(),
             TypedPane::Other => crate::t!("vertical-tabs-pane-kind-other"),
         }
     }
@@ -2680,6 +2683,7 @@ impl TypedPane<'_> {
             | TypedPane::AIFact
             | TypedPane::AIDocument
             | TypedPane::ExecutionProfileEditor
+            | TypedPane::DeepSeek
             | TypedPane::Other => None,
         }
     }
@@ -2702,6 +2706,7 @@ impl TypedPane<'_> {
             TypedPane::AIFact => WarpIcon::BookOpen,
             TypedPane::AIDocument => WarpIcon::Compass,
             TypedPane::ExecutionProfileEditor => WarpIcon::Lightning,
+            TypedPane::DeepSeek => WarpIcon::DeepSeek,
             TypedPane::Other => WarpIcon::File,
         }
     }
@@ -2840,6 +2845,7 @@ fn build_vertical_tabs_summary_data(
             | TypedPane::AIFact
             | TypedPane::AIDocument
             | TypedPane::ExecutionProfileEditor
+            | TypedPane::DeepSeek
             | TypedPane::Other => {
                 push_normalized_unique_summary_text(
                     &mut primary_labels,
@@ -2963,6 +2969,7 @@ impl<'a> PaneProps<'a> {
             | TypedPane::AIFact
             | TypedPane::AIDocument
             | TypedPane::ExecutionProfileEditor
+            | TypedPane::DeepSeek
             | TypedPane::Other => {
                 non_terminal_search_text_fragments(self.generated_or_tab_title(), &self.subtitle)
             }
@@ -3300,6 +3307,7 @@ impl PaneGroup {
             IPaneType::AIFact => TypedPane::AIFact,
             IPaneType::AIDocument => TypedPane::AIDocument,
             IPaneType::ExecutionProfileEditor => TypedPane::ExecutionProfileEditor,
+            IPaneType::DeepSeek => TypedPane::DeepSeek,
             IPaneType::ImageViewer
             | IPaneType::GetStarted
             | IPaneType::SshServer
@@ -5757,6 +5765,7 @@ fn typed_pane_warp_drive_object_type(typed: &TypedPane<'_>) -> Option<DriveObjec
         | TypedPane::Settings
         // Zap Wave 7-3:`TypedPane::EnvironmentManagement` arm 随 variant 物理删。
         | TypedPane::ExecutionProfileEditor
+        | TypedPane::DeepSeek
         | TypedPane::Other => None,
     }
 }
@@ -5784,6 +5793,7 @@ fn render_detail_section(
         | TypedPane::Settings
         // Zap Wave 7-3:`TypedPane::EnvironmentManagement` arm 随 variant 物理删。
         | TypedPane::ExecutionProfileEditor
+        | TypedPane::DeepSeek
         | TypedPane::Other => Empty::new().finish(),
     }
 }

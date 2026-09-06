@@ -109,9 +109,58 @@ pub struct DiffStatus {
     change_mapping: RangeMap<usize, ChangeType>,
     /// A deletion that maps a line index in current content to an old range in base.
     deletion_mapping: HashMap<usize, Range<usize>>,
+    /// Hunk-level deletion ranges (one entry per deletion/replacement hunk, in the
+    /// side-by-side view also used for pure-deletion placeholders on the new side).
+    /// Hunk navigation/counting must use these, NOT `deletion_mapping` (whose keys are
+    /// per-row for indicator rendering).
+    deletion_hunks: Vec<Range<usize>>,
+    /// Reverse-insertion overrides for side-by-side pure-deletion hunks on the
+    /// *other* column. Maps a zero-width navigation position (the row right after
+    /// the deleted block in the opposite buffer) to the base range whose content
+    /// must be re-inserted to undo the deletion.
+    ///
+    /// This is consulted only by [`DiffModel::reverse_action_by_diff_hunk_index`]
+    /// and is deliberately not used by gutter rendering (`diff_hunk` /
+    /// `removed_diff_range`), so it can carry zero-width positions that would
+    /// otherwise be rejected by the `RangeMap`-backed `change_mapping` (which
+    /// panics on `start >= end`).
+    reverse_insertion_mapping: HashMap<usize, Range<usize>>,
 }
 
 impl DiffStatus {
+    /// Construct a diff status from explicit mappings. Used by the side-by-side
+    /// diff view, which computes hunks itself (git alignment) and must not run the
+    /// diff engine (its mappings would mark spacer rows as diff lines).
+    pub fn from_mappings(
+        change_mapping: RangeMap<usize, ChangeType>,
+        deletion_mapping: HashMap<usize, Range<usize>>,
+    ) -> Self {
+        Self {
+            change_mapping,
+            deletion_mapping,
+            deletion_hunks: Vec::new(),
+            reverse_insertion_mapping: HashMap::new(),
+        }
+    }
+
+    /// Record hunk-level deletion ranges (one per deletion/replacement hunk) so hunk
+    /// navigation/counting works per hunk instead of per deleted row.
+    pub fn with_deletion_hunks(mut self, deletion_hunks: Vec<Range<usize>>) -> Self {
+        self.deletion_hunks = deletion_hunks;
+        self
+    }
+
+    /// Record reverse-insertion overrides for side-by-side pure-deletion hunks
+    /// (see `reverse_insertion_mapping`). Keyed by the zero-width navigation
+    /// position; values are base ranges whose content re-inserts the deletion.
+    pub fn with_reverse_insertion_mapping(
+        mut self,
+        reverse_insertion_mapping: HashMap<usize, Range<usize>>,
+    ) -> Self {
+        self.reverse_insertion_mapping = reverse_insertion_mapping;
+        self
+    }
+
     /// Returns the number of lines added and removed in the current diff.
     pub fn get_diff_lines(&self) -> (usize, usize) {
         let mut lines_added = 0;
@@ -225,6 +274,12 @@ pub struct DiffModel {
     base: Option<Arc<MultilineString<LF>>>,
     status: DiffStatus,
     abort_handle: Option<(AbortHandle, BufferVersion)>,
+    /// Set when the side-by-side view injects its own precise status via
+    /// [`DiffModel::set_status`]. While set, asynchronous diff-engine results must
+    /// not overwrite the manual status. Lifetime: the side-by-side editor pair is
+    /// torn down and recreated when the diff layout/active file changes, so a stale
+    /// manual status does not persist across view rebuilds.
+    manual_status: bool,
 }
 
 impl DiffModel {
@@ -233,26 +288,19 @@ impl DiffModel {
             base: None,
             status: DiffStatus::default(),
             abort_handle: None,
+            manual_status: false,
         }
     }
 
     /// Total number of diff hunks in the current diff model.
     pub fn diff_hunk_count(&self) -> usize {
-        self.status.change_mapping.len() + self.status.deletion_mapping.len()
+        self.status.change_mapping.len() + self.status.deletion_hunks.len()
     }
 
     /// Given an index of a diff hunk, expand it to the range of lines the hunk describes
     /// in the current buffer.
     pub fn line_range_by_diff_hunk_index(&self, index: usize) -> Option<Range<usize>> {
-        self.added_or_changed_lines()
-            .chain(
-                self.status
-                    .deletion_mapping
-                    .keys()
-                    .map(|index| *index..*index),
-            )
-            .sorted_by(|a, b| Ord::cmp(&a.start, &b.start))
-            .nth(index)
+        self.hunk_ranges().nth(index).map(|(range, _)| range)
     }
 
     /// Get a single renderable diff hunk by its index.
@@ -365,15 +413,23 @@ impl DiffModel {
 
     /// Returns the number of diff hunks before the given line number.
     pub fn diff_hunk_count_before_line(&self, line: usize) -> usize {
-        self.added_or_changed_lines()
-            .chain(
-                self.status
-                    .deletion_mapping
-                    .keys()
-                    .map(|index| *index..*index + 1),
-            )
-            .filter(|range| range.start < line)
+        self.hunk_ranges()
+            .filter(|(range, _)| range.start < line)
             .count()
+    }
+
+    /// Returns the index of the diff hunk that contains `line`, or whose zero-width
+    /// navigation position equals `line`. Unlike `diff_hunk_count_before_line`, this does
+    /// not count the hunk itself when clicking inside a multi-line hunk (side-by-side left
+    /// column reports a single-line range, while the hunk's deletion range spans several rows).
+    pub fn diff_hunk_index_at_line(&self, line: usize) -> Option<usize> {
+        self.hunk_ranges().position(|(range, _)| {
+            if range.start == range.end {
+                range.start == line
+            } else {
+                line >= range.start && line < range.end
+            }
+        })
     }
 
     /// Given a diff hunk index, calculate what is the reverse action that undo this diff.
@@ -396,6 +452,16 @@ impl DiffModel {
                     return Some((line_range, text));
                 }
             };
+        }
+
+        // Side-by-side pure-deletion hunk on the opposite column: the navigation
+        // position is zero-width, so it can't live in `change_mapping` (a `RangeMap`
+        // that panics on empty ranges) and must not pollute `deletion_mapping`
+        // (which drives gutter rendering). Re-insert the deleted base lines here.
+        if let Some(replaced_range) = self.status.reverse_insertion_mapping.get(&line_range.start)
+        {
+            let text = self.base_text_by_line_range(replaced_range)?;
+            return Some((line_range, text));
         }
 
         None
@@ -514,20 +580,35 @@ impl DiffModel {
     }
 
     fn diff_by_index(&self, index: usize) -> Option<(Range<usize>, bool)> {
+        self.hunk_ranges().nth(index)
+    }
+
+    /// All hunk ranges as `(range, is_addition)` — change hunks (`true`) first, then
+    /// deletion hunks (`false`), sorted by start row. Hunk navigation must use this
+    /// instead of the per-row `deletion_mapping`.
+    fn hunk_ranges(&self) -> impl Iterator<Item = (Range<usize>, bool)> + '_ {
         self.added_or_changed_lines()
             .map(|range| (range, true))
             .chain(
                 self.status
-                    .deletion_mapping
-                    .keys()
-                    .map(|index| (*index..*index + 1, false)),
+                    .deletion_hunks
+                    .iter()
+                    .cloned()
+                    .map(|range| (range, false)),
             )
             .sorted_by(|a, b| Ord::cmp(&a.0.start, &b.0.start))
-            .nth(index)
     }
 
     pub fn diff_status(&self) -> &DiffStatus {
         &self.status
+    }
+
+    /// Replace the diff status directly (bypasses the diff engine). Used by the
+    /// side-by-side diff view, which supplies its own hunk mappings. Also marks the
+    /// status as manual so later asynchronous engine results don't overwrite it.
+    pub fn set_status(&mut self, status: DiffStatus) {
+        self.status = status;
+        self.manual_status = true;
     }
 
     pub fn set_base(&mut self, base: MultilineString<LF>) {
@@ -567,8 +648,22 @@ impl DiffModel {
             .spawn(
                 async move { Self::compute_diff_internal(&base_text, &new).await },
                 move |model, (change_mapping, deletion_mapping), ctx| {
+                    if model.manual_status {
+                        // The side-by-side view injected its own precise status (git
+                        // alignment); the engine's spacer-row mappings must not replace it.
+                        return;
+                    }
                     model.status.change_mapping = change_mapping;
+                    // Engine path: derive hunk-level deletion navigation ranges from the
+                    // per-row deletion mapping (keys are buffer/new positions of the
+                    // deleted rows). Keeps `diff_hunk_count` / hunk navigation consistent
+                    // with the side-by-side path which supplies `deletion_hunks` explicitly.
+                    let deletion_hunks = deletion_mapping
+                        .keys()
+                        .map(|index| *index..*index)
+                        .collect();
                     model.status.deletion_mapping = deletion_mapping;
+                    model.status.deletion_hunks = deletion_hunks;
                     log::debug!("diff status updated: {:#?}", &model.status);
                     ctx.emit(DiffModelEvent::DiffUpdated {
                         should_recalculate_hidden_lines,
@@ -590,8 +685,21 @@ impl DiffModel {
 
         let (change_mapping, deletion_mapping) =
             Self::compute_diff_internal(&base_text, new.to_format().as_ref()).await;
+        // Mirror the async path: side-by-side view injects its own precise status, so the
+        // engine must not overwrite it (also keeps test behavior aligned with production).
+        if self.manual_status {
+            return;
+        }
         self.status.change_mapping = change_mapping;
         self.status.deletion_mapping = deletion_mapping;
+        // Engine path: derive hunk-level deletion navigation ranges from the per-row
+        // deletion mapping (see the async `compute_diff` callback above).
+        self.status.deletion_hunks = self
+            .status
+            .deletion_mapping
+            .keys()
+            .map(|index| *index..*index)
+            .collect();
     }
 
     pub fn retrieve_unified_diff(

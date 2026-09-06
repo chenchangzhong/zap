@@ -559,11 +559,20 @@ impl<V: EditorView> EditorWrapper<V> {
     /// Returning **no** gutter means the gutter shouldn't be rendered at all.
     /// Returning an **empty** gutter means the gutter should be rendered with no contents.
     fn gutter_elements(&self, app: &AppContext) -> Option<Vec<GutterElement>> {
+        let _build_start = std::time::Instant::now();
         let appearance = Appearance::as_ref(app);
         let Some(line_number_config) = &self.line_number_config else {
+            let elapsed = _build_start.elapsed();
+            if elapsed.as_micros() > 500 {
+                log::debug!("[perf] gutter_elements took {:.3}ms (no line_number_config)", elapsed.as_secs_f64() * 1000.0);
+            }
             return None;
         };
         let Some(blocks) = self.editor.blocks() else {
+            let elapsed = _build_start.elapsed();
+            if elapsed.as_micros() > 500 {
+                log::debug!("[perf] gutter_elements took {:.3}ms (no blocks)", elapsed.as_secs_f64() * 1000.0);
+            }
             return Some(Vec::new());
         };
 
@@ -588,7 +597,14 @@ impl<V: EditorView> EditorWrapper<V> {
                 .into_pixels(),
                 InnerEditor::FullEditor(_) => block.viewport_item().viewport_offset,
             };
-            let diff_hunk = self.diff_status.diff_hunk(line_count, appearance);
+            // Spacer blocks (blank alignment blocks in the side-by-side view) must
+            // never show a diff indicator: their line-domain row can coincide with a
+            // real diff row of a neighbouring hunk.
+            let diff_hunk = if block.is_spacer() {
+                None
+            } else {
+                self.diff_status.diff_hunk(line_count, appearance)
+            };
             let is_removal = matches!(diff_hunk, Some(DiffHunkDisplay::Remove(_)));
 
             let current_line =
@@ -778,7 +794,12 @@ impl<V: EditorView> EditorWrapper<V> {
             let diff_range = self.diff_status.added_diff_range(line_count);
             let range_already_clicked = diff_range
                 .as_ref()
-                .is_some_and(|range| self.state_handle.is_range_clicked(range));
+                .is_some_and(|range| self.state_handle.is_range_clicked(range))
+                // Side-by-side left (baseline) column has an empty change_mapping, so
+                // `added_diff_range` is None and the gutter action records the fallback
+                // single-line range (`line_count..line_count+1`). Check that too so the
+                // revert button's hover/pointer style is released after clicking.
+                || self.state_handle.is_range_clicked(&(line_count..line_count + 1));
 
             // If the corresponding line in the editor element has a line decoration, we should apply the decoration
             // in the wrapper as well. This does assume the line could only have a single decoration. I think it's fine
@@ -821,11 +842,11 @@ impl<V: EditorView> EditorWrapper<V> {
 
             // We want to show the gutter buttons if either:
             // 1) This line is part of a diff hunk that is being hovered and the comment box
-            // isn't open on another line.
+            // isn't open on another line. (Removed lines in the side-by-side view are
+            // regular content rows, so they must show buttons here too.)
             // 2) We're currently on a line where the comment box is open.
             let should_show_diff_hunk_button = (is_diff_line
                 && is_this_line_hovered
-                && !is_removal
                 && !range_already_clicked
                 && !is_comment_box_open_on_different_line)
                 || is_comment_box_open_on_current_line;
@@ -861,18 +882,15 @@ impl<V: EditorView> EditorWrapper<V> {
                 appearance,
             );
 
-            let diff_hunk = if is_removal && self.diff_hunks_are_expanded() {
-                None
-            } else {
-                diff_hunk
-            };
+            // The gutter for a removed line is normally rendered on the temporary block
+            // that represents it (single-column diff). In the side-by-side view the
+            // removed lines are regular content rows (no temporary block), so keep the
+            // diff hunk here to show the red indicator and hover buttons.
             elements.push(GutterElement {
                 element,
                 height,
                 offset,
                 hovered: range_hovered,
-                // We can skip rendering this removal gutter element if its hunk is expanded since
-                // the gutter is rendered on the temporary block.
                 line,
                 element_type: GutterElementType::DiffHunk {
                     hunk: diff_hunk,
@@ -880,6 +898,15 @@ impl<V: EditorView> EditorWrapper<V> {
                 },
                 overlay: None,
             });
+        }
+        let elapsed = _build_start.elapsed();
+        if elapsed.as_micros() > 500 {
+            let block_count = blocks.len();
+            log::debug!(
+                "[perf] gutter_elements took {:.3}ms (blocks={block_count}, elements={})",
+                elapsed.as_secs_f64() * 1000.0,
+                elements.len(),
+            );
         }
         Some(elements)
     }
@@ -1001,6 +1028,10 @@ impl<V: EditorView> EditorWrapper<V> {
 
         if enabled {
             button = button.with_cursor(warpui::platform::Cursor::PointingHand);
+            // Clicking the gutter button usually removes it (revert/add-context), so the
+            // pointing-hand cursor must be reset immediately; otherwise the pointer stays in
+            // "hand" mode over the now-button-less gutter until the next mouse move.
+            button = button.with_reset_cursor_after_click();
 
             if let Some(on_click_action) = on_click_action {
                 let action = on_click_action.clone();
@@ -1281,7 +1312,10 @@ impl<V: EditorView> Element for EditorWrapper<V> {
         );
 
         // Layout the editor element first so we can read the laid out visible blocks.
+        let _layout_start = std::time::Instant::now();
+        let editor_layout_start = std::time::Instant::now();
         let editor_size = self.editor.layout(content_constraint, ctx, app);
+        let editor_layout_elapsed = editor_layout_start.elapsed();
 
         let size = match self.vertical_expansion_behavior {
             VerticalExpansionBehavior::GrowToMaxHeight
@@ -1291,33 +1325,58 @@ impl<V: EditorView> Element for EditorWrapper<V> {
             VerticalExpansionBehavior::FillMaxHeight => constraint.max,
         };
 
+        // Time gutter_elements construction and layout separately.
+        let gutter_build_start = std::time::Instant::now();
         let mut gutter_elements = self.gutter_elements(app);
-        if let Some(gutter_elements) = &mut gutter_elements {
-            for gutter_element in gutter_elements {
-                let gutter_element_size = gutter_element.element.layout(constraint, ctx, app);
+        let gutter_build_elapsed = gutter_build_start.elapsed();
 
-                if FeatureFlag::InlineCodeReview.is_enabled() {
-                    if let Some(comment_box) = &mut self.comment_box {
-                        let highlight_line = &comment_box.line;
-                        if gutter_element.line == *highlight_line {
-                            let highlight_width = size.x();
-                            let highlight_height = gutter_element_size.y();
-                            comment_box.line_highlight_element.layout(
-                                SizeConstraint {
-                                    min: vec2f(0.0, 0.0),
-                                    max: vec2f(highlight_width, highlight_height),
-                                },
-                                ctx,
-                                app,
-                            );
+        let gutter_layout_start = std::time::Instant::now();
+        let gutter_count = match &mut gutter_elements {
+            Some(gutter_elements) => {
+                let count = gutter_elements.len();
+                for gutter_element in gutter_elements {
+                    let gutter_element_size =
+                        gutter_element.element.layout(constraint, ctx, app);
+
+                    if FeatureFlag::InlineCodeReview.is_enabled() {
+                        if let Some(comment_box) = &mut self.comment_box {
+                            let highlight_line = &comment_box.line;
+                            if gutter_element.line == *highlight_line {
+                                let highlight_width = size.x();
+                                let highlight_height = gutter_element_size.y();
+                                comment_box.line_highlight_element.layout(
+                                    SizeConstraint {
+                                        min: vec2f(0.0, 0.0),
+                                        max: vec2f(highlight_width, highlight_height),
+                                    },
+                                    ctx,
+                                    app,
+                                );
+                            }
                         }
                     }
                 }
+                count
             }
-        }
+            None => 0,
+        };
+        let gutter_layout_elapsed = gutter_layout_start.elapsed();
 
         self.gutter_elements = gutter_elements;
         self.element_size = Some(size);
+        // All timers guarded by >500μs threshold.
+        let layout_elapsed = _layout_start.elapsed();
+        if layout_elapsed.as_micros() > 500 {
+            log::debug!(
+                "[perf] EditorWrapper::layout total {:.3}ms | \
+                 editor {:.3}ms | gutter_build {:.3}ms ({gutter_count} elements) | \
+                 gutter_layout {:.3}ms",
+                layout_elapsed.as_secs_f64() * 1000.0,
+                editor_layout_elapsed.as_secs_f64() * 1000.0,
+                gutter_build_elapsed.as_secs_f64() * 1000.0,
+                gutter_layout_elapsed.as_secs_f64() * 1000.0,
+            );
+        }
         size
     }
 
@@ -1330,18 +1389,21 @@ impl<V: EditorView> Element for EditorWrapper<V> {
         let element_origin = Point::from_vec2f(origin, ctx.scene.z_index());
         self.element_origin = Some(element_origin);
 
+        let paint_start = std::time::Instant::now();
         let size_buffer = self.size_buffer();
         let wrapper_size = self.size().unwrap_or_default();
 
-        // Pre-pass: Draw full-width overlay rects for diff highlighting.
-        // Drawing before the inner editor and gutter elements so they appear behind text.
-        // Clip to the wrapper bounds so overlays don't bleed outside the element
-        // (important for Lens mode where LineDecoration ranges may exceed the visible range).
-        let overlay_clip = RectF::new(origin, wrapper_size);
+        // Pre-pass: Draw overlay rects for diff highlighting in the content area only.
+        // Clip to content area (right of gutter) to prevent background bleeding into gutter.
+        let content_origin = origin + vec2f(size_buffer.x(), 0.);
+        let content_width = wrapper_size.x() - size_buffer.x();
+        let overlay_clip = RectF::new(
+            content_origin,
+            vec2f(content_width, wrapper_size.y()),
+        );
         ctx.scene
             .start_layer(ClipBounds::BoundedByActiveLayerAnd(overlay_clip));
 
-        // Added/replaced lines: one rect per LineDecoration range.
         {
             let model = self.model().as_ref(app);
             let content = model.content();
@@ -1352,23 +1414,109 @@ impl<V: EditorView> Element for EditorWrapper<V> {
                     .into_pixels(),
                 InnerEditor::FullEditor(_) => model.viewport().scroll_top(),
             };
-            for decoration in model.decorations().line_decoration_ranges() {
+            // Compute spacer Y ranges once per paint (they are content-space coordinates and
+            // do not depend on the decoration being drawn). Doing this inside the decoration
+            // loop would re-walk the whole render tree for every decoration — O(d * s) with a
+            // fresh Vec allocation each time, which is very slow for large side-by-side diffs.
+            // 结果已由 RenderState 内部缓存(内容树未变时直接返回,不重新遍历),这里每次
+            // paint 调用一次即可。
+            let spacer_ranges = model.spacer_y_ranges();
+            // Only paint decorations that intersect the visible content region. `y_adjustment`
+            // is the viewport scroll (full editor) or lens offset, so visible content is
+            // [y_adjustment, y_adjustment + wrapper height]. Skipping off-screen decorations
+            // makes the diff-highlight pass O(visible decorations * spacers) instead of O(all
+            // decorations * spacers) when virtual scrolling shows only a few dozen rows.
+            let visible_top = y_adjustment.as_f32();
+            let visible_bottom = visible_top + wrapper_size.y();
+            let line_decorations = model.decorations().line_decoration_ranges();
+            // `line_decorations` is sorted by `end` (ascending). Use a binary search to skip
+            // decorations whose whole range is above the viewport, so we don't pay a SumTree
+            // seek for every decoration on every paint frame (thousands of decorations on large
+            // diffs). `partition_point` costs O(log d) seeks instead of O(d).
+            let first_visible = line_decorations.partition_point(|decoration| {
+                content.y_offset_at_line(decoration.end).as_f32() <= visible_top
+            });
+            let mut seek_total = std::time::Duration::ZERO;
+            for decoration in &line_decorations[first_visible..] {
+                let seek_start = std::time::Instant::now();
                 let start_y = content.y_offset_at_line(decoration.start);
                 let end_y = content.y_offset_at_line(decoration.end);
-                ctx.scene
-                    .draw_rect_without_hit_recording(RectF::new(
-                        origin + vec2f(0., (start_y - y_adjustment).as_f32()),
-                        vec2f(wrapper_size.x(), (end_y - start_y).as_f32()),
-                    ))
-                    .with_background(decoration.overlay);
+                let seek_elapsed = seek_start.elapsed();
+                if seek_elapsed.as_micros() > 50 {
+                    log::debug!(
+                        "[perf] decoration seek {:?}..{:?} took {:?} (total deco {}, first_visible {})",
+                        decoration.start,
+                        decoration.end,
+                        seek_elapsed,
+                        line_decorations.len(),
+                        first_visible
+                    );
+                }
+                seek_total += seek_elapsed;
+                let start_f = start_y.as_f32();
+                let end_f = end_y.as_f32();
+                if end_f <= visible_top || start_f >= visible_bottom {
+                    continue;
+                }
+
+                // Split the decoration rectangle around side-by-side spacer rows so diff
+                // red/green backgrounds never paint over blank spacer lines (they render
+                // their own striped placeholder instead).
+                let mut segments = vec![(start_f, end_f)];
+                for range in &spacer_ranges {
+                    let mut next = Vec::new();
+                    for (seg_start, seg_end) in segments {
+                        if range.start > seg_start {
+                            next.push((seg_start, range.start.min(seg_end)));
+                        }
+                        if range.end < seg_end {
+                            next.push((range.end.max(seg_start), seg_end));
+                        }
+                    }
+                    segments = next;
+                }
+                for (seg_start, seg_end) in segments {
+                    if seg_end - seg_start > 0.5 {
+                        ctx.scene
+                            .draw_rect_without_hit_recording(RectF::new(
+                                content_origin
+                                    + vec2f(0., (seg_start - y_adjustment.as_f32())),
+                                vec2f(content_width, seg_end - seg_start),
+                            ))
+                            .with_background(decoration.overlay);
+                    }
+                }
             }
+            if seek_total.as_micros() > 500 {
+                log::debug!(
+                    "[perf] visible decoration seek total took {:?} (n={})",
+                    seek_total,
+                    line_decorations.len() - first_visible
+                );
+            }
+        }
+
+        ctx.scene.stop_layer();
+
+        let overlay_elapsed = paint_start.elapsed();
+        if overlay_elapsed.as_micros() > 2000 {
+            log::debug!(
+                "[perf] diff overlay pass took {:?}",
+                overlay_elapsed
+            );
         }
 
         self.paint_removed_line_overlays(origin, wrapper_size, ctx);
 
-        ctx.scene.stop_layer();
-
+        let editor_paint_start = std::time::Instant::now();
         self.editor.paint(origin + size_buffer, ctx, app);
+        let editor_paint_elapsed = editor_paint_start.elapsed();
+        if editor_paint_elapsed.as_micros() > 3000 {
+            log::debug!(
+                "[perf] inner editor paint took {:?}",
+                editor_paint_elapsed
+            );
+        }
 
         let diff_hunks_are_expanded = self.diff_hunks_are_expanded();
         let gutter_width = self.size_buffer().x();
@@ -1510,6 +1658,14 @@ impl<V: EditorView> Element for EditorWrapper<V> {
 
         // Cache find references anchor position if we have one.
         // LSP 下线后不再需要缓存 find-references gutter 位置。
+
+        let total_paint = paint_start.elapsed();
+        if total_paint.as_micros() > 5000 {
+            log::debug!(
+                "[perf] EditorWrapper::paint total {:?} (decoration overlay was part of it)",
+                total_paint
+            );
+        }
 
         self.child_max_z_index = Some(ctx.scene.max_active_z_index());
     }

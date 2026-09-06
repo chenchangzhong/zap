@@ -36,7 +36,7 @@ use super::model::{
 use crate::{content::version::BufferVersion, editor::EditorView};
 use string_offset::CharOffset;
 
-use self::{
+pub use self::{
     empty::Empty, header::RenderableHeader, hidden_section::RenderableHiddenSection,
     horizontal_rule::HorizontalRule, image::RenderableImage, mermaid::RenderableMermaidDiagram,
     ordered_list::RenderableOrderedListItem, paragraph::RenderableParagraph,
@@ -228,6 +228,13 @@ pub trait RenderableBlock {
         _ctx: &mut EventContext,
         _app: &AppContext,
     ) -> bool {
+        false
+    }
+
+    /// Whether this block is a side-by-side alignment spacer (a blank temporary
+    /// block). Spacers must never render diff indicators, even though their
+    /// line-domain row can coincide with a real diff row.
+    fn is_spacer(&self) -> bool {
         false
     }
 
@@ -842,7 +849,8 @@ impl<V: EditorView> RichTextElement<V> {
             scroll_data.scroll_start,
         );
 
-        let blocks = viewport_items
+        let _build_start = Instant::now();
+        let blocks: Vec<_> = viewport_items
             .map(|(item, block)| {
                 let renderable_block = match block {
                     BlockItem::Paragraph(_) => RenderableParagraph::new(item).finish(),
@@ -892,8 +900,15 @@ impl<V: EditorView> RichTextElement<V> {
                         decoration,
                         text_decoration,
                         ..
-                    } => RenderableTemporaryBlock::new(item, *decoration, text_decoration.clone())
-                        .finish(),
+                    } => RenderableTemporaryBlock::new(
+                        item,
+                        *decoration,
+                        text_decoration.clone(),
+                        // Side-by-side alignment spacers are blank temporary blocks
+                        // with no decoration; single-column removal hunks carry one.
+                        decoration.is_none(),
+                    )
+                    .finish(),
                     BlockItem::HorizontalRule(_) => HorizontalRule::new(item).finish(),
                     BlockItem::Image { .. } => RenderableImage::new(item).finish(),
                     BlockItem::Table { .. } => RenderableTable::new(item).finish(),
@@ -913,6 +928,15 @@ impl<V: EditorView> RichTextElement<V> {
                 renderable_block
             })
             .collect();
+
+        let _build_elapsed = _build_start.elapsed();
+        if _build_elapsed > Duration::from_micros(500) {
+            log::debug!(
+                "[perf] renderable_blocks build took {:.3}ms ({} blocks)",
+                _build_elapsed.as_secs_f64() * 1000.0,
+                blocks.len(),
+            );
+        }
 
         self.blocks = Some(blocks);
     }
@@ -971,10 +995,19 @@ impl<V: EditorView> Element for RichTextElement<V> {
         ctx: &mut LayoutContext,
         app: &AppContext,
     ) -> Vector2F {
+        let _layout_start = Instant::now();
+
         let model = self.model.as_ref(app);
+
+        // --- sub-step timing ---
+        let buf_ver_start = Instant::now();
         self.buffer_version = model.next_render_buffer_version();
+        let buf_ver_elapsed = buf_ver_start.elapsed();
+
+        let pending_edits_start = Instant::now();
         // Try flushing any pending edits at layout time (if we are performing layout lazily).
         self.pending_edits_flushed = model.try_layout_pending_edits(app);
+        let pending_edits_elapsed = pending_edits_start.elapsed();
 
         let size_buffer = vec2f(
             self.display_options.left_gutter + self.display_options.right_gutter,
@@ -983,20 +1016,24 @@ impl<V: EditorView> Element for RichTextElement<V> {
 
         let mut constraint = constraint;
 
+        // If we should grow to the max height as more code is added, instead of filling all available space,
+        // we should set the max height to be the shorter of the content height and the max height.
+        let height_start = Instant::now();
         if matches!(
             self.display_options.vertical_expansion_behavior,
             VerticalExpansionBehavior::GrowToMaxHeight | VerticalExpansionBehavior::InfiniteHeight
         ) {
-            // If we should grow to the max height as more code is added, instead of filling all available space,
-            // we should set the max height to be the shorter of the content height and the max height.
             constraint
                 .max
                 .set_y(constraint.max.y().min(model.height().as_f32()))
         }
+        let height_elapsed = height_start.elapsed();
 
+        let viewport_start = Instant::now();
         let size_info = model
             .viewport()
             .viewport_size(constraint, size_buffer, self.max_width);
+        let viewport_elapsed = viewport_start.elapsed();
         log::trace!(
             "Viewport size is {} within {}",
             size_info.viewport_size.display_size(),
@@ -1008,14 +1045,43 @@ impl<V: EditorView> Element for RichTextElement<V> {
         let size = constraint.max;
         self.element_size = Some(size);
 
+        // --- renderable_blocks timing ---
+        let renderable_blocks_start = Instant::now();
         self.renderable_blocks(model.styles(), app);
-        match self.blocks.as_mut() {
+        let renderable_blocks_elapsed = renderable_blocks_start.elapsed();
+
+        // --- block.layout() loop timing ---
+        let block_layout_start = Instant::now();
+        let block_count = match self.blocks.as_mut() {
             Some(blocks) => {
                 for block in blocks.iter_mut() {
                     block.layout(model, ctx, app);
                 }
+                blocks.len()
             }
-            None => log::error!("Rich-text blocks missing for layout"),
+            None => {
+                log::error!("Rich-text blocks missing for layout");
+                0
+            }
+        };
+        let block_layout_elapsed = block_layout_start.elapsed();
+
+        // --- log sub-steps if total is slow ---
+        let total_elapsed = _layout_start.elapsed();
+        if total_elapsed.as_micros() > 500 {
+            log::debug!(
+                "[perf] RichTextElement::layout total {:.3}ms | \
+                 buf_ver {:.3}ms | pending_edits {:.3}ms | height {:.3}ms | \
+                 viewport {:.3}ms | renderable_blocks {:.3}ms ({block_count} blocks) | \
+                 block.layout {:.3}ms",
+                total_elapsed.as_secs_f64() * 1000.0,
+                buf_ver_elapsed.as_secs_f64() * 1000.0,
+                pending_edits_elapsed.as_secs_f64() * 1000.0,
+                height_elapsed.as_secs_f64() * 1000.0,
+                viewport_elapsed.as_secs_f64() * 1000.0,
+                renderable_blocks_elapsed.as_secs_f64() * 1000.0,
+                block_layout_elapsed.as_secs_f64() * 1000.0,
+            );
         }
 
         size

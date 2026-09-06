@@ -1,3 +1,4 @@
+use warpui::color::ColorU;
 use warp_core::ui::theme::Fill;
 
 use crate::render::model::{BlockItem, Decoration, RenderState, viewport::ViewportItem};
@@ -8,6 +9,7 @@ pub struct RenderableTemporaryBlock {
     viewport_item: ViewportItem,
     decoration: Option<Fill>,
     text_decoration: Vec<Decoration>,
+    is_spacer: bool,
 }
 
 impl RenderableTemporaryBlock {
@@ -15,11 +17,13 @@ impl RenderableTemporaryBlock {
         viewport_item: ViewportItem,
         decoration: Option<Fill>,
         text_decoration: Vec<Decoration>,
+        is_spacer: bool,
     ) -> Self {
         Self {
             viewport_item,
             decoration,
             text_decoration,
+            is_spacer,
         }
     }
 }
@@ -31,6 +35,10 @@ impl RenderableBlock for RenderableTemporaryBlock {
 
     fn overlay_decoration(&self) -> Option<Fill> {
         self.decoration
+    }
+
+    fn is_spacer(&self) -> bool {
+        self.is_spacer
     }
 
     fn layout(
@@ -64,10 +72,25 @@ impl RenderableBlock for RenderableTemporaryBlock {
             None => return,
         };
 
+        // Side-by-side alignment spacers: paint a very light neutral background.
+        // Diff line decorations are excluded from spacer rows by EditorWrapper, so
+        // no red/green cover-up is needed here. The block now occupies exactly the
+        // same height as the rows it aligns (see BlockItem::content_height), so one
+        // rect over the whole reserved box covers every spacer row contiguously.
+        if self.is_spacer {
+            // 深色背景上 α=26(10%)的灰与底色几乎无差,肉眼等同于「空行
+            // 没渲染」;α=80 时叠加结果明显可见,又不盖过 diff 行高亮。
+            let background: Fill = ColorU::new(140, 140, 140, 80).into();
+            ctx.paint.scene.draw_rect_without_hit_recording(
+                self.viewport_item.reserved_bounds(ctx),
+            )
+            .with_background(background);
+        }
+
         let start = paragraph_block.start_char_offset;
         let paragraph_styles = &model.styles().base_text;
         let mut decoration_index = 0;
-        for paragraph in paragraph_block.paragraphs() {
+        for paragraph in paragraph_block.row_pitched_paragraphs() {
             // We could draw text directly since temporary paragraph should have its own decoration and selection state.
             ctx.draw_text(
                 paragraph.content_origin(),

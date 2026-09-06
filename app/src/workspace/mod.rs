@@ -649,6 +649,28 @@ pub fn init(app: &mut AppContext) {
             id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED) & !id!("Workspace_PaneDragging"),
         ),
         EditableBinding::new(
+            "workspace:open_dsh_pane",
+            BindingDescription::new(crate::t!("keybinding-desc-workspace-open-dsh-pane")),
+            WorkspaceAction::OpenDshPane,
+        )
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
+        .with_context_predicate(id!("Workspace") & !id!("Workspace_PaneDragging"))
+        .with_enabled(|| FeatureFlag::DshPane.is_enabled()),
+        // 打开一个不加载网页(about:blank)的内嵌 webview,便于查看 webview
+        // 透明背景跟随窗口透明度/模糊的效果。
+        EditableBinding::new(
+            "workspace:open_blank_web_preview",
+            BindingDescription::new(crate::t!(
+                "keybinding-desc-workspace-open-blank-web-preview"
+            )),
+            WorkspaceAction::OpenBrowserPreview {
+                url: "about:blank".to_string(),
+            },
+        )
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
+        .with_context_predicate(id!("Workspace") & !id!("Workspace_PaneDragging"))
+        .with_enabled(|| FeatureFlag::BrowserPane.is_enabled()),
+        EditableBinding::new(
             "workspace:toggle_left_panel",
             BindingDescription::new(crate::t!("keybinding-desc-workspace-toggle-left-panel")),
             WorkspaceAction::ToggleLeftPanel,

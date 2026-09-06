@@ -13,8 +13,9 @@ mod app_state;
 mod auth;
 mod autoupdate;
 mod banner;
-mod browser;
 mod changelog_model;
+mod browser;
+mod dsh;
 mod chip_configurator;
 mod cloud_object;
 mod code;
@@ -1359,12 +1360,8 @@ fn initialize_app(
             send_telemetry_from_app_ctx!(event, ctx);
         });
 
-        #[cfg(enable_crash_recovery)]
-        ctx.on_frame_drawn(|ctx, window_id| {
-            crash_recovery::CrashRecovery::handle(ctx).update(ctx, |crash_recovery, ctx| {
-                crash_recovery.on_frame_drawn(window_id, ctx);
-            });
-        })
+        // crash_recovery 的 on_frame_drawn 合并到后方统一的 on_frame_drawn 单回调中(见下方合并段)，
+        // 此处不再单独注册，避免覆盖式单回调被后注册覆盖导致丢失。
     } else {
         // If the app was opened while logged out, record an event for measuring new users.
         // This is sent immediately in case they quit the app on the signup screen.
@@ -1443,17 +1440,93 @@ fn initialize_app(
 
     ctx.add_singleton_model(CustomSecretRegexUpdater::new);
 
-    // Web preview:全局 webview 管理器。每帧消费 platform-view 上报
-    // (渲染线程写入的暂存队列),把 webview 定位到场景声明的 rect。
-    if FeatureFlag::BrowserPane.is_enabled() {
+    // Web preview:全局 webview 管理器(platform view 定位在下方合并的
+    // on_frame_drawn 中处理)。DshPane 也内嵌 webview 依赖该单例,故
+    // BrowserPane 或 DshPane 任一启用即注册,避免 DshPane 开 BrowserPane
+    // 关时 set_ready 的 as_ref panic。
+    if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
         ctx.add_singleton_model(|_| browser::BrowserWebViewManager::new());
-        ctx.on_frame_drawn(|ctx, window_id| {
+    }
+
+    // DeepSeek Harness runtime:管理 dsh 子进程,驱动崩溃重启轮询。
+    // 注意:on_frame_drawn 是覆盖式单回调,必须与 BrowserPane 的合并,
+    // 否则后注册的会覆盖先注册的(导致 webview 收不到 rect 上报)。
+    if FeatureFlag::DshPane.is_enabled() {
+        ctx.add_singleton_model(|_| dsh::DshRuntime::new());
+    }
+
+    // 每帧回调:合并 crash_recovery + BrowserPane(platform view 定位) + DshRuntime(崩溃轮询/IPC drain)。
+    // on_frame_drawn 是覆盖式单回调(核心层 Some(Box::new))，所有每帧工作必须合并在同一注册内，
+    // 无条件注册一次，内部分支按 flag 守卫（避免 crash_recovery 被 BrowserPane/DshPane 门控误伤丢失登录态）。
+    ctx.on_frame_drawn(move |ctx, window_id| {
+        // crash_recovery 仅在登录用户下执行(对齐原 `if user_is_logged_in` 分支)。
+        if user_is_logged_in {
+            #[cfg(enable_crash_recovery)]
+            crash_recovery::CrashRecovery::handle(ctx).update(ctx, |crash_recovery, ctx| {
+                crash_recovery.on_frame_drawn(window_id, ctx);
+            });
+        }
+        if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
             browser::BrowserWebViewManager::handle(ctx).update(ctx, |manager, ctx| {
                 manager.drain_pending_platform_views(window_id);
                 manager.drain_pending_webview_focus(ctx);
             });
-        });
-    }
+            if FeatureFlag::DshPane.is_enabled() {
+                dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
+                    // 阶段3:提取活动终端最近命令(受隐私开关,节流)。
+                    dsh::runtime::update_terminal_context_from_active(ctx, window_id);
+                    match runtime.poll_child() {
+                        dsh::PollResult::Crashed => {
+                            // 崩溃:标记重启(保留崩溃计数,使 MAX_RESTARTS 上限可达),
+                            // 调度重启。
+                            let gen = runtime.begin_restart();
+                            ctx.spawn(
+                                dsh::DshRuntime::restart_future(),
+                                move |runtime, result, ctx| match result {
+                                    dsh::DshRestartResult::Restarted { url, child } => {
+                                        log::info!("[dsh] restarted at {url}");
+                                        // 仅真正收养(未被停止/代次未过期)才通知
+                                        // workspace 导航。
+                                        if runtime.adopt_child(child, url.clone(), gen) {
+                                            ctx.emit(dsh::bridge::BridgeEvent::Restarted { url });
+                                        }
+                                    }
+                                    dsh::DshRestartResult::GiveUp { error } => {
+                                        log::error!("[dsh] restart gave up: {error}");
+                                        runtime.set_status(dsh::DshRuntimeStatus::Failed);
+                                        // 通知 workspace 展示失败(pane 已停,提示用户)。
+                                        ctx.emit(dsh::bridge::BridgeEvent::Failed { error });
+                                    }
+                                },
+                            );
+                        }
+                        dsh::PollResult::GiveUp => {
+                            // 连续崩溃超过上限:放弃重启,通知用户。
+                            log::error!("[dsh] gave up after repeated crashes");
+                            ctx.emit(dsh::bridge::BridgeEvent::Failed {
+                                error: "repeated crashes".to_string(),
+                            });
+                        }
+                        _ => {}
+                    }
+                });
+                // 消费 IPC 推入的待处理事件(SwitchProject, Notify 等)。
+                dsh::DshRuntime::handle(ctx).update(ctx, |_runtime, ctx| {
+                    dsh::bridge::drain_events(ctx);
+                });
+                // Fallback: drain_events 在 on_frame_drawn 中运行，但 push_event 可能在
+                // 事件循环空闲期调用（此时 on_frame_drawn 不触发）。检测到残余事件时
+                // 强制重绘所有窗口，确保 drain_events 在下一帧执行。
+                if dsh::bridge::has_pending_events() {
+                    for wid in ctx.window_ids() {
+                        if let Some(window) = ctx.windows().platform_window(wid) {
+                            window.request_redraw();
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     // Register initial keybindings prior to creating menus
     ai::init(ctx);
@@ -1815,6 +1888,12 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
             PersistenceWriter::handle(ctx).update(ctx, |writer, _ctx| {
                 writer.terminate();
             });
+            // DeepSeek Harness:退出前停止 dsh 子进程,避免残留。
+            if FeatureFlag::DshPane.is_enabled() {
+                dsh::DshRuntime::handle(ctx).update(ctx, |runtime, _ctx| {
+                    runtime.request_stop();
+                });
+            }
 
             // We want to tear down the terminal server before relaunching for
             // autoupdate, to ensure we're not running any extra Zap processes
@@ -2038,9 +2117,9 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
                 // 供 undo 恢复),但窗口不恢复时 pane 的 Closed detach 不会
                 // 发生,webview 会泄漏;这里兜底清理。undo 恢复时
                 // `BrowserPaneView::handle_attach` 检测到 webview 缺失会重建。
-                // 仅当 BrowserPane 启用时 manager 才注册,未启用时 as_ref
-                // 会 panic,故此处按同一 flag 门控。
-                if FeatureFlag::BrowserPane.is_enabled() {
+                // manager 在 BrowserPane || DshPane 任一启用时注册,故按
+                // 同一条件门控(未启用时 as_ref 会 panic)。
+                if FeatureFlag::BrowserPane.is_enabled() || FeatureFlag::DshPane.is_enabled() {
                     browser::BrowserWebViewManager::as_ref(ctx).cleanup_window(window_id);
                 }
             }
@@ -2305,6 +2384,10 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
     // 保持关闭。已从 DOGFOOD 灰度毕业,release 构建同样启用。
     #[cfg(target_os = "macos")]
     flags.insert(FeatureFlag::BrowserPane);
+    // DeepSeek Harness webview 集成:与 BrowserPane 同策略,仅 macOS 启用
+    // (wry webview 基建目前仅 macOS 实现)。开发期默认开启便于联调。
+    #[cfg(target_os = "macos")]
+    flags.insert(FeatureFlag::DshPane);
 
     // Issue #72: HTTP 代理设置页面。不走 channel 判断,所有 channel 含 zap-oss
     // 默认启用,作为企业 VPN / 公司代理场景的基本能力。
