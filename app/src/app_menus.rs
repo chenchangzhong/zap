@@ -378,14 +378,6 @@ fn make_new_view_menu(ctx: &AppContext) -> Menu {
         )),
     ];
 
-    let is_compact_mode = matches!(
-        TerminalSettings::handle(ctx)
-            .as_ref(ctx)
-            .spacing_mode
-            .value(),
-        SpacingMode::Compact
-    );
-
     items.extend([
         MenuItem::Separator,
         MenuItem::Custom(CustomMenuItem::new(
@@ -398,8 +390,14 @@ fn make_new_view_menu(ctx: &AppContext) -> Menu {
                         .set_value(current_value.other_mode(), ctx));
                 });
             },
-            move |_props, _| MenuItemPropertyChanges {
-                checked: Some(is_compact_mode),
+            move |_props, ctx| MenuItemPropertyChanges {
+                checked: Some(matches!(
+                    TerminalSettings::handle(ctx)
+                        .as_ref(ctx)
+                        .spacing_mode
+                        .value(),
+                    SpacingMode::Compact
+                )),
                 ..Default::default()
             },
             None,
