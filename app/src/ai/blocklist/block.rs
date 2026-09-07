@@ -4227,6 +4227,31 @@ impl AIBlock {
         });
     }
 
+    /// Zap(P0-B):整块复制组的统一反馈——文本为空(纯空白)时不写剪贴板以保留用户原有内容,
+    /// 并给出明确提示 toast;非空则写入剪贴板并弹出成功 toast。
+    fn copy_text_with_feedback(text: String, ctx: &mut ViewContext<Self>) {
+        if text.trim().is_empty() {
+            let window_id = ctx.window_id();
+            ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                toast_stack.add_ephemeral_toast(
+                    DismissibleToast::error(crate::t!("common-nothing-to-copy")),
+                    window_id,
+                    ctx,
+                );
+            });
+            return;
+        }
+        ctx.clipboard().write(ClipboardContent::plain_text(text));
+        let window_id = ctx.window_id();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            toast_stack.add_ephemeral_toast(
+                DismissibleToast::success(crate::t!("common-copied-to-clipboard")),
+                window_id,
+                ctx,
+            );
+        });
+    }
+
     /// Start a selection at the top left corner of the block's SelectableArea.
     pub fn start_selection_at_min_point(&self, selection_type: SelectionType, x_pos: Option<f32>) {
         self.state_handles.selection_handle.start_selection_outside(
@@ -5791,24 +5816,21 @@ impl TypedActionView for AIBlock {
                 self.clear_other_selections(*source_view_id, *source_window_id, ctx);
             }
             AIBlockAction::CopyQuery => {
-                // Copy the prompt from the preceding user query (where overflow menu would appear)
+                // Zap(P0-B):复制 preceding user query;空文本不写剪贴板并给提示 toast。
                 let prompt_text = self.get_preceding_user_query(ctx);
-                ctx.clipboard()
-                    .write(ClipboardContent::plain_text(prompt_text));
+                Self::copy_text_with_feedback(prompt_text, ctx);
             }
             AIBlockAction::CopyOutput => {
-                // Copy all AI output from preceding user query until the next user query
+                // Zap(P0-B):复制自 preceding user query 起的全部输出;空文本不写剪贴板并给提示
+                // toast(流式未出 output、取消或全是 reasoning 步骤时会走到这里)。
                 let output_text = self.get_output_text_since_preceding_user_query(ctx);
-                ctx.clipboard()
-                    .write(ClipboardContent::plain_text(output_text));
+                Self::copy_text_with_feedback(output_text, ctx);
             }
             AIBlockAction::Copy => {
-                // Copy the preceding user query and all AI output until the next user query
+                // Zap(P0-B):复制 preceding user query 与全部输出;两者皆空时不写剪贴板并提示。
                 let prompt_text = self.get_preceding_user_query(ctx);
                 let output_text = self.get_output_text_since_preceding_user_query(ctx);
-                let combined_text = format!("{prompt_text}\n\n{output_text}");
-                ctx.clipboard()
-                    .write(ClipboardContent::plain_text(combined_text));
+                Self::copy_text_with_feedback(format!("{prompt_text}\n\n{output_text}"), ctx);
             }
             AIBlockAction::CopyConversation => {
                 let conversation_text = {
@@ -5835,8 +5857,8 @@ impl TypedActionView for AIBlock {
 
                     result.join("\n\n")
                 };
-                ctx.clipboard()
-                    .write(ClipboardContent::plain_text(conversation_text));
+                // Zap(P0-B):空对话文本不写剪贴板并给提示 toast。
+                Self::copy_text_with_feedback(conversation_text, ctx);
             }
             AIBlockAction::CopyCommand => {
                 let command_text = if let Some(stored_command) = &self.last_right_clicked_command {
@@ -5862,8 +5884,8 @@ impl TypedActionView for AIBlock {
                     commands.join("\n")
                 };
 
-                ctx.clipboard()
-                    .write(ClipboardContent::plain_text(command_text));
+                // Zap(P0-B):空命令文本不写剪贴板并给提示 toast。
+                Self::copy_text_with_feedback(command_text, ctx);
 
                 // Clear the stored command after copying
                 self.last_right_clicked_command = None;

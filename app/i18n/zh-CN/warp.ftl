@@ -79,6 +79,7 @@ common-cut = 剪切
 common-previous = 上一个
 common-suggested = 推荐
 common-copied-to-clipboard = 已复制到剪贴板
+common-nothing-to-copy = 没有可复制的内容
 common-new = 新增
 common-no-results = 无结果
 common-learn-more = 了解更多

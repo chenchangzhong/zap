@@ -82,6 +82,7 @@ common-cut = Cut
 common-previous = Previous
 common-suggested = Suggested
 common-copied-to-clipboard = Copied to clipboard
+common-nothing-to-copy = Nothing to copy
 common-new = New
 common-no-results = No results
 common-learn-more = Learn more

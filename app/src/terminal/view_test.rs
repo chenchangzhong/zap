@@ -6968,6 +6968,222 @@ fn copy_selected_text_from_ai_block() {
     })
 }
 
+// Zap(P1-C):取出已插入的两个 AI block handle,用于选区同步测试。
+fn two_ai_blocks(
+    terminal: &ViewHandle<TerminalView>,
+    app: &mut App,
+) -> (ViewHandle<AIBlock>, ViewHandle<AIBlock>) {
+    terminal.read(app, |view, _| {
+        let blocks: Vec<ViewHandle<AIBlock>> = view
+            .rich_content_views
+            .iter()
+            .filter_map(|rich_content| {
+                rich_content
+                    .ai_block_metadata()
+                    .map(|metadata| metadata.ai_block_handle.clone())
+            })
+            .collect();
+        assert_eq!(blocks.len(), 2, "two AI blocks should have been inserted");
+        (blocks[0].clone(), blocks[1].clone())
+    })
+}
+
+/// Zap(P1-C)回归:在单个 AI block 内产生新选区时,必须清除其他 AI block 的 view 层选区。
+///
+/// 真实触发路径:上方 AI block 滚出视野后其选区残留(滚出视野的块不再收到 mouse 广播,
+/// `SelectableArea` 在 mouse down 时"无条件清自身 + invoke handler"的兜底失效),随后用户
+/// 在下方块拖出新选区。此时复制路径 `selected_text_from_visible_ai_blocks` 按列表序取第一个
+/// 有选区的块,会复制到残留块的旧文本,且旧高亮滚回视野后仍可见。
+/// 这里用 `simulate_text_selection_for_test` 直接构造"块 A 残留 + 块 B 新选区"的状态。
+#[test]
+fn new_ai_block_selection_clears_other_ai_block_selections() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        // 插入两个 AI block(各带一个 user query)。
+        terminal.update(&mut app, |view, ctx| {
+            for query in ["first query", "second query"] {
+                let _ = append_exchange_with_inputs_and_handle_event(
+                    view,
+                    vec![AIAgentInput::UserQuery {
+                        query: query.to_owned(),
+                        context: Default::default(),
+                        static_query_type: None,
+                        referenced_attachments: Default::default(),
+                        user_query_mode: UserQueryMode::Normal,
+                        running_command: None,
+                        intended_agent: None,
+                    }],
+                    ctx,
+                );
+            }
+        });
+        let (block_a, block_b) = two_ai_blocks(&terminal, &mut app);
+
+        // 块 A 先有选区,随后块 B 拖出新选区。
+        block_a.update(&mut app, |block, ctx| {
+            block.simulate_text_selection_for_test(Some("old text in block a".to_owned()), ctx);
+        });
+        block_b.update(&mut app, |block, ctx| {
+            block.simulate_text_selection_for_test(Some("new text in block b".to_owned()), ctx);
+        });
+
+        // 块 B 的新选区必须清掉块 A 的残留:view 层选区同时只能存在一份。
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                block_a.as_ref(ctx).selected_text(ctx).is_none(),
+                "block A's stale selection must be cleared when block B selects text"
+            );
+            assert_eq!(
+                block_b.as_ref(ctx).selected_text(ctx).as_deref(),
+                Some("new text in block b"),
+                "block B's fresh selection must be preserved"
+            );
+            // 复制路径按列表序取第一个有选区的块,修复后必须命中块 B 的新文本。
+            assert_eq!(
+                view.selected_text_from_visible_ai_blocks(ctx).as_deref(),
+                Some("new text in block b"),
+            );
+        });
+    })
+}
+
+/// Zap(P1-C):跨块拖选(从 grid/普通块起拖)时,各 AI 块的选区是显式播种的
+/// (`begin_block_text_selection`),单块选区变化不得清除其他块的选区。
+#[test]
+fn cross_block_selection_seeding_survives_per_block_selection_change() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            for query in ["first query", "second query"] {
+                let _ = append_exchange_with_inputs_and_handle_event(
+                    view,
+                    vec![AIAgentInput::UserQuery {
+                        query: query.to_owned(),
+                        context: Default::default(),
+                        static_query_type: None,
+                        referenced_attachments: Default::default(),
+                        user_query_mode: UserQueryMode::Normal,
+                        running_command: None,
+                        intended_agent: None,
+                    }],
+                    ctx,
+                );
+            }
+            // 模拟跨块拖选:终端处于拖选中,且模型点选区存在(与真实拖选一致)。
+            view.is_selecting = true;
+            let mut model = view.model.lock();
+            let blocks = model.block_list_mut();
+            let block_index = insert_block(blocks, "cmd\n", "output\n");
+            let block = blocks.block_at(block_index).expect("block should exist");
+            let command_grid_offset = block.command_grid_offset();
+            blocks.start_selection(
+                BlockListPoint::new(command_grid_offset, 0),
+                SelectionType::Simple,
+                Side::Left,
+            );
+        });
+        let (block_a, block_b) = two_ai_blocks(&terminal, &mut app);
+
+        // 跨块拖选中各块被播种选区,任一块的 SelectionChanged 都不得清除其他块。
+        block_a.update(&mut app, |block, ctx| {
+            block.simulate_text_selection_for_test(Some("seeded a".to_owned()), ctx);
+        });
+        block_b.update(&mut app, |block, ctx| {
+            block.simulate_text_selection_for_test(Some("seeded b".to_owned()), ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                block_a.as_ref(ctx).selected_text(ctx).is_some(),
+                "cross-block seeding must not be cleared while dragging"
+            );
+            assert!(
+                block_b.as_ref(ctx).selected_text(ctx).is_some(),
+                "cross-block seeding must not be cleared while dragging"
+            );
+            assert!(
+                view.is_selecting,
+                "dragging state must be untouched by selection sync"
+            );
+        });
+    })
+}
+
+/// Zap(P0-B):整块复制组的空串守卫——输出为空时不得把剪贴板写成空(保留用户原内容),
+/// 有内容时正常写入。toast 反馈依赖 `ToastStack` singleton,一并在此注册。
+#[test]
+fn ai_block_copy_actions_guard_against_empty_text() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(|_| ToastStack);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        // 插入一个仅含 user query、输出为空的 AI block(模拟流式未出 output / 取消场景)。
+        terminal.update(&mut app, |view, ctx| {
+            let _ = append_exchange_with_inputs_and_handle_event(
+                view,
+                vec![AIAgentInput::UserQuery {
+                    query: "the query".to_owned(),
+                    context: Default::default(),
+                    static_query_type: None,
+                    referenced_attachments: Default::default(),
+                    user_query_mode: UserQueryMode::Normal,
+                    running_command: None,
+                    intended_agent: None,
+                }],
+                ctx,
+            );
+        });
+        let ai_block = terminal.read(&app, |view, _| {
+            view.rich_content_views
+                .iter()
+                .find_map(|rich_content| {
+                    rich_content
+                        .ai_block_metadata()
+                        .map(|metadata| metadata.ai_block_handle.clone())
+                })
+                .expect("an AI block should have been inserted")
+        });
+
+        // 哨兵:先写剪贴板,空输出复制必须保住它。
+        app.update(|ctx| {
+            ctx.clipboard()
+                .write(ClipboardContent::plain_text("sentinel".to_owned()));
+        });
+
+        // CopyOutput(输出为空):不写剪贴板。
+        ai_block.update(&mut app, |block, ctx| {
+            block.handle_action(&AIBlockAction::CopyOutput, ctx);
+        });
+        app.update(|ctx| {
+            assert_eq!(
+                ctx.clipboard().read().plain_text,
+                "sentinel",
+                "empty output copy must not clobber the user's clipboard"
+            );
+        });
+
+        // CopyQuery(有 query):正常写入剪贴板。
+        ai_block.update(&mut app, |block, ctx| {
+            block.handle_action(&AIBlockAction::CopyQuery, ctx);
+        });
+        app.update(|ctx| {
+            assert_eq!(
+                ctx.clipboard().read().plain_text,
+                "the query",
+                "non-empty copy must write the query text"
+            );
+        });
+    })
+}
+
 #[test]
 fn cmd_k_does_not_clear_buffer_when_agent_is_driving_command() {
     App::test((), |mut app| async move {

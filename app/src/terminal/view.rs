@@ -14249,6 +14249,15 @@ impl TerminalView {
         });
     }
 
+    // Zap(P0-B):右键菜单复制选区成功后的统一反馈。
+    fn show_copied_toast(&mut self, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            let toast = DismissibleToast::success(crate::t!("common-copied-to-clipboard"));
+            toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+        });
+    }
+
     /// Currently, we show the notification error in the form of a banner,
     /// similar to how we help the user discover notifications via a banner.
     pub fn show_notification_error(
@@ -14859,6 +14868,23 @@ impl TerminalView {
             ..
         } = menu_source
         {
+            // Zap(P0-A):当前存在 AI 块选区时,整块菜单也提供「复制选中」(复用选区菜单同一
+            // action),置于整块复制项之前;否则用户右键点偏选区高亮时只能整轮复制。
+            // `selected_text_from_visible_ai_blocks` 不触碰终端模型,持锁调用安全。
+            if self.selected_text_from_visible_ai_blocks(ctx).is_some() {
+                items.push(
+                    MenuItemFields::new(crate::t!("menu-block-copy"))
+                        .with_on_select_action(TerminalAction::ContextMenu(
+                            ContextMenuAction::CopySelectedText,
+                        ))
+                        .with_key_shortcut_label(keybinding_name_to_display_string(
+                            "terminal:copy",
+                            ctx,
+                        ))
+                        .into_item(),
+                );
+                items.push(MenuItem::Separator);
+            }
             let hovered_link = self.hovered_rich_content_link_for_view(*rich_content_view_id, ctx);
             for rich_content in self.rich_content_views.iter() {
                 if let Some(ai_metadata) = rich_content.ai_block_metadata() {
@@ -15772,6 +15798,19 @@ impl TerminalView {
                 ctx,
             )
         };
+
+        // Zap(P0-A):存在 AI 块选区时,「...」溢出菜单同样提供「复制选中」,置于整块复制项之前。
+        if self.selected_text_from_visible_ai_blocks(ctx).is_some() {
+            menu_items.insert(
+                0,
+                MenuItemFields::new(crate::t!("menu-block-copy"))
+                    .with_on_select_action(TerminalAction::ContextMenu(
+                        ContextMenuAction::CopySelectedText,
+                    ))
+                    .into_item(),
+            );
+            menu_items.insert(1, MenuItem::Separator);
+        }
 
         if !cfg!(target_family = "wasm") {
             let fork_label = fork_label_for_query(
@@ -19068,6 +19107,10 @@ impl TerminalView {
                 self.sync_ai_block_model_selection(&block, ctx);
             }
             AIBlockEvent::SelectionChanged => {
+                // Zap(P1-C):单块产生新选区时清掉其他 AI 块的 view 层选区,否则复制路径
+                // (`selected_text_from_visible_ai_blocks` 按列表序取第一个)会命中残留块的
+                // 旧文本,旧高亮也会残留。跨块拖选(显式播种多块选区)时必须跳过。
+                self.clear_other_ai_block_selections(&block, ctx);
                 self.sync_ai_block_model_selection(&block, ctx);
             }
             AIBlockEvent::CopiedEmptyText => {
@@ -19184,6 +19227,28 @@ impl TerminalView {
         } else {
             model.block_list_mut().clear_rich_content_selection(view_id);
         }
+    }
+
+    // Zap(P1-C):单个 AI 块产生新选区时,清除其他 AI 块的 view 层选区。
+    // 仅在以下条件同时满足时介入,避免破坏跨块拖选(从 grid/普通块起拖、显式播种多块选区)路径:
+    // - 本块确实有新选区;
+    // - 终端不处于拖选中(与 `sync_ai_block_model_selection` 的 `is_selecting` guard 同源);
+    // - 模型无点选区(跨块拖选中点选区是选区来源,且 mouse up 后各块事件顺序不定,靠它兜底)。
+    fn clear_other_ai_block_selections(
+        &mut self,
+        block: &ViewHandle<AIBlock>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.is_selecting {
+            return;
+        }
+        if block.as_ref(ctx).selected_text(ctx).is_none() {
+            return;
+        }
+        if self.model.lock().block_list().selection().is_some() {
+            return;
+        }
+        self.clear_selected_text_except(Some(block.id()), ctx);
     }
 
     fn imported_comments_panel_arg(&self) -> CodeReviewPanelArg {
@@ -19655,12 +19720,15 @@ impl TerminalView {
             if !selected_text.is_empty() {
                 ctx.clipboard()
                     .write(ClipboardContent::plain_text(selected_text));
+                // Zap(P0-B):复制成功补 toast 反馈。
+                self.show_copied_toast(ctx);
             }
             self.close_context_menu(ctx, true);
             return;
         }
 
-        {
+        // Zap(P0-B):避免在终端模型锁持锁期间弹 toast,先记录是否复制成功。
+        let did_copy = {
             let semantic_selection = SemanticSelection::as_ref(ctx);
             let model = self.model.lock();
             let selected_text =
@@ -19668,7 +19736,13 @@ impl TerminalView {
             if let Some(selected_text) = selected_text {
                 ctx.clipboard()
                     .write(ClipboardContent::plain_text(selected_text));
+                true
+            } else {
+                false
             }
+        };
+        if did_copy {
+            self.show_copied_toast(ctx);
         }
         self.close_context_menu(ctx, true);
     }
