@@ -79,7 +79,6 @@ fn byop_dispatch_info(
 ) -> Option<ByopDispatch> {
     let (provider, api_key, model_id) =
         crate::ai::agent_providers::lookup_byop(ctx, &params.model)?;
-    let extra_headers = provider.extra_headers.clone();
     // 从 provider.models 里找当前模型条目,取其 context_window(tokens)。
     // 0 视为未填,后续走 None 分支 ⇒ chat_stream 不算占用率。
     let context_window = provider
@@ -89,6 +88,12 @@ fn byop_dispatch_info(
         .map(|m| m.context_window)
         .filter(|n| *n > 0);
     let conversation_id = ai_identifiers.client_conversation_id.as_ref()?;
+    // headers 值中的 {{session_id}} 占位符 → 当前会话 id(每会话稳定,供
+    // OpenCode Go 等网关做会话亲和路由)。
+    let extra_headers = crate::ai::agent_providers::substitute_session_id(
+        provider.extra_headers.clone(),
+        &conversation_id.to_string(),
+    );
     let history = BlocklistAIHistoryModel::as_ref(ctx);
     let conversation = history.conversation(conversation_id)?;
     let root_task_id = conversation.get_root_task_id().to_string();

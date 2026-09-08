@@ -3220,11 +3220,17 @@ impl TypedActionView for AISettingsPageView {
                 ctx.notify();
             }
             AISettingsPageAction::AddAgentProvider => {
+                let new_provider = crate::settings::AgentProvider::new_empty();
+                let new_provider_id = new_provider.id.clone();
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     let mut providers = settings.agent_providers.value().clone();
-                    providers.push(crate::settings::AgentProvider::new_empty());
+                    providers.push(new_provider);
                     let _ = settings.agent_providers.set_value(providers, ctx);
                 });
+                // 滚到新 provider 卡片,让"添加成功"有可见反馈。
+                self.page.scroll_to_dynamic_position(
+                    super::agent_providers_widget::provider_card_position_id(&new_provider_id),
+                );
                 self.rebuild_current_page(ctx);
             }
             AISettingsPageAction::RemoveAgentProvider { provider_id } => {
@@ -3638,11 +3644,19 @@ impl TypedActionView for AISettingsPageView {
                     .values()
                     .map(models_dev::into_agent_provider_model)
                     .collect();
+                // OpenCode Zen / Go 预设自动预填 x-opencode-session 会话头,
+                // 值为 {{session_id}} 占位符,发送请求时替换为当前会话 id。
+                new_provider.extra_headers = models_dev::preset_extra_headers(&catalog_provider_id);
+                let new_provider_id = new_provider.id.clone();
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     let mut providers = settings.agent_providers.value().clone();
                     providers.push(new_provider);
                     let _ = settings.agent_providers.set_value(providers, ctx);
                 });
+                // 滚到新 provider 卡片,让"添加成功"有可见反馈。
+                self.page.scroll_to_dynamic_position(
+                    super::agent_providers_widget::provider_card_position_id(&new_provider_id),
+                );
                 self.rebuild_current_page(ctx);
             }
             AISettingsPageAction::SyncProviderModelsFromModelsDev { provider_id } => {

@@ -1482,6 +1482,31 @@ impl<V: warpui::View> PageType<V> {
         }
     }
 
+    /// 滚动到动态注册的 position_id(如按 provider id 拼出的卡片锚点)。
+    /// 与 [`Self::scroll_to_widget`] 的差别:不设置高亮,id 不要求 'static,且用
+    /// TopIntoView(超高卡片也能滚到)。
+    pub fn scroll_to_dynamic_position(&mut self, position_id: String) {
+        match self {
+            Self::Monolith { .. } => {}
+            Self::Uncategorized {
+                vertical_scroll_state: scrollable_state,
+                ..
+            }
+            | Self::Categorized {
+                vertical_scroll_state: scrollable_state,
+                ..
+            } => {
+                // TopIntoView:卡片可能高于视口,FullyIntoView 对超高元素返回
+                // delta=0 会静默不滚动;TopIntoView 放得下时行为与之相同,
+                // 放不下时顶边对齐,保证反馈可见。
+                scrollable_state.scroll_to_position(ScrollTarget {
+                    position_id,
+                    mode: ScrollToPositionMode::TopIntoView,
+                })
+            }
+        }
+    }
+
     pub fn clear_highlighted_widget(&mut self) {
         match self {
             Self::Monolith { .. } => {}

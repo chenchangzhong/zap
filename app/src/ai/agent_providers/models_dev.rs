@@ -368,3 +368,19 @@ pub fn into_agent_provider_model(model: &Model) -> crate::settings::AgentProvide
         audio: Some(caps.audio),
     }
 }
+
+/// 快速添加(`AddProviderFromModelsDev`)时需要预填 `extra_headers` 的目录 provider。
+///
+/// OpenCode Zen / Go 网关要求请求携带 `x-opencode-session`(每个会话一个稳定 id,
+/// 供网关做 prompt cache 亲和路由,见 opencode.ai/docs/go)。值用
+/// [`super::SESSION_ID_PLACEHOLDER`] 占位,发送请求时由 `substitute_session_id`
+/// 替换为当前会话 id。
+pub fn preset_extra_headers(catalog_provider_id: &str) -> Vec<(String, String)> {
+    match catalog_provider_id {
+        "opencode" | "opencode-go" => vec![(
+            "x-opencode-session".to_owned(),
+            super::SESSION_ID_PLACEHOLDER.to_owned(),
+        )],
+        _ => Vec::new(),
+    }
+}

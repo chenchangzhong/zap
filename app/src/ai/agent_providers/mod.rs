@@ -40,6 +40,26 @@ pub use openai_compatible::fetch_openai_compatible_models;
 pub use secrets::AgentProviderSecrets;
 
 // ---------------------------------------------------------------------------
+// 会话 id 占位符:extra_headers 值中的动态片段
+// ---------------------------------------------------------------------------
+
+/// `extra_headers` 值中的占位符,发送请求前替换为当前会话 id。
+/// 请求链路(`substitute_session_id`)与设置页文案共用此常量,避免字面量漂移。
+pub const SESSION_ID_PLACEHOLDER: &str = "{{session_id}}";
+
+/// 把 headers 值中出现的 [`SESSION_ID_PLACEHOLDER`] 全部替换为 `session_id`。
+/// header 名不参与替换;不含占位符的值原样保留。
+pub fn substitute_session_id(
+    headers: Vec<(String, String)>,
+    session_id: &str,
+) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .map(|(k, v)| (k, v.replace(SESSION_ID_PLACEHOLDER, session_id)))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // LLMInfo 合成:把 settings 中配置的 agent_providers 转成 picker 可用的形态
 // ---------------------------------------------------------------------------
 

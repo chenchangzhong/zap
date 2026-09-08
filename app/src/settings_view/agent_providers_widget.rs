@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use settings::Setting;
 use warpui::elements::{
     ChildView, Clipped, Container, CornerRadius, CrossAxisAlignment, Expanded, Flex,
-    MainAxisAlignment, MouseStateHandle, ParentElement, Radius, Text, Wrap,
+    MainAxisAlignment, MouseStateHandle, ParentElement, Radius, SavePosition, Text, Wrap,
 };
 use warpui::ui_components::{
     button::ButtonVariant,
@@ -128,6 +128,12 @@ pub(super) fn clear_expanded_models_for_provider(provider_id: &str) {
     FETCHING_PROVIDERS.with(|m| {
         m.borrow_mut().remove(provider_id);
     });
+}
+
+/// provider 卡片的滚动锚点 position_id:卡片渲染处用 `SavePosition` 登记,
+/// 添加/定位时用 `PageType::scroll_to_dynamic_position` 消费。
+pub(super) fn provider_card_position_id(provider_id: &str) -> String {
+    format!("agent-provider-card/{provider_id}")
 }
 
 /// 删除单条模型后清掉该 provider 的单行展开记录(模型 index 漂移,避免误展开)。
@@ -502,7 +508,13 @@ impl AgentProvidersWidget {
             let appearance = Appearance::handle(ctx).as_ref(ctx);
             let options = single_line_editor_options(appearance, false);
             let mut editor = EditorView::single_line(options, ctx);
-            editor.set_placeholder_text("openai", ctx);
+            editor.set_placeholder_text(
+                crate::t!(
+                    "settings-agent-providers-header-value-placeholder",
+                    placeholder = crate::ai::agent_providers::SESSION_ID_PLACEHOLDER
+                ),
+                ctx,
+            );
             if !initial_value.is_empty() {
                 editor.set_buffer_text(&initial_value, ctx);
             }
@@ -1086,9 +1098,25 @@ impl AgentProvidersWidget {
         .with_margin_top(FIELD_LABEL_MARGIN_TOP)
         .with_margin_bottom(FIELD_LABEL_MARGIN_BOTTOM)
         .finish();
+        let headers_hint = Container::new(
+            Text::new(
+                crate::t!(
+                    "settings-agent-providers-headers-hint",
+                    placeholder = crate::ai::agent_providers::SESSION_ID_PLACEHOLDER
+                ),
+                appearance.ui_font_family(),
+                appearance.ui_font_size(),
+            )
+            .with_color(appearance.theme().disabled_ui_text_color().into())
+            .soft_wrap(true)
+            .finish(),
+        )
+        .with_margin_top(2.)
+        .finish();
         let mut headers_column = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(headers_label);
+            .with_child(headers_label)
+            .with_child(headers_hint);
 
         for (idx, h_row) in row.header_rows.iter().enumerate() {
             let remove_header_button = Self::render_card_button_preserving_draft(
@@ -1798,7 +1826,14 @@ impl SettingsWidget for AgentProvidersWidget {
             column.add_child(empty);
         } else {
             for provider in &providers {
-                column.add_child(self.render_provider_card(provider, appearance, app));
+                // 每张卡片登记滚动锚点:快速添加/手动添加后可滚到新卡位置。
+                column.add_child(
+                    SavePosition::new(
+                        self.render_provider_card(provider, appearance, app),
+                        &provider_card_position_id(&provider.id),
+                    )
+                    .finish(),
+                );
             }
         }
 

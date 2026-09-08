@@ -1,10 +1,14 @@
-//! Smoke tests for BYOP provider configuration and lookup.
+//! Smoke tests for BYOP provider configuration and lookup, plus
+//! {{session_id}} placeholder substitution and preset header seeding.
 
 use ai::LLMId;
 use settings::Setting;
 use warpui::{App, SingletonEntity};
 
-use crate::ai::agent_providers::{llm_id, lookup_byop, AgentProviderSecrets};
+use crate::ai::agent_providers::models_dev::preset_extra_headers;
+use crate::ai::agent_providers::{
+    llm_id, lookup_byop, substitute_session_id, AgentProviderSecrets, SESSION_ID_PLACEHOLDER,
+};
 use crate::ai::llms::{DisableReason, LLMPreferences};
 use crate::auth::{AuthManager, AuthStateProvider};
 use crate::network::NetworkStatus;
@@ -150,4 +154,45 @@ fn smoke_lookup_byop_returns_none_for_unknown_id() {
             assert!(lookup_byop(ctx, &LLMId::from("not-byop")).is_none());
         });
     });
+}
+
+#[test]
+fn substitute_session_id_replaces_all_occurrences() {
+    let headers = vec![
+        (
+            "x-opencode-session".to_owned(),
+            SESSION_ID_PLACEHOLDER.to_owned(),
+        ),
+        ("x-prefixed".to_owned(), "zap-{{session_id}}-a".to_owned()),
+        ("x-static".to_owned(), "static-value".to_owned()),
+    ];
+    assert_eq!(
+        substitute_session_id(headers, "conv-1"),
+        vec![
+            ("x-opencode-session".to_owned(), "conv-1".to_owned()),
+            ("x-prefixed".to_owned(), "zap-conv-1-a".to_owned()),
+            ("x-static".to_owned(), "static-value".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn substitute_session_id_keeps_header_name_untouched() {
+    let headers = vec![("{{session_id}}".to_owned(), "{{session_id}}".to_owned())];
+    assert_eq!(
+        substitute_session_id(headers, "conv-1"),
+        vec![("{{session_id}}".to_owned(), "conv-1".to_owned())]
+    );
+}
+
+#[test]
+fn preset_extra_headers_seeds_opencode_gateways_only() {
+    let expected = vec![(
+        "x-opencode-session".to_owned(),
+        SESSION_ID_PLACEHOLDER.to_owned(),
+    )];
+    assert_eq!(preset_extra_headers("opencode"), expected);
+    assert_eq!(preset_extra_headers("opencode-go"), expected);
+    assert!(preset_extra_headers("deepseek").is_empty());
+    assert!(preset_extra_headers("").is_empty());
 }
