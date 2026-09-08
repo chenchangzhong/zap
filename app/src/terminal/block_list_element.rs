@@ -1776,10 +1776,9 @@ impl BlockListElement {
         ctx: &mut EventContext,
         app: &AppContext,
     ) -> bool {
-        if self.is_terminal_selecting {
-            ctx.dispatch_typed_action(TerminalAction::BlockTextSelect(BlockTextSelectAction::End));
-        }
-
+        // Zap(P2-D 重排查):`BlockTextSelectAction::End` 的派发已统一前移到
+        // `dispatch_event` 的 z-filter 之后,避免被提前 return 的分发路径跳过;
+        // 这里不再重复派发。
         let handled = if self.is_mouse_position_within_bounds(position) {
             if let Some(point) = self.coord_to_point(
                 SnackbarPoint::within_snackbar(position),
@@ -4494,6 +4493,21 @@ impl Element for BlockListElement {
             };
             e
         };
+
+        // Zap(P2-D 重排查):跨块拖选在 AI 块内释放时,`LeftMouseUp` 会被块内
+        // `SelectableArea` 消费并因 `should_stop_after_rich_content_handles_event`
+        // 在下方 match 之前提前 `return true`(悬浮按钮、CLI 子代理视图的拦截同理),
+        // 导致 `mouse_up` 不执行、`BlockTextSelectAction::End` 不派发,
+        // `TerminalView.is_selecting` 卡死:`sync_ai_block_model_selection` 与
+        // `clear_other_ai_block_selections` 的 guard 全部短路,模型选区失同步,
+        // AI 回复文本复制失效(关闭重开会话才会复位)。因此只要渲染快照显示
+        // 拖选仍在进行,就在任何可能提前 return 的分发路径之前先把 `End` 派发出去;
+        // 派发点已从 `mouse_up` 挪出,避免与下方 match 路径重复派发。
+        if self.is_terminal_selecting && matches!(event.raw_event(), Event::LeftMouseUp { .. }) {
+            ctx.dispatch_typed_action(TerminalAction::BlockTextSelect(
+                BlockTextSelectAction::End,
+            ));
+        }
 
         let mut handled = false;
         let events_to_propagate_on = matches!(
