@@ -29,6 +29,9 @@ use crate::terminal::omp_models::get_user_env;
 /// 复制而来,与用户终端自用的 web profile、DSH Desktop 的 desktop profile
 /// 互不干扰,插件/配置各自独立)。
 const DSH_PROFILE: &str = "zap";
+/// Zap 专属 dsh web 日志文件名(带 zap 前缀,与用户终端 dsh、DSH Desktop
+/// 的日志区分开;位于 DSH_HOME 根目录)。
+const DSH_WEB_LOG_FILE: &str = "zap-dsh-web.log";
 /// dsh npm 包名(升级命令与 registry 查询共用)。
 pub(crate) const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh";
 /// 就绪探测超时。
@@ -483,7 +486,7 @@ impl DshRuntime {
         let mut cmd = Command::new(&dsh_bin);
         // command crate 默认 stdout/stderr = null;dsh web 对 null/socket 无效
         // stdout 会启动即退出(exit 1)。重定向到文件(正常可写目标),顺带留日志。
-        let dsh_web_log = std::fs::File::create(dsh_home.join("dsh-web.log"))?;
+        let dsh_web_log = std::fs::File::create(dsh_home.join(DSH_WEB_LOG_FILE))?;
         cmd.stdout(std::process::Stdio::from(dsh_web_log.try_clone()?));
         cmd.stderr(std::process::Stdio::from(dsh_web_log));
         cmd.arg("--profile")
@@ -506,10 +509,10 @@ impl DshRuntime {
         let mut child = cmd.spawn().context("Failed to spawn dsh web")?;
 
         // 4. 就绪探测:dsh 启动成功后会把最终 URL(含随机端口与访问 token)
-        //    打到 stdout(已重定向到 dsh-web.log),解析出该 URL 并 HTTP 探测。
+        //    打到 stdout(已重定向到 zap-dsh-web.log),解析出该 URL 并 HTTP 探测。
         //    失败时显式清理子进程,避免 async-process 的 Child drop 不杀进程
         //    导致泄漏。
-        let log_path = dsh_home.join("dsh-web.log");
+        let log_path = dsh_home.join(DSH_WEB_LOG_FILE);
         let url = match Self::wait_until_ready(&log_path).await {
             Ok(url) => url,
             Err(err) => {
@@ -564,7 +567,7 @@ impl DshRuntime {
     ///
     /// Finder/Dock 启动的 GUI 进程 PATH 不含 nvm/homebrew 的 node:dsh 定位
     /// 虽可经登录 shell 回退(`find_global_dsh`),但即便定位成功,shebang 的
-    /// `env node` 解析失败仍会让 dsh 启动即死(dsh-web.log 首行
+    /// `env node` 解析失败仍会让 dsh 启动即死(zap-dsh-web.log 首行
     /// `env: node: No such file or directory`),`wait_until_ready` 空转到
     /// 120s 超时,面板永远停在"启动中"。当前进程 PATH 已含 node 时(终端
     /// 启动)不覆盖,保留完整原环境。
@@ -645,7 +648,7 @@ impl DshRuntime {
     /// 轮询等待 dsh web 就绪并返回其 URL。
     ///
     /// dsh 启动成功后把最终 URL(随机端口 + 访问 token)打到 stdout(已重
-    /// 定向到 dsh-web.log):`dsh web: http://127.0.0.1:<port>/?token=<token>`。
+    /// 定向到 zap-dsh-web.log):`dsh web: http://127.0.0.1:<port>/?token=<token>`。
     /// 0.1.2-rc.1 起 web 端有 token 鉴权,裸地址 GET 返回 401,故必须解析
     /// 该 URL 用作探测与 webview 加载地址;URL 中的 token 随启动随机生成。
     async fn wait_until_ready(log_path: &Path) -> Result<String> {
@@ -698,7 +701,7 @@ impl DshRuntime {
         }
     }
 
-    /// 从 dsh-web.log 读取就绪 URL(尚无输出时返回 None)。
+    /// 从 zap-dsh-web.log 读取就绪 URL(尚无输出时返回 None)。
     fn read_ready_url(log_path: &Path) -> Option<String> {
         Self::parse_ready_url(&std::fs::read_to_string(log_path).ok()?)
     }

@@ -19179,27 +19179,15 @@ impl Workspace {
         {
             return;
         }
-        // 2. 无可用 DshPane tab → 创建 Loading tab(已有 stale pane 时复用,不重复建)
-        if !self.has_dsh_pane(ctx) {
-            let pane = crate::dsh::DshPane::new(ctx);
-            let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
-            let new_idx = match new_tab_placement_setting {
-                NewTabPlacement::AfterAllTabs => self.tab_count(),
-                NewTabPlacement::AfterCurrentTab => self.active_tab_index + 1,
-            };
-            self.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
-        }
-        // 3. 启动/重启 runtime(Starting 返回等就绪;Ready 主动触发就绪;
-        //    Stopped/Failed 重新 begin_start 以支持失败后重试)。
+        // 2. 启动/重启 runtime(Starting 返回等就绪;Ready 无需动作——就绪
+        //    URL 同步由随后创建/恢复的 pane 在 attach 时完成;Stopped/Failed
+        //    重新 begin_start 以支持失败后重试)。先于建 tab:保证新建/恢复
+        //    的 DshPane 在 attach 时 runtime 已非停止态,不会被 DshPane::attach
+        //    的停止态检查误标为失败。
         crate::dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
             match runtime.status() {
                 crate::dsh::DshRuntimeStatus::Starting => return,
-                crate::dsh::DshRuntimeStatus::Ready => {
-                    if let Some(url) = runtime.url().map(str::to_string) {
-                        ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
-                    }
-                    return;
-                }
+                crate::dsh::DshRuntimeStatus::Ready => return,
                 crate::dsh::DshRuntimeStatus::Stopped | crate::dsh::DshRuntimeStatus::Failed => {}
             }
             // 注入最近打开的 Zap 项目目录作 dsh 工作目录(DSH_CWD),
@@ -19242,6 +19230,16 @@ impl Workspace {
                 },
             );
         });
+        // 3. 无可用 DshPane tab → 创建 Loading tab(已有 stale pane 时复用,不重复建)
+        if !self.has_dsh_pane(ctx) {
+            let pane = crate::dsh::DshPane::new(ctx);
+            let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
+            let new_idx = match new_tab_placement_setting {
+                NewTabPlacement::AfterAllTabs => self.tab_count(),
+                NewTabPlacement::AfterCurrentTab => self.active_tab_index + 1,
+            };
+            self.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
+        }
         // 初始化 dsh 项目的 git status 订阅与文件浏览器（首次打开时无 SwitchProject）。
         // 仅在有 DshPane 时才订阅，避免无 pane 时创建无用 watcher。
         if self.has_dsh_pane(ctx) {

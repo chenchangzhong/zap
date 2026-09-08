@@ -1,7 +1,8 @@
-//! DeepSeek Harness (dsh) pane:加载中 / WebUI 双态视图。
+//! DeepSeek Harness (dsh) pane:加载中 / WebUI 双态视图(+ runtime 失败覆盖态)。
 //!
 //! 架构:
-//! - `DshPaneView`:BackingView,持有 `Loading`|`Ready(webview)` 双态
+//! - `DshPaneView`:BackingView,持有 `Loading`|`Ready(webview)` 双态,
+//!   runtime 失败/停止时覆盖渲染错误态 + 重启入口
 //! - `DshPane`:PaneContent,持有 `PaneView<DshPaneView>`
 //!
 //! 流程:tab 打开时先显示 Loading spinner → runtime 就绪后创建 webview →
@@ -12,12 +13,15 @@ use std::time::{Duration, Instant};
 
 use crate::appearance::Appearance;
 use crate::app_state::LeafContents;
-use crate::browser::{BrowserPaneView, BrowserWebViewEvent, BrowserWebViewManager};
-use crate::dsh::DshRuntime;
+use crate::browser::{BrowserPaneAction, BrowserPaneView, BrowserWebViewEvent, BrowserWebViewManager};
+use crate::dsh::bridge::BridgeEvent;
+use crate::dsh::{DshRuntime, DshRuntimeStatus};
 use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::pane_group::pane::view::{self, PaneView};
 use crate::pane_group::pane::{BackingView, DetachType, PaneContent, ShareableLink, ShareableLinkError, IPaneType};
 use crate::pane_group::{PaneConfiguration, PaneGroup, PaneId};
+use crate::view_components::action_button::{ActionButton, PrimaryTheme};
+use crate::workspace::WorkspaceAction;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::Vector2F;
 use warp_core::ui::icons::Icon as WarpIcon;
@@ -148,11 +152,33 @@ pub struct DshPaneView {
     webview_id: Option<u64>,
     /// pane focus 句柄(BackingView required)。
     focus_handle: Option<PaneFocusHandle>,
+    /// dsh runtime 失败/已停止(启动失败、崩溃放弃重启、或恢复自已停止的
+    /// pane):覆盖渲染为错误态 + 重启入口,避免展示指向已死服务的僵尸页面。
+    runtime_failed: bool,
+    /// 重启按钮(ActionButton 是 Entity,需以 ChildView 渲染;进入失败态时懒创建)。
+    restart_button: Option<ViewHandle<ActionButton>>,
 }
 
 impl DshPaneView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
         let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new("DeepSeek Harness"));
+        // 订阅 runtime 事件:失败切错误态,就绪/重启成功自动恢复。
+        // webview 导航到新 URL 由 workspace 的 Ready/Restarted 处理,这里只翻标志位。
+        ctx.subscribe_to_model(&DshRuntime::handle(ctx), |me, _, event, ctx| {
+            match event {
+                BridgeEvent::Failed { .. } => {
+                    me.enter_runtime_failed(ctx);
+                }
+                BridgeEvent::Ready { .. } | BridgeEvent::Restarted { .. } => {
+                    me.runtime_failed = false;
+                    ctx.notify();
+                }
+                BridgeEvent::Notify { .. }
+                | BridgeEvent::SwitchProject { .. }
+                | BridgeEvent::OpenFileExplorer { .. }
+                | BridgeEvent::OpenFile { .. } => {}
+            }
+        });
         Self {
             state: DshPaneState::Loading,
             pane_configuration,
@@ -162,6 +188,8 @@ impl DshPaneView {
             load_started_at: None,
             webview_id: None,
             focus_handle: None,
+            runtime_failed: false,
+            restart_button: None,
         }
     }
 
@@ -230,6 +258,106 @@ impl DshPaneView {
         ctx.notify();
         browser_view
     }
+
+    /// 进入 runtime 失败态:置标志并确保重启按钮视图存在(ActionButton 是
+    /// Entity,需以 ChildView 渲染,懒创建避免健康路径开销)。
+    fn enter_runtime_failed(&mut self, ctx: &mut ViewContext<Self>) {
+        self.runtime_failed = true;
+        if self.restart_button.is_none() {
+            self.restart_button = Some(ctx.add_typed_action_view(|_ctx| {
+                ActionButton::new("重新启动", PrimaryTheme).on_click(|ctx| {
+                    ctx.dispatch_typed_action(WorkspaceAction::OpenDshPane)
+                })
+            }));
+        }
+        ctx.notify();
+    }
+
+    /// attach 时把本 pane 与当前 runtime 实例的 URL 同步:每次启动的 URL
+    /// (随机端口/token)都会变。以 webview 实际 URL 为准(browser model 实时
+    /// 同步)按 origin 比较——dsh 对 token URL 做 303 重定向并种 cookie,加载
+    /// 完成后 model.url 已漂移为无 token 裸地址,完整 URL 相等恒不成立;只有
+    /// 端口能稳定标识实例。同源则无需动作;跨实例(重启后恢复旧 pane)导航
+    /// 到新 URL,避免展示指向已死旧实例的僵尸页面;Loading 态直接就绪。
+    fn sync_runtime_url(&mut self, runtime_url: &str, ctx: &mut ViewContext<Self>) {
+        // 一次 clone 复用句柄:两次 get_browser_view() 之间仅写 current_url,
+        // state 不变,结果恒等。
+        let browser_view = self.get_browser_view().cloned();
+        let live_url = browser_view
+            .as_ref()
+            .map(|bv| bv.as_ref(ctx).model().url.clone());
+        match live_url {
+            Some(live) if Self::url_origin(&live) == Self::url_origin(runtime_url) => return,
+            Some(_) => {
+                self.current_url = runtime_url.to_string();
+                if let Some(bv) = browser_view {
+                    bv.update(ctx, |view, ctx| {
+                        view.handle_action(
+                            &BrowserPaneAction::Navigate(runtime_url.to_string()),
+                            ctx,
+                        );
+                    });
+                }
+            }
+            None => {
+                self.set_ready(runtime_url, ctx);
+            }
+        }
+    }
+
+    /// 取 `scheme://host:port` 前缀:dsh 的 303 重定向只丢 token query,端口
+    /// 不变;每实例端口随机,端口相同即同一实例。
+    fn url_origin(url: &str) -> &str {
+        match url.find("://") {
+            Some(scheme_end) => {
+                let after_scheme = scheme_end + 3;
+                let host_end = url[after_scheme..]
+                    .find('/')
+                    .map(|i| after_scheme + i)
+                    .unwrap_or(url.len());
+                &url[..host_end]
+            }
+            None => url,
+        }
+    }
+
+    /// runtime 失败态:图标 + 说明 + 重启入口(布局与 Loading 态一致)。
+    /// 重启复用 WorkspaceAction::OpenDshPane(Stopped/Failed 态下 begin_start,
+    /// 就绪后 workspace 会把本 pane 导航到新 URL)。
+    fn render_runtime_failed(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let mut column = Flex::column()
+            .with_main_axis_alignment(MainAxisAlignment::Center)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(Box::new(
+                ConstrainedBox::new(Box::new(Icon::new(
+                    WarpIcon::DeepSeek.into(),
+                    appearance.theme().foreground(),
+                )))
+                .with_width(40.)
+                .with_height(40.),
+            ))
+            .with_child(
+                Container::new(Box::new(
+                    Text::new_inline(
+                        "DeepSeek Harness 已停止",
+                        appearance.ui_font_family(),
+                        16.,
+                    )
+                    .with_color(appearance.theme().foreground().into()),
+                ))
+                .with_margin_top(16.)
+                .finish(),
+            );
+        if let Some(button) = &self.restart_button {
+            column = column.with_child(
+                Container::new(Box::new(ChildView::new(button)))
+                    .with_margin_top(16.)
+                    .finish(),
+            );
+        }
+        Align::new(column.finish()).finish()
+    }
 }
 
 impl Entity for DshPaneView {
@@ -251,6 +379,11 @@ impl View for DshPaneView {
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
+        // runtime 失败/已停止:显示错误态 + 重启入口,而非指向已死服务的
+        // 僵尸页面或无限转圈。
+        if self.runtime_failed {
+            return self.render_runtime_failed(app);
+        }
         // webview 已加载完成(或加载超时兜底)才显示 webview;否则保持 spinner。
         let show_webview = matches!(self.state, DshPaneState::Ready(_))
             && (self.webview_loaded
@@ -409,6 +542,25 @@ impl DshPane {
     pub fn is_loading(&self, ctx: &AppContext) -> bool {
         self.dsh_view(ctx).as_ref(ctx).is_loading()
     }
+
+    /// 恢复 webview(Ready 态才有):默认已加载恢复(HiddenForClose)走带焦点
+    /// attach、重建重载中(spinner)不抢占焦点;`force_without_focus` 用于
+    /// 停止态(错误态即将换出 webview),一律不抢占焦点——同时保持缺失
+    /// webview 的重建(lib.rs「undo 恢复时 handle_attach 检测到 webview 缺失
+    /// 会重建」不变量),否则重启成功后会渲染指向不存在 webview 的空白 pane。
+    fn attach_webview(&self, force_without_focus: bool, ctx: &mut ViewContext<PaneGroup>) {
+        if let Some(bv) = self.dsh_view(ctx).as_ref(ctx).get_browser_view().cloned() {
+            let webview_loaded = self.dsh_view(ctx).as_ref(ctx).webview_loaded;
+            let with_focus = !force_without_focus && webview_loaded;
+            bv.update(ctx, |view, ctx| {
+                if with_focus {
+                    view.handle_attach(ctx);
+                } else {
+                    view.handle_attach_without_focus(ctx);
+                }
+            });
+        }
+    }
 }
 
 impl PaneContent for DshPane {
@@ -425,18 +577,45 @@ impl PaneContent for DshPane {
         self.view
             .update(ctx, |view, ctx| view.set_focus_handle(focus_handle, ctx));
 
-        // 跨窗口移动后重建 webview / undo 恢复时重新显示(Ready 态才有 webview)。
-        // 移动后 webview 重建重载中(spinner 显示)不抢占焦点,与 set_ready 的
-        // without_focus 一致;已加载恢复(HiddenForClose)则正常 attach 带焦点。
-        if let Some(bv) = self.dsh_view(ctx).as_ref(ctx).get_browser_view().cloned() {
-            let webview_loaded = self.dsh_view(ctx).as_ref(ctx).webview_loaded;
-            bv.update(ctx, |view, ctx| {
-                if webview_loaded {
-                    view.handle_attach(ctx);
-                } else {
-                    view.handle_attach_without_focus(ctx);
+        // 先读 runtime 状态再决定 webview attach / 失败态:停止态下不让即将
+        // 被错误视图换出的 webview 抢占焦点(避免重引入 2848eaeec 修掉的
+        // 「按键进不可见 webview」缺陷)。
+        let (runtime_status, runtime_url) = DshRuntime::handle(ctx).read(ctx, |runtime, _| {
+            (runtime.status(), runtime.url().map(str::to_string))
+        });
+        match runtime_status {
+            DshRuntimeStatus::Starting => {
+                // 启动/重启进行中:webview 按既有逻辑恢复,等 Ready/Restarted
+                // 事件导航到新 URL;Loading 态等待就绪。
+                self.attach_webview(false, ctx);
+            }
+            DshRuntimeStatus::Ready => {
+                // 先同步 URL 再 attach:需重建的 webview(Moved/窗口清理销毁
+                // 后)直接以当前实例 URL 创建,避免先加载已死旧地址再被导航
+                // (白费一次加载)。同源(同端口)则不动作。
+                if let Some(url) = runtime_url {
+                    self.dsh_view(ctx).update(ctx, |view, ctx| {
+                        view.sync_runtime_url(&url, ctx);
+                    });
                 }
-            });
+                self.attach_webview(false, ctx);
+            }
+            DshRuntimeStatus::Stopped | DshRuntimeStatus::Failed => {
+                // undo 恢复/复用既有 pane 而 runtime 已停止(detach 时
+                // request_stop):置失败态显示重启入口,避免展示指向已死服务
+                // 的僵尸页面或永久转圈(Loading 态无 webview 也一并覆盖)。
+                // 新建 pane 的 attach 发生在 open_dsh_pane 的 begin_start 之后,
+                // 正常启动流程不会走到这里。webview 仍以无焦点方式 attach:
+                // Moved/窗口清理销毁后在这里重建(保持 lib.rs「undo 恢复时
+                // handle_attach 检测到 webview 缺失会重建」不变量),否则重启
+                // 成功清掉错误态后会渲染指向不存在 webview 的空白 pane。
+                self.attach_webview(true, ctx);
+                self.dsh_view(ctx).update(ctx, |view, ctx| {
+                    if !view.runtime_failed {
+                        view.enter_runtime_failed(ctx);
+                    }
+                });
+            }
         }
 
         let pane_id = self.id();
