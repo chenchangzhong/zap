@@ -17,6 +17,9 @@ use parking_lot::Mutex;
 use pathfinder_geometry::rect::RectF;
 use warpui::{Entity, ModelContext, PlatformView, SingletonEntity, WindowId};
 
+#[cfg(target_os = "macos")]
+use wry::WebViewBuilderExtDarwin;
+
 /// platform-view handler 的暂存区:`platform_view_id -> rect` 按窗口暂存。
 /// 每帧由 warpui 渲染线程写入(覆盖语义),由 `on_frame_drawn` 消费。
 pub(crate) static PENDING_PLATFORM_VIEWS: std::sync::LazyLock<
@@ -43,11 +46,22 @@ pub enum BrowserWebViewEvent {
     PageFocused(u64),
     /// 页面加载完成,URL 可能已变化(后退/前进/页面内导航)。
     UrlChanged(u64),
+    /// WebContent 渲染进程已崩溃(WKWebView 空洞/死页)。runtime 与页面
+    /// URL 均未变化,重载页面即可恢复;由 DshPane 据此弹出确认入口。
+    WebContentCrashed(u64),
 }
 
 /// 页面加载完成事件的暂存区。由 wry 的 `on_page_load_handler`(主线程)
 /// 写入,由每帧 `on_frame_drawn` 消费。消费后触发地址栏同步与 pane 标题更新。
 pub(crate) static PENDING_WEBVIEW_URL_CHANGED: std::sync::LazyLock<
+    Mutex<std::collections::HashSet<u64>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// WebContent 渲染进程崩溃事件的暂存区。由 wry 的
+/// `on_web_content_process_terminate_handler`(WKNavigationDelegate 回调,
+/// 主线程)写入,由每帧 `on_frame_drawn` 消费。渲染进程崩溃后页面变死页,
+/// 由 DshPane 弹出崩溃态 + 重新加载入口。
+pub(crate) static PENDING_WEBVIEW_CRASHED: std::sync::LazyLock<
     Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
@@ -218,6 +232,7 @@ setInterval(() => {
         let handler_url = current_url.clone();
         let ipc_id = id;
         let url_notify_id = id;
+        let terminate_id = id;
         // IPC handler 里同步调 makeFirstResponder,不等下一帧。
         // 用 raw pointer + Box(堆分配,地址不受 HashMap rehash 影响);
         // focus_ptr 同时存入 WebViewEntry,destroy 时置空防止悬垂。
@@ -234,6 +249,12 @@ setInterval(() => {
                 if matches!(event, wry::PageLoadEvent::Finished) {
                     PENDING_WEBVIEW_URL_CHANGED.lock().insert(url_notify_id);
                 }
+            })
+            // WebContent 渲染进程崩溃(如 macOS beta 的 JSC JIT bug,页面变
+            // 死页)。入队经每帧 drain 分发,DshPane 弹出崩溃态 + 重新加载。
+            .with_on_web_content_process_terminate_handler(move || {
+                log::error!("[browser] webview {terminate_id} WebContent process terminated");
+                PENDING_WEBVIEW_CRASHED.lock().insert(terminate_id);
             })
             .with_ipc_handler(move |request| {
                 let body = request.body();
@@ -645,8 +666,22 @@ setInterval(() => {
             .drain()
             .map(BrowserWebViewEvent::UrlChanged)
             .collect();
-        log::debug!("[browser] drain events: focus={:?} url={:?}", focus_events, url_events);
-        for event in focus_events.into_iter().chain(url_events) {
+        let crashed_events: Vec<BrowserWebViewEvent> = PENDING_WEBVIEW_CRASHED
+            .lock()
+            .drain()
+            .map(BrowserWebViewEvent::WebContentCrashed)
+            .collect();
+        log::debug!(
+            "[browser] drain events: focus={:?} url={:?} crashed={:?}",
+            focus_events,
+            url_events,
+            crashed_events
+        );
+        for event in focus_events
+            .into_iter()
+            .chain(url_events)
+            .chain(crashed_events)
+        {
             ctx.emit(event);
         }
     }

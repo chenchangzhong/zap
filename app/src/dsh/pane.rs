@@ -132,6 +132,15 @@ impl Element for EllipsisText {
 
 // ── DshPaneState ──
 
+/// DshPane 自身的 typed action(从 pane 内元素派发,经 responder chain
+/// 由 [`DshPaneView::handle_action`] 处理)。
+#[derive(Debug, Clone)]
+pub enum DshPaneAction {
+    /// 用户确认后重新加载已崩溃的 webview(仅重载页面,不重启 runtime:
+    /// WebContent 崩溃是渲染进程问题,dsh 服务本身仍健康)。
+    ReloadWebview,
+}
+
 enum DshPaneState {
     Loading,
     Ready(ViewHandle<BrowserPaneView>),
@@ -157,6 +166,14 @@ pub struct DshPaneView {
     runtime_failed: bool,
     /// 重启按钮(ActionButton 是 Entity,需以 ChildView 渲染;进入失败态时懒创建)。
     restart_button: Option<ViewHandle<ActionButton>>,
+    /// WebContent 渲染进程已崩溃(runtime 仍健康):覆盖渲染崩溃态 +
+    /// 重新加载入口,避免展示死页/白屏。wry 的导航委托恒实现
+    /// webViewWebContentProcessDidTerminate,WebKit 不会自动重载,恢复
+    /// 只能靠用户确认后的重建;收到 UrlChanged(重建完成)后自动清除。
+    webview_crashed: bool,
+    /// 重新加载按钮(ActionButton 是 Entity,需以 ChildView 渲染;进入
+    /// 崩溃态时懒创建)。
+    crash_reload_button: Option<ViewHandle<ActionButton>>,
 }
 
 impl DshPaneView {
@@ -190,6 +207,8 @@ impl DshPaneView {
             focus_handle: None,
             runtime_failed: false,
             restart_button: None,
+            webview_crashed: false,
+            crash_reload_button: None,
         }
     }
 
@@ -234,12 +253,13 @@ impl DshPaneView {
         self.load_started_at = Some(Instant::now());
         self.webview_loaded = false;
         // 订阅 webview 加载完成(UrlChanged):完成后才从 spinner 切到 webview,
-        // 避免 runtime 就绪但页面还在加载时白屏闪烁。
+        // 避免 runtime 就绪但页面还在加载时白屏闪烁。WebContentCrashed 时
+        // 弹出崩溃态(渲染进程崩溃,runtime 仍健康)。
         ctx.subscribe_to_model(
             &BrowserWebViewManager::handle(ctx),
             move |view, _, event, ctx| {
-                if let BrowserWebViewEvent::UrlChanged(id) = event {
-                    if *id == webview_id {
+                match event {
+                    BrowserWebViewEvent::UrlChanged(id) if *id == webview_id => {
                         view.webview_loaded = true;
                         // 加载完成且本 pane 仍持焦点时补一次 focus_webview:
                         // on_focus 只在焦点转移时触发,set_ready(without_focus)
@@ -249,8 +269,18 @@ impl DshPaneView {
                         if ctx.is_self_focused() {
                             BrowserWebViewManager::as_ref(ctx).focus_webview(webview_id);
                         }
+                        // 页面(重)加载完成:清除崩溃态。wry 的导航委托恒实现
+                        // webViewWebContentProcessDidTerminate,WebKit 视为
+                        // "客户端已接管",不会自动重载;此清除覆盖的是重建
+                        // 完成后的正常揭示。
+                        view.webview_crashed = false;
                         ctx.notify();
                     }
+                    BrowserWebViewEvent::WebContentCrashed(id) if *id == webview_id => {
+                        view.enter_webview_crashed(ctx);
+                    }
+                    // 其他 webview 的事件与 PageFocused:与本 pane 无关。
+                    _ => {}
                 }
             },
         );
@@ -269,6 +299,58 @@ impl DshPaneView {
                     ctx.dispatch_typed_action(WorkspaceAction::OpenDshPane)
                 })
             }));
+        }
+        ctx.notify();
+    }
+
+    /// 进入 webview 崩溃态:WebContent 渲染进程已终止(runtime 仍健康)。
+    /// 覆盖渲染崩溃说明 + 重新加载入口,避免展示死页/白屏。用户点击重新
+    /// 加载(确认)后经 [`DshPaneAction::ReloadWebview`] 重建 webview。
+    fn enter_webview_crashed(&mut self, ctx: &mut ViewContext<Self>) {
+        log::error!(
+            "[dsh] webview crashed, showing reload prompt (webview_id={:?})",
+            self.webview_id
+        );
+        // 崩溃前用户正在操作页面时,WKWebView 持有窗口 first responder;
+        // 覆盖层换出后 webview 虽被隐藏,但 AppKit 的 mouseMoved 按 responder
+        // chain 投递给 first responder(不像 mouseDown 走 hitTest),Warp 收
+        // 不到鼠标移动 → 覆盖层按钮无 hover 效果(点击不受影响)。把 first
+        // responder 还给 host view 恢复 hover。判定用 is_self_or_child_
+        // focused:点击页面时 warp 焦点落在子视图 BrowserPaneView 上(其
+        // handle_webview_event 里 focus_self),严格 is_self_focused 恒为
+        // false 会漏掉主场景;且仅在本 pane(或其 webview)持焦点时才执行,
+        // 避免抢占其他 pane(如另一 webview)的键盘焦点。
+        #[cfg(target_os = "macos")]
+        if ctx.is_self_or_child_focused() {
+            warpui::platform::mac::Window::focus_host_view(ctx.window_id());
+        }
+        self.webview_crashed = true;
+        if self.crash_reload_button.is_none() {
+            self.crash_reload_button = Some(ctx.add_typed_action_view(|_ctx| {
+                ActionButton::new("重新加载", PrimaryTheme).on_click(|ctx| {
+                    ctx.dispatch_typed_action(DshPaneAction::ReloadWebview)
+                })
+            }));
+        }
+        ctx.notify();
+    }
+
+    /// 用户确认后执行:销毁崩溃的 webview 并按既有重建路径(Moved 同款)以
+    /// 当前 URL 重建——全新 WKWebView 与全新渲染进程,不携带崩溃后残留的
+    /// layer/进程状态;收到 UrlChanged(加载完成)后从 spinner 切回,与初始
+    /// 打开的揭示时机一致。仅重建页面,不重启 runtime(WebContent 崩溃是
+    /// 渲染进程问题,dsh 服务本身仍健康)。
+    fn recreate_webview(&mut self, ctx: &mut ViewContext<Self>) {
+        self.webview_crashed = false;
+        if let Some(id) = self.webview_id {
+            BrowserWebViewManager::as_ref(ctx).destroy(id);
+            self.load_started_at = Some(Instant::now());
+            self.webview_loaded = false;
+            // handle_attach 检测到 webview 缺失会以当前 URL 重建并重注册
+            // platform-view handler;不带焦点重建,键盘不进加载中的 webview。
+            if let Some(bv) = self.get_browser_view().cloned() {
+                bv.update(ctx, |view, ctx| view.handle_attach_without_focus(ctx));
+            }
         }
         ctx.notify();
     }
@@ -358,6 +440,55 @@ impl DshPaneView {
         }
         Align::new(column.finish()).finish()
     }
+
+    /// webview 崩溃态:图标 + 说明 + 重新加载入口(布局与 runtime 失败态一致)。
+    /// 仅重载页面即可恢复,不涉及 runtime 重启。
+    fn render_webview_crashed(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let mut column = Flex::column()
+            .with_main_axis_alignment(MainAxisAlignment::Center)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(Box::new(
+                ConstrainedBox::new(Box::new(Icon::new(
+                    WarpIcon::DeepSeek.into(),
+                    appearance.theme().foreground(),
+                )))
+                .with_width(40.)
+                .with_height(40.),
+            ))
+            .with_child(
+                Container::new(Box::new(
+                    Text::new_inline(
+                        "DeepSeek Harness 页面已崩溃",
+                        appearance.ui_font_family(),
+                        16.,
+                    )
+                    .with_color(appearance.theme().foreground().into()),
+                ))
+                .with_margin_top(16.)
+                .finish(),
+            )
+            .with_child(
+                Container::new(Box::new(
+                    Text::new_inline(
+                        "页面渲染进程异常终止,重新加载即可恢复。",
+                        appearance.ui_font_family(),
+                        13.,
+                    )
+                    .with_color(appearance.theme().foreground().into()),
+                ))
+                .with_margin_top(8.)
+                .finish(),
+            );
+        if let Some(button) = &self.crash_reload_button {
+            column = column.with_child(
+                Container::new(Box::new(ChildView::new(button)))
+                    .with_margin_top(16.)
+                    .finish(),
+            );
+        }
+        Align::new(column.finish()).finish()
+    }
 }
 
 impl Entity for DshPaneView {
@@ -383,6 +514,11 @@ impl View for DshPaneView {
         // 僵尸页面或无限转圈。
         if self.runtime_failed {
             return self.render_runtime_failed(app);
+        }
+        // webview 渲染进程崩溃(runtime 仍健康):显示崩溃态 + 重新加载入口。
+        // 与 runtime 失败态区分:重载页面即可恢复,不重启 dsh 服务。
+        if self.webview_crashed {
+            return self.render_webview_crashed(app);
         }
         // webview 已加载完成(或加载超时兜底)才显示 webview;否则保持 spinner。
         let show_webview = matches!(self.state, DshPaneState::Ready(_))
@@ -459,7 +595,13 @@ impl View for DshPaneView {
 }
 
 impl TypedActionView for DshPaneView {
-    type Action = ();
+    type Action = DshPaneAction;
+
+    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
+        match action {
+            DshPaneAction::ReloadWebview => self.recreate_webview(ctx),
+        }
+    }
 }
 
 impl BackingView for DshPaneView {
