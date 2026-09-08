@@ -7115,6 +7115,99 @@ fn cross_block_selection_seeding_survives_per_block_selection_change() {
     })
 }
 
+/// Zap(P2-D 后续)回归:跨块拖选在 AI 块内松手后,模型点选区(普通块部分的高亮)按
+/// 设计保留;`clear_other_ai_block_selections` 的"模型无点选区"守卫因此挡住清理。
+/// 若 `clear_other` 先于 `sync` 执行,残留点选区会把守卫永久卡住:下一次在 AI 块内
+/// 正常拖选时,残留块的旧选区清不掉,Cmd+C 按列表序复制到旧文本。修复后 `sync`
+/// 先行,`set_rich_content_selection` 的单选区语义会清掉与本块无关的点选区,守卫
+/// 随即解锁。
+#[test]
+fn ai_block_mouse_down_clears_stale_point_selection_and_unblocks_cross_block_cleanup() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        // 插入两个 AI block,并让模型点选区残留(模拟跨块拖选已结束:is_selecting=false)。
+        terminal.update(&mut app, |view, ctx| {
+            for query in ["first query", "second query"] {
+                let _ = append_exchange_with_inputs_and_handle_event(
+                    view,
+                    vec![AIAgentInput::UserQuery {
+                        query: query.to_owned(),
+                        context: Default::default(),
+                        static_query_type: None,
+                        referenced_attachments: Default::default(),
+                        user_query_mode: UserQueryMode::Normal,
+                        running_command: None,
+                        intended_agent: None,
+                    }],
+                    ctx,
+                );
+            }
+            // 模型点选区残留,但拖选已结束。
+            let mut model = view.model.lock();
+            let blocks = model.block_list_mut();
+            let block_index = insert_block(blocks, "cmd\n", "output\n");
+            let block = blocks.block_at(block_index).expect("block should exist");
+            let command_grid_offset = block.command_grid_offset();
+            blocks.start_selection(
+                BlockListPoint::new(command_grid_offset, 0),
+                SelectionType::Simple,
+                Side::Left,
+            );
+        });
+        let (block_a, block_b) = two_ai_blocks(&terminal, &mut app);
+
+        // 前置状态自检:点选区必须真实存在(模拟跨块拖选结束后残留的点选区)。
+        terminal.read(&app, |view, _| {
+            assert!(
+                view.model.lock().block_list().selection().is_some(),
+                "setup: point-based selection must survive block insertion"
+            );
+        });
+
+        // 块 A 的旧选区残留:直接写选区、不发事件,模拟"块 A 自己的拖选事件已经
+        // 处理完"之后仍残留的状态(与真实场景一致:残留产生于过去的某次交互)。
+        block_a.update(&mut app, |block, _| {
+            block.set_block_level_selected_text_for_test(Some("stale text in block a".to_owned()));
+        });
+        // 模拟块 B 上的 mousedown:SelectableArea 清空本块选区并发出空选区事件。
+        block_b.update(&mut app, |block, ctx| {
+            block.simulate_text_selection_for_test(None, ctx);
+        });
+        // 模拟块 B 拖选结束:非空新选区。修复后 sync 先行:残留点选区与块 B 无关,
+        // 被 `set_rich_content_selection` 的单选区语义清掉,"模型无点选区"守卫随即
+        // 解锁,clear_other 得以清掉块 A 的旧选区;修复前 clear_other 先于 sync 执行,
+        // 残留点选区会把守卫卡住,块 A 清不掉、复制按列表序命中旧文本。
+        block_b.update(&mut app, |block, ctx| {
+            block.simulate_text_selection_for_test(Some("new text in block b".to_owned()), ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let model = view.model.lock();
+            assert!(
+                model.block_list().selection().is_none(),
+                "mousedown on an AI block must clear the stale point-based selection"
+            );
+            assert!(
+                block_a.as_ref(ctx).selected_text(ctx).is_none(),
+                "block A's stale selection must be cleared when block B selects text"
+            );
+            assert_eq!(
+                block_b.as_ref(ctx).selected_text(ctx).as_deref(),
+                Some("new text in block b"),
+                "block B's fresh selection must be preserved"
+            );
+            // 复制路径按列表序取第一个有选区的块,修复后必须命中块 B 的新文本。
+            assert_eq!(
+                view.selected_text_from_visible_ai_blocks(ctx).as_deref(),
+                Some("new text in block b"),
+            );
+        });
+    })
+}
+
 /// Zap(P0-B):整块复制组的空串守卫——输出为空时不得把剪贴板写成空(保留用户原内容),
 /// 有内容时正常写入。toast 反馈依赖 `ToastStack` singleton,一并在此注册。
 #[test]

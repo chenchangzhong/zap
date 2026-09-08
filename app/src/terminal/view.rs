@@ -19110,8 +19110,15 @@ impl TerminalView {
                 // Zap(P1-C):单块产生新选区时清掉其他 AI 块的 view 层选区,否则复制路径
                 // (`selected_text_from_visible_ai_blocks` 按列表序取第一个)会命中残留块的
                 // 旧文本,旧高亮也会残留。跨块拖选(显式播种多块选区)时必须跳过。
-                self.clear_other_ai_block_selections(&block, ctx);
+                //
+                // Zap(P2-D 后续):必须先 `sync` 再 `clear_other`。`sync` 走到
+                // `set_rich_content_selection`:若模型点选区与本次选区无关(例如跨块拖选
+                // 结束后残留的点选区),会被单选区语义清掉;若点选区确实覆盖本块(跨块
+                // 拖选进行中)则保留。之后 `clear_other` 的"模型无点选区"守卫才反映真实
+                // 语义——反向顺序会让残留点选区永久卡住守卫,旧 AI 块选区清不掉,
+                // Cmd+C 按列表序复制到残留块的旧文本。
                 self.sync_ai_block_model_selection(&block, ctx);
+                self.clear_other_ai_block_selections(&block, ctx);
             }
             AIBlockEvent::CopiedEmptyText => {
                 self.copy(ctx);
