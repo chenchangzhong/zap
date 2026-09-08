@@ -18552,7 +18552,7 @@ impl Workspace {
     /// TODO: update positioning based on input mode.
     fn agent_toast_positioning(&self) -> OffsetPositioning {
         OffsetPositioning::offset_from_save_position_element(
-            TAB_CONTENT_POSITION_ID,
+            TAB_BAR_POSITION_ID,
             vec2f(0., 16.),
             PositionedElementOffsetBounds::WindowByPosition,
             PositionedElementAnchor::TopRight,
@@ -18564,7 +18564,7 @@ impl Workspace {
     // TODO: update positioning based on input mode.
     fn global_toast_positioning(&self) -> OffsetPositioning {
         OffsetPositioning::offset_from_save_position_element(
-            TAB_CONTENT_POSITION_ID,
+            TAB_BAR_POSITION_ID,
             vec2f(0., 16.),
             PositionedElementOffsetBounds::WindowByPosition,
             PositionedElementAnchor::TopMiddle,
