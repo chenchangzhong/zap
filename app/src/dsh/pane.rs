@@ -289,9 +289,28 @@ impl DshPaneView {
         browser_view
     }
 
+    /// webview 将被覆盖层换出隐藏时,把 AppKit first responder 从(可能仍
+    /// 持焦的)WKWebView 还给 host view:AppKit 的 mouseMoved 按 responder
+    /// chain 投递给 first responder(不像 mouseDown 走 hitTest),不还原则
+    /// 覆盖层按钮无 hover 效果(点击不受影响)。判定用 is_self_or_child_
+    /// focused:点击页面时 warp 焦点落在子视图 BrowserPaneView 上(其
+    /// handle_webview_event 里 focus_self),严格 is_self_focused 恒为
+    /// false 会漏掉主场景;且仅在本 pane(或其 webview)持焦点时才执行,
+    /// 避免抢占其他 pane(如另一 webview)的键盘焦点。
+    #[cfg(target_os = "macos")]
+    fn restore_host_first_responder(&self, ctx: &ViewContext<Self>) {
+        if ctx.is_self_or_child_focused() {
+            warpui::platform::mac::Window::focus_host_view(ctx.window_id());
+        }
+    }
+
     /// 进入 runtime 失败态:置标志并确保重启按钮视图存在(ActionButton 是
     /// Entity,需以 ChildView 渲染,懒创建避免健康路径开销)。
     fn enter_runtime_failed(&mut self, ctx: &mut ViewContext<Self>) {
+        // 覆盖层会换出并隐藏 webview,还原 first responder 保证按钮 hover
+        // 可用(机理同 webview 崩溃态,见 restore_host_first_responder)。
+        #[cfg(target_os = "macos")]
+        self.restore_host_first_responder(ctx);
         self.runtime_failed = true;
         if self.restart_button.is_none() {
             self.restart_button = Some(ctx.add_typed_action_view(|_ctx| {
@@ -311,19 +330,10 @@ impl DshPaneView {
             "[dsh] webview crashed, showing reload prompt (webview_id={:?})",
             self.webview_id
         );
-        // 崩溃前用户正在操作页面时,WKWebView 持有窗口 first responder;
-        // 覆盖层换出后 webview 虽被隐藏,但 AppKit 的 mouseMoved 按 responder
-        // chain 投递给 first responder(不像 mouseDown 走 hitTest),Warp 收
-        // 不到鼠标移动 → 覆盖层按钮无 hover 效果(点击不受影响)。把 first
-        // responder 还给 host view 恢复 hover。判定用 is_self_or_child_
-        // focused:点击页面时 warp 焦点落在子视图 BrowserPaneView 上(其
-        // handle_webview_event 里 focus_self),严格 is_self_focused 恒为
-        // false 会漏掉主场景;且仅在本 pane(或其 webview)持焦点时才执行,
-        // 避免抢占其他 pane(如另一 webview)的键盘焦点。
+        // 覆盖层换出 webview,还原 first responder 保证按钮 hover 可用
+        // (机理见 restore_host_first_responder)。
         #[cfg(target_os = "macos")]
-        if ctx.is_self_or_child_focused() {
-            warpui::platform::mac::Window::focus_host_view(ctx.window_id());
-        }
+        self.restore_host_first_responder(ctx);
         self.webview_crashed = true;
         if self.crash_reload_button.is_none() {
             self.crash_reload_button = Some(ctx.add_typed_action_view(|_ctx| {
