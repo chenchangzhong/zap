@@ -11044,20 +11044,13 @@ impl TerminalView {
                     }
                 }
 
-                if self.is_navigated_away_from_window(ctx) {
-                    let notification_title =
-                        title.clone().unwrap_or_else(|| "Notification".to_string());
-                    let notification = BlockNotification {
-                        title: notification_title,
-                        body: body.clone(),
-                    };
-                    ctx.emit(Event::SendNotification(notification));
-                } else {
-                    ctx.emit(Event::PluggableNotification {
-                        title: title.clone(),
-                        body: body.clone(),
-                    });
-                }
+                // OSC 9/777 通知不再转发为系统通知:此前失焦时会 emit
+                // Event::SendNotification 直发系统桌面通知,且不受任何通知设置
+                // 门控。现在无论焦点状态,统一只走应用内 toast。
+                ctx.emit(Event::PluggableNotification {
+                    title: title.clone(),
+                    body: body.clone(),
+                });
             }
             ModelEvent::ExitShell { session_id } => {
                 // Drop the remote server client for this session before the
