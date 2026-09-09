@@ -2304,6 +2304,18 @@ pub enum PerAgentDimension {
     Titlebar,
 }
 
+/// Debug 脱敏包装:action 会被框架层以 Info 级打印完整 Debug(warpui_core
+/// 的 dispatch 路径),api_key / 请求头值等敏感明文必须遮蔽,否则会随日志
+/// 落盘(~/Library/Logs)。仅遮值,键名与其它字段保留可读。
+#[derive(Clone, PartialEq)]
+pub struct Redacted<T>(pub T);
+
+impl<T> std::fmt::Debug for Redacted<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AISettingsPageAction {
     OpenUrl(String),
@@ -2401,7 +2413,7 @@ pub enum AISettingsPageAction {
     },
     UpdateAgentProviderApiKey {
         provider_id: String,
-        api_key: String,
+        api_key: Redacted<String>,
     },
     /// 一次性保存某个 provider 卡片上的全部可编辑字段(name / base_url / api_key /
     /// extra_headers / models)。取代原来"失焦/Enter 逐字段推入"的 UX —— 用户在
@@ -2410,8 +2422,8 @@ pub enum AISettingsPageAction {
         provider_id: String,
         name: String,
         base_url: String,
-        api_key: String,
-        headers: Vec<(String, String)>,
+        api_key: Redacted<String>,
+        headers: Vec<(String, Redacted<String>)>,
         /// 只携带可编辑部分:`(model_index, name, id, context_window, max_output_tokens)`。
         /// reasoning / tool_call / image / pdf / audio 由独立的 chip 动作维护,不走这里。
         models: Vec<(usize, String, String, u32, u32)>,
@@ -2420,8 +2432,8 @@ pub enum AISettingsPageAction {
         provider_id: String,
         name: String,
         base_url: String,
-        api_key: String,
-        headers: Vec<(String, String)>,
+        api_key: Redacted<String>,
+        headers: Vec<(String, Redacted<String>)>,
         /// 只携带可编辑部分:`(model_index, name, id, context_window, max_output_tokens)`。
         models: Vec<(usize, String, String, u32, u32)>,
         action: Box<AISettingsPageAction>,
@@ -2470,7 +2482,7 @@ pub enum AISettingsPageAction {
         provider_id: String,
         header_index: usize,
         key: String,
-        value: String,
+        value: Redacted<String>,
     },
     FetchAgentProviderModels {
         provider_id: String,
@@ -3301,7 +3313,7 @@ impl TypedActionView for AISettingsPageView {
                 crate::ai::agent_providers::AgentProviderSecrets::handle(ctx).update(
                     ctx,
                     |secrets, ctx| {
-                        secrets.set(provider_id, api_key.clone(), ctx);
+                        secrets.set(provider_id, api_key.0.clone(), ctx);
                     },
                 );
                 ctx.notify();
@@ -3314,12 +3326,16 @@ impl TypedActionView for AISettingsPageView {
                 headers,
                 models,
             } => {
+                let headers: Vec<(String, String)> = headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.0.clone()))
+                    .collect();
                 Self::save_agent_provider_edits(
                     provider_id,
                     name,
                     base_url,
-                    api_key,
-                    headers,
+                    &api_key.0,
+                    &headers,
                     models,
                     ctx,
                 );
@@ -3335,12 +3351,16 @@ impl TypedActionView for AISettingsPageView {
                 models,
                 action,
             } => {
+                let headers: Vec<(String, String)> = headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.0.clone()))
+                    .collect();
                 Self::save_agent_provider_edits(
                     provider_id,
                     name,
                     base_url,
-                    api_key,
-                    headers,
+                    &api_key.0,
+                    &headers,
                     models,
                     ctx,
                 );
@@ -3570,7 +3590,7 @@ impl TypedActionView for AISettingsPageView {
                     let mut providers = settings.agent_providers.value().clone();
                     if let Some(p) = providers.iter_mut().find(|p| p.id == *provider_id) {
                         if let Some(h) = p.extra_headers.get_mut(*header_index) {
-                            *h = (key.clone(), value.clone());
+                            *h = (key.clone(), value.0.clone());
                         }
                     }
                     let _ = settings.agent_providers.set_value(providers, ctx);
@@ -7400,3 +7420,7 @@ mod styles {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ai_page_tests.rs"]
+mod tests;

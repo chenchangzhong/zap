@@ -11,7 +11,10 @@
 //! 与 `AgentProviderSecrets`。输入框失焦/按 Enter 不会保存 —— 这是为了
 //! 避免用户边改边被“隐式提交”。会重建页面的结构性操作(添加/删除模型行、
 //! 添加/删除 header 行、API 协议 chip、模型能力 chip)会先提交当前卡片草稿,
-//! 再执行原操作,避免重建时丢失未保存输入。
+//! 再执行原操作,避免重建时丢失未保存输入。卡外入口(右上角 `+ 添加提供商`、
+//! models.dev 快速添加芯片、`刷新目录`)不隶属任何单张卡片,点击时会把
+//! 全部卡片的草稿折成嵌套 `SaveAgentProviderEditsThen` 链逐卡提交,最后
+//! 才执行原操作(该变体保存时不弹"已保存"toast)。
 //!
 //! 当 provider 列表大小或某条 provider 的 models 数量变化时,
 //! `AISettingsPageView::rebuild_current_page` 会被触发以重建整个 widget,
@@ -44,7 +47,7 @@ use crate::editor::{
 use crate::settings::{AISettings, AgentProvider, AgentProviderApiType, AgentProviderModel};
 use strum::IntoEnumIterator;
 
-use super::ai_page::{AISettingsPageAction, AISettingsPageView, ModelCapabilityKind};
+use super::ai_page::{AISettingsPageAction, AISettingsPageView, ModelCapabilityKind, Redacted};
 use super::settings_page::{build_sub_header, SettingsWidget, HEADER_PADDING};
 
 const CARD_BUTTON_PADDING: f32 = 6.0;
@@ -245,8 +248,11 @@ impl ProviderDraftEditors {
                     provider_id,
                     name,
                     base_url,
-                    api_key,
-                    headers,
+                    api_key: Redacted(api_key),
+                    headers: headers
+                        .into_iter()
+                        .map(|(key, value)| (key, Redacted(value)))
+                        .collect(),
                     models,
                 }
             },
@@ -265,8 +271,11 @@ impl ProviderDraftEditors {
                     provider_id,
                     name,
                     base_url,
-                    api_key,
-                    headers,
+                    api_key: Redacted(api_key),
+                    headers: headers
+                        .into_iter()
+                        .map(|(key, value)| (key, Redacted(value)))
+                        .collect(),
                     models,
                     action: Box::new(action),
                 }
@@ -754,6 +763,51 @@ impl AgentProvidersWidget {
             .build()
             .on_click(move |ctx, app, _| {
                 ctx.dispatch_typed_action(draft_editors.to_save_then_action(app, action.clone()));
+            })
+            .finish()
+    }
+
+    /// 收集当前所有卡片的草稿编辑器句柄(供卡外入口按钮使用)。
+    fn all_draft_editors(&self) -> Vec<ProviderDraftEditors> {
+        self.rows
+            .borrow()
+            .iter()
+            .map(|(id, row)| ProviderDraftEditors::from_row(id.clone(), row))
+            .collect()
+    }
+
+    /// 卡外入口按钮(头部"添加提供商"、models.dev 快速添加芯片)。
+    ///
+    /// 这两个按钮不属于任何单张卡片,无法像卡内按钮那样先保存"所属草稿"
+    /// (见 render_card_button_preserving_draft)。点击时把全部卡片的草稿折成
+    /// 嵌套保存链、最内层才执行 `action`,避免添加后的页面重建吞掉其它卡片
+    /// 未保存的输入。各 provider 保存互不依赖,折叠顺序无关紧要;保存走
+    /// Then 变体,不弹"已保存"toast。表单值随输入变化,所以草稿列表在渲染
+    /// 时收集,文本留到点击时经句柄读取,不能预先 build action。
+    fn render_card_button_flushing_all_drafts(
+        label: impl Into<String>,
+        mouse_state: MouseStateHandle,
+        all_drafts: Vec<ProviderDraftEditors>,
+        action: AISettingsPageAction,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        appearance
+            .ui_builder()
+            .button(ButtonVariant::Secondary, mouse_state)
+            .with_style(UiComponentStyles {
+                font_size: Some(appearance.ui_font_body()),
+                padding: Some(Coords::uniform(CARD_BUTTON_PADDING)),
+                ..Default::default()
+            })
+            .with_centered_text_label(label.into())
+            .build()
+            .on_click(move |ctx, app, _| {
+                // on_click 是 FnMut(可多次点击),草稿列表不能被消费,只重建 action。
+                let mut action = action.clone();
+                for draft in all_drafts.iter().rev() {
+                    action = draft.to_save_then_action(app, action);
+                }
+                ctx.dispatch_typed_action(action);
             })
             .finish()
     }
@@ -1583,9 +1637,10 @@ impl AgentProvidersWidget {
         .with_color(label_color.into())
         .finish();
 
-        let refresh_button = Self::render_card_button(
+        let refresh_button = Self::render_card_button_flushing_all_drafts(
             crate::t!("settings-agent-providers-refresh-catalog"),
             self.refresh_catalog_button_state.clone(),
+            self.all_draft_editors(),
             AISettingsPageAction::RefreshModelsDev,
             appearance,
         );
@@ -1666,6 +1721,7 @@ impl AgentProvidersWidget {
                     .with_cross_axis_alignment(CrossAxisAlignment::Center);
                 {
                     let mut states = self.quick_add_button_states.borrow_mut();
+                    let all_drafts = self.all_draft_editors();
                     for (cat_id, cat_provider) in filtered.iter().take(visible_count) {
                         let label = if cat_provider.name.is_empty() {
                             cat_id.clone()
@@ -1675,9 +1731,10 @@ impl AgentProvidersWidget {
                         let state = states.entry(cat_id.clone()).or_default().clone();
                         let model_count = cat_provider.models.len();
                         let display_label = format!("+ {label} ({model_count})");
-                        let chip = Self::render_card_button(
+                        let chip = Self::render_card_button_flushing_all_drafts(
                             display_label,
                             state,
+                            all_drafts.clone(),
                             AISettingsPageAction::AddProviderFromModelsDev {
                                 catalog_provider_id: cat_id.clone(),
                             },
@@ -1771,9 +1828,10 @@ impl SettingsWidget for AgentProvidersWidget {
         )
         .finish();
 
-        let header_add_button = Self::render_card_button(
+        let header_add_button = Self::render_card_button_flushing_all_drafts(
             crate::t!("settings-agent-providers-add-button"),
             self.add_button_state.clone(),
+            self.all_draft_editors(),
             AISettingsPageAction::AddAgentProvider,
             appearance,
         );

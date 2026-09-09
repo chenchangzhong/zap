@@ -38,7 +38,17 @@ impl AgentProviderSecrets {
 
     /// 设置/更新某个 Provider 的 API key。
     /// 传入空字符串等价于删除。
+    /// 值未变化时短路,不 emit 也不落盘 —— 卡外入口的全量 flush 会对每张卡
+    /// 调一次 `set`,未改动的卡不应产生冗余 keychain 写入。
     pub fn set(&mut self, provider_id: &str, api_key: String, ctx: &mut ModelContext<Self>) {
+        let unchanged = if api_key.is_empty() {
+            !self.keys.contains_key(provider_id)
+        } else {
+            self.keys.get(provider_id) == Some(&api_key)
+        };
+        if unchanged {
+            return;
+        }
         if api_key.is_empty() {
             self.keys.remove(provider_id);
         } else {
@@ -90,3 +100,7 @@ impl Entity for AgentProviderSecrets {
 }
 
 impl SingletonEntity for AgentProviderSecrets {}
+
+#[cfg(test)]
+#[path = "secrets_tests.rs"]
+mod tests;
