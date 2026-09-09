@@ -87,9 +87,19 @@ impl PaneContent for SettingsPane {
     fn detach(
         &self,
         _group: &PaneGroup,
-        _detach_type: DetachType,
+        detach_type: DetachType,
         ctx: &mut ViewContext<PaneGroup>,
     ) {
+        // 面板被真正关闭(或为关闭而隐藏)时丢弃未保存的设置草稿。
+        // `SettingsView` 会被 SettingsPaneManager 缓存复用,不重置的话,
+        // Provider 等仅显式保存的未保存编辑会在下次打开设置时残留。
+        // Moved 是拖动重排,同一 view 仍会重新挂载,保留编辑上下文。
+        if !matches!(detach_type, DetachType::Moved) {
+            self.settings_view(ctx).update(ctx, |view, ctx| {
+                view.discard_unsaved_edits(ctx);
+            });
+        }
+
         // Always unsubscribe from views
         let settings_view = self.settings_view(ctx);
         ctx.unsubscribe_to_view(&settings_view);

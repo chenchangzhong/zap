@@ -1795,6 +1795,15 @@ impl SettingsView {
         self.set_and_refresh_current_page_internal(section, true, true, ctx);
     }
 
+    /// 关闭设置面板时丢弃未保存的编辑草稿(目前是 AI Provider 卡片)。
+    ///
+    /// 面板关闭不会销毁 `SettingsView`(被 `SettingsPaneManager` 缓存复用),
+    /// 必须显式重置,否则未保存的 Provider 编辑会在下次打开设置时残留。
+    pub fn discard_unsaved_edits(&mut self, ctx: &mut ViewContext<Self>) {
+        self.ai_page_handle
+            .update(ctx, |view, ctx| view.discard_unsaved_edits(ctx));
+    }
+
     pub fn set_search_query(&mut self, query: &str, ctx: &mut ViewContext<Self>) {
         self.search_editor.update(ctx, |editor, ctx| {
             editor.set_buffer_text(query, ctx);

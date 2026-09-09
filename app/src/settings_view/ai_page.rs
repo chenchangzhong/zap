@@ -1530,6 +1530,21 @@ impl AISettingsPageView {
         ctx.notify();
     }
 
+    /// 丢弃自定义 Provider 卡片上未保存的编辑草稿。
+    ///
+    /// 设置面板关闭时 `SettingsView` 会被 `SettingsPaneManager` 缓存复用,
+    /// 若不主动重置,Provider 编辑器里的未保存草稿会在下次打开设置时残留。
+    /// 这里通过重建当前 subpage 的 widget 实现:编辑器从 `AISettings` 的已
+    /// 保存值重新生成,草稿随之丢弃。
+    ///
+    /// 只有 Providers 子页(及 legacy 全页)上的 Provider 卡片是"仅显式保存"
+    /// 式编辑;其余子页的控件都是即时落盘,无需重置,避免误伤其它页面状态。
+    pub fn discard_unsaved_edits(&mut self, ctx: &mut ViewContext<Self>) {
+        if matches!(self.active_subpage, None | Some(AISubpage::Providers)) {
+            self.rebuild_current_page(ctx);
+        }
+    }
+
     fn build_page(subpage: Option<AISubpage>, ctx: &mut ViewContext<Self>) -> PageType<Self> {
         let ai_settings = AISettings::as_ref(ctx);
         let should_show_usage_widget = !UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled();
