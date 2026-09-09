@@ -5,7 +5,9 @@ use ai::LLMId;
 use settings::Setting;
 use warpui::{App, SingletonEntity};
 
-use crate::ai::agent_providers::models_dev::preset_extra_headers;
+use crate::ai::agent_providers::models_dev::{
+    filter_catalog, popular_only, preset_extra_headers, Catalog, Provider, POPULAR_PROVIDER_IDS,
+};
 use crate::ai::agent_providers::{
     llm_id, lookup_byop, substitute_session_id, AgentProviderSecrets, SESSION_ID_PLACEHOLDER,
 };
@@ -195,4 +197,73 @@ fn preset_extra_headers_seeds_opencode_gateways_only() {
     assert_eq!(preset_extra_headers("opencode-go"), expected);
     assert!(preset_extra_headers("deepseek").is_empty());
     assert!(preset_extra_headers("").is_empty());
+}
+
+fn catalog_with(id: &str) -> Catalog {
+    let mut catalog = Catalog::default();
+    let mut provider = Provider::default();
+    provider.name = id.to_uppercase();
+    catalog.insert(id.to_owned(), provider);
+    catalog
+}
+
+#[test]
+fn filter_catalog_only_returns_popular_providers() {
+    let mut catalog = Catalog::default();
+    for id in POPULAR_PROVIDER_IDS {
+        catalog.extend(catalog_with(id));
+    }
+    // 混入若干非热门提供商,必须全部不可见。
+    for id in ["moonshotai", "azure", "subconscious"] {
+        catalog.extend(catalog_with(id));
+    }
+
+    // 空 query:只返回白名单条目,且按白名单声明顺序。
+    let all = filter_catalog(&catalog, "");
+    let ids: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, POPULAR_PROVIDER_IDS.to_vec());
+
+    // 搜索命中非热门 id / name 也不返回(预设已删除,搜索只在白名单内)。
+    assert!(filter_catalog(&catalog, "moonshot").is_empty());
+    assert!(filter_catalog(&catalog, "SUBCONSCIOUS").is_empty());
+
+    // 搜索按 id 与 name 匹配,仍只限白名单。
+    let by_name = filter_catalog(&catalog, "DEEPSEEK");
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0].0, "deepseek");
+    let by_id = filter_catalog(&catalog, "openrouter");
+    assert_eq!(by_id.len(), 1);
+    assert_eq!(by_id[0].0, "openrouter");
+}
+
+#[test]
+fn filter_catalog_skips_popular_ids_missing_from_catalog() {
+    // catalog 缺失某热门条目时跳过而不是报错。
+    assert!(filter_catalog(&Catalog::default(), "").is_empty());
+    let by_name = filter_catalog(&catalog_with("openai"), "OpenAI");
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0].0, "openai");
+}
+
+#[test]
+fn popular_only_drops_non_popular_providers() {
+    let mut catalog = Catalog::default();
+    for id in POPULAR_PROVIDER_IDS {
+        catalog.extend(catalog_with(id));
+    }
+    for id in ["moonshotai", "azure", "subconscious"] {
+        catalog.extend(catalog_with(id));
+    }
+
+    let filtered = popular_only(&catalog);
+    assert_eq!(filtered.len(), POPULAR_PROVIDER_IDS.len());
+    assert!(filtered.contains_key("openai"));
+    assert!(filtered.contains_key("opencode-go"));
+    // 非热门条目在数据入口即被剔除,lookup_caps / 模型同步对其不再可见。
+    assert!(!filtered.contains_key("moonshotai"));
+    assert!(!filtered.contains_key("azure"));
+    assert!(!filtered.contains_key("subconscious"));
+
+    // 空目录安全。
+    assert!(popular_only(&Catalog::default()).is_empty());
 }

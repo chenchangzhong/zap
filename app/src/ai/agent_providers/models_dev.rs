@@ -207,7 +207,8 @@ pub fn load_from_disk() -> bool {
     match serde_json::from_slice::<Catalog>(&bytes) {
         Ok(catalog) => {
             if let Ok(mut s) = state().write() {
-                s.catalog = Some(catalog);
+                // 兼容旧版全量缓存文件:读入后按白名单裁剪,非热门提供商不进内存。
+                s.catalog = Some(popular_only(&catalog));
                 s.loaded_at = mtime;
             }
             true
@@ -255,13 +256,16 @@ pub async fn fetch_and_cache(client: Client) -> Result<(), String> {
 
     let catalog: Catalog =
         serde_json::from_slice(&bytes).map_err(|e| format!("JSON parsing failed: {e}"))?;
+    let catalog = popular_only(&catalog);
 
-    // 写盘 — 失败不算致命,只 log。
+    // 写盘 — 失败不算致命,只 log。写过滤后的白名单数据,非热门提供商不落盘。
     let path = cache_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&path, &bytes) {
+    let serialized =
+        serde_json::to_vec(&catalog).map_err(|e| format!("serialization failed: {e}"))?;
+    if let Err(e) = std::fs::write(&path, &serialized) {
         log::warn!("[models.dev] 写磁盘缓存失败 ({path:?}): {e}");
     }
 
@@ -319,20 +323,50 @@ pub fn set_search_query(q: String) {
     }
 }
 
+/// 快速添加预设只收录的热门提供商(catalog key 白名单)。
+///
+/// 2026-09 产品决策「删除非热门的提供商预设」:白名单之外的提供商在磁盘缓存
+/// 读取与网络拉取两个入口即被 [`popular_only`] 剔除,不进内存也不落盘;
+/// `lookup_caps`(模型能力推断)与「同步模型列表」因此只对白名单提供商生效,
+/// 非热门提供商由调用方走各自的 fallback 规则。
+pub const POPULAR_PROVIDER_IDS: &[&str] = &[
+    "openai",
+    "google",
+    "deepseek",
+    "xai",
+    "zai",
+    "zhipuai",
+    "minimax",
+    "stepfun",
+    "siliconflow",
+    "zhipuai-coding-plan",
+    "openrouter",
+    "opencode",
+    "opencode-go",
+];
+
+/// 只保留 [`POPULAR_PROVIDER_IDS`] 白名单内的提供商,其余条目直接丢弃。
+pub(crate) fn popular_only(catalog: &Catalog) -> Catalog {
+    POPULAR_PROVIDER_IDS
+        .iter()
+        .filter_map(|id| catalog.get(*id).map(|p| ((*id).to_owned(), p.clone())))
+        .collect()
+}
+
 /// 按当前搜索 query 过滤 catalog,大小写不敏感子串匹配 provider.name 与 provider.id。
-/// 空 query 返回全部条目顺序。返回拥有所有权的 Vec 以便 UI 端 take/iter。
+/// 只收录 [`POPULAR_PROVIDER_IDS`] 白名单内的提供商,输出按白名单声明顺序;
+/// 空 query 返回白名单内全部条目,catalog 中缺失的白名单条目直接跳过。
+/// 返回拥有所有权的 Vec 以便 UI 端 take/iter。
 pub fn filter_catalog(catalog: &Catalog, query: &str) -> Vec<(String, Provider)> {
     let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return catalog
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-    }
-    catalog
+    POPULAR_PROVIDER_IDS
         .iter()
-        .filter(|(id, p)| id.to_lowercase().contains(&q) || p.name.to_lowercase().contains(&q))
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .filter_map(|id| catalog.get(*id).map(|p| ((*id).to_owned(), p.clone())))
+        .filter(|(id, p)| {
+            q.is_empty()
+                || id.to_lowercase().contains(&q)
+                || p.name.to_lowercase().contains(&q)
+        })
         .collect()
 }
 
