@@ -2026,3 +2026,51 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 5. **基线对比是判定「测试失败是否既存」的唯一可靠手段**：本轮两处失败集（10 / 26）都是既存环境干扰，靠 `git checkout` 回基线同跑才敢下结论。
 6. **上游大提交常把「目标特性的依赖」一并带上**：`a7326f8fe` 的 `write_wide_char` 混入超链接中转、`5e7030db7` 混入 multi-agent API 解耦、`3a6f05512` 混入 orchestration/mermaid——移植时必须逐 hunk 判断「这是本特性的必要部分，还是顺路带上的其他特性」。
 
+---
+
+## 36. 追加移植与 P3 裁决（2026-09-12 续）
+
+> 承接 §35：§35.5 里 12 项「本轮不做」经二次裁决后**又落地 3 项**；另对 `511b952c2` 的 proto 依赖做了专项调查并给出终局裁决。三项追加移植均在 `cargo check -p warp` 0 error 下各一个 commit。
+
+### 36.1 追加落地（3 项）
+
+| 上游 | 内容 | 本地适配要点 |
+|---|---|---|
+| `0a0fd3ae1` (#15346) | 块列表右键菜单加「粘贴」 | 新增 `TerminalView::paste_menu_item`（剪贴板空则禁用、带 `terminal:paste` 标签）；块右键（含悬停链接）与三类右键来源追加，overflow / 键位菜单不加（同上游语义）；新增 ftl key `menu-block-paste`（en/zh-CN） |
+| `092c1dce9` (#13967) | 切 markdown Raw/Rendered 保持滚动位置 | editor 新增 `ScrollPosition::Fraction` + `viewport::scroll_fraction` + `LayoutAction::ScrollToFraction`（延迟到 element layout 应用、携 `minimum_version` 防陈旧高度）；code view / local code editor / notebooks file view / pane_group 切换前抓 fraction、重建 pane 时先 seed 再 open。**剔除上游夹带**的 `warp_tui` CharCell `new_tui` 与 Jupyter 分支（本地无 `FeatureFlag::JupyterNotebookRendering` / `is_jupyter_notebook_file`）；远端文件分支跳过（本地无 `file_state.path()`，沿用 `local_path()`）；`view.open(...)` → `view.open_local(...)` |
+| `b7ec0fc55` (#15605) | Agent Mode 用户提问显示时间戳 | `util/time_format` 新增 `format_message_timestamp` / `is_trustworthy_message_timestamp`（+2 测试）；block model 加 `query_sent_at`（过滤 epoch 默认值）；query 视图 Props/render_query 加时间戳 + tooltip 句柄（头像包 `overlay_tool_tip`）；新增 `AIBlockAction::CopyTimestamp`；上游 `terminal/view/context_menu.rs` 的 21 行菜单门控按**本地等价位置**落进 `terminal/view.rs`。**跳过上游夹带**的 completer v2 refactor（153 行，与时间戳无关） |
+
+顺带修复：§35.5 批次 1 带入的 `test_duplicate_single_file_discard_confirmation_is_ignored` 用 `&str` 调用，而本地 `TestContext::new` 要 `PathBuf`——`cargo check`（只查 lib）不编译测试故未暴露，本轮 `cargo test -p warp --lib` 才现形，已改为 `PathBuf::from("test.txt")`。
+
+### 36.2 剩余项终局裁决
+
+| 提交 | 裁决 | 依据（本会话实测） |
+|---|---|---|
+| `c25ac4070` + `18179177a`（右键行为设置：菜单 vs 直接粘贴） | **缓：值得但属独立项目** | 无缺失前置——19 文件里 16 个存在，缺的 3 个只是路径漂移（`elements/gui/event_handler.rs` → 本地 `elements/event_handler.rs`）与测试文件；设置项落点现成（`settings/select.rs` 已有同类 `middle_click_paste_enabled`）；实测 14 hunk / 10 文件，覆盖 `warpui_core` 事件层 + terminal / notebooks / env_vars / inline_action / agent 各视图 → 估 1–2 天，非顺手同步 |
+| `4b894db80`（serde Content → 手写 Deserialize） | 不做 | 纯编译期优化、无行为收益；7 hunk / 3 生产文件 |
+| `8b88df987` + `40e397170`（按住修饰键显示 tab 快捷键） | 不做 | 26 hunk / 5 文件；本地完全无该机制，`vertical_tabs` 自研度最高 |
+| `5e7030db7`（warping 行显示模型名） | 不做 | 7 hunk；本地完成态已展示模型名（`status_bar.rs:799/890`），收益低；上游夹带 multi-agent 解耦改动 |
+| `4cd1c77c4`（原生 agent 工具条 File explorer chip） | 不做 | 本地**已有** `AgentToolbarItemKind::FileExplorer`（现仅 CLI agent），属重复建设；依赖本地缺失的 `server/telemetry/events.rs`；落点在自研 footer 区 |
+| `142b87102`（Attach file 调色板命令） | 不做 | 本地**已有** attach 按钮与 `EditorAction::AttachFiles`；13 hunk / 6 文件 + 依赖 shared-session 的 `file_attach_allowed_for_shared_session`（本地 0 命中） |
+
+### 36.3 `511b952c2`（create_file `allow_overwrite`）终局：不合
+
+专项调查（两个 proto fork 对比，只读）：
+
+- 本地 pin 的是 **`zerx-lab/warp-proto-apis`** fork（`14ab9a71`，2026-05-10，= 该 fork 的 main tip）；与上游共同祖先为 `aa2f9cde`。fork 只多 **1 个定制提交**：「删除 SearchCodebase / search_codebase / search_codebase_stats wire 字段」（3 文件 +13/−23，注释写明 *codebase index 全栈下线*，用 `reserved` 占位）。
+- 上游自该祖先起已走 **46 个提交**到 `0ca49ce5`（#365）：23 文件 **+13754/−3972**（`request.proto` 366 行、`task.proto` 525 行，新增 `orchestration.proto` / `input_context.proto`）；`Request` 能力位从 27 涨到 32。
+- #365 的 proto delta **仅 7 行**：`Request.supports_create_file_overwrite = 32` + `NewFile.allow_overwrite = 3`；`apis/multi_agent/v1/gen/rust/build.rs` 是**构建期**读 `.proto` 现生成（`src/lib.rs` 只 `include_bytes!` 描述符集），改 `.proto` 无需提交生成物。
+- **决定性事实：本地根本不构造 proto `Request`**——全库 `supports_*` 能力位 **0 命中**；`warp_multi_agent_api::Request` 只出现在集成测试的 `decode`（`integration_testing/agent_mode/step.rs:76`）；`app/src/server/` 无任何 multi-agent 请求构造；`api::RequestParams`（`ai/agent/api.rs:77`）是 Zap 自有结构，由 BYOP `agent_providers/chat_stream.rs` 翻译成 genai `ChatRequest`；上游该能力位落点 `app/src/ai/agent/api/impl.rs` 本地不存在。
+
+→ 方案 A（撤 `[patch]` 切上游 rev）会引入 46 提交的行为漂移，并**恢复 Zap 刻意删除的 codebase-index wire 面**（服务端可能重新下发本地已无处理链的 `SearchCodebase`）；方案 B（把 7 行 backport 到 fork）**拿不到任何行为变化**（能力位无处可发）。**裁决：不合**。
+
+→ 需求本身（AI 覆盖已存在文件）在本地是真实可达的（本地 BYOP 工具 `apply_file_diffs` 的 `op:"create"` 落成 `FileEdit::Create{file,content}`，命中已存在文件即报 `Could not create {file} because it already exists.`，`diff_application.rs:124`），但正确做法是**本地自研**：`FileEdit::Create` 加 `overwrite` + 工具 schema 暴露参数 + `diff_application.rs:326` 按它决定覆盖/报错（连带 `code_diff_view.rs:2938/3018` 两处 match 臂），**与 proto 无关**。
+
+### 36.4 本轮追加教训
+
+1. **`cargo check -p warp` 不编译测试**：只跑 check 会漏掉本地测试适配错误（本轮 `TestContext::new` 的 `PathBuf` 就是实例）。凡改动涉及测试文件，必须补 `cargo test -p <crate> --no-run`。
+2. **上游提交普遍夹带无关改动**：`b7ec0fc55` 的 completer v2 重构（153 行）、`a7326f8fe` 的超链接中转、`3a6f05512` 的 mermaid/orchestration 都属此类——逐 hunk 判断归属，不符就整块丢弃。
+3. **依赖类改动先比 fork/rev，再看本仓 diff**：本地 `warp-proto-apis` 是自有 fork，只对比本仓源码会得出完全错误的可行性结论（§36.3）。
+4. **import 冲突别硬合上游 blob**：上游常把分组 import 拆成单行 import，本地风格相反；此时保留本地、让编译器报缺哪个符号再补，比合并 import 块可靠得多（本轮 query.rs / block.rs / model_impl.rs 均用此法）。
+
+
