@@ -2164,6 +2164,17 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 
 → **同态抖动仅 ±0.2s**，而两态差 **+2.1s（+2.1%）**：改后**更慢**。
 
+**体积（精确复测，2026-09-12 晚）**：同一条命令 `CARGO_INCREMENTAL=0 cargo build --bin zap-oss`，两态产出的
+**同一 rlib**（`libwarp-91fc53b275388999.rlib`，hash 相同可与基线对齐）：
+
+| 产物 | 基线 | 含阶段 1 | 减少 |
+|---|---|---|---|
+| rlib | 982,614,840 B（937.1 MiB）| 981,656,648 B（936.2 MiB）| **−958,192 B（−0.91 MiB，−0.098%）** |
+| 调试二进制 `target/debug/zap-oss` | 615,273,968 B（586.8 MiB）| 614,248,192 B（585.8 MiB）| **−1,025,776 B（−0.98 MiB，−0.167%）** |
+
+结论：**体积收益约 −0.1% ~ −0.17%（不足 1 MB）**，远小于构建时间的 +2.1% 代价。此前的「937→935 MB（−0.2%）」
+是 `du -h` 的磁盘分配粗测且落在另一个 rlib 变体上（`-p warp`，hash `9e9d8e1b40e6db51`），已由本表取代。
+
 机制层面确实生效（同一个 rlib `9e9d8e1b40e6db51`，feature 集相同，可比）：
 
 | 指标 | 基线 | 改后 | 变化 |
@@ -2171,12 +2182,12 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 | `ContentDeserializer` 实例化 | 866 | 333 | **−62%** |
 | `__DeserializeWith` 实例化 | 2071 | 1216 | **−41%** |
 | `ContentRefDeserializer` 实例化 | 991 | 974 | −1.7% |
-| rlib 体积 | 937 MB | 935 MB | **−0.2%** |
+| rlib 体积（`du -h` 粗测）| 937 MB | 935 MB | −0.2%（后续精确复测见下行）|
 | `warp` crate 编译 | 98.6s | 100.7s | **+2.1%** |
 
 ### 38.4 为什么净收益为负 & 阶段 2 的天花板
 
-- 被消除的 serde 机械（`Content*` / `__DeserializeWith`）在符号总量里占比极小（rlib 仅小 2MB / 0.2%）；`warp` crate 的编译成本由其余数千符号的 codegen 主导。
+- 被消除的 serde 机械（`Content*` / `__DeserializeWith`）在符号总量里占比极小（rlib 精确缩小 **958 KB / −0.098%**，二进制 −1.0 MB / −0.167%）；`warp` crate 的编译成本由其余数千符号的 codegen 主导。
 - 手写 impl + raw 结构体 + 13 臂 match **本身也是要编译的代码**，抵消并超过被消除的部分。
 - **阶段 2 天花板同样低**：符号层面统计，rlib 中含 `BlockContext` 的符号 199 个，而真正把 `BlockContext` 拖进 `ContentRefDeserializer` 的只有 **13 个**（形如 `<BlockContext as Deserialize>::deserialize::<ContentRefDeserializer<serde_json::Error>>`）。即使阶段 2 全清，量级与阶段 1 同阶。
 - 判定方法学：**这类“消除泛型机械”的改动用机制级指标（`nm -C` 计数）判断是否生效，用绕过 sccache 的 real/user 时间判断是否值得**；两者本轮给出了相反的结论——机制生效，但不值得。

@@ -184,7 +184,7 @@
 | `app/src/ai/artifacts/mod.rs` | `Artifact`（相邻标签 `artifact_type`/`data`，由 `ArtifactEnvelope` 取代 `ArtifactHelper`）|
 
 **实测与天花板**（详见 `history.md §38`）：stage 1 后 `warp` crate 编译 **98.6s → 100.7s（+2.1%）**，
-rlib 仅 −0.2%（`ContentDeserializer` 实例化 −62%、`__DeserializeWith` −41% 但占比过小）；
+**体积仅 −958 KB（rlib，−0.098%）/ −1.0 MB（调试二进制，−0.167%）**（`ContentDeserializer` 实例化 −62%、`__DeserializeWith` −41%，但占比过小）；
 stage 2 的目标 `BlockContext × ContentRefDeserializer` 在符号层面只有 **13 个**。
 
 **栈外同期的编译期提交**：`1e4b86a81` (#15517，见 §五 附)、`21f413b79` (#14875 终端 grid 大搬运，已在淘汰 53)、
