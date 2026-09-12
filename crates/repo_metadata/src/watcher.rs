@@ -16,9 +16,6 @@ use crate::{repository::SubscriberId, RepoMetadataError, Repository};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "local_fs")] {
-        use std::sync::Arc;
-
-        use ignore::gitignore::Gitignore;
         use watcher::{BulkFilesystemWatcher, BulkFilesystemWatcherEvent};
         use crate::entry::{
             extract_worktree_git_dir, is_commit_related_git_file, is_git_internal_path,
@@ -268,12 +265,11 @@ impl DirectoryWatcher {
     pub(crate) fn start_watching_directories(
         &mut self,
         directory_paths: Vec<StandardizedPath>,
-        gitignores: Vec<Arc<Gitignore>>,
         ctx: &mut ModelContext<Self>,
     ) -> impl Future<Output = Result<(), RepoMetadataError>> {
         let futures: Vec<_> = directory_paths
             .into_iter()
-            .map(|path| self.start_watching_directory(&path, gitignores.clone(), ctx))
+            .map(|path| self.start_watching_directory(&path, ctx))
             .collect();
 
         async move {
@@ -291,7 +287,6 @@ impl DirectoryWatcher {
     pub(crate) fn start_watching_directory(
         &mut self,
         directory_path: &StandardizedPath,
-        gitignores: Vec<Arc<Gitignore>>,
         ctx: &mut ModelContext<Self>,
     ) -> impl Future<Output = Result<(), RepoMetadataError>> {
         let local_path = directory_path.to_local_path();

@@ -208,9 +208,8 @@ impl Repository {
                     }
                 }
 
-                let gitignores = self.gitignores.clone();
                 Box::pin(DirectoryWatcher::handle(ctx).update(ctx, |watcher, ctx| {
-                    watcher.start_watching_directories(directories_to_watch, gitignores, ctx)
+                    watcher.start_watching_directories(directories_to_watch, ctx)
                 }))
             } else {
                 Box::pin(ready(Ok(())))
