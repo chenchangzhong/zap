@@ -2350,6 +2350,28 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 **维护约定**：以后每轮同步**只更新状态总表的表格**；过程细节继续往本文件追加新章节，两处不互相复制。
 本节起，`lessons.md` 头部与 `CHANGELOG` 的更新责任不变。
 
+---
+
+## 42. 合并 `1e4b86a81`（#15517）：release-cli `codegen-units` 1 → 4（2026-09-12）
+
+**来源**：盘查「编译期」主题时发现该提交（2026-08-25，属本区间）**不在计划的 89/53 名单内**——它只动根
+`Cargo.toml`，疑被路径过滤漏掉（见 §41 之后 status.md §五 附注）。上游自述：*"4 (not the default 16, and
+not 1) roughly halves build time versus codegen-units=1 for ~4% larger stripped/gzipped binaries."*
+
+**落地**：`Cargo.toml` 的 `[profile.release-cli]`（`inherits = "release-lto"`，`opt-level = "s"`）由
+`codegen-units = 1` 改为 `4`，注释按本仓规范改写为中文（保留上游三点理由：不是 16 也不是 1；约减半构建时间、
+二进制约大 4%；thin LTO 已承担跨 crate 体积优化）。**未动** `[profile.release-wasm]`（其 `codegen-units = 1`
+是另一件事，本地仍为 1）。
+
+**受益范围（本地核实）**：`script/macos/bundle:382/388` 与 `script/linux/bundle:138/144` 打 CLI 产物时用的正是
+`release-cli`（dev/local 用 `release-cli-debug_assertions`），另有 Windows 短别名 `rcli`/`rclida` 继承它
+（`Cargo.toml:514-524`）→ 这些构建全部受益；**应用包（`release-lto`）不受影响**。
+
+**验证**：`cargo check -p warp` 0 error（cargo 每次都会解析 profile，manifest 合法）；`grep codegen-units`
+确认落点正确、`release-wasm` 仍为 1。
+**未验证**：上游「构建时间约减半」这一具体数字**未在本仓复测**——`release-cli` 是 LTO 全量构建（数十分钟），
+如需该数字应单独跑一次 `release-cli` 构建前后对比。
+
 ### 39.6 本地补齐：「复制时间戳」菜单入口（上游未做）
 
 用户确认「补」。落点：`app/src/terminal/view.rs::ai_block_copying_menu_items`（AI 块「复制类」菜单的统一构造处），门控照抄上游 `context_menu.rs` 的原始 21 行：

@@ -507,7 +507,10 @@ inherits = "release-lto-debug_assertions"
 [profile.release-cli]
 inherits = "release-lto"
 opt-level = "s"
-codegen-units = 1
+# 4 而不是默认的 16、也不是 1：相对 codegen-units = 1 大致把构建时间减半，代价是
+# 去符号/gzip 后的二进制大约大 4%。该 profile 已启用 thin LTO，跨 crate 的体积优化
+# 主要由 LTO 完成，所以 1 付出了大量编译时间却只换来很小的体积收益。
+codegen-units = 4
 
 # A custom CLI release-like profile that forces debug assertions on, used for
 # dev/local channel CLI bundles.
