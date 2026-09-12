@@ -19401,8 +19401,14 @@ impl Workspace {
     /// dsh 内文件链接点击 → 在 Zap 内打开(文件链接拦截)。
     /// 复用 `uri::open_file` 的分类:Markdown → notebook、可编辑文件 → editor、
     /// 目录/其他 → 在目录路径开 session(可执行文件排队执行)。
+    ///
+    /// 本回调运行在 `emit_event` 内,Workspace 自身此时已被移出 window.views;
+    /// 同步调用 `uri::open_file` 会让 Notebook 分支重入更新 Workspace(panic:
+    /// Circular view update)、令 Editor 分支取不到 Workspace 而静默失败。
+    /// 故改为入队全局 action,在 effect flush 阶段(不摘除任何 view)执行。
     fn handle_dsh_open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
-        crate::uri::open_file(Some(ctx.window_id()), path, &mut *ctx);
+        let window_id = ctx.window_id();
+        ctx.dispatch_global_action("root_view:open_dsh_file", (window_id, path));
     }
 
     /// 清除 dsh git status 订阅与右侧面板状态：解绑旧 handle 订阅（防止

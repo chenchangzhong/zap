@@ -68,6 +68,10 @@ void warp_marked_text_cleared(WarpHostView *);
     MetalRenderView *_metalRenderView;
     WebViewContainerView *_webViewContainer;
     MetalBackgroundView *_metalBackgroundView;
+
+    // 覆盖整个可见区域的鼠标 tracking area,让 mouseMoved 直接投递给本视图而不是
+    // first responder;见 updateTrackingAreas。
+    NSTrackingArea *mouseTrackingArea;
 }
 
 - (BOOL)acceptsFirstResponder {
@@ -273,6 +277,31 @@ void warp_marked_text_cleared(WarpHostView *);
     if (self.readyForWarp) warp_handle_view_event(self, event, NO);
 }
 
+// AppKit 默认按 responder chain 把 mouseMoved 投递给 first responder。嵌入的
+// webview(如 dsh 面板的 WKWebView)一旦拿到 first responder,本视图就再也收不到
+// mouseMoved,Warp 的 hover 全面失效,直到用户点一次本视图把焦点抢回来。挂一个
+// 覆盖整个可见区域的 tracking area,让 mouseMoved 由 tracking area 投递给本视图,
+// 与 first responder 无关;鼠标位于 webview 上方时仍由更上层的 webview 处理,
+// 不影响其输入。
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (mouseTrackingArea != nil) {
+        [self removeTrackingArea:mouseTrackingArea];
+        [mouseTrackingArea release];
+        mouseTrackingArea = nil;
+    }
+    // NSTrackingInVisibleRect:rect 参数被忽略,区域自动跟随视图可见范围。
+    // NSTrackingActiveInKeyWindow:与 window.acceptsMouseMovedEvents 语义一致,
+    // 仅在本窗口是 key window 时投递。
+    NSTrackingAreaOptions options =
+        NSTrackingMouseMoved | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect;
+    mouseTrackingArea = [[NSTrackingArea alloc] initWithRect:NSZeroRect
+                                                     options:options
+                                                       owner:self
+                                                    userInfo:nil];
+    [self addTrackingArea:mouseTrackingArea];
+}
+
 - (void)mouseMoved:(NSEvent *)event {
     if (self.readyForWarp) warp_handle_view_event(self, event, NO);
 }
@@ -282,6 +311,7 @@ void warp_marked_text_cleared(WarpHostView *);
 }
 
 - (void)dealloc {
+    [mouseTrackingArea release];
     [markedText release];
     [textToInsert release];
     [_metalRenderView release];

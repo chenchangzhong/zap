@@ -336,6 +336,18 @@ pub fn init(app: &mut AppContext) {
         RootView::open_linear_issue_work_in_existing_window,
     );
 
+    // dsh 文件链接在 DshRuntime 事件回调里派发，回调期间 Workspace 已被
+    // `emit_event` 移出 window.views；同步走 `uri::open_file` 会让 Notebook
+    // 分支重入更新 Workspace（panic: Circular view update），令 Editor 分支
+    // 取不到 Workspace 而静默失败。改由本全局 action 延迟到 effect flush
+    // 阶段执行：该阶段不摘除任何 view，三个分类都能正常打开。
+    app.add_global_action(
+        "root_view:open_dsh_file",
+        |arg: &(WindowId, PathBuf), ctx| {
+            let (window_id, path) = arg;
+            crate::uri::open_file(Some(*window_id), path.clone(), ctx);
+        },
+    );
     app.add_action("root_view:add_file_pane", RootView::add_file_pane);
     app.add_global_action(
         "root_view:open_new_with_file_notebook",
@@ -2078,7 +2090,12 @@ impl RootView {
                 workspace.add_tab_for_file_notebook(Some(path.to_owned()), ctx);
             });
             let window_id = ctx.window_id();
-            ctx.windows().show_window_and_focus_app(window_id);
+            // 仅在窗口尚未处于前台时才把它带到前台：dsh 文件打开发生在渲染帧
+            // (displayLayer → flush_effects)里，对已经是 key 的窗口重复
+            // makeKeyAndOrderFront 没有意义。
+            if ctx.windows().frontmost_window_id() != Some(window_id) {
+                ctx.windows().show_window_and_focus_app(window_id);
+            }
             ctx.notify();
         } else {
             log::warn!("Auth not complete before trying to open file pane");

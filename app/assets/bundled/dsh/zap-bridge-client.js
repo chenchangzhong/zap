@@ -35,11 +35,11 @@ window.__ModuleLoader__.load({
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
 		// 依赖 sessions/workspaces 服务(dsh-client-runtime 用 reflect.provide
-		// 注册;框架保证 apply 时已就绪)。remote / remote.session 是 dsh 官方
-		// remote 代理(dsh-api-remotes),文件链接拦截器 patch 其上的
-		// openWorkspacePath/canOpenWorkspacePath;未声明 inject 直接访问会
+		// 注册;框架保证 apply 时已就绪)。sidebarRight 是 dsh-client-ui-sidebar-right
+		// 提供的右侧栏导航 face——dsh 0.1.5 起聊天内文件入口全部收敛到它的
+		// openResource,文件链接拦截器 patch 的即是该方法;未声明 inject 直接访问会
 		// 报 "cannot get property ... without inject" 并使整个 apply 失败。
-		const inject = ["sessions", "workspaces", "remote", "remote.session"];
+		const inject = ["sessions", "workspaces", "sidebarRight"];
 
 		/// 最近上报的 workspace path(去重:同 path 不重复上报)。
 		let lastReportedPath = undefined;
@@ -369,45 +369,81 @@ window.__ModuleLoader__.load({
 		}
 
 		// ── 文件链接拦截:统一改在 Zap 内打开 ──
-		// dsh 聊天 UI 的所有文件入口(工具卡片 fileLink、ProducedFiles chips、
-		// markdown file mention 按钮、deliverables 提及)都收敛到
-		// `ctx.remote.session.openWorkspacePath`(默认发给 host native opener,
-		// 即系统默认应用)。Zap 内嵌场景 patch 此方法改发 `zap.open_file` IPC,
-		// 由 Zap 按 Notebook/Editor/Session 分类在 Zap 内打开。
-		// `canOpenWorkspacePath` 是 ProducedFiles 行的渲染门控,一并放行。
+		// dsh 0.1.5 起,聊天 UI 的所有文件入口(工具卡片 fileLink、ProducedFiles/
+		// deliverables chips、markdown file mention)经 chat 的 openFile face 收敛到
+		// `ctx.sidebarRight.openResource("dsh-resource://file/…")`——旧版收敛点
+		// `ctx.remote.session.openWorkspacePath` 已无 UI 调用方(dsh-api-remotes
+		// 仅保留协议端点)。Zap 内嵌场景 patch 此公共 face 改发 `zap.open_file`
+		// IPC,由 Zap 按 Notebook/Editor/Session 分类在 Zap 内打开。侧栏文件树的
+		// onOpen 走 tabActions → openResourceIn(内部路径,不经此 face),其 dsh
+		// 原生预览不受影响。
+		/// 文件地址前缀(dsh-util/workspace-path 的 file-address.ts)。
+		const FILE_ADDRESS_PREFIX = "dsh-resource://file/";
+
+		/// 把地址里的 path 归一成本机绝对路径:已是绝对路径直接返回,工作区相对
+		/// 路径按该会话的根(cwd)拼接,cwd 取不到时回退到上报过的项目路径。
+		function absoluteFilePath(path, sessionId) {
+			if (path.startsWith("/") || /^[A-Za-z]:[/\\]/.test(path) || path.startsWith("\\\\")) {
+				return path;
+			}
+			const cwd = sessionsRef?.list.getSnapshot().byId[sessionId]?.cwd;
+			const root = cwd || lastReportedPath;
+			if (!root) return undefined;
+			return root.replace(/\/+$/, "") + "/" + path;
+		}
+
+		/// 解析 `dsh-resource://file/…` 地址为文件绝对路径;非文件地址、或无法
+		/// 定位到本机路径时返回 undefined,交回原方法。
+		/// 段语义逐行对齐 dsh-util-workspace-path 的 parseFileAddress:session 形态
+		/// 取 id + 其余段(首段为空即绝对路径);absolute 形态单斜杠补前导 `/`、
+		/// 双斜杠还原 UNC、盘符首段保持字面;`?`/`#` 之后一律截断。
+		function resolveFileAddressPath(address) {
+			try {
+				if (typeof address !== "string" || !address.startsWith(FILE_ADDRESS_PREFIX)) return undefined;
+				const end = address.search(/[?#]/);
+				const [scope, ...rest] = address
+					.slice(FILE_ADDRESS_PREFIX.length, end === -1 ? undefined : end)
+					.split("/");
+				if (scope === "session") {
+					const [id, ...segments] = rest;
+					if (id === undefined || id === "" || segments.length === 0) return undefined;
+					const path = segments.map(decodeURIComponent).join("/");
+					// 空路径即工作区根(目录):交给 dsh 原生处理。
+					if (path === "") return undefined;
+					return absoluteFilePath(path, decodeURIComponent(id));
+				}
+				if (scope === "absolute") {
+					const unc = rest[0] === "" && rest.length > 1;
+					const segments = (unc ? rest.slice(1) : rest).map(decodeURIComponent);
+					if (segments.length === 0 || segments[0] === "") return undefined;
+					if (unc) return `//${segments.join("/")}`;
+					return /^[A-Za-z]:$/.test(segments[0]) ? segments.join("/") : `/${segments.join("/")}`;
+				}
+				return undefined;
+			} catch {
+				return undefined;
+			}
+		}
+
 		function installOpenFileInterceptor(ctx) {
-			const session = ctx.remote && ctx.remote.session;
-			if (!session) {
-				console.error("[zap-bridge-client] ctx.remote.session unavailable; file links stay native");
+			const sidebarRight = ctx.sidebarRight;
+			if (!sidebarRight || typeof sidebarRight.openResource !== "function") {
+				console.error("[zap-bridge-client] ctx.sidebarRight.openResource unavailable; file links stay in dsh");
 				return;
 			}
-			function patch(name, replacement) {
-				const original = session[name];
-				if (typeof original !== "function") {
-					console.error(`[zap-bridge-client] remote.session.${name} is not a function; skip`);
-					return undefined;
-				}
-				session[name] = replacement;
-				return original;
-			}
-			const origOpen = patch("openWorkspacePath", async (request) => {
-				const path = request && request.path;
-				if (typeof path === "string" && path !== "") {
-					zapRpc('zap.open_file', { path }).catch((err) => {
-						console.error("[zap-bridge-client] open_file failed:", err);
-					});
-					// remote 信封形状:{ ok, value };与 zap-bridge 现有通知类 IPC 一致,
-					// 不等 Zap ack(点击即时生效,失败仅记日志)。
-					return { ok: true, value: { opened: true } };
-				}
-				return origOpen(request);
-			});
-			const origCanOpen = patch("canOpenWorkspacePath", () =>
-				Promise.resolve({ ok: true, value: true })
-			);
+			const origOpenResource = sidebarRight.openResource;
+			sidebarRight.openResource = function (address, options) {
+				const path = resolveFileAddressPath(address);
+				if (path === undefined) return origOpenResource.call(this, address, options);
+				// 与 zap-bridge 现有通知类 IPC 一致:不等 Zap ack(点击即时生效,
+				// 失败仅记日志)。
+				zapRpc('zap.open_file', { path }).catch((err) => {
+					console.error("[zap-bridge-client] open_file failed:", err);
+				});
+				console.log("[zap-bridge-client] open_file ->", path);
+			};
 			ctx.effect(() => () => {
-				if (origOpen) session.openWorkspacePath = origOpen;
-				if (origCanOpen) session.canOpenWorkspacePath = origCanOpen;
+				sidebarRight.openResource = origOpenResource;
 			}, "zap-bridge-client: open-file interceptor");
 		}
 
@@ -426,7 +462,7 @@ window.__ModuleLoader__.load({
 			workspacesRef = workspaces;
 			// 「附加为上下文」末端:暴露结构化 @ 引用芯片插入,供 Rust 侧 evaluate_script 调用。
 			installFileReferenceInjection(ctx, sessions);
-			// 文件链接拦截:openWorkspacePath → Zap 内打开。
+			// 文件链接拦截:sidebarRight.openResource → Zap 内打开。
 			installOpenFileInterceptor(ctx);
 
 			const unsubSessions = sessions.list.subscribe(reportCurrentPath);

@@ -822,7 +822,12 @@ pub(crate) fn open_file(window_id: Option<WindowId>, path: PathBuf, ctx: &mut Ap
                 .0
             };
 
-            ctx.windows().show_window_and_focus_app(window_id);
+            // 仅在窗口尚未处于前台时才把它带到前台：dsh 文件打开发生在渲染帧
+            // (displayLayer → flush_effects)里，对已经是 key 的窗口重复
+            // makeKeyAndOrderFront 没有意义。
+            if ctx.windows().frontmost_window_id() != Some(window_id) {
+                ctx.windows().show_window_and_focus_app(window_id);
+            }
 
             if let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id) {
                 if let Some(workspace) = workspaces.into_iter().next() {
