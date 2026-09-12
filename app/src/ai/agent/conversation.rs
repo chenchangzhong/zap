@@ -14,7 +14,8 @@ use crate::terminal::model::block::{
 };
 
 use crate::ai::agent::api::convert_conversation::{
-    compute_time_to_first_token_ms_from_messages, ConvertToExchanges,
+    compute_time_to_first_token_ms_from_messages, proto_timestamp_to_local_datetime,
+    ConvertToExchanges,
 };
 use ai::document::AIDocumentId;
 use chrono::{DateTime, Local, TimeZone};
@@ -105,7 +106,17 @@ pub(crate) struct CommandBlockInfo {
     pub(crate) subagent_task_id: Option<TaskId>,
     /// The api message ID that this command block was extracted from.
     /// Used to find the corresponding exchange for timestamp and PWD.
+    /// The api message ID of the tool call that initiated this command.
+    /// Used to find the corresponding exchange for PWD and start_ts fallback.
     pub(crate) message_id: String,
+    /// Estimated timestamp when the command started.
+    /// Note that this may not be perfectly accurate, because it may come from the tool call timestamp
+    /// which is when the agent made the tool call, before the command actually started.
+    pub(crate) start_ts: Option<DateTime<Local>>,
+    /// Estimated timestamp when the command finished.
+    /// Note that this may not be perfectly accurate, because it may come from the tool call result timestamp
+    /// which is when the server receives the result, after the command actually finished.
+    pub(crate) completed_ts: Option<DateTime<Local>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3505,7 +3516,27 @@ impl AIConversation {
             return command_blocks;
         };
 
-        self.extract_command_blocks_from_messages(&api_task.messages, &mut command_blocks);
+        // Build a map from message ID to exchange for timestamp lookups.
+        // The exchange's start_time (derived from CurrentTime input context) is combined with
+        // the result message proto ts to pick the earlier time as completed_ts for RunShellCommand blocks.
+        let message_id_to_exchange: HashMap<&str, &AIAgentExchange> = self
+            .all_exchanges()
+            .into_iter()
+            .flat_map(|exchange| {
+                exchange
+                    .added_message_ids
+                    .iter()
+                    .map(move |mid| (&**mid, exchange))
+            })
+            .collect();
+
+        let mut seen_command_ids = HashSet::new();
+        self.extract_command_blocks_from_messages(
+            &api_task.messages,
+            &message_id_to_exchange,
+            &mut command_blocks,
+            &mut seen_command_ids,
+        );
 
         command_blocks
     }
@@ -3517,22 +3548,36 @@ impl AIConversation {
     fn extract_command_blocks_from_messages(
         &self,
         messages: &[api::Message],
+        message_id_to_exchange: &HashMap<&str, &AIAgentExchange>,
         command_blocks: &mut Vec<CommandBlockInfo>,
+        seen_command_ids: &mut HashSet<String>,
     ) {
         // 记录每个 RunShellCommand 的稳定 command id，CLI subagent 会用这个 id
         // 指向实际被接管的命令块，不能只按最近一条命令猜测。
         let mut run_shell_command_block_indices_by_id = HashMap::new();
 
         // Build a map from tool_call_id to (RunShellCommandResult, result_message_id)
+
+        // Build a map from tool_call_id to (RunShellCommandResult, result_message_id, result_proto_timestamp)
         // for efficient lookup within this message set.
-        let tool_call_results: HashMap<&str, (&api::RunShellCommandResult, &str)> = messages
+        let tool_call_results: HashMap<
+            &str,
+            (&api::RunShellCommandResult, &str, Option<DateTime<Local>>),
+        > = messages
             .iter()
             .filter_map(|msg| {
                 let result = msg.tool_call_result()?;
                 if let Some(api::message::tool_call_result::Result::RunShellCommand(cmd_result)) =
                     &result.result
                 {
-                    Some((result.tool_call_id.as_str(), (cmd_result, msg.id.as_str())))
+                    let ts = msg
+                        .timestamp
+                        .as_ref()
+                        .map(|ts| proto_timestamp_to_local_datetime(ts.seconds, ts.nanos));
+                    Some((
+                        result.tool_call_id.as_str(),
+                        (cmd_result, msg.id.as_str(), ts),
+                    ))
                 } else {
                     None
                 }
@@ -3553,7 +3598,9 @@ impl AIConversation {
                                 // Recursively extract from subtask (in case of nested summarization).
                                 self.extract_command_blocks_from_messages(
                                     &subtask_source.messages,
+                                    message_id_to_exchange,
                                     command_blocks,
+                                    seen_command_ids,
                                 );
                             }
                         }
@@ -3570,17 +3617,52 @@ impl AIConversation {
                     let command = &run_cmd.command;
 
                     // Find the corresponding tool call result in this message set.
-                    if let Some((cmd_result, result_message_id)) =
+                    if let Some((cmd_result, result_message_id, result_proto_ts)) =
                         tool_call_results.get(tool_call_id.as_str())
                     {
                         if let Some(api::run_shell_command_result::Result::CommandFinished(
                             api::ShellCommandFinished {
-                                command_id,
                                 output: command_output,
                                 exit_code,
+                                command_id: finished_command_id,
                             },
                         )) = &cmd_result.result
                         {
+                            // Track the command_id so attachment/context blocks for the
+                            // same command are skipped (RunShellCommand blocks have
+                            // better timestamps).
+                            if !finished_command_id.is_empty() {
+                                seen_command_ids.insert(finished_command_id.clone());
+                            }
+
+                            // 本地适配：本仓 proto fork 的 ShellCommandFinished 没有 start_ts/
+                            // finish_ts 字段（上游 proto rev 才有），故这里只用 tool call 消息自身的
+                            // 时间戳（上游的「命令运行时长」特性因此未移植，见 history.md §43）。
+                            let start_ts = message.timestamp.as_ref().map(|ts| {
+                                proto_timestamp_to_local_datetime(ts.seconds, ts.nanos)
+                            });
+                            if start_ts.is_none() {
+                                log::error!(
+                                    "RunShellCommand tool call message has no timestamp (message_id: {message_id})"
+                                );
+                            }
+
+                            // completed_ts 回退链：取 (1) 结果消息所属交换的 start_time 与
+                            // (2) 结果消息自身 proto 时间戳中较早者（本地无 proto 层 finish_ts）。
+                            let completed_ts = {
+                                let exchange_ts = message_id_to_exchange
+                                    .get(*result_message_id)
+                                    .map(|exchange| exchange.start_time);
+                                match (*result_proto_ts, exchange_ts) {
+                                    (Some(proto_ts), Some(exchange_ts)) => {
+                                        Some(proto_ts.min(exchange_ts))
+                                    }
+                                    (Some(proto_ts), None) => Some(proto_ts),
+                                    (None, Some(exchange_ts)) => Some(exchange_ts),
+                                    (None, None) => None,
+                                }
+                            };
+
                             command_blocks.push(CommandBlockInfo {
                                 command: command.clone(),
                                 output: command_output.clone(),
@@ -3599,11 +3681,17 @@ impl AIConversation {
                                 block_id: None,
                                 requested_command_action_id: Some(tool_call_id.clone().into()),
                                 subagent_task_id: None,
-                                message_id: (*result_message_id).to_string(),
+                                // Use the tool call message ID (not the result message ID)
+                                // so that to_serialized_blocklist_items looks up the exchange
+                                // where the command was initiated — the right exchange for PWD
+                                // and the start_ts fallback.
+                                message_id: message_id.clone(),
+                                start_ts,
+                                completed_ts,
                             });
                             if let Some(index) = command_blocks.len().checked_sub(1) {
                                 run_shell_command_block_indices_by_id
-                                    .insert(command_id.clone(), index);
+                                    .insert(finished_command_id.clone(), index);
                             }
                         }
                     }
@@ -3640,9 +3728,31 @@ impl AIConversation {
                 _ => vec![],
             };
 
+            let msg_ts = message
+                .timestamp
+                .as_ref()
+                .map(|ts| proto_timestamp_to_local_datetime(ts.seconds, ts.nanos));
+
             for attachment in attachments {
                 // Attachments have ExecutedShellCommand in their value oneof.
                 if let Some(api::attachment::Value::ExecutedShellCommand(cmd)) = &attachment.value {
+                    // Skip if we've already seen this command_id (e.g. from a
+                    // RunShellCommand tool call or a duplicate attachment).
+                    if !cmd.command_id.is_empty()
+                        && !seen_command_ids.insert(cmd.command_id.clone())
+                    {
+                        continue;
+                    }
+                    let start_ts = cmd
+                        .started_ts
+                        .as_ref()
+                        .map(|ts| proto_timestamp_to_local_datetime(ts.seconds, ts.nanos))
+                        .or(msg_ts);
+                    let completed_ts = cmd
+                        .finished_ts
+                        .as_ref()
+                        .map(|ts| proto_timestamp_to_local_datetime(ts.seconds, ts.nanos))
+                        .or(msg_ts);
                     command_blocks.push(CommandBlockInfo {
                         command: cmd.command.clone(),
                         output: cmd.output.clone(),
@@ -3652,6 +3762,8 @@ impl AIConversation {
                         requested_command_action_id: None,
                         subagent_task_id: None,
                         message_id: message_id.clone(),
+                        start_ts,
+                        completed_ts,
                     });
                 }
             }
@@ -3669,6 +3781,22 @@ impl AIConversation {
                 #[allow(deprecated)]
                 for executed_shell_command in &context.executed_shell_commands {
                     if !executed_shell_command.command.is_empty() {
+                        // Skip if we've already seen this command_id.
+                        if !executed_shell_command.command_id.is_empty()
+                            && !seen_command_ids.insert(executed_shell_command.command_id.clone())
+                        {
+                            continue;
+                        }
+                        let start_ts = executed_shell_command
+                            .started_ts
+                            .as_ref()
+                            .map(|ts| proto_timestamp_to_local_datetime(ts.seconds, ts.nanos))
+                            .or(msg_ts);
+                        let completed_ts = executed_shell_command
+                            .finished_ts
+                            .as_ref()
+                            .map(|ts| proto_timestamp_to_local_datetime(ts.seconds, ts.nanos))
+                            .or(msg_ts);
                         command_blocks.push(CommandBlockInfo {
                             command: executed_shell_command.command.clone(),
                             output: executed_shell_command.output.clone(),
@@ -3678,6 +3806,8 @@ impl AIConversation {
                             requested_command_action_id: None,
                             subagent_task_id: None,
                             message_id: message_id.clone(),
+                            start_ts,
+                            completed_ts,
                         });
                     }
                 }
@@ -3685,18 +3815,23 @@ impl AIConversation {
         }
     }
 
-    /// Converts the conversation into a vector of serialized AI and command blocks.
+    /// Converts the conversation into a vector of serialized command blocks.
     /// When we open a new tab to restore a conversation in, we need to precompute this serialized list of blocks
     /// to pass into the TerminalModel constructor since command blocks must be created
     /// before the warp input block to not break bootstrapping.
-    /// Only the command blocks are actually created in the terminal model, but this sequencing is used later in the TerminalView
-    /// to know where to insert AI blocks relative to the command blocks.
+    /// Only the command blocks are actually created in the terminal model. During restoration in the TerminalView,
+    /// AI blocks are inserted relative to the command blocks based on timestamp.
     pub fn to_serialized_blocklist_items(&self) -> Vec<SerializedBlockListItem> {
         let mut serialized_blocks = Vec::new();
         let mut used_cli_snapshot_block_ids = HashSet::new();
 
         // Extract all command blocks from the task messages
         let command_blocks = self.extract_command_blocks();
+        log::info!(
+            "Extracted {} command blocks for conversation {}",
+            command_blocks.len(),
+            self.id()
+        );
 
         // Build a map from message ID to exchange for quick lookup
         let mut message_id_to_exchange: HashMap<&str, &AIAgentExchange> = HashMap::new();
@@ -3707,10 +3842,11 @@ impl AIConversation {
             }
         }
 
-        // Get a fallback exchange for working directory and timestamp (used if message ID not found)
-        let first_exchange = self.root_task_exchanges().next();
-        let fallback_pwd = first_exchange.and_then(|e| e.working_directory.clone());
-        let fallback_time = first_exchange.map(|e| e.start_time).unwrap_or_default();
+        // Get a fallback working directory from the first exchange (used if message ID not found)
+        let fallback_pwd = self
+            .root_task_exchanges()
+            .next()
+            .and_then(|e| e.working_directory.clone());
 
         // Create serialized blocks from the extracted command blocks
         for command_block in command_blocks {
@@ -3733,11 +3869,16 @@ impl AIConversation {
                 continue;
             }
 
-            // Find the exchange that contains this command block's message ID
-            let (pwd, timestamp) = message_id_to_exchange
+
+            // Find the exchange that contains this command block's message ID for PWD and
+            // a fallback timestamp. The exchange start time is used as a last-resort fallback
+            // when proto-level timestamps are unavailable, because `restore_block` treats
+            // `start_ts: None` as "block was never started" and skips `start()`/`finish()`,
+            // which leaves the block in an unfinished state with zero height.
+            let (pwd, exchange_time) = message_id_to_exchange
                 .get(command_block.message_id.as_str())
-                .map(|exchange| (exchange.working_directory.clone(), exchange.start_time))
-                .unwrap_or((fallback_pwd.clone(), fallback_time));
+                .map(|e| (e.working_directory.clone(), Some(e.start_time)))
+                .unwrap_or((fallback_pwd.clone(), None));
 
             // CLI subagent 恢复时序列化可见、只读的 agent 关联元数据；其他块保持原有元数据。
             let ai_metadata = if let Some(subagent_task_id) = command_block.subagent_task_id.clone()
@@ -3772,8 +3913,8 @@ impl AIConversation {
                 node_version: None,
                 exit_code: command_block.exit_code,
                 did_execute: true,
-                start_ts: Some(timestamp),
-                completed_ts: Some(timestamp),
+                start_ts: command_block.start_ts.or(exchange_time),
+                completed_ts: command_block.completed_ts.or(exchange_time),
                 ps1: None,
                 rprompt: None,
                 honor_ps1: false,
