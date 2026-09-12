@@ -62,6 +62,9 @@
 
 ## 2. 执行环境（一次性准备）
 
+> **执行时变更（2026-09-12）**：实际**未新建 worktree**，改在**主 worktree** 执行。原因：新建 worktree 的 `target/` 为空，cargo 需全量重编（额外约 33G 磁盘 + 数十分钟），而主 worktree 当时的未提交改动只有本次的两份 specs 文档——先提交即可满足 cherry-pick 的干净树要求（已提交 `e3cffdf0f`）。其余规约（逐条独立 commit、每批 `cargo check`、冲突取本地、回滚靠 revert）照本计划执行。
+> **磁盘门禁（用户要求）**：每批 `cargo check -p warp` 之前检查可用空间，低于 10G 先清理构建缓存再继续；全程 74G → 67G，未触发。
+
 ```bash
 # 主 worktree 有未提交改动（specs/upstream-merge-history.md），cherry-pick 要求干净工作区 → 独立 worktree
 # 复用上一轮已并入 main 的分支名会歧义，故新建：

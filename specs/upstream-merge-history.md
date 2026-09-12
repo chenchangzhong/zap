@@ -1955,3 +1955,74 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 | ④ 上游最终版 | 是 | `git log a7326f8fe..upstream/master -- cell.rs` = 0 |
 
 路径适配：上游 `crates/warp_terminal/src/model/grid/ansi_handler.rs` → 本地 `app/src/terminal/model/grid/ansi_handler.rs`（未随 `21f413b79` 搬迁）；`cell.rs` 同路径。
+
+### 35.5 执行记录（2026-09-12，已落地）
+
+计划文档：`specs/upstream-merge-plan-2026-09-11.md`（34 项任务 / 36 个上游提交）。
+执行环境：**主 worktree**（未新建 worktree——新 target 需额外 ~33G 与全量重编；主 worktree 的未提交改动只有本文档，先提交即可满足 cherry-pick 的干净树要求）。
+落地 **24 个上游提交**（27 个本地 commit，含 2 个测试适配 commit）。
+
+#### 落地清单（按批次）
+
+| 批次 | 上游提交 | 本地 commit 摘要 |
+|------|----------|------------------|
+| 1 P0 | `a7326f8fe` `92a98662f` `83e270f1d` `ee95ac0fd` `33c3bf6b7` `fbbfc41f3` `53b502c8e` `90c2484dc` `5cd24ed1b` | 宽字符崩溃/空文档崩溃/em_width panic/双光标/丢弃越界/grep 冒号路径/新建窗口可重绑/Alt+1 固定绑定/in-band 警告 |
+| 2 shell | `607be8c26` `0140af045` `294033bb1` `e722ebeda` `17f432027` | bash shell_plugins、zsh compadd -ld、zsh kill-buffer 全 keymap、四个 shell-integration bug、honor PS1 二次展开 |
+| 3 构建 | `ccf683193` `542683634` | 删 12 个孤儿 cargo feature、cosmic-text pin（Hack 不作 fallback donor） |
+| 4 性能 | `d89e78385` `1c925e333` `213c9b32e` `c6609ef23` | styled blocks Arc 化、布局 fan-out 与单行 shaping 上限、SignatureCache miss cache、gitignore matcher 缓存 |
+| 5 功能 | `3a7a4a5b3` `79a9cb721` `d15645c77` `3a6f05512` | 空 category 头、completer 选项参数按值位置、AgentSource::Orchestration、AI plan 文档延迟布局 |
+
+#### 未落地（12 个上游提交，逐条原因）
+
+| 上游 | 原因 |
+|------|------|
+| `511b952c2` | **前置不成立**：本地 `warp_multi_agent_api` 走 `zerx-lab/warp-proto-apis` fork（rev `14ab9a71`），上游该提交的 `supports_create_file_overwrite` 在 `warpdotdev/warp-proto-apis` 自有 rev 上 |
+| `092c1dce9` | 10 hunk 冲突（code editor / notebooks / pane_group / editor viewport） |
+| `8b88df987`+`40e397170` | 26 hunk 冲突，落在本地自研 tab / vertical_tabs 体系 |
+| `c25ac4070`+`18179177a` | 14 hunk 冲突（17 文件，含 `warpui_core` 事件层） |
+| `b7ec0fc55` | 10 hunk 冲突（含本地不存在的 `terminal/view/context_menu.rs`） |
+| `5e7030db7` | 7 hunk 冲突，且上游该提交混有 `warp_multi_agent_api` 解耦改动 |
+| `4b894db80` | 7 hunk 冲突；且属编译期优化，与本地 serde Content 结构分叉 |
+| `0a0fd3ae1` | 4 hunk 冲突，本地 `terminal/view.rs::context_menu_items` 已分叉需手工重写菜单构造 |
+| `4cd1c77c4` | 落点在 Zap 自研 CLI agent footer 区（决策表「取本地」），且依赖本地不存在的 `server/telemetry/events.rs` |
+| `142b87102` | 13 hunk 冲突跨 6 文件，含自研 footer 与 `terminal/view.rs` 定制区，且依赖 shared-session 的 `file_attach_allowed_for_shared_session` |
+
+#### 关键适配点（本地能力差异）
+
+1. **cell 内嵌超链接本地不存在**（`a7326f8fe`）：上游 `write_wide_char` 调用 `Cell::hyperlink_id()`/`set_hyperlink_id()`，本地 `CellExtra` 只有 `cell_with_zero_width`/`end_of_prompt` → 去掉超链接中转，其余逻辑照搬。同时 `push_zerowidth` 改返回 `bool` 后，`flat_storage/{row_iterator,testing}.rs` 的闭包必须加块体（上游同 commit 已改，先前误判为「纯格式化」）。
+2. **edition 2021 无 let-chain**：`e722ebeda`（pty_controller）、`213c9b32e`（miss_cache）两处 `if let … && let …` 改嵌套 if（§34 同款教训）。
+3. **`EditDelta::precise_deltas` 本地早已 Arc 化**（§34 #15810），故 `d89e78385` 的 `new_lines` Arc 化只影响一半；本地渲染队列是自研「300 行/帧分块懒布局」，该路径改 `Arc::unwrap_or_clone`。
+4. **本地 layout 管线与上游分叉**：`1c925e333` 的 chunk 化要嵌进本地 Step1–Step4 + `collect/build/parallel/fold` 计时结构；`layout.rs` 已走 `layout_text_uncached`（§34），故把上游的 `truncate_text_for_layout`/`clamp_style_runs_for_layout` 接到 uncached 调用。
+5. **本地无 standing_queries / repo_watch_filter / force_included_paths**：`c6609ef23` 只取 repo_metadata 侧；`Entry::load` 保持同步（本地调用方为同步函数，函数体无 await）；`compute_file_tree_mutations` 保持一元返回。
+6. **ai_document/notebook 的 orchestration 与 mermaid 依赖本地缺失**：`3a6f05512` 只取 `LayoutTiming`/`new_unbound_lazy`/`will_auto_open`，剔除 `DirtyOrchestrationEvent`、`set_default_mermaid_display_mode`、`sync_mermaid_render_offsets`、`is_rendered_mermaid`。
+7. **测试文件命名差异**：本地 `cell_test.rs`/`registry_test.rs`/`layout`（新增）/`*_tests.rs` 混用；上游 `mod_tests.rs`、`view_tests.rs`、`buffer_tests.rs`、`task_tests.rs` 等本地不存在 → 一律只移生产代码，上游新增的独立测试文件（`miss_cache_tests.rs`、`gitignore_cache_tests.rs`、`layout_tests.rs`）则保留（需把 `warpui_core::` 适配为本地 `warpui::`）。
+
+#### 本地测试适配（Arc 化的连带改动）
+
+`EditDelta::new_lines` Arc 化 + `Gitignore` Arc 化打破了本地既有测试文件：
+
+- `crates/editor/src/content/buffer_test.rs`：97 处断言改 `*delta.new_lines` / `*edit_delta.new_lines`
+- `crates/editor/src/content/edit_tests.rs`：`layout_text_block`/`layout_mermaid_diagram_block`/`layout_table_block` 传 `&block`（上游签名改为引用）
+- `crates/repo_metadata/src/entry_test.rs`、`local_model_test.rs`：`gitignores` 容器改 `Vec<Arc<Gitignore>>`
+
+#### 验证状态（2026-09-12）
+
+| 项 | 结果 |
+|----|------|
+| `cargo check -p warp` | 每批均 0 error（批次 1 首次失败 2 处：cell.rs `hyperlink_id` 字段 + 闭包块体；修正后通过） |
+| `cargo test -p warp_editor` | 456 过 / 10 败——**与基线（batch4 前 `6beea36c7`：449 过 / 10 败）失败集完全一致**，新增 7 个通过（layout_tests） |
+| `cargo test -p warp_completer` | 125 过 / 26 败——与基线（121 过 / 26 败）失败集一致，新增 4 个通过（miss_cache_tests） |
+| `cargo test -p repo_metadata` | 55 过 / 0 败 |
+| `cargo test -p warpui text_layout` | 33/33（cosmic-text pin 后） |
+| bash/zsh 脚本 | `bash -n` / `zsh -n` 全部通过 |
+| 磁盘门禁（用户要求） | 每批 `cargo check` 前检查，全程 74G → 67G，未触发 10G 清理线 |
+
+#### 本轮教训
+
+1. **`git apply --3way --check` 返回 0 不代表干净**：它只保证能产出一个「可含冲突标记」的结果——本轮据此误判多次，后续一律以「实际 apply 后扫 `<<<<<<<`」为准。
+2. **`git apply` 是事务性的**：只要有一个目标文件不存在（上游测试文件本地常缺），**整个 patch 全部回滚**。必须显式列出「本地存在的文件」再应用，或先 `git status` 确认真的落地。
+3. **`git apply … | tail` 会吞掉退出码**：本轮因此把带冲突标记的 `bash_body.sh` 提交进历史（随后 `git reset --hard` 重做）。同类风险还有 `cargo check 2>&1 | tail`——退出码取自 tail；应改用 `echo "EXIT=${PIPESTATUS[0]}"`。
+4. **`git checkout <旧commit> -- <目录>` 会连带冲掉未提交的同目录改动**：本轮做基线对比时把已改好的 `buffer_test.rs`/`edit_tests.rs` 适配冲掉，只能重做。基线对比更安全的做法是先提交当前状态，或用独立 worktree。
+5. **基线对比是判定「测试失败是否既存」的唯一可靠手段**：本轮两处失败集（10 / 26）都是既存环境干扰，靠 `git checkout` 回基线同跑才敢下结论。
+6. **上游大提交常把「目标特性的依赖」一并带上**：`a7326f8fe` 的 `write_wide_char` 混入超链接中转、`5e7030db7` 混入 multi-agent API 解耦、`3a6f05512` 混入 orchestration/mermaid——移植时必须逐 hunk 判断「这是本特性的必要部分，还是顺路带上的其他特性」。
+

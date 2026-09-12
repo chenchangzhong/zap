@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- **上游同步（2026-09-12）**:2026-08-14 → `4143c09ff`（上游 master 2026-09-11）区间同步,落地 24 个上游提交——崩溃/真实 bug:宽字符提升崩溃(#15763)、空流式 Agent 文档崩溃(#15720)、glyph 无包围盒 em_width panic(#15705)、已结束后台块双光标(#15322)、重复确认丢弃文件越界(#15884)、grep 含冒号路径 ParseIntError(#15422)、「新建窗口」可重绑(#15771)、移除不可重绑的 Alt+1 固定绑定(#15310)、静默 in-band 重置警告(#15779);shell 集成:bash 丢 shell_plugins(#15518)、zsh compadd 丢 `-ld` 描述(#15313)、zsh kill-buffer 绑定全部 keymap 修 bootstrap 残留回显(#15118)、四个 shell-integration bug(#15428)、honor PS1 二次展开(#15792);构建:删除 12 个孤儿 cargo feature(#15694)、cosmic-text pin 禁止 Hack 作 fallback donor(#15569);性能:大文件加载不再整份克隆 styled blocks(#13508)、布局 fan-out 与单行 shaping 上限(#15128)、SignatureCache 有界 miss 缓存(#15181)、gitignore matcher 共享缓存(#15240);功能:首次搜索前不绘制空 category 标题(#15376)、completer 选项参数按值位置解析(#15475)、AgentSource 增加 Orchestration 变体(#15164)、AI plan 文档编辑器延迟布局(#15579)。另有 12 个上游提交记为「本轮不做」(冲突规模/前置不成立,详见 `specs/upstream-merge-history.md` §35.5)
+
 - **上游同步（2026-09-06）**:两个上游开放 PR 批次拣入 15 项——warp 上游:CoreText autorelease 排水(#15746)、bash 首个 precmd 丢失死锁(#15652)、终端 resize 每行深拷贝(#15751)、macOS History/Up 菜单 Circular update 崩溃(#15719)、APFS case-only rename 文件树残留(#15699)、AppContext 订阅泄漏(#15764)、连续 ViewNotification 去重(#15741)、EditDelta precise_deltas Arc 化(#15810)、Code editor 文件读 100MiB 守卫(#15835)、编辑器文本绕过 LayoutCache(#15831)、rich input 打开时光标下字形丢失(#15724)、启动 block 恢复 SQL LIMIT(#15757,新增 blocks_restore_order 索引迁移)、后台 pane SSH 提示不再抢焦点(#15670);zerx 上游:BYOP 模型名 `-max` 后缀被剥修复(#338)、硬编码中文接入 Fluent(#339,新增 91 key)
 
 - **AI / BYOP**:port opencode `applyCaching`,启用 prompt caching;`write_to_long_running_shell_command` 在 line 模式下拒绝嵌入 LF;BYOP LRC monitor fallback 改走 silent subtask;`cancel_execution` 50ms 窗口内 sender 泄漏修复(#134 follow-up,#137)
