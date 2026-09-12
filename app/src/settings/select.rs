@@ -34,10 +34,11 @@ pub enum RightClickBehavior {
 }
 
 impl RightClickBehavior {
-    pub fn as_dropdown_label(&self) -> &str {
+    /// 下拉项文案，跟随界面语言（同 `settings/ai.rs::command_palette_description` 的本地化模式）。
+    pub fn as_dropdown_label(&self) -> String {
         match self {
-            Self::ContextMenu => "Open the context menu",
-            Self::Paste => "Paste from the clipboard",
+            Self::ContextMenu => crate::t!("settings-features-right-click-behavior-context-menu"),
+            Self::Paste => crate::t!("settings-features-right-click-behavior-paste"),
         }
     }
 }

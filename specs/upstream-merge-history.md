@@ -2091,7 +2091,7 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 | 右键面（6 处） | 块列表、alt screen、输入行、CLI agent rich input、prompt 区 ×2、输入下方空区块 |
 | 块列表额外语义 | 运行中的全屏程序接管鼠标（`should_intercept_mouse` 为假）时，把原始右键经 `AltMouseAction` 转发给它——与左键 down/up/drag、滚轮同条件（上游同语义，本地此前无） |
 | 设置页 | Feature 页加 `RightClickBehaviorWidget`（Dropdown，`editor_widgets` 内紧随中键粘贴）+ `SelectionSettings` 变更订阅 + 动作/遥测臂 |
-| i18n | `settings-features-right-click-behavior-{label,hint}`（en/zh-CN）；下拉项文案沿用本地 `as_dropdown_label()` 硬编码英文惯例 |
+| i18n | `settings-features-right-click-behavior-{label,hint}`（en/zh-CN）；下拉项文案**已中文化**：`RightClickBehavior::as_dropdown_label()` 改用 `crate::t!`（key `…-context-menu` / `…-paste`，模式同 `settings/ai.rs::command_palette_description`）。注：`settings/mod.rs` 里更早的 `CtrlTabBehavior`/`GlobalHotkeyMode` 下拉项仍是硬编码英文，属既存状态，未在本轮一并处理 |
 
 ### 37.2 适配要点（本地差异）
 
