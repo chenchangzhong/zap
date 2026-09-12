@@ -14,7 +14,7 @@ pub use view::TerminalView;
 pub use warp_terminal::shell::{self, ShellLaunchData};
 use warpui::geometry::vector::Vector2F;
 use warpui::units::{IntoPixels, Lines, Pixels};
-use warpui::AppContext;
+use warpui::{AppContext, SingletonEntity};
 use warpui::WindowId;
 pub use {history::History, history::HistoryEntry, history::HistoryEvent, history::ShellHost};
 mod block_list_settings;
@@ -124,6 +124,12 @@ pub const PTY_READS_BROADCAST_CHANNEL_SIZE: usize = 1024;
 pub fn init(app: &mut AppContext) {
     // Zap:删除 share_block_modal::init
     view::init(app);
+}
+
+/// 终端里裸右键是否应当直接粘贴：设置开启且未按 Shift 时粘贴；Shift+右键始终保留上下文菜单。
+/// 供块列表、alt screen、输入行三处右键处理共用。
+pub fn should_right_click_paste(shift: bool, ctx: &AppContext) -> bool {
+    !shift && crate::settings::SelectionSettings::as_ref(ctx).right_click_pastes()
 }
 
 /// Treat rounding errors for heights within this amount as equal.

@@ -310,6 +310,7 @@ use super::{
         session::{Session, SessionId, SessionType, Sessions},
     },
     prompt,
+    should_right_click_paste,
     prompt_render_helper::{
         should_render_prompt_on_same_line, should_render_prompt_using_editor_decorator_elements,
         PromptRenderHelper, SameLinePromptElements,
@@ -13700,7 +13701,12 @@ impl Input {
         let input_editor_save_position_id = self.editor_save_position_id();
         SavePosition::new(
             EventHandler::new(input_box)
-                .on_right_mouse_down(move |ctx, _, position| {
+                .on_right_mouse_down(move |ctx, app, position, modifiers| {
+                    if should_right_click_paste(modifiers.shift, app) {
+                        // 与 `terminal:paste` 键位同一条路径，转义路径与 CLI agent 图片处理行为一致。
+                        ctx.dispatch_typed_action(TerminalAction::Paste);
+                        return DispatchEventResult::StopPropagation;
+                    }
                     let input_rect = ctx
                         .element_position_by_id(input_editor_save_position_id.clone())
                         .expect("input editor position id should be saved");

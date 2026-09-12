@@ -75,6 +75,7 @@ use crate::view_components::action_button::{ActionButton, ButtonSize, KeystrokeS
 use use_agent_footer::UseAgentToolbar;
 
 use super::cli_agent;
+use super::should_right_click_paste;
 use super::CLIAgent;
 #[cfg(feature = "local_fs")]
 use crate::ai::agent::{CurrentHead, DiffBase};
@@ -22686,7 +22687,11 @@ impl TerminalView {
             SavePosition::new(
                 EventHandler::new(child)
                     .on_right_mouse_down(
-                        enclose!((position_id, input_position_id) move |ctx, _app, position | {
+                        enclose!((position_id, input_position_id) move |ctx, app, position, modifiers| {
+                                if should_right_click_paste(modifiers.shift, app) {
+                                    ctx.dispatch_typed_action(TerminalAction::Paste);
+                                    return DispatchEventResult::StopPropagation;
+                                }
                                 if let Some(position_in_terminal_view) = offset_position_outside_block(
                                     position,
                                     &position_id,

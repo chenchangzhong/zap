@@ -1,10 +1,46 @@
 use std::ops::Not;
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use warpui::{clipboard::ClipboardContent, AppContext};
 
 use settings::{
     macros::define_settings_group, RespectUserSyncSetting, Setting, SupportedPlatforms, SyncToCloud,
 };
+
+/// 终端里裸右键（不按修饰键）的行为。
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "What a bare right-click does in the terminal.",
+    rename_all = "snake_case"
+)]
+pub enum RightClickBehavior {
+    #[default]
+    /// 右键打开上下文菜单。
+    ContextMenu,
+    /// 右键从剪贴板粘贴；按住 Shift 右键仍打开上下文菜单。
+    Paste,
+}
+
+impl RightClickBehavior {
+    pub fn as_dropdown_label(&self) -> &str {
+        match self {
+            Self::ContextMenu => "Open the context menu",
+            Self::Paste => "Paste from the clipboard",
+        }
+    }
+}
 
 define_settings_group!(SelectionSettings, settings: [
     copy_on_select: CopyOnSelect {
@@ -36,12 +72,26 @@ define_settings_group!(SelectionSettings, settings: [
         private: false,
         toml_path: "terminal.input.middle_click_paste_enabled",
         description: "Whether middle-click pastes from the clipboard.",
+    },
+    right_click_behavior: RightClickBehaviorSetting {
+        type: RightClickBehavior,
+        default: RightClickBehavior::ContextMenu,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "terminal.input.right_click_behavior",
+        description: "What a bare right-click does in the terminal.",
     }
 ]);
 
 impl SelectionSettings {
     pub fn copy_on_select_enabled(&self) -> bool {
         *self.copy_on_select.value()
+    }
+
+    /// 终端裸右键是否直接粘贴（否则打开上下文菜单）。
+    pub fn right_click_pastes(&self) -> bool {
+        *self.right_click_behavior.value() == RightClickBehavior::Paste
     }
 
     /// Returns whether honoring the Linux primary selection clipboard is enabled. On non-linux

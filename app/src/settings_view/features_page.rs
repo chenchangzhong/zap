@@ -49,8 +49,10 @@ use crate::settings::{
     ErrorUnderliningEnabled, ExtraMetaKeys,
     GPUSettings, GlobalHotkeyMode, InputSettings, InputSettingsChangedEvent,
     LinuxSelectionClipboard, MiddleClickPasteEnabled, MouseScrollMultiplier, PreferLowPowerGPU,
+    RightClickBehavior, RightClickBehaviorSetting,
     PreferencesSettings, PreferredGraphicsBackend, QuakeModeSettings, ScrollSettings,
-    SelectionSettings, ShowAutosuggestionIgnoreButton, ShowTerminalInputMessageBar, SshSettings,
+    SelectionSettings, SelectionSettingsChangedEvent, ShowAutosuggestionIgnoreButton,
+    ShowTerminalInputMessageBar, SshSettings,
     SyntaxHighlighting, TabBehavior, VimModeEnabled, VimStatusBar, VimUnnamedSystemClipboard,
     DEFAULT_QUAKE_MODE_SIZE_PERCENTAGES, QUAKE_WINDOW_AUTOHIDE_SUPPORTED,
 };
@@ -702,6 +704,7 @@ pub enum FeaturesPageAction {
     SetGlobalHotkeyMode(GlobalHotkeyMode),
     SetTabBehavior(TabBehavior),
     SetCtrlTabBehavior(CtrlTabBehavior),
+    SetRightClickBehavior(RightClickBehavior),
     SetPreferredGraphicsBackend(Option<GraphicsBackend>),
     SetNewTabPlacement(NewTabPlacement),
     SetDefaultSessionMode(DefaultSessionMode),
@@ -1109,6 +1112,10 @@ impl FeaturesPageAction {
                 action: "SetCtrlTabBehavior".to_string(),
                 value: format!("{ctrl_tab_behavior:?}"),
             },
+            Self::SetRightClickBehavior(right_click_behavior) => TelemetryEvent::FeaturesPageAction {
+                action: "SetRightClickBehavior".to_string(),
+                value: format!("{right_click_behavior:?}"),
+            },
             Self::SetNewTabPlacement(new_tab_placement) => TelemetryEvent::FeaturesPageAction {
                 action: "SetNewTabPlacement".to_string(),
                 value: format!("{new_tab_placement:?}"),
@@ -1263,6 +1270,7 @@ pub struct FeaturesPageView {
 
     button_mouse_states: MouseStateHandles,
     ctrl_tab_behavior_dropdown: ViewHandle<Dropdown<FeaturesPageAction>>,
+    right_click_behavior_dropdown: ViewHandle<Dropdown<FeaturesPageAction>>,
 
     global_hotkey_dropdown: ViewHandle<Dropdown<FeaturesPageAction>>,
     activation_hotkey_keybinding_editor_state: KeybindingEditorState,
@@ -1335,6 +1343,15 @@ impl TypedActionView for FeaturesPageView {
             ToggleCopyOnSelect => {
                 SelectionSettings::handle(ctx).update(ctx, |selection_settings, ctx| {
                     report_if_error!(selection_settings.copy_on_select.toggle_and_save_value(ctx));
+                });
+            }
+            SetRightClickBehavior(right_click_behavior) => {
+                SelectionSettings::handle(ctx).update(ctx, |selection_settings, ctx| {
+                    report_if_error!(
+                        selection_settings
+                            .right_click_behavior
+                            .set_value(*right_click_behavior, ctx)
+                    );
                 });
             }
             ToggleSnackbar => {
@@ -2225,6 +2242,19 @@ impl FeaturesPageView {
         let ctrl_tab_behavior_dropdown = ctx.add_typed_action_view(Dropdown::new);
         Self::update_ctrl_tab_behavior_dropdown(ctrl_tab_behavior_dropdown.clone(), ctx);
 
+        let right_click_behavior_dropdown = ctx.add_typed_action_view(Dropdown::new);
+        Self::update_right_click_behavior_dropdown(right_click_behavior_dropdown.clone(), ctx);
+
+        ctx.subscribe_to_model(&SelectionSettings::handle(ctx), |me, _, event, ctx| {
+            if let SelectionSettingsChangedEvent::RightClickBehaviorSetting { .. } = event {
+                Self::update_right_click_behavior_dropdown(
+                    me.right_click_behavior_dropdown.clone(),
+                    ctx,
+                );
+            }
+            ctx.notify();
+        });
+
         ctx.subscribe_to_model(&KeysSettings::handle(ctx), |me, _, event, ctx| {
             if matches!(
                 event,
@@ -2460,6 +2490,7 @@ impl FeaturesPageView {
 
             tab_behavior_dropdown,
             ctrl_tab_behavior_dropdown,
+            right_click_behavior_dropdown,
             graphics_backend_dropdown,
             new_tab_placement_dropdown,
             default_session_mode_dropdown,
@@ -2677,6 +2708,13 @@ impl FeaturesPageView {
             editor_widgets.push(Box::new(MiddleClickPasteWidget::default()));
         }
 
+        if selection_settings
+            .right_click_behavior
+            .is_supported_on_current_platform()
+        {
+            editor_widgets.push(Box::new(RightClickBehaviorWidget::default()));
+        }
+
         editor_widgets.push(Box::new(AutosuggestionKeybindingHintWidget::default()));
 
         if FeatureFlag::AllowIgnoringInputSuggestions.is_enabled() {
@@ -2853,6 +2891,41 @@ impl FeaturesPageView {
                         DropdownItem::new(
                             val.as_dropdown_label(),
                             FeaturesPageAction::SetCtrlTabBehavior(val),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown.set_selected_by_index(selected_index, ctx);
+        });
+    }
+
+    fn update_right_click_behavior_dropdown(
+        dropdown: ViewHandle<Dropdown<FeaturesPageAction>>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        dropdown.update(ctx, |dropdown, ctx| {
+            let values = vec![RightClickBehavior::ContextMenu, RightClickBehavior::Paste];
+
+            let current_value = *SelectionSettings::as_ref(ctx).right_click_behavior;
+
+            let selected_index = values
+                .iter()
+                .position(|val| *val == current_value)
+                .unwrap_or_else(|| {
+                    log::error!(
+                        "Could not find current right-click behavior value in dropdown option list"
+                    );
+                    0
+                });
+
+            dropdown.set_items(
+                values
+                    .into_iter()
+                    .map(|val| {
+                        DropdownItem::new(
+                            val.as_dropdown_label(),
+                            FeaturesPageAction::SetRightClickBehavior(val),
                         )
                     })
                     .collect(),
@@ -5759,6 +5832,55 @@ impl SettingsWidget for MiddleClickPasteWidget {
                 .finish(),
             None,
         )
+    }
+}
+
+#[derive(Default)]
+struct RightClickBehaviorWidget {}
+
+impl SettingsWidget for RightClickBehaviorWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "right click behavior context menu paste clipboard"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let mut column = Flex::column();
+        let selection_settings = SelectionSettings::as_ref(app);
+        // 设为粘贴后，裸右键不再弹菜单；此处提示 Shift+右键仍可打开，否则该操作无从发现。
+        let paste_hint = crate::t!("settings-features-right-click-behavior-hint");
+        add_setting(
+            &mut column,
+            &selection_settings.right_click_behavior,
+            || {
+                render_dropdown_item(
+                    appearance,
+                    &crate::t!("settings-features-right-click-behavior-label"),
+                    selection_settings
+                        .right_click_pastes()
+                        .then_some(paste_hint.as_str()),
+                    None,
+                    LocalOnlyIconState::for_setting(
+                        RightClickBehaviorSetting::storage_key(),
+                        RightClickBehaviorSetting::sync_to_cloud(),
+                        &mut view
+                            .button_mouse_states
+                            .local_only_icon_tooltip_states
+                            .borrow_mut(),
+                        app,
+                    ),
+                    None,
+                    &view.right_click_behavior_dropdown,
+                )
+            },
+        );
+        column.finish()
     }
 }
 
