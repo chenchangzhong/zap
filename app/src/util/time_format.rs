@@ -1,9 +1,17 @@
 use chrono::{DateTime, Duration, Local, Utc};
 use std::ops::Sub;
 
-/// 消息时间戳展示格式（如 `9/12 at 3:04 PM`）。
+/// 消息时间戳展示格式，跟随界面语言：中文用 24 小时制且不带英文介词，
+/// 其它语言沿用上游的 `9/12 at 3:04 PM` 形态。
 pub fn format_message_timestamp(datetime: &DateTime<Local>) -> String {
-    datetime.format("%-m/%-d at %-I:%M %p").to_string()
+    let prefers_chinese = crate::i18n::current_languages()
+        .first()
+        .is_some_and(|language| language.to_string().starts_with("zh"));
+    if prefers_chinese {
+        datetime.format("%-m月%-d日 %H:%M").to_string()
+    } else {
+        datetime.format("%-m/%-d at %-I:%M %p").to_string()
+    }
 }
 
 /// 过滤服务端未提供时间戳时反序列化出的默认值（epoch）。
