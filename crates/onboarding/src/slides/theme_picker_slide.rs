@@ -46,7 +46,7 @@ struct ThemeOption {
 
 pub struct ThemePickerSlide {
     onboarding_state: ModelHandle<OnboardingStateModel>,
-    theme_options: [ThemeOption; 4],
+    theme_options: [ThemeOption; 2],
     selected_theme_index: usize,
     sync_with_os: bool,
     sync_with_os_mouse: MouseStateHandle,
@@ -57,7 +57,7 @@ pub struct ThemePickerSlide {
 
 impl ThemePickerSlide {
     pub(crate) fn new(
-        themes: [WarpTheme; 4],
+        themes: [WarpTheme; 2],
         onboarding_state: ModelHandle<OnboardingStateModel>,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
@@ -416,23 +416,15 @@ impl ThemePickerSlide {
     /// All onboarding image paths used by the theme picker slide visual.
     pub(crate) const VISUAL_IMAGE_PATHS: &'static [&'static str] = &[
         // Terminal intention
-        "async/png/onboarding/terminal_intention/theme/theme_phenomenon_vertical.png",
-        "async/png/onboarding/terminal_intention/theme/theme_phenomenon_horizontal.png",
         "async/png/onboarding/terminal_intention/theme/theme_dark_vertical.png",
         "async/png/onboarding/terminal_intention/theme/theme_dark_horizontal.png",
         "async/png/onboarding/terminal_intention/theme/theme_light_vertical.png",
         "async/png/onboarding/terminal_intention/theme/theme_light_horizontal.png",
-        "async/png/onboarding/terminal_intention/theme/theme_adeberry_vertical.png",
-        "async/png/onboarding/terminal_intention/theme/theme_adeberry_horizontal.png",
         // Agent intention
-        "async/png/onboarding/agent_intention/theme/theme_phenomenon_vertical.png",
-        "async/png/onboarding/agent_intention/theme/theme_phenomenon_horizontal.png",
         "async/png/onboarding/agent_intention/theme/theme_dark_vertical.png",
         "async/png/onboarding/agent_intention/theme/theme_dark_horizontal.png",
         "async/png/onboarding/agent_intention/theme/theme_light_vertical.png",
         "async/png/onboarding/agent_intention/theme/theme_light_horizontal.png",
-        "async/png/onboarding/agent_intention/theme/theme_adeberry_vertical.png",
-        "async/png/onboarding/agent_intention/theme/theme_adeberry_horizontal.png",
     ];
 
     fn theme_visual_path(&self, app: &AppContext) -> &'static str {
@@ -444,10 +436,8 @@ impl ThemePickerSlide {
         };
         let theme_name = self.theme_display_name(self.selected_theme_index);
         let name_key = match theme_name.as_str() {
-            "Phenomenon" => "phenomenon",
             "Dark" => "dark",
             "Light" => "light",
-            "Adeberry" => "adeberry",
             _ => "dark",
         };
         let orientation = if vertical { "vertical" } else { "horizontal" };

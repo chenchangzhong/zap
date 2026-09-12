@@ -529,6 +529,19 @@ fn vscode_2026_dark_registered_in_default_config() {
     assert_eq!(theme.unwrap().name(), Some("VS Code 2026 Dark".to_string()));
 }
 
+/// 验证默认配置仅保留 Dark / Light / VS Code 2026 Dark 三个内置主题。
+#[test]
+fn default_config_only_contains_three_built_in_themes() {
+    let config = WarpThemeConfig::default();
+    let mut names: Vec<String> = config
+        .theme_map
+        .values()
+        .filter_map(|theme| theme.name())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Dark", "Light", "VS Code 2026 Dark"]);
+}
+
 /// 验证 ThemeKind::VsCode2026Dark 的 Display 输出。
 #[test]
 fn vscode_2026_dark_display_name() {
