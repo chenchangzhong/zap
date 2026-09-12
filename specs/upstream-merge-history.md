@@ -2073,4 +2073,47 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 3. **依赖类改动先比 fork/rev，再看本仓 diff**：本地 `warp-proto-apis` 是自有 fork，只对比本仓源码会得出完全错误的可行性结论（§36.3）。
 4. **import 冲突别硬合上游 blob**：上游常把分组 import 拆成单行 import，本地风格相反；此时保留本地、让编译器报缺哪个符号再补，比合并 import 块可靠得多（本轮 query.rs / block.rs / model_impl.rs 均用此法）。
 
+---
+
+## 37. P3-a 落地：右键行为设置（2026-09-12 续）
+
+> 上游 `c25ac4070`（#15365，右键行为设置）+ `18179177a`（#15392，Shift+右键提示）。§36.2 曾判「值得但属 1–2 天独立项目」，用户决定继续后一次落地，20 文件 +387/−77（上游同版本为 975 行，差额主要是上游 555 行 `view_tests.rs` 测试）。
+
+### 37.1 实现结构
+
+| 层 | 改动 |
+|---|---|
+| 设置 | `SelectionSettings::right_click_behavior`（`RightClickBehavior::{ContextMenu 默认, Paste}`，toml `terminal.input.right_click_behavior`，enum 而非 bool，便于将来加 "Quick Edit"）+ `right_click_pastes()` |
+| 判定 | `app/src/terminal/mod.rs::should_right_click_paste(shift, ctx) = !shift && 设置开启`，块列表 / alt screen / 输入行三处共用 |
+| 框架 | `warpui_core::EventHandler::on_right_mouse_down` 回调增加 `&ModifiersState`：新增 `HandlerWithModifiers` 与 `dispatch_callback_with_modifiers`，事件分支从 `Event::RightMouseDown { cmd, shift, .. }` 组装 `ModifiersState` |
+| 右键面（6 处） | 块列表、alt screen、输入行、CLI agent rich input、prompt 区 ×2、输入下方空区块 |
+| 块列表额外语义 | 运行中的全屏程序接管鼠标（`should_intercept_mouse` 为假）时，把原始右键经 `AltMouseAction` 转发给它——与左键 down/up/drag、滚轮同条件（上游同语义，本地此前无） |
+| 设置页 | Feature 页加 `RightClickBehaviorWidget`（Dropdown，`editor_widgets` 内紧随中键粘贴）+ `SelectionSettings` 变更订阅 + 动作/遥测臂 |
+| i18n | `settings-features-right-click-behavior-{label,hint}`（en/zh-CN）；下拉项文案沿用本地 `as_dropdown_label()` 硬编码英文惯例 |
+
+### 37.2 适配要点（本地差异）
+
+1. **不跟随上游的 `ScrollHandler` 改名与 `&Vector2F → Vector2F`**：上游顺手把 scroll 回调签名也改了，会牵动全部 `on_scroll_wheel` 调用点；本地只改右键所需部分。
+2. **let-chain 改嵌套 if**（edition 2021）：`event_handler.rs` 的分支用 `dispatch_callback_with_modifiers` 承载，避免 let-chain。
+3. **保留本地 `dispatch_callback`**：仅新增带修饰键的变体，不动既有回调路径（首次改写误将其重命名，编译器立刻报 3 处 `mouse_in/mouse_out/mouse_dragged` 缺方法，已恢复）。
+4. **设置页沿用本地模式**：以 `CtrlTabBehavior` 那套（Dropdown + `update_*_dropdown` + `SettingsWidget` + `add_setting`/`render_dropdown_item`）为模板；标签走 Fluent（`crate::t!`），下拉项文案走 `as_dropdown_label()`（本地 `settings/mod.rs` 既有惯例）。
+5. **测试未带**：上游 555 行 `app/src/terminal/view_tests.rs` 本地为单数命名（`view_test.rs`）且结构不同，未直接移植；本项验证依赖编译 + 「点一次」的手动确认。
+
+### 37.3 验证状态（2026-09-12）
+
+| 项 | 结果 |
+|---|---|
+| `cargo check -p warp` | 0 error |
+| `cargo test -p warpui_core` | 290 过 / 0 败（事件层改动无回归） |
+| `cargo test -p warp --lib settings_view` | 19 过 / 0 败 |
+| 测试目标编译 | `cargo test -p warp --lib --no-run`、`-p warpui_core --no-run` 均通过 |
+| 手动确认（待用户执行） | 设置 → Features → 右键行为切到「Paste from the clipboard」后：终端内裸右键直接粘贴；Shift+右键仍弹菜单；全屏程序（如 vim/htop 开鼠标上报）里右键仍转发给程序 |
+
+### 37.4 本轮教训
+
+1. **批量正则替换必须限定「行内上下文」**：本轮用 `re.sub` 全局替换 `|ctx, _, position|`，不仅把 `on_click` / `on_left_mouse_down` / `on_right_click` 的回调一起改坏，还把正则里的 `\|` 反向转义写进了源码（`\|ctx, _, _\, _|`）。正确做法：先按「同一行含 `on_right_mouse_down(`」筛行，再做纯字符串替换。改完必须 `git diff -U0` 逐行复核，而不是只看替换计数。
+2. **上游「顺手改签名」的部分要主动剥离**：`ScrollHandler` 的 `&Vector2F → Vector2F` 与本特性无关，跟随会放大改动面（§36.4 第 2 条的同一形态）。
+3. **改动事件层后必须跑测试目标编译**：`cargo check -p warp` 只查 lib；`warpui_core` 的 `event_handler_test.rs` 与测试目标里的回调签名要单独 `--no-run` 确认（本轮两者都通过，但这是运气，不是流程）。
+
+
 

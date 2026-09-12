@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+- **上游同步追加（2026-09-12 三波）**:新增「右键行为」设置(#15365)——终端裸右键可选「打开上下文菜单」(默认)或「直接从剪贴板粘贴」,粘贴模式按住 Shift 右键仍打开菜单(并显示该提示 #15392);块列表、alt screen、输入行等 6 处右键面统一接入,鼠标被运行中全屏程序接管时仍转发原始右键
+
+
 - **上游同步追加（2026-09-12 续）**:二次裁决后再落地 3 项——块列表右键菜单新增「粘贴」(#15346)、切换 markdown Raw/Rendered 保持滚动位置(#13967,editor 新增 `ScrollPosition::Fraction` + 延迟到 element layout 的 `ScrollToFraction`)、Agent Mode 用户提问显示时间戳并支持复制(#15605)。其余候选终局:右键行为设置(菜单/直接粘贴 #15365)缓做;原生 agent File explorer chip / Attach file 调色板命令 / 模型名提示 / 按住修饰键 tab 快捷键提示 / 编译期 serde 优化 不做;`create_file allow_overwrite` 因本地不发 proto `Request` 而不适用(详见 `specs/upstream-merge-history.md` §36)
 
 - **上游同步（2026-09-12）**:2026-08-14 → `4143c09ff`（上游 master 2026-09-11）区间同步,落地 24 个上游提交——崩溃/真实 bug:宽字符提升崩溃(#15763)、空流式 Agent 文档崩溃(#15720)、glyph 无包围盒 em_width panic(#15705)、已结束后台块双光标(#15322)、重复确认丢弃文件越界(#15884)、grep 含冒号路径 ParseIntError(#15422)、「新建窗口」可重绑(#15771)、移除不可重绑的 Alt+1 固定绑定(#15310)、静默 in-band 重置警告(#15779);shell 集成:bash 丢 shell_plugins(#15518)、zsh compadd 丢 `-ld` 描述(#15313)、zsh kill-buffer 绑定全部 keymap 修 bootstrap 残留回显(#15118)、四个 shell-integration bug(#15428)、honor PS1 二次展开(#15792);构建:删除 12 个孤儿 cargo feature(#15694)、cosmic-text pin 禁止 Hack 作 fallback donor(#15569);性能:大文件加载不再整份克隆 styled blocks(#13508)、布局 fan-out 与单行 shaping 上限(#15128)、SignatureCache 有界 miss 缓存(#15181)、gitignore matcher 共享缓存(#15240);功能:首次搜索前不绘制空 category 标题(#15376)、completer 选项参数按值位置解析(#15475)、AgentSource 增加 Orchestration 变体(#15164)、AI plan 文档编辑器延迟布局(#15579)。另有 12 个上游提交记为「本轮不做」(冲突规模/前置不成立,详见 `specs/upstream-merge-history.md` §35.5)
