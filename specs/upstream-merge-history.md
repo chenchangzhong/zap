@@ -2050,8 +2050,19 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 | `4b894db80`（serde Content → 手写 Deserialize） | 不做 | 纯编译期优化、无行为收益；7 hunk / 3 生产文件 |
 | `8b88df987` + `40e397170`（按住修饰键显示 tab 快捷键） | 不做 | 26 hunk / 5 文件；本地完全无该机制，`vertical_tabs` 自研度最高 |
 | `5e7030db7`（warping 行显示模型名） | 不做 | 7 hunk；本地完成态已展示模型名（`status_bar.rs:799/890`），收益低；上游夹带 multi-agent 解耦改动 |
-| `4cd1c77c4`（原生 agent 工具条 File explorer chip） | 不做 | 本地**已有** `AgentToolbarItemKind::FileExplorer`（现仅 CLI agent），属重复建设；依赖本地缺失的 `server/telemetry/events.rs`；落点在自研 footer 区 |
-| `142b87102`（Attach file 调色板命令） | 不做 | 本地**已有** attach 按钮与 `EditorAction::AttachFiles`；13 hunk / 6 文件 + 依赖 shared-session 的 `file_attach_allowed_for_shared_session`（本地 0 命中） |
+| `4cd1c77c4`（原生 agent 工具条 File explorer chip） | 不做 | 本地**已有** `AgentToolbarItemKind::FileExplorer`（现仅 CLI agent），属重复建设；落点在自研 footer 区。**⚠️ 更正（2026-09-12 复核）**：原写「依赖本地缺失的 `server/telemetry/events.rs`」是**路径漂移误读**——本地 telemetry 是单文件 `app/src/server/telemetry.rs`，`FileTreeSource` **已存在**（5 个变体：PaneHeader/Keybinding/LeftPanelToolbelt/ForceOpened/CLIAgentView），该提交只需新增 1 个 `AgentToolbelt` 变体 |
+| `142b87102`（Attach file 调色板命令） | 不做 | 本地**已有** attach 按钮与 `EditorAction::AttachFiles`，本项只是补一个命令面板入口。**⚠️ 更正（2026-09-12 复核）**：原写「依赖 `file_attach_allowed_for_shared_session`（本地 0 命中）」**不成立**——它只是 `AgentToolbarItemKind::FileAttach.available_to_session_viewer(...)` 的薄封装，而 `available_to_session_viewer`（`agent_input_footer/toolbar_item.rs:92`）与 `SharedSessionStatus` 本地都有，需补的只是约 10 行本地 helper |
+
+> **⚠️ 注记 2（2026-09-12 复核，HEAD `c535a02c5`）**：对「不做」的 4 项重测冲突规模并复核前置——
+>
+> | 上游 | 冲突文件 | hunk | 前置复核结论 |
+> |---|---|---|---|
+> | `8b88df987`+`40e397170` | 6 | **29** | 本地确实零基础（`TabShortcutModifierState`/`TAB_ACTIVATE_BINDING_NAMES`/`reveals_tab_shortcut_hints` 均 0 命中）→ 「成本/风险」理由成立 |
+> | `5e7030db7` | 4 | 7 | 数据链具备（`status_bar.rs` 已读 `model_info.display_name`）→ 「收益偏小 + 夹带 multi-agent 解耦改动」理由成立 |
+> | `4cd1c77c4` | 3 | 10 | **前置并不缺失**（见上表更正）→ 仅剩「重复建设 + 自研 footer 区」 |
+> | `142b87102` | 6 | 13 | **前置并不缺失**（见上表更正）→ 仅剩「入口重复 + 冲突多」 |
+>
+> 教训：**「前置缺失」必须按符号名全仓 grep 判断，不能用上游文件路径是否存在来判断**——本地 `server/telemetry.rs`(单文件) vs 上游 `server/telemetry/events.rs`(拆分) 这类漂移会直接得出相反的结论（§18.5 路径坑的第二次踩中）。
 
 > **⚠️ 注记（2026-09-12 晚）**：上表中 `4b894db80` 的处理已变更，见 §38——用户要求实做后，**阶段 1（`dcs_hooks.rs` 的 `DProtoHook`/`BootstrappedValue`）已落地并保留**（提交 `e11deb51e`），实测净收益为负（`warp` crate 编译 +2.1%）；阶段 2（`Artifact` + `AIAgentContext`/`AIAgentAttachment`）**不做**。上表「不做」的裁决对阶段 2 仍然成立。
 
