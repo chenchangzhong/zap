@@ -2436,6 +2436,21 @@ impl BlockListElement {
         ctx: &mut PaintContext,
     ) {
         let block_height = block.height(agent_view_state).as_f64() as f32 * cell_size.y();
+
+        // 展开的命令内容与它上面的卡片头部是同一块:头部底色是 `surface_2`,这里给可见的命令
+        // 内容块补上同一个底色(底部圆角),否则会出现"上半截有底色、下半截透明"。
+        if block.requested_command_action_id().is_some()
+            && !block.should_hide_block(agent_view_state)
+        {
+            ctx.scene
+                .draw_rect_with_hit_recording(RectF::new(
+                    grid_origin,
+                    Vector2F::new(bounds.width(), block_height),
+                ))
+                .with_background(warp_theme.surface_2())
+                .with_corner_radius(CornerRadius::with_bottom(Radius::Pixels(8.)));
+        }
+
         if block.is_restored()
             && (!FeatureFlag::AgentView.is_enabled() || !agent_view_state.is_fullscreen())
         {
