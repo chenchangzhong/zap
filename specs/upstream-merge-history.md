@@ -2049,7 +2049,7 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 | `c25ac4070` + `18179177a`（右键行为设置：菜单 vs 直接粘贴） | **缓：值得但属独立项目** | 无缺失前置——19 文件里 16 个存在，缺的 3 个只是路径漂移（`elements/gui/event_handler.rs` → 本地 `elements/event_handler.rs`）与测试文件；设置项落点现成（`settings/select.rs` 已有同类 `middle_click_paste_enabled`）；实测 14 hunk / 10 文件，覆盖 `warpui_core` 事件层 + terminal / notebooks / env_vars / inline_action / agent 各视图 → 估 1–2 天，非顺手同步 |
 | `4b894db80`（serde Content → 手写 Deserialize） | 不做 | 纯编译期优化、无行为收益；7 hunk / 3 生产文件 |
 | `8b88df987` + `40e397170`（按住修饰键显示 tab 快捷键） | 不做 | 26 hunk / 5 文件；本地完全无该机制，`vertical_tabs` 自研度最高 |
-| `5e7030db7`（warping 行显示模型名） | **已合并（2026-09-12，见 §40）** | 用户复核后决定仍要该功能。原复核理由（下方保留）：**理由更硬**：① 上游做成**双重门控的 dogfood 特性**——非默认 Cargo feature `warping_model_name = []`（`app/Cargo.toml:920`，不在 default 列表）+ `FeatureFlag::WarpingModelName` 仅列在 `DOGFOOD_FLAGS`（upstream master `warp_features/src/lib.rs:1072`），即**上游自己也不默认展示**；② 本仓无自动路由/自定义 router（`CustomModelRouters` 仅是 flag 名、无实现；BYOP 模型由 `build_byop_models_by_feature` 从用户配置构造），模型是用户显式选的 → **用户已知**；唯一有信息量的 `is_fallback` 场景本地**已展示**（`status_bar.rs:793-830` 的 `resolve_fallback_warping_message`）；③ 本地另有**未接线**的 `AIBlock::output_model_display_name`（`block.rs:4783`，全仓无调用＝死代码）→ 若真需要，应接线它而非移植上游 flag。成本：7 hunk / 4 文件 + feature/flag 三处接线，且需剥离该提交夹带的 multi-agent 解耦改动 |
+| `5e7030db7`（warping 行显示模型名） | **不做（已试并回滚，见 §40.7）** | 移植后实测无效：本仓**从不构造** `api::message::Message::ModelUsed`（BYOP 把它归入忽略分支），`AIAgentOutput::model_info` 恒为 `None` → warping 行永远保持 "Warping..."；用户判定不需要该功能，提交 `73843d81e` 已由 `ea3b6fadf` 回滚。原复核理由（下方保留）：**理由更硬**：① 上游做成**双重门控的 dogfood 特性**——非默认 Cargo feature `warping_model_name = []`（`app/Cargo.toml:920`，不在 default 列表）+ `FeatureFlag::WarpingModelName` 仅列在 `DOGFOOD_FLAGS`（upstream master `warp_features/src/lib.rs:1072`），即**上游自己也不默认展示**；② 本仓无自动路由/自定义 router（`CustomModelRouters` 仅是 flag 名、无实现；BYOP 模型由 `build_byop_models_by_feature` 从用户配置构造），模型是用户显式选的 → **用户已知**；唯一有信息量的 `is_fallback` 场景本地**已展示**（`status_bar.rs:793-830` 的 `resolve_fallback_warping_message`）；③ 本地另有**未接线**的 `AIBlock::output_model_display_name`（`block.rs:4783`，全仓无调用＝死代码）→ 若真需要，应接线它而非移植上游 flag。成本：7 hunk / 4 文件 + feature/flag 三处接线，且需剥离该提交夹带的 multi-agent 解耦改动 |
 | `4cd1c77c4`（原生 agent 工具条 File explorer chip） | 不做 | 本地**已有** `AgentToolbarItemKind::FileExplorer`（现仅 CLI agent），属重复建设；落点在自研 footer 区。**⚠️ 更正（2026-09-12 复核）**：原写「依赖本地缺失的 `server/telemetry/events.rs`」是**路径漂移误读**——本地 telemetry 是单文件 `app/src/server/telemetry.rs`，`FileTreeSource` **已存在**（5 个变体：PaneHeader/Keybinding/LeftPanelToolbelt/ForceOpened/CLIAgentView），该提交只需新增 1 个 `AgentToolbelt` 变体 |
 | `142b87102`（Attach file 调色板命令） | **已合并（2026-09-12，见 §40）** | 用户复核后决定合并。原复核理由（下方保留）：本地**已有** attach 按钮与 `EditorAction::AttachFiles`，本项只是补一个命令面板入口。**⚠️ 更正（2026-09-12 复核）**：原写「依赖 `file_attach_allowed_for_shared_session`（本地 0 命中）」**不成立**——它只是 `AgentToolbarItemKind::FileAttach.available_to_session_viewer(...)` 的薄封装，而 `available_to_session_viewer`（`agent_input_footer/toolbar_item.rs:92`）与 `SharedSessionStatus` 本地都有，需补的只是约 10 行本地 helper |
 
@@ -2249,7 +2249,9 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 
 `app/src/ai/blocklist/block.rs` 里该函数（23 行）全仓无调用（grep 仅命中定义行），且它正是「显示真实模型名」的本地历史实现——与 ② 的目标重合，故先清理以免两套并存。同步删除因之孤立的 `use crate::LLMPreferences;`。
 
-### 40.2 ② 移植 `5e7030db7`（warping 行显示模型名，#15323）
+### 40.2 ② 移植 `5e7030db7`（warping 行显示模型名，#15323）——**已于 §40.7 回滚**
+
+> ⚠️ 本节记录的是当时的移植实现；该提交随后被回滚（用户判定不需要），见 §40.7。
 
 | 层 | 内容 |
 |---|---|
@@ -2300,6 +2302,21 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 2. **上游 flag 的门控要按本仓渠道重接**：本仓 `zap_oss.rs` 有专属 `with_additional_features` 入口——比照搬上游 `#[cfg(feature=...)]` + DOGFOOD 列表更贴合（也符合 AGENTS §5.4「优先运行时 flag」）。
 3. **3-way 冲突默认取本地侧 + 事后只补所需片段，是应对「本地裁剪版」上游改动的稳妥法**：本地缺的整套上游结构（lightbox/cloud pane）若跟着 theirs 进来，会带进无关分支与死代码；本轮先全部取 ours，再由编译器逐条指出缺什么。
 4. **移植 UI 动作要顺手补 i18n**：上游硬编码的 `"Attach file to agent conversation"` 在本地必须走 `crate::t!`（§39 教训的再次适用）。
+
+### 40.7 补记：② 已回滚——本仓没有该功能的数据源（2026-09-12 晚）
+
+**现象**：重建启动后用户点验，warping 行**仍是 `Warping...`**，未出现「Warping with {模型名}...」。
+
+**根因**（证据）：
+1. 上游这套是**服务端驱动**：模型名来自 proto 消息 `Message::ModelUsed`，由服务端在首个 LLM 尝试时下发；客户端在 `conversation.rs:2603` 把它写进 `AIAgentOutput::model_info`。
+2. 本仓**从不构造** `Message::ModelUsed`——全仓只有 3 处**读取**（`conversation.rs:2593`、`conversation_yaml.rs:237`、`convert_conversation.rs:1414`），而 BYOP 流把它归入忽略分支（`agent_providers/chat_stream.rs:804` 与 `:967` 的 `=> {}`）。
+3. ⇒ BYOP 会话里 `output.model_info` **恒为 `None`** ⇒ `resolve_warping_model_message(current=None, …)` 每次都走「尚未上报」分支 ⇒ 界面只能显示通用文案。16 个移植用例全绿也改变不了这一点：它们直接喂 `WarpingModelInputs`，绕过了空数据源。
+
+**处置**：`git revert 73843d81e` → `ea3b6fadf`（5 文件 −477/+76，含删除 `status_bar_tests.rs`）。回滚后 `cargo check -p warp` 0 error、`view_impl::common` 18 过；③ attach-file 未受影响。
+
+**若将来仍想要该效果**：正确路径不是移植上游（它等不到数据），而是**本地自行命名**——客户端本来就知道自己请求的模型（`LLMPreferences::get_llm_info(model_id).display_name`），这正是先前那个死代码 `AIBlock::output_model_display_name` 的思路。用户已判定不需要，故未实现；该死代码的删除（`43417ffc8`）仍然有效。
+
+**教训**：「移植上游 UI 特性」前必须确认**数据源在本仓是否存在**——上游的展示层往往依赖服务端/云端消息，而本仓是纯客户端 BYOP。判断方法：构造点（写入侧）grep + 流处理分支是否有 `=> {}` 忽略。仅凭「代码能编译 + 单测全绿」不足以证明特性可用（本轮 16 个用例全绿，功能却是死的）。
 
 ### 39.6 本地补齐：「复制时间戳」菜单入口（上游未做）
 
