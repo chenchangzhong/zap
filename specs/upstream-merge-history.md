@@ -2049,9 +2049,9 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 | `c25ac4070` + `18179177a`（右键行为设置：菜单 vs 直接粘贴） | **缓：值得但属独立项目** | 无缺失前置——19 文件里 16 个存在，缺的 3 个只是路径漂移（`elements/gui/event_handler.rs` → 本地 `elements/event_handler.rs`）与测试文件；设置项落点现成（`settings/select.rs` 已有同类 `middle_click_paste_enabled`）；实测 14 hunk / 10 文件，覆盖 `warpui_core` 事件层 + terminal / notebooks / env_vars / inline_action / agent 各视图 → 估 1–2 天，非顺手同步 |
 | `4b894db80`（serde Content → 手写 Deserialize） | 不做 | 纯编译期优化、无行为收益；7 hunk / 3 生产文件 |
 | `8b88df987` + `40e397170`（按住修饰键显示 tab 快捷键） | 不做 | 26 hunk / 5 文件；本地完全无该机制，`vertical_tabs` 自研度最高 |
-| `5e7030db7`（warping 行显示模型名） | 不做 | **2026-09-12 复核后理由更硬**：① 上游做成**双重门控的 dogfood 特性**——非默认 Cargo feature `warping_model_name = []`（`app/Cargo.toml:920`，不在 default 列表）+ `FeatureFlag::WarpingModelName` 仅列在 `DOGFOOD_FLAGS`（upstream master `warp_features/src/lib.rs:1072`），即**上游自己也不默认展示**；② 本仓无自动路由/自定义 router（`CustomModelRouters` 仅是 flag 名、无实现；BYOP 模型由 `build_byop_models_by_feature` 从用户配置构造），模型是用户显式选的 → **用户已知**；唯一有信息量的 `is_fallback` 场景本地**已展示**（`status_bar.rs:793-830` 的 `resolve_fallback_warping_message`）；③ 本地另有**未接线**的 `AIBlock::output_model_display_name`（`block.rs:4783`，全仓无调用＝死代码）→ 若真需要，应接线它而非移植上游 flag。成本：7 hunk / 4 文件 + feature/flag 三处接线，且需剥离该提交夹带的 multi-agent 解耦改动 |
+| `5e7030db7`（warping 行显示模型名） | **已合并（2026-09-12，见 §40）** | 用户复核后决定仍要该功能。原复核理由（下方保留）：**理由更硬**：① 上游做成**双重门控的 dogfood 特性**——非默认 Cargo feature `warping_model_name = []`（`app/Cargo.toml:920`，不在 default 列表）+ `FeatureFlag::WarpingModelName` 仅列在 `DOGFOOD_FLAGS`（upstream master `warp_features/src/lib.rs:1072`），即**上游自己也不默认展示**；② 本仓无自动路由/自定义 router（`CustomModelRouters` 仅是 flag 名、无实现；BYOP 模型由 `build_byop_models_by_feature` 从用户配置构造），模型是用户显式选的 → **用户已知**；唯一有信息量的 `is_fallback` 场景本地**已展示**（`status_bar.rs:793-830` 的 `resolve_fallback_warping_message`）；③ 本地另有**未接线**的 `AIBlock::output_model_display_name`（`block.rs:4783`，全仓无调用＝死代码）→ 若真需要，应接线它而非移植上游 flag。成本：7 hunk / 4 文件 + feature/flag 三处接线，且需剥离该提交夹带的 multi-agent 解耦改动 |
 | `4cd1c77c4`（原生 agent 工具条 File explorer chip） | 不做 | 本地**已有** `AgentToolbarItemKind::FileExplorer`（现仅 CLI agent），属重复建设；落点在自研 footer 区。**⚠️ 更正（2026-09-12 复核）**：原写「依赖本地缺失的 `server/telemetry/events.rs`」是**路径漂移误读**——本地 telemetry 是单文件 `app/src/server/telemetry.rs`，`FileTreeSource` **已存在**（5 个变体：PaneHeader/Keybinding/LeftPanelToolbelt/ForceOpened/CLIAgentView），该提交只需新增 1 个 `AgentToolbelt` 变体 |
-| `142b87102`（Attach file 调色板命令） | 不做 | 本地**已有** attach 按钮与 `EditorAction::AttachFiles`，本项只是补一个命令面板入口。**⚠️ 更正（2026-09-12 复核）**：原写「依赖 `file_attach_allowed_for_shared_session`（本地 0 命中）」**不成立**——它只是 `AgentToolbarItemKind::FileAttach.available_to_session_viewer(...)` 的薄封装，而 `available_to_session_viewer`（`agent_input_footer/toolbar_item.rs:92`）与 `SharedSessionStatus` 本地都有，需补的只是约 10 行本地 helper |
+| `142b87102`（Attach file 调色板命令） | **已合并（2026-09-12，见 §40）** | 用户复核后决定合并。原复核理由（下方保留）：本地**已有** attach 按钮与 `EditorAction::AttachFiles`，本项只是补一个命令面板入口。**⚠️ 更正（2026-09-12 复核）**：原写「依赖 `file_attach_allowed_for_shared_session`（本地 0 命中）」**不成立**——它只是 `AgentToolbarItemKind::FileAttach.available_to_session_viewer(...)` 的薄封装，而 `available_to_session_viewer`（`agent_input_footer/toolbar_item.rs:92`）与 `SharedSessionStatus` 本地都有，需补的只是约 10 行本地 helper |
 
 > **⚠️ 注记 2（2026-09-12 复核，HEAD `c535a02c5`）**：对「不做」的 4 项重测冲突规模并复核前置——
 >
@@ -2238,6 +2238,68 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 2. **枚举展示文案的本地化范式**：返回 `String` + `crate::t!`（`t!` 有两臂，支持 `key, arg = value`）；改返回类型前先确认调用点的 trait bound（`Into<String>` / `AsRef<str>` 可免改）。
 3. **占位/时间格式也要本地化**：`%I:%M %p`、`"at"` 这类不显眼的英文最容易漏；本仓判断语言的既有方式是 `crate::i18n::current_languages()` + `starts_with("zh")`。
 4. **并行测试失败先回基线复现再定性**：`git stash` 一次即确认 `fallback_chain_works` 的并行失败为既存（全局 `init()` 竞争），避免误判为自己引入。
+
+---
+
+## 40. 收尾三项：删死代码 + 合并 `5e7030db7` + 合并 `142b87102`（2026-09-12）
+
+> 用户指令：「删死代码，然后合并 5e7030db7、142b87102」。三项均已落地并重建启动点验（提交 `43417ffc8` / `73843d81e` / `6d9e859f8`）。
+
+### 40.1 ① 删除死代码 `AIBlock::output_model_display_name`
+
+`app/src/ai/blocklist/block.rs` 里该函数（23 行）全仓无调用（grep 仅命中定义行），且它正是「显示真实模型名」的本地历史实现——与 ② 的目标重合，故先清理以免两套并存。同步删除因之孤立的 `use crate::LLMPreferences;`。
+
+### 40.2 ② 移植 `5e7030db7`（warping 行显示模型名，#15323）
+
+| 层 | 内容 |
+|---|---|
+| `status_bar.rs` | 新增 `ModelInUse`（`From<&OutputModelInfo>`，空 display_name 归一为 None）、`WarpingModelMessage`、`WarpingModelInputs`、`UNNAMED_FALLBACK_MODEL_WARPING_TEXT`、`fallback_warping_text`、`warping_model_message`、`resolve_warping_model_message`；`render` 里改为传 `model_in_use_name`，次级元素按 `show_fallback_explanation` 选择 |
+| `view_impl/common.rs` | `STATUS_MESSAGE_ELLIPSIS`、`WarpingProps.model_in_use_name`、`status_message_naming_model`；6 处「生成中」文案改为带模型名（摘要阶段刻意不带——服务端摘要用另一个模型且不上报） |
+| 门控（**本地有意偏差**） | 上游是「非默认 Cargo feature `warping_model_name` + `FeatureFlag::WarpingModelName` 仅列 `DOGFOOD_FLAGS`」双层门控 → 连上游都不默认展示。本地改为**纯运行时 flag**（`FeatureFlag::WarpingModelName`）并在 `app/src/bin/zap_oss.rs` 的 `with_additional_features` 里默认开启，使其对 Zap 真正可见。要回退成 dogfood-only：删掉 `zap_oss.rs` 里那一行即可 |
+| 测试 | 移植 `status_bar_tests.rs`（16 个决策矩阵用例，全部通过）+ 上游 `common_tests.rs` 的 `status_message_naming_model` 用例 |
+| 本地适配 | `OutputModelInfo` 无 `prompt_cache_expires_at`；该提交夹带的 multi-agent 解耦改动一并剥离（改用 `ModelInUse`，删除 `use warp_multi_agent_api as api` 与 `api::message::ModelUsed` 构造） |
+
+### 40.3 ③ 移植 `142b87102`（Attach file 命令面板动作，#15762）
+
+上游意图是「**默认不绑键**的命令面板动作」：`register_editable_bindings` 只注册、不给默认键位。
+
+| 文件 | 内容 |
+|---|---|
+| `terminal/view.rs` | 新增 `file_attach_allowed_for_shared_session`（薄封装 `AgentToolbarItemKind::FileAttach.available_to_session_viewer`）、`is_in_agent_or_cli_attach_context`、`can_attach_file`；`View` 上下文集插入 `init::CAN_ATTACH_FILE_KEY`；转发列表加 `\| AttachFile` |
+| `view/action.rs` | `TerminalAction::AttachFile` 变体 + `Debug` 臂 + 分派臂（`can_attach_file` 为假直接 return） |
+| `view/init.rs` | `ATTACH_FILE_KEYBINDING` / `CAN_ATTACH_FILE_KEY` 常量 + `register_editable_bindings` 注册（WarpAi 组，context 断言用 `CAN_ATTACH_FILE_KEY`）；描述按本地惯例走 `crate::t!("keybinding-desc-terminal-attach-file")` |
+| `terminal/input.rs` | `attach_file()`（转给 `footer.select_file()`）+ 登录 CLI agent 语境插入 `CLI_AGENT_SESSION_ACTIVE_KEY` + `CAN_ATTACH_FILE_KEY` 语境 |
+| `agent_input_footer/mod.rs` | 抽出 `select_file()`（按钮与动作共用）；attach 按钮 tooltip 加键位提示 |
+| `right_panel.rs` / `view_components/action_button.rs` | 新增 `ActionButton::with_tooltip_keybinding`，取代手写的 `keybinding_name_to_display_string` + `with_tooltip_sublabel`（两处按钮 + 一处新建按钮） |
+
+**本地适配**：
+- 本地**无** `FeatureFlag::CloudModeImageContext`（无云端 Agent）→ `is_cloud_mode` 直接用 `is_ambient_agent()` 判定；
+- 本地 `ambient_agent_view_model` 是**非 Option 字段**（上游为 Option）→ 调用处传 `Some(&field)`，未改本地访问器签名；
+- 本地缺 `OpenAttachmentLightbox` / `WriteCodebaseIndex` / `ROOT_CLOUD_MODE_PANE_KEY` 等上游分支结构 → 13 处冲突一律取本地侧，再只补 attach-file 所需片段（未把无关分支拖进来）；
+- `OutputModelInfo` 等差异同上。
+
+### 40.4 验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo check -p warp` | 三项各自 0 error / 0 warning |
+| `cargo test -p warp --lib status_bar` | **15 过 / 0 败**（16 个新用例 + 既有） |
+| `cargo test -p warp --lib view_impl::common` | **18 过 / 0 败** |
+| `cargo test -p warp --lib --no-run` | 通过（新增 action 变体未破坏测试目标） |
+| 二进制 grep | `terminal:attach_file` / `CanAttachFile` / `Warping with` / `keybinding-desc-terminal-attach-file` 均在 |
+| 手动点验 | 见 §40.5 待用户确认 |
+
+### 40.5 待点验 / 已知偏差
+
+- 点验项：① Agent 回复期间 warping 行应显示「Warping with {模型名}...」；② ⌘K 搜索「附加文件 / Attach file to agent conversation」应能触发附加文件（默认无键位，属上游设计）。
+- 已知偏差：模型名的可见性由**本地** flag 决定（Zap 默认开启），与上游「默认隐藏」不同；如需隐藏，删 `zap_oss.rs` 中该 flag 一行。
+
+### 40.6 教训
+
+1. **「删除死代码 → 再移植上游实现」的顺序很重要**：先删避免两套并存（本轮 `output_model_display_name` 与上游 `warping_model_message` 是同一需求的两种实现）。
+2. **上游 flag 的门控要按本仓渠道重接**：本仓 `zap_oss.rs` 有专属 `with_additional_features` 入口——比照搬上游 `#[cfg(feature=...)]` + DOGFOOD 列表更贴合（也符合 AGENTS §5.4「优先运行时 flag」）。
+3. **3-way 冲突默认取本地侧 + 事后只补所需片段，是应对「本地裁剪版」上游改动的稳妥法**：本地缺的整套上游结构（lightbox/cloud pane）若跟着 theirs 进来，会带进无关分支与死代码；本轮先全部取 ours，再由编译器逐条指出缺什么。
+4. **移植 UI 动作要顺手补 i18n**：上游硬编码的 `"Attach file to agent conversation"` 在本地必须走 `crate::t!`（§39 教训的再次适用）。
 
 ### 39.6 本地补齐：「复制时间戳」菜单入口（上游未做）
 
