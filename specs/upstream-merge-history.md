@@ -2115,5 +2115,70 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 2. **上游「顺手改签名」的部分要主动剥离**：`ScrollHandler` 的 `&Vector2F → Vector2F` 与本特性无关，跟随会放大改动面（§36.4 第 2 条的同一形态）。
 3. **改动事件层后必须跑测试目标编译**：`cargo check -p warp` 只查 lib；`warpui_core` 的 `event_handler_test.rs` 与测试目标里的回调签名要单独 `--no-run` 确认（本轮两者都通过，但这是运气，不是流程）。
 
+---
+
+## 38. `4b894db80`（编译期 serde 优化）实测：净收益为负（2026-09-12）
+
+> §36.2 原判「不做（纯编译期优化、无行为收益）」。用户要求改为「要做」，遂分阶段执行：**阶段 1 = `dcs_hooks.rs` 的两个类型**（本提交 `e11deb51e`），做完即用实测数据决定是否继续阶段 2（`Artifact` + `AIAgentContext`/`AIAgentAttachment`）。**实测结论：阶段 1 让 `warp` crate 编译慢约 2.1%，未测出任何正向收益 → 阶段 2 不再做，整项终局为不做。**
+
+### 38.1 先纠正两个此前的判断错误
+
+1. **“栈前置不成立”是错的**：`4b894db80`（#15455）声明的栈前置 `#15454`（`6a96a72d8`）只动 `crates/settings/{lib,macros,registration}.rs`，与 `4b894db80` 的 6 个 app 文件**零重叠**（`comm -12` 验证）。“stacked on” 只是分支基线，不是内容依赖 → 可单独移植。
+2. **“值得做”也是错的**：上一轮基于上游提交描述（“reduces the compile time of the `warp` crate”）判为值得做。**本地实测推翻了它**（见 §38.3）。教训：**compile-time 类提交必须本地实测后再决定，不能凭上游描述**。
+
+### 38.2 阶段 1 实现（`e11deb51e`）
+
+| 类型 | 改法 | 本地适配 |
+|---|---|---|
+| `DProtoHook`（内部标签 `tag = "hook"`） | 去 `Deserialize` derive；新增 `DPROTO_HOOK_VARIANTS`、`RawDProtoHook{hook,value}`、`parse_hook_value` 与 13 臂 match（未知变体走 `unknown_variant`） | 本地 13 个变体与上游逐一对应，无差异 |
+| `BootstrappedValue`（逐字段 `deserialize_with`） | 去 `Deserialize` derive 与全部字段属性；新增 `RawBootstrappedField{Missing,Present}`（复刻 `#[serde(default)]` 的缺字段语义）、`RawBootstrappedValue` 与手写 impl；`empty_string_is_none` 抽出 `empty_string_to_none(String)`；删除 `parse_shell_options_list_deserializer`、`parse_float_from_string_deserializer` | **本地无 `cdpath` 字段** → raw 结构不列该字段；`trim_null_byte_deserializer` 仍被 `InitShellValue` 等使用，**保留** |
+| 测试 | 新增 `app/src/terminal/model/ansi/dcs_hooks_test.rs`（13 个格式冻结测试） | 上游文件名为 `dcs_hooks_tests.rs`，本地为单数约定，按 `#[cfg(test)] #[path = "dcs_hooks_test.rs"] mod tests;` 声明 |
+
+测试覆盖：全字段解析（含 `shell` 的 NUL 截断、`shell_options`/`shell_plugins` 的空格列表、字符串浮点）、可选字段默认、必填缺失报错、malformed float 报错、未知 hook 报错（断言含 “unknown variant”）、缺 `value` 报错、13 个 tag 逐一派发且与 `DPROTO_HOOK_VARIANTS` 完全一致、`SourcedRcFileForWarp` 冻结片段格式（该字面量随用户 RC 文件分发）、legacy `tmux` 字段被忽略、SSH/InitShell 序列化往返。
+
+### 38.3 实测数据
+
+**测量陷阱（本轮最大收获）**：`.cargo/config.toml:12` 强制 `rustc-wrapper = "sccache"`，它按**内容**缓存，`touch` 只改 mtime 时直接命中缓存 → wall-time 完全失真（实测同一命令出现 23s / 117s / 139s 三种结果，且 `user` 仅 5s，说明时间花在取缓存而非编译）。**必须 `RUSTC_WRAPPER=` 绕过 sccache**，并用 `user` 时间做交叉校验。
+
+测量口径：`RUSTC_WRAPPER= CARGO_INCREMENTAL=0` + `touch app/src/lib.rs` + `cargo build -p warp`（只重编 `warp` crate，正是上游这套优化的目标）。每态两次：
+
+| 状态 | real #1 | real #2 | user #1 | user #2 |
+|---|---|---|---|---|
+| 基线（派生 serde） | 98.67s | 98.50s | 161.78s | 164.41s |
+| 阶段 1 改后 | 100.65s | 100.71s | 165.98s | 163.44s |
+
+→ **同态抖动仅 ±0.2s**，而两态差 **+2.1s（+2.1%）**：改后**更慢**。
+
+机制层面确实生效（同一个 rlib `9e9d8e1b40e6db51`，feature 集相同，可比）：
+
+| 指标 | 基线 | 改后 | 变化 |
+|---|---|---|---|
+| `ContentDeserializer` 实例化 | 866 | 333 | **−62%** |
+| `__DeserializeWith` 实例化 | 2071 | 1216 | **−41%** |
+| `ContentRefDeserializer` 实例化 | 991 | 974 | −1.7% |
+| rlib 体积 | 937 MB | 935 MB | **−0.2%** |
+| `warp` crate 编译 | 98.6s | 100.7s | **+2.1%** |
+
+### 38.4 为什么净收益为负 & 阶段 2 的天花板
+
+- 被消除的 serde 机械（`Content*` / `__DeserializeWith`）在符号总量里占比极小（rlib 仅小 2MB / 0.2%）；`warp` crate 的编译成本由其余数千符号的 codegen 主导。
+- 手写 impl + raw 结构体 + 13 臂 match **本身也是要编译的代码**，抵消并超过被消除的部分。
+- **阶段 2 天花板同样低**：符号层面统计，rlib 中含 `BlockContext` 的符号 199 个，而真正把 `BlockContext` 拖进 `ContentRefDeserializer` 的只有 **13 个**（形如 `<BlockContext as Deserialize>::deserialize::<ContentRefDeserializer<serde_json::Error>>`）。即使阶段 2 全清，量级与阶段 1 同阶。
+- 判定方法学：**这类“消除泛型机械”的改动用机制级指标（`nm -C` 计数）判断是否生效，用绕过 sccache 的 real/user 时间判断是否值得**；两者本轮给出了相反的结论——机制生效，但不值得。
+
+### 38.5 终局裁决
+
+- **整项 `4b894db80` 不做**；`Artifact` 与 `AIAgentContext`/`AIAgentAttachment`（阶段 2）**不再继续**。
+- 阶段 1 的提交 `e11deb51e` **可一键回滚**（`git revert e11deb51e`），若保留，其价值仅为「与上游对齐 + 机制正确」，不含可测量的构建收益。
+- 重新考虑的条件：① 上游把整个编译期栈做完且其 CI 给出可复现收益；② 本地构建时间成为实际痛点（届时按 §38.3 的方法先测基线再决定）。
+- **未记入 CHANGELOG**：无用户可见行为变化，仅编译期机制调整。
+
+### 38.6 本轮教训
+
+1. **sccache 会把编译时间测量彻底污染**：内容缓存 + `touch` 只改 mtime → 同一命令可测出 23s/117s/139s。识别信号是 `user` 时间与 `real` 严重不成比例（5s vs 139s）。教训推广：以后凡涉及构建耗时结论，必须 `RUSTC_WRAPPER=` 并至少两次重复。
+2. **上游的“compile time”类提交必须本地实测再决定**：同一个改动在别的仓库/CI 有收益，不代表本地有——本仓库的 crate 规模与代码构成决定了 serde 机械占比过小。
+3. **机制正确 ≠ 收益成立**：符号计数（−62% ContentDeserializer）与构建时间（+2.1%）方向相反时，以端到端时间为准，机制数据仅用于解释原因。
+4. **栈（stack）依赖要用文件重叠验证，不能只看提交描述**：本轮 `comm -12` 一步就否掉了“必须连 #15454 一起做”的误判。
+
 
 
