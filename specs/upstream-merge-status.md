@@ -137,6 +137,11 @@
 | promote 无对象（本地无对应 Cargo feature）| 4 |
 | 已含等效实现 | 3 |
 
+> **附：筛选之外新发现 1 条（2026-09-12 盘查编译期提交时发现）**：`1e4b86a81` (#15517)
+> "Bump release-cli codegen-units from 1 to 4"（2026-08-25，属本区间）**不在 89/53 名单内**
+> （只动根 `Cargo.toml`，疑被路径过滤漏掉）。本地对应 `Cargo.toml` 的 `[profile.release-cli]`
+> 仍是 `codegen-units = 1`。纯构建配置、无行为风险，列为候选（见 §六）。
+
 ---
 
 ## 六、未决事项
@@ -145,6 +150,9 @@
 2. **`4b894db80` 阶段 1 去留**：保留中（实测负收益）；若要回滚：`git revert e11deb51e`。
 3. **`5e7030db7` 若将来仍要该效果**：正确路径是**本地自行命名**（客户端本就知道请求的模型），
    即已删除的 `AIBlock::output_model_display_name` 的思路，而非移植上游（它等不到数据）。
+4. **编译期栈的其余部分是否补做**（见 §八）：栈内 #15453 / #15454 未做；`4b894db80` 自身还剩
+   「阶段 2」（2 文件 / 4 处冲突）；栈外的 `1e4b86a81` (#15517) 是 1 行配置。建议：除 #15517 外都不做，
+   理由是 §38 实测 stage 1 已是 **+2.1%（更慢）**、stage 2 天花板低。
 
 ---
 
@@ -157,6 +165,33 @@
 | `specs/upstream-merge-lessons.md` | 教训速查（头部含同步边界与每轮要点）| 每轮追加行 |
 | `specs/upstream-merge-plan-2026-09-11.md` | 原始计划（批次、锚点、适配要点、淘汰依据）| 仅计划期，不再改 |
 | `CHANGELOG.md` | 用户可见变化 | 有用户可见变化时 |
+
+## 八、编译期（compile time）优化专项
+
+上游那条栈是 **3 个 PR，`4b894db80` 就是最后一个**（提交正文自述 "PR 3 of a stack"，`6a96a72d8` 为 "PR 2 of 3"）：
+
+| 栈序 | 上游 | 内容 | 本地状态 |
+|---|---|---|---|
+| PR 1/3 | `dc1077845` (#15453) | Reduce monomorphization in `warpui_core` update/spawn paths | ❌ 未做（规划期按「纯重构 / 编译期」淘汰）|
+| PR 2/3 | `6a96a72d8` (#15454) | share settings registration code across settings | ❌ 未做（规划期按「依赖缺失符号」淘汰：落点 `crates/settings/src/registration.rs` 本地不存在）|
+| PR 3/3 | `4b894db80` (#15455) | serde `Content` 缓冲 → JSON-value 反序列化 | ⚠️ **仅阶段 1**（`dcs_hooks.rs` 的 `DProtoHook`/`BootstrappedValue`，`e11deb51e`）；**阶段 2 未做** |
+
+**`4b894db80` 自身剩余（＝阶段 2）**，共 2 个文件、今日 HEAD 上 **4 处冲突（2+2）**：
+
+| 文件 | 内容 |
+|---|---|
+| `app/src/ai/agent/mod.rs` | `AIAgentContext` / `AIAgentAttachment`（外部标签 + `#[serde(untagged)] Block(Box<BlockContext>)` 混用，上游称「最贵的模式」）|
+| `app/src/ai/artifacts/mod.rs` | `Artifact`（相邻标签 `artifact_type`/`data`，由 `ArtifactEnvelope` 取代 `ArtifactHelper`）|
+
+**实测与天花板**（详见 `history.md §38`）：stage 1 后 `warp` crate 编译 **98.6s → 100.7s（+2.1%）**，
+rlib 仅 −0.2%（`ContentDeserializer` 实例化 −62%、`__DeserializeWith` −41% 但占比过小）；
+stage 2 的目标 `BlockContext × ContentRefDeserializer` 在符号层面只有 **13 个**。
+
+**栈外同期的编译期提交**：`1e4b86a81` (#15517，见 §五 附)、`21f413b79` (#14875 终端 grid 大搬运，已在淘汰 53)、
+`2a183d552` (#15462 抽 `secret_redaction` crate，已在淘汰 53)。
+
+**结论**：这条栈在本仓的收益基本测不出（stage 1 反向），除 `1e4b86a81`（1 行配置、纯构建期）外不建议继续；
+若将来要做栈内其余部分，先按 `history.md §38.3` 的方法（`RUSTC_WRAPPER=` 绕过 sccache + 同态两次）测基线再决定。
 
 ### 附：验证基线（判断「失败是否既存」的对照）
 
