@@ -1484,23 +1484,20 @@ impl GridHandler {
 
             let leading_spacer = self.write_at_cursor(cell::DEFAULT_CHAR);
             leading_spacer.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
-            leading_spacer.set_hyperlink_id(None);
             self.wrapline();
         }
 
-        let hyperlink_id = {
+        {
             let wide_cell = self.write_at_cursor(c);
             update_wide_cell(wide_cell);
             wide_cell.flags.insert(Flags::WIDE_CHAR);
-            wide_cell.hyperlink_id()
-        };
+        }
 
         self.move_cursor_forward(|cursor| {
             cursor.point.col += 1;
         });
         let spacer = self.write_at_cursor(cell::DEFAULT_CHAR);
         spacer.flags.insert(Flags::WIDE_CHAR_SPACER);
-        spacer.set_hyperlink_id(hyperlink_id);
         self.advance_cursor_by_one_cell();
     }
 

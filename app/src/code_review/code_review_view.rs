@@ -9519,9 +9519,10 @@ impl TypedActionView for CodeReviewView {
                     .discard_dialog_state
                     .discard_file_paths
                     .first()
+                    .cloned()
                 {
                     self.discard_file(
-                        file_path,
+                        &file_path,
                         self.discard_dialog_state.stash_changes_enabled,
                         ctx,
                     );

@@ -272,9 +272,8 @@ impl Cell {
         if content.len() == base_char_len {
             extra.cell_with_zero_width = None;
         }
-        let extra_is_empty = extra.cell_with_zero_width.is_none()
-            && extra.end_of_prompt.is_none()
-            && extra.hyperlink_id.is_none();
+        let extra_is_empty =
+            extra.cell_with_zero_width.is_none() && extra.end_of_prompt.is_none();
         if extra_is_empty {
             self.extra = None;
         }
