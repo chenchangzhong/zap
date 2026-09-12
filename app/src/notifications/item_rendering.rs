@@ -422,6 +422,7 @@ fn render_agent_avatar(
             status: Some(status),
         },
         NotificationSourceAgent::Dsh => IconWithStatusVariant::Dsh {
+            icon: Icon::Terminal,
             status: Some(status),
         },
     };

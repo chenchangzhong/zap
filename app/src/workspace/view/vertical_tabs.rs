@@ -2419,6 +2419,11 @@ fn resolve_icon_with_status_variant(
                 }
             }
         }
+        // DSH pane:品牌 logo + 主题背景,配色与 Oz 智能体图标一致(不用通用灰底)。
+        TypedPane::DeepSeek => IconWithStatusVariant::Dsh {
+            icon: WarpIcon::DeepSeek,
+            status: None,
+        },
         // Settings and environment management use the foreground color per design spec
         // Zap Wave 7-3:`TypedPane::EnvironmentManagement` 随 ambient-agent UI 子系统物理删。
         TypedPane::Settings => IconWithStatusVariant::Neutral {

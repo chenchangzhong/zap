@@ -80,8 +80,9 @@ pub(crate) enum IconWithStatusVariant {
         agent: CLIAgent,
         status: Option<ConversationStatus>,
     },
-    /// DSH plugin icon.
+    /// DSH pane 图标:品牌 logo 画在主题背景上,背景色与图标色和 Oz 智能体一致。
     Dsh {
+        icon: WarpIcon,
         status: Option<ConversationStatus>,
     },
 }
@@ -182,9 +183,7 @@ pub(crate) fn render_icon_with_status(
                 badge_ring_background,
             )
         }
-        IconWithStatusVariant::Dsh { status } => {
-            // DSH 使用通用图标。
-            let icon = WarpIcon::Terminal;
+        IconWithStatusVariant::Dsh { icon, status } => {
             let inner = ConstrainedBox::new(
                 icon.to_warpui_icon(theme.main_text_color(theme.background()))
                     .finish(),
