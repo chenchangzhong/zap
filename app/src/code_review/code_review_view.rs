@@ -9515,10 +9515,13 @@ impl TypedActionView for CodeReviewView {
                             ctx,
                         );
                     }
-                } else {
-                    let file_path = self.discard_dialog_state.discard_file_paths[0].clone();
+                } else if let Some(file_path) = self
+                    .discard_dialog_state
+                    .discard_file_paths
+                    .first()
+                {
                     self.discard_file(
-                        &file_path,
+                        file_path,
                         self.discard_dialog_state.stash_changes_enabled,
                         ctx,
                     );
