@@ -2252,6 +2252,32 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 
 ---
 
+### 39.6 本地补齐：「复制时间戳」菜单入口（上游未做）
+
+用户确认「补」。落点：`app/src/terminal/view.rs::ai_block_copying_menu_items`（AI 块「复制类」菜单的统一构造处），门控照抄上游 `context_menu.rs` 的原始 21 行：
+
+```rust
+let has_query_timestamp = self.rich_content_views.iter().any(|rich_content| {
+    rich_content.ai_block_metadata()
+        .filter(|metadata| metadata.ai_block_handle.id() == ai_block_view_id)
+        .is_some_and(|metadata| metadata.ai_block_handle.as_ref(ctx).query_sent_at(ctx).is_some())
+});
+if has_query_timestamp {
+    items.push(MenuItemFields::new(crate::t!("menu-ai-block-copy-timestamp"))
+        .with_on_select_action(TerminalAction::ContextMenu(
+            ContextMenuAction::CopyAIBlockTimestamp { ai_block_view_id }))
+        .into_item());
+}
+```
+
+- **本地偏差（有意）**：该 helper 同时服务「右键行菜单」与「三点溢出菜单」两处调用（`view.rs:14912`、`view.rs:15820`），因此本地上两处菜单都会出现「复制时间戳」；上游只在其行菜单里有。这是超集，不是遗漏。
+- ftl：`menu-ai-block-copy-timestamp`（en `Copy timestamp` / zh-CN `复制时间戳`）。
+- 至此 P3-b 的链路闭合：悬停看时间戳（tooltip）→ 右键/溢出菜单「复制时间戳」→ `AIBlockAction::CopyTimestamp` 写剪贴板。
+- 归属说明：这是**本地功能补齐**，不是上游移植；文档按「本地功能」记录，不写入上游同步的落地清单。
+- **验证（2026-09-12）**：`cargo check -p warp` 0 error；重建后用户手动点验**通过**——悬停显示时间戳、右键/溢出菜单出现「复制时间戳」、点击后剪贴板写入时间文本、无时间戳的块不显示该条目（门控生效）。
+
+---
+
 ## 40. 收尾三项：删死代码 + 合并 `5e7030db7` + 合并 `142b87102`（2026-09-12）
 
 > 用户指令：「删死代码，然后合并 5e7030db7、142b87102」。三项均已落地并重建启动点验（提交 `43417ffc8` / `73843d81e` / `6d9e859f8`）。
@@ -2372,29 +2398,53 @@ not 1) roughly halves build time versus codegen-units=1 for ~4% larger stripped/
 **未验证**：上游「构建时间约减半」这一具体数字**未在本仓复测**——`release-cli` 是 LTO 全量构建（数十分钟），
 如需该数字应单独跑一次 `release-cli` 构建前后对比。
 
-### 39.6 本地补齐：「复制时间戳」菜单入口（上游未做）
+---
 
-用户确认「补」。落点：`app/src/terminal/view.rs::ai_block_copying_menu_items`（AI 块「复制类」菜单的统一构造处），门控照抄上游 `context_menu.rs` 的原始 21 行：
+## 43. 移植 `a2f586584`（#10423）：修复历史会话里点命令行不展开（2026-09-12）
 
-```rust
-let has_query_timestamp = self.rich_content_views.iter().any(|rich_content| {
-    rich_content.ai_block_metadata()
-        .filter(|metadata| metadata.ai_block_handle.id() == ai_block_view_id)
-        .is_some_and(|metadata| metadata.ai_block_handle.as_ref(ctx).query_sent_at(ctx).is_some())
-});
-if has_query_timestamp {
-    items.push(MenuItemFields::new(crate::t!("menu-ai-block-copy-timestamp"))
-        .with_on_select_action(TerminalAction::ContextMenu(
-            ContextMenuAction::CopyAIBlockTimestamp { ai_block_view_id }))
-        .into_item());
-}
-```
+> 触发：用户报「zap 智能体（Agent 对话）的历史会话里，点击命令行不展开命令内容块」，并问「之前命令行展开的相关代码是否都合并了」。结论：**机制在（base 代码 `0dbd3d567`），但上游针对恢复会话命令渲染的系统性修复没合**——`a2f586584`(#10423) 与 `1daed2f0a`(#10776) 本地都没有。
 
-- **本地偏差（有意）**：该 helper 同时服务「右键行菜单」与「三点溢出菜单」两处调用（`view.rs:14912`、`view.rs:15820`），因此本地上两处菜单都会出现「复制时间戳」；上游只在其行菜单里有。这是超集，不是遗漏。
-- ftl：`menu-ai-block-copy-timestamp`（en `Copy timestamp` / zh-CN `复制时间戳`）。
-- 至此 P3-b 的链路闭合：悬停看时间戳（tooltip）→ 右键/溢出菜单「复制时间戳」→ `AIBlockAction::CopyTimestamp` 写剪贴板。
-- 归属说明：这是**本地功能补齐**，不是上游移植；文档按「本地功能」记录，不写入上游同步的落地清单。
-- **验证（2026-09-12）**：`cargo check -p warp` 0 error；重建后用户手动点验**通过**——悬停显示时间戳、右键/溢出菜单出现「复制时间戳」、点击后剪贴板写入时间文本、无时间戳的块不显示该条目（门控生效）。
+### 43.1 根因（三轮临时探针实测，探针用完即删）
 
+| 探针 | 结果 | 结论 |
+|---|---|---|
+| A | `action_type=Command 旧expanded=false` | 点击到达处理函数 ✓ |
+| B | `value=true 当前=false editor_some=false` | 状态翻转 ✓（但无 editor）|
+| C | `status done=true` **无早返回** | AI 块事件处理通过，已发 `UpdateInlineActionVisibility{true}` ✓ |
+| G | `is_visible=true 匹配块数=1` | 按 action_id 揭示生效 ✓ |
+| H | `目标 action 的块索引=[15] 块总数=19 AI块 total_idx=TotalIndex(23)` | 命令块确实存在 ✓ |
+| D | `上方渲染=false 立即后继块=false editor=false mcp=false` | **三道渲染条件全不成立** ✗ |
+| E2/E3 | `紧邻块: 存在=true 有 agent metadata=false` / `不是终端 Block` | **AI 块紧邻的下一项不是那个命令块** ✗ |
 
+**根因**：`append_rich_content(AI, false)` 把 AI 块插在**活动块之前**，而 `create_restored_command_block` 又 `create_new_block` **push 到列表末尾** ⇒ 恢复后布局是 `[AI 块][隐藏的空输入块][命令块]`，隐藏块卡在中间 ⇒ `is_requested_command_block_immediately_after_ai_block`（`blocks.rs:2064`，与上游逐字相同）恒为 false ⇒ 展开后无内容可渲染。
 
+### 43.2 上游解法（本提交采纳）
+
+恢复时**先**把该会话持久化的命令块按序插入块列表（`insert_restored_block`，它经 `restore_block` **复用活动块**成为新的活动块 ⇒ 天然与 AI 块相邻），**再**按时间戳算出每个交换的 `command_block_index`，AI 块据此插到命令块之前；随后删除 `create_restored_command_block`（`blocks.rs` 69 行）。
+
+### 43.3 本地适配（4 处）
+
+1. **proto 时间戳不可用**：本仓 proto fork（`zerx-lab/warp-proto-apis` rev `14ab9a71`）的 `ShellCommandFinished` 只有 `output/exit_code/command_id`，**没有** `start_ts/finish_ts` ⇒ 上游顺带的「shell 命令运行时长」**未移植**；回退 `action_result/{convert,mod}.rs`、`shell_command.rs`、`convert_conversation.rs`、`convert_to_tests.rs` 的时间戳 plumbing，`conversation.rs` 的 `start_ts/completed_ts` 退回「消息时间戳 + 交换时间」回退链。
+2. **保留本地 CLI subagent 机制**（本地 `54905881d`）：`restore_missing_cli_subagent_blocks_for_conversation` 被上游方案取代而删除，但其 `restore_cli_subagent_views_for_conversation` 调用与快照去重语义保留；`conversation.rs` 里本地的 `block_id/requested_command_action_id/subagent_task_id` 三字段与 5 个 helper 全部保留，与上游的 `message_id/start_ts/completed_ts` 并存。
+3. **插入循环补去重保护**：`block_list.block_with_id(&block.id).is_none()` 才插入，避免「历史对话进入已有终端」时命令块重复（本地原本的去重语义）。
+4. `pane_group/mod.rs` 上游新增的是 **cloud mode** 插桩（`replace_loading_pane_with_restored_ambient_cloud_mode_pane`），本仓无 cloud mode → 取本地侧（空）。
+
+### 43.4 验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo check -p warp` | 0 error / 0 warning |
+| `cargo test -p warp --lib --no-run` | 通过（含新移植的测试文件）|
+| `load_ai_conversation`（新移植 14 用例）| **14 过 / 0 败** |
+| `terminal::model::blocks` | 65 过 / 0 败 |
+| `requested_command` | 15 过 / 0 败 |
+| `terminal::view::` | **198 过 / 7 败**；基线（移植前）**184 过 / 同样 7 败** → 7 个失败为**既存环境问题**，本次净增 14 个通过 |
+| 手动点验 | 待用户确认（历史会话里展开命令卡片应出现命令内容）|
+
+### 43.5 教训
+
+1. **「点击无反应」类问题要先分清「交互链路断」还是「渲染无内容」**：本轮 A/B/C 证明链路全通，真正的问题是**状态翻转后没有任何可渲染内容**（D 三条件全 false）——只看点击处理函数会白查。
+2. **恢复/重放类路径的「顺序」是核心不变量**：同一批块，插入顺序不同就导致「块存在但相邻性检查失败」；对照上游**同名检查函数逐字相同**即可断定问题在插入侧而非检查侧——比继续加探针更快定位。
+3. **移植前先核对 proto 依赖**：`ShellCommandFinished` 的时间戳字段是本仓 proto fork 没有的，导致「顺带特性」必须剥离（4 个文件回退）；不先核对就会到编译期才发现，还可能误判为「代码没合全」。
+4. **`git stash pop` 后必须重新 `git add`**：本次因 pop 后未暂存、又直接 `git commit`（无 `-A`），提交只含新增测试文件、11 个改动文件漏在外面（已用 `--amend` 修正）。
+5. **追加章节前先确认锚点唯一性**：此前追加 §40 时锚点落在 §39.5/§39.6 之间，导致 §39.6 被挤到 §42 之后——本轮已把 §39.6 移回 §39 内、§40 之前。
