@@ -2448,3 +2448,14 @@ not 1) roughly halves build time versus codegen-units=1 for ~4% larger stripped/
 3. **移植前先核对 proto 依赖**：`ShellCommandFinished` 的时间戳字段是本仓 proto fork 没有的，导致「顺带特性」必须剥离（4 个文件回退）；不先核对就会到编译期才发现，还可能误判为「代码没合全」。
 4. **`git stash pop` 后必须重新 `git add`**：本次因 pop 后未暂存、又直接 `git commit`（无 `-A`），提交只含新增测试文件、11 个改动文件漏在外面（已用 `--amend` 修正）。
 5. **追加章节前先确认锚点唯一性**：此前追加 §40 时锚点落在 §39.5/§39.6 之间，导致 §39.6 被挤到 §42 之后——本轮已把 §39.6 移回 §39 内、§40 之前。
+
+### 43.6 同批 `1daed2f0a`(#10776) 评估：**不适用**
+
+上游该提交修「恢复 cloud mode 会话时重复渲染 requested command」，改 4 个文件：
+`terminal_model.rs`（移除 `FeatureFlag::CloudModeSetupV2` 门控的 `set_is_executing_oz_environment_startup_commands(true)`）、
+`view/ambient_agent/mod.rs`（`create_cloud_mode_view` 里连上游后开始 setup command tracking）、
+`shared_session/viewer/terminal_manager.rs`、以及其测试文件。
+
+**本地核对（全 0 命中）**：`CloudModeSetupV2` 0、`fn create_cloud_mode_view` 0、
+`start_cloud_mode_setup_command_tracking` 0，且 `app/src/terminal/shared_session/viewer/terminal_manager.rs` **不存在**
+（本仓无 cloud mode / 共享会话 viewer 体系，见 §28.2）。⇒ **不需要移植**；本仓的「命令块重复插入」风险已由 §43.3 第 3 条的去重保护覆盖。
