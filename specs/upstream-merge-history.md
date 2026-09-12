@@ -2183,5 +2183,48 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 3. **机制正确 ≠ 收益成立**：符号计数（−62% ContentDeserializer）与构建时间（+2.1%）方向相反时，以端到端时间为准，机制数据仅用于解释原因。
 4. **栈（stack）依赖要用文件重叠验证，不能只看提交描述**：本轮 `comm -12` 一步就否掉了“必须连 #15454 一起做”的误判。
 
+---
+
+## 39. i18n 补齐（2026-09-12 收尾）
+
+> 用户手动验证 P1/P2/P3-a/P3-b 后反馈「**还是英文，要补上中文**」「**还有其他的，不止这一个**」。逐处排查本轮移植引入的**用户可见文案**，共 4 处硬编码英文（提交 `2e0604f55`、`7fbb3b105`）。
+
+### 39.1 问题与修法
+
+| # | 位置 | 原因 | 修法（ftl key） |
+|---|------|------|-----------------|
+| 1 | 「右键行为」**下拉两项**（P3-a） | `RightClickBehavior::as_dropdown_label()` 照 `settings/mod.rs` 旧惯例硬编码英文 | 改返回 `String` + `crate::t!`；key `settings-features-right-click-behavior-{context-menu,paste}` |
+| 2 | 提问时间戳 **tooltip**（P3-b） | `query.rs` 里 `format!("Message sent {}", …)` 硬编码 | `crate::t!("ai-block-query-timestamp-tooltip", timestamp = …)`（`t!` 支持参数） |
+| 3 | 时间戳**格式**（P3-b） | `format_message_timestamp` 固定 `%-m/%-d at %-I:%M %p`（"at"/"PM" 英文） | 按 `crate::i18n::current_languages()` 分支：中文 `%-m月%-d日 %H:%M`，其它语言保持上游形态（先例：`ai/agent_providers/active_ai/mod.rs` 的 locale 判断） |
+| 4 | **Ctrl+Tab 行为 / 全局热键**下拉项（**既存**，非本轮引入，但同页同类） | `settings/mod.rs` 两个 `as_dropdown_label()` 硬编码英文 | 同样改 `String` + `crate::t!`；5 个 key（`…ctrl-tab-behavior-{activate-prev-next-tab,cycle-most-recent-session}`、`…global-hotkey-{disabled,quake-mode,activation-hotkey}`） |
+
+新增 ftl key **6 条 × (en, zh-CN)**（`2e0604f55` 另含右键行为 2 条）。返回类型改 `String` 后**调用点无需改动**：`DropdownItem::new` 取 `Into<String>`、`set_selected_by_name` 取 `impl AsRef<str>`。
+
+### 39.2 复查结论（全仓检索）
+
+- `fn as_dropdown_label` 现仅 3 处，**全部**已本地化。
+- 设置页 `render_dropdown_item` / `render_body_item` / `Text::new` 的英文字面量检索为**空**。
+- 全仓硬编码 `MenuItemFields::new("…")` 仅剩 10 处：8 处在测试文件（`menu_test.rs`），真实 UI 只有 `workspace/view/server_file_browser.rs:4962` 的 `"Refresh"`（既存，未处理）。
+
+### 39.3 验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo check -p warp` | 0 error |
+| `cargo test -p warp --lib i18n -- --test-threads=1` | **4/4 通过**（zh-CN 资源正常解析，`current_languages=[zh-CN, en]`）|
+| 并行跑 i18n 测试 | `fallback_chain_works` 失败，但**既存干扰**——用 `git stash` 回基线复现同样失败（两个测试都调全局 `init()` 且语言不同）|
+| 手动验证（用户） | **通过**：右键行为 / Ctrl+Tab / 全局热键下拉为中文；提问悬停显示「提问时间：9月12日 15:04」|
+
+### 39.4 附带更正：`CopyAIBlockTimestamp` 是「悬空动作」
+
+`b7ec0fc55`（P3-b）只加了 `ContextMenuAction::CopyAIBlockTimestamp` 变体、`Debug` 分支与**处理函数**，**全仓（含 `upstream/master`）没有任何地方构造它**——即「复制时间戳」**菜单入口上游就不存在**。§36.1 记录 P3-b 时未察觉，此前给用户的手动验证步骤（「右键提问行应有复制时间戳」）因此是错的；已在对话中更正。若要该入口需**本地补齐**（上游未做），尚未落地。
+
+### 39.5 教训
+
+1. **移植上游 UI 功能时必须顺带检查文案是否走 i18n**：上游大量使用硬编码英文（`as_dropdown_label`、`format!("Message sent …")`），本仓是中文优先的 UI，直接照搬就会出现「中文界面里混英文」。
+2. **枚举展示文案的本地化范式**：返回 `String` + `crate::t!`（`t!` 有两臂，支持 `key, arg = value`）；改返回类型前先确认调用点的 trait bound（`Into<String>` / `AsRef<str>` 可免改）。
+3. **占位/时间格式也要本地化**：`%I:%M %p`、`"at"` 这类不显眼的英文最容易漏；本仓判断语言的既有方式是 `crate::i18n::current_languages()` + `starts_with("zh")`。
+4. **并行测试失败先回基线复现再定性**：`git stash` 一次即确认 `fallback_chain_works` 的并行失败为既存（全局 `init()` 竞争），避免误判为自己引入。
+
 
 
