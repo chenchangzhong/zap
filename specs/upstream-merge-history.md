@@ -2049,7 +2049,7 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 | `c25ac4070` + `18179177a`（右键行为设置：菜单 vs 直接粘贴） | **缓：值得但属独立项目** | 无缺失前置——19 文件里 16 个存在，缺的 3 个只是路径漂移（`elements/gui/event_handler.rs` → 本地 `elements/event_handler.rs`）与测试文件；设置项落点现成（`settings/select.rs` 已有同类 `middle_click_paste_enabled`）；实测 14 hunk / 10 文件，覆盖 `warpui_core` 事件层 + terminal / notebooks / env_vars / inline_action / agent 各视图 → 估 1–2 天，非顺手同步 |
 | `4b894db80`（serde Content → 手写 Deserialize） | 不做 | 纯编译期优化、无行为收益；7 hunk / 3 生产文件 |
 | `8b88df987` + `40e397170`（按住修饰键显示 tab 快捷键） | 不做 | 26 hunk / 5 文件；本地完全无该机制，`vertical_tabs` 自研度最高 |
-| `5e7030db7`（warping 行显示模型名） | 不做 | 7 hunk；本地完成态已展示模型名（`status_bar.rs:799/890`），收益低；上游夹带 multi-agent 解耦改动 |
+| `5e7030db7`（warping 行显示模型名） | 不做 | **2026-09-12 复核后理由更硬**：① 上游做成**双重门控的 dogfood 特性**——非默认 Cargo feature `warping_model_name = []`（`app/Cargo.toml:920`，不在 default 列表）+ `FeatureFlag::WarpingModelName` 仅列在 `DOGFOOD_FLAGS`（upstream master `warp_features/src/lib.rs:1072`），即**上游自己也不默认展示**；② 本仓无自动路由/自定义 router（`CustomModelRouters` 仅是 flag 名、无实现；BYOP 模型由 `build_byop_models_by_feature` 从用户配置构造），模型是用户显式选的 → **用户已知**；唯一有信息量的 `is_fallback` 场景本地**已展示**（`status_bar.rs:793-830` 的 `resolve_fallback_warping_message`）；③ 本地另有**未接线**的 `AIBlock::output_model_display_name`（`block.rs:4783`，全仓无调用＝死代码）→ 若真需要，应接线它而非移植上游 flag。成本：7 hunk / 4 文件 + feature/flag 三处接线，且需剥离该提交夹带的 multi-agent 解耦改动 |
 | `4cd1c77c4`（原生 agent 工具条 File explorer chip） | 不做 | 本地**已有** `AgentToolbarItemKind::FileExplorer`（现仅 CLI agent），属重复建设；落点在自研 footer 区。**⚠️ 更正（2026-09-12 复核）**：原写「依赖本地缺失的 `server/telemetry/events.rs`」是**路径漂移误读**——本地 telemetry 是单文件 `app/src/server/telemetry.rs`，`FileTreeSource` **已存在**（5 个变体：PaneHeader/Keybinding/LeftPanelToolbelt/ForceOpened/CLIAgentView），该提交只需新增 1 个 `AgentToolbelt` 变体 |
 | `142b87102`（Attach file 调色板命令） | 不做 | 本地**已有** attach 按钮与 `EditorAction::AttachFiles`，本项只是补一个命令面板入口。**⚠️ 更正（2026-09-12 复核）**：原写「依赖 `file_attach_allowed_for_shared_session`（本地 0 命中）」**不成立**——它只是 `AgentToolbarItemKind::FileAttach.available_to_session_viewer(...)` 的薄封装，而 `available_to_session_viewer`（`agent_input_footer/toolbar_item.rs:92`）与 `SharedSessionStatus` 本地都有，需补的只是约 10 行本地 helper |
 
@@ -2061,6 +2061,8 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 > | `5e7030db7` | 4 | 7 | 数据链具备（`status_bar.rs` 已读 `model_info.display_name`）→ 「收益偏小 + 夹带 multi-agent 解耦改动」理由成立 |
 > | `4cd1c77c4` | 3 | 10 | **前置并不缺失**（见上表更正）→ 仅剩「重复建设 + 自研 footer 区」 |
 > | `142b87102` | 6 | 13 | **前置并不缺失**（见上表更正）→ 仅剩「入口重复 + 冲突多」 |
+>
+> 附带发现（既存，未处理）：`AIBlock::output_model_display_name`（`ai/blocklist/block.rs:4783`）全仓**无调用**＝死代码——它正是「显示真实模型名」的本地历史实现，与 `5e7030db7` 想做的事重合；是否清理/接线待用户决定。
 >
 > 教训：**「前置缺失」必须按符号名全仓 grep 判断，不能用上游文件路径是否存在来判断**——本地 `server/telemetry.rs`(单文件) vs 上游 `server/telemetry/events.rs`(拆分) 这类漂移会直接得出相反的结论（§18.5 路径坑的第二次踩中）。
 
