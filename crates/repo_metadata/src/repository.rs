@@ -73,7 +73,7 @@ pub struct Repository {
     next_subscriber_id: SubscriberId,
     /// Cached gitignore patterns for this repository.
     #[cfg(feature = "local_fs")]
-    gitignores: Vec<Gitignore>,
+    gitignores: Vec<Arc<Gitignore>>,
 
     task_queue: ModelHandle<TaskQueue>,
 }
@@ -208,8 +208,9 @@ impl Repository {
                     }
                 }
 
+                let gitignores = self.gitignores.clone();
                 Box::pin(DirectoryWatcher::handle(ctx).update(ctx, |watcher, ctx| {
-                    watcher.start_watching_directories(directories_to_watch, ctx)
+                    watcher.start_watching_directories(directories_to_watch, gitignores, ctx)
                 }))
             } else {
                 Box::pin(ready(Ok(())))

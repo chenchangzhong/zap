@@ -23,6 +23,7 @@ cfg_if::cfg_if! {
         use repo_metadata::repository::RepositorySubscriber;
         use repo_metadata::{Repository, DirectoryWatcher, RepositoryUpdate};
         use ignore::gitignore::Gitignore;
+        use std::sync::Arc;
         use async_channel::Sender;
         // `instant::Instant` 是本仓库全局约定的跨平台(含 WASM)起点,代替
         // `std::time::Instant`。使用 `clippy.toml` 中的 disallowed_types 强制。
@@ -805,7 +806,7 @@ impl ProjectContextModel {
 
         // Use build_tree to collect all files, then filter for rule files
         let mut files = Vec::<FileMetadata>::new();
-        let mut gitignores = Vec::<Gitignore>::new();
+        let mut gitignores = Vec::<Arc<Gitignore>>::new();
 
         // Collect patterns that should not be ignored
         let override_ignore_patterns: Vec<String> =

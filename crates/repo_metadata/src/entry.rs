@@ -3,10 +3,12 @@
 use ignore::gitignore::Gitignore;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use warp_util::standardized_path::StandardizedPath;
 
+use crate::gitignore_cache;
 /// Maximum file size allowed for treesitter parsing (3MB).
 const MAX_FILE_SIZE: usize = 3 * 1000 * 1000;
 
@@ -90,7 +92,7 @@ impl Entry {
     pub fn build_tree(
         path: impl Into<PathBuf>,
         files: &mut Vec<FileMetadata>,
-        gitignores: &mut Vec<Gitignore>,
+        gitignores: &mut Vec<Arc<Gitignore>>,
         mut remaining_file_quota: Option<&mut usize>,
         max_depth: usize,
         current_depth: usize,
@@ -106,8 +108,7 @@ impl Entry {
 
         let gitignore_path = curr_path.join(".gitignore");
         if gitignore_path.exists() {
-            let (gitignore, _) = Gitignore::new(gitignore_path);
-            gitignores.push(gitignore);
+            gitignores.push(gitignore_cache::get_or_parse(&gitignore_path));
         }
 
         let path_is_ignored = matches_gitignores(
@@ -254,7 +255,7 @@ impl Entry {
     }
 
     /// Loads an unloaded directory
-    pub fn load(&mut self, gitignores: &mut Vec<Gitignore>) -> Result<(), BuildTreeError> {
+    pub fn load(&mut self, gitignores: &mut Vec<Arc<Gitignore>>) -> Result<(), BuildTreeError> {
         // TODO: Consider a similar `unload` method if we run into performance issues.
         let Self::Directory(directory) = self else {
             return Ok(());
@@ -336,7 +337,7 @@ pub fn is_git_internal_path(path: &Path) -> bool {
 pub fn matches_gitignores(
     path: &Path,
     is_dir: bool,
-    gitignores: &[Gitignore],
+    gitignores: &[Arc<Gitignore>],
     check_ancestors: bool,
 ) -> bool {
     gitignores.iter().any(|gitignore| {
@@ -463,7 +464,7 @@ pub fn should_ignore_git_path(path: &Path) -> bool {
     !is_commit_related_git_file(path) && !is_index_lock_file(path)
 }
 
-pub fn path_passes_filters(path: &Path, gitignores: &[Gitignore]) -> bool {
+pub fn path_passes_filters(path: &Path, gitignores: &[Arc<Gitignore>]) -> bool {
     let to_check_path = if path.exists() {
         match dunce::canonicalize(path) {
             Ok(canonical_path) => canonical_path,
@@ -508,16 +509,15 @@ pub fn is_file_parsable(path: &Path) -> Result<bool, io::Error> {
     std::fs::metadata(path).map(|metadata| (metadata.len() as usize) < MAX_FILE_SIZE)
 }
 
-pub fn gitignores_for_directory(directory_path: &Path) -> Vec<Gitignore> {
+pub fn gitignores_for_directory(directory_path: &Path) -> Vec<Arc<Gitignore>> {
     let mut gitignores = Vec::new();
     let gitignore_path = directory_path.join(".gitignore");
     if gitignore_path.exists() {
-        let (gitignore, _) = Gitignore::new(&gitignore_path);
-        gitignores.push(gitignore);
+        gitignores.push(gitignore_cache::get_or_parse(&gitignore_path));
     }
     let (global_gitignore, _) = Gitignore::global();
     if !global_gitignore.is_empty() {
-        gitignores.push(global_gitignore);
+        gitignores.push(Arc::new(global_gitignore));
     }
     gitignores
 }

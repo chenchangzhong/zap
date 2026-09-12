@@ -44,7 +44,7 @@ impl FileTreeEntry {
     pub fn load_at_path(
         &mut self,
         path: &StandardizedPath,
-        gitignores: &mut Vec<Gitignore>,
+        gitignores: &mut Vec<Arc<Gitignore>>,
     ) -> Result<(), BuildTreeError> {
         self.state_map.load_at_path(path, gitignores)
     }
@@ -354,7 +354,7 @@ pub struct FileTreeState {
     /// The entry representing the file tree structure.
     pub entry: FileTreeEntry,
     /// Gitignore rules applicable to this repository.
-    pub gitignores: Vec<Gitignore>,
+    pub gitignores: Arc<Vec<Arc<Gitignore>>>,
 
     /// Handle to the backing repository (None for lazily-loaded standalone paths).
     #[expect(unused)]
@@ -365,12 +365,12 @@ impl FileTreeState {
     /// Creates a new FileTreeState.
     pub fn new(
         entry: Entry,
-        gitignores: Vec<Gitignore>,
+        gitignores: Vec<Arc<Gitignore>>,
         repository: Option<ModelHandle<Repository>>,
     ) -> Self {
         Self {
             entry: entry.into(),
-            gitignores,
+            gitignores: Arc::new(gitignores),
             repository,
         }
     }
@@ -379,7 +379,7 @@ impl FileTreeState {
     pub fn new_lazy_loaded(entry: Entry) -> Self {
         Self {
             entry: entry.into(),
-            gitignores: vec![],
+            gitignores: Arc::new(vec![]),
             repository: None,
         }
     }
@@ -391,7 +391,7 @@ impl FileTreeState {
     pub fn from_file_tree_entry(entry: FileTreeEntry) -> Self {
         Self {
             entry,
-            gitignores: vec![],
+            gitignores: Arc::new(vec![]),
             repository: None,
         }
     }
