@@ -74,6 +74,8 @@ fn render_user_query(
             &user_display_name,
             profile_image_url.as_ref(),
             None,
+            None,
+            Default::default(),
             &Default::default(),
             &Default::default(),
             0,

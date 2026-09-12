@@ -1,6 +1,16 @@
 use chrono::{DateTime, Duration, Local, Utc};
 use std::ops::Sub;
 
+/// 消息时间戳展示格式（如 `9/12 at 3:04 PM`）。
+pub fn format_message_timestamp(datetime: &DateTime<Local>) -> String {
+    datetime.format("%-m/%-d at %-I:%M %p").to_string()
+}
+
+/// 过滤服务端未提供时间戳时反序列化出的默认值（epoch）。
+pub fn is_trustworthy_message_timestamp(datetime: &DateTime<Local>) -> bool {
+    datetime != &DateTime::<Local>::default()
+}
+
 // Some conversion ratios for time units.
 const SEC_TO_MS: f64 = 1000.;
 const MIN_TO_MS: f64 = 60. * SEC_TO_MS;

@@ -126,7 +126,8 @@ use warpui::ui_components::components::UiComponent;
 use warpui::ui_components::components::UiComponentStyles;
 
 use crate::util::link_detection::*;
-use chrono::Duration;
+use crate::util::time_format::format_message_timestamp;
+use chrono::{DateTime, Duration, Local};
 use itertools::Itertools;
 use secret_redaction::*;
 #[cfg(feature = "local_fs")]
@@ -386,6 +387,7 @@ pub(super) struct AIBlockStateHandles {
 
     /// Mouse state handle for the overflow menu button
     overflow_menu_handle: MouseStateHandle,
+    query_timestamp_tooltip_handle: MouseStateHandle,
 
     menu_accept_button_handle: MouseStateHandle,
     menu_reject_button_handle: MouseStateHandle,
@@ -3697,6 +3699,10 @@ impl AIBlock {
         self.model.status(app)
     }
 
+    pub fn query_sent_at(&self, app: &AppContext) -> Option<DateTime<Local>> {
+        self.model.query_sent_at(app)
+    }
+
     /// Returns `true` if this AI block contains user input.
     pub fn has_user_input(&self, app: &AppContext) -> bool {
         self.model
@@ -5439,6 +5445,7 @@ pub enum AIBlockAction {
     /// Copy the content from the previous user query.
     /// Note that this block may not have the user query.
     CopyQuery,
+    CopyTimestamp,
     /// Copy all AI output from the previous user query to the next user query.
     /// Note that this contains more than just this block, since from the user perspective everything after the user query appears like one block.
     CopyOutput,
@@ -5821,6 +5828,14 @@ impl TypedActionView for AIBlock {
                 // Zap(P0-B):复制 preceding user query;空文本不写剪贴板并给提示 toast。
                 let prompt_text = self.get_preceding_user_query(ctx);
                 Self::copy_text_with_feedback(prompt_text, ctx);
+            }
+            AIBlockAction::CopyTimestamp => {
+                if let Some(timestamp) = self.query_sent_at(ctx) {
+                    ctx.clipboard()
+                        .write(ClipboardContent::plain_text(format_message_timestamp(
+                            &timestamp,
+                        )));
+                }
             }
             AIBlockAction::CopyOutput => {
                 // Zap(P0-B):复制自 preceding user query 起的全部输出;空文本不写剪贴板并给提示
