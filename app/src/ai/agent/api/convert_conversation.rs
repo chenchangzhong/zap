@@ -1380,6 +1380,7 @@ fn create_exchange_from_messages(
         })
         .unwrap_or_default();
 
+
     // Get the exchange's finish time from the last message timestamp in this exchange.
     let finish_time = message_ids
         .iter()

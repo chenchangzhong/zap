@@ -89,6 +89,21 @@ use super::user_context;
 use crate::ai::agent::AIAgentContext;
 
 /// 从 input 中抽出最近一条 `UserQuery.context`(等价 warp `convert_to.rs::convert_input` 取的那条)。
+/// 本地 BYOP 构造 `api::Message` 时写入的真实时间戳。
+///
+/// 上游这些消息来自服务端，自带 `timestamp`；本地 BYOP 自己造消息，此前一律写 `None`，
+/// 导致恢复会话时 `exchange.start_time` 与命令块 `start_ts` 全部退化成 epoch
+/// （`convert_conversation.rs` 的 CurrentTime/消息时间戳两条回退都取不到值），
+/// 进而使上游「按时间戳把 AI 块与命令块配对」的算法失效——历史会话里命令块被插到所有
+/// 消息块之前、展开后落在最下面。见 history.md §43.7。
+fn message_timestamp_now() -> prost_types::Timestamp {
+    let now = chrono::Local::now();
+    prost_types::Timestamp {
+        seconds: now.timestamp(),
+        nanos: now.timestamp_subsec_nanos() as i32,
+    }
+}
+
 fn latest_input_context(input: &[AIAgentInput]) -> &[AIAgentContext] {
     for i in input.iter().rev() {
         if let Some(ctx) = i.context() {
@@ -4741,7 +4756,7 @@ fn make_append_event(task_id: &str, message_id: &str, kind: AppendKind) -> api::
         citations: vec![],
         message: Some(msg_inner),
         request_id: String::new(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     };
     api::ResponseEvent {
         r#type: Some(api::response_event::Type::ClientActions(
@@ -4880,7 +4895,7 @@ fn make_reasoning_message(task_id: &str, request_id: &str, reasoning: String) ->
             },
         )),
         request_id: request_id.to_owned(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     }
 }
 
@@ -4894,7 +4909,7 @@ fn make_agent_output_message(task_id: &str, request_id: &str, text: String) -> a
             api::message::AgentOutput { text },
         )),
         request_id: request_id.to_owned(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     }
 }
 
@@ -4941,7 +4956,7 @@ fn make_user_query_message(
             ..Default::default()
         })),
         request_id: request_id.to_owned(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     }
 }
 
@@ -4965,7 +4980,7 @@ fn make_web_search_searching_message(
             }),
         })),
         request_id: request_id.to_owned(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     }
 }
 
@@ -5075,7 +5090,7 @@ fn make_web_search_status_from_result(
             }),
         })),
         request_id: request_id.to_owned(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     }
 }
 
@@ -5099,7 +5114,7 @@ fn make_web_fetch_fetching_message(
             }),
         })),
         request_id: request_id.to_owned(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     }
 }
 
@@ -5145,7 +5160,7 @@ fn make_web_fetch_status_from_result(
             }),
         })),
         request_id: request_id.to_owned(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     }
 }
 
@@ -5175,7 +5190,7 @@ fn make_tool_call_result_message(
             },
         )),
         request_id: request_id.to_owned(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     }
 }
 
@@ -5203,7 +5218,7 @@ fn make_tool_call_carrier_message(
             tool: None,
         })),
         request_id: request_id.to_owned(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     }
 }
 
@@ -5223,7 +5238,7 @@ fn make_tool_call_message(
             tool: Some(tool),
         })),
         request_id: request_id.to_owned(),
-        timestamp: None,
+        timestamp: Some(message_timestamp_now()),
     }
 }
 
@@ -7624,7 +7639,7 @@ mod issue_94_task_linearization_tests {
                 ..Default::default()
             })),
             request_id: request_id.to_string(),
-            timestamp: None,
+            timestamp: Some(message_timestamp_now()),
         }
     }
 

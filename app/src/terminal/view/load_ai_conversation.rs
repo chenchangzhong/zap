@@ -27,7 +27,7 @@ use std::ops::Not;
 
 use super::DEFAULT_AI_BLOCK_HEIGHT;
 
-use crate::ai::agent::AIAgentActionResultType;
+use crate::ai::agent::{AIAgentActionId, AIAgentActionResultType};
 use crate::ai::agent::CreateDocumentsRequest;
 use crate::ai::agent::{
     AIAgentAction, AIAgentActionType, AIAgentOutputMessage, AIAgentOutputMessageType,
@@ -61,6 +61,8 @@ use crate::{
 };
 use warp_core::channel::ChannelState;
 use warp_multi_agent_api as api;
+use std::collections::{HashMap, HashSet};
+
 use warpui::units::IntoPixels;
 use warpui::{ModelHandle, SingletonEntity};
 
@@ -629,6 +631,7 @@ impl TerminalView {
             )
         };
 
+
         // Process all exchanges for this conversation
         let mut all_ai_block_params = Vec::new();
         for (exchange, command_block_index) in exchanges.into_iter().zip(command_block_indices) {
@@ -668,6 +671,7 @@ impl TerminalView {
             &conversation_for_cli_subagent_restore,
             ctx,
         );
+
 
         log::info!(
             "Successfully restored {blocks_created} AI blocks for conversation: {conversation_id}"
@@ -760,6 +764,7 @@ impl TerminalView {
 
         // Sort by timestamp to prepare for batch block index lookup
         all_exchanges_with_conversation_ids.sort_by_key(|(exchange, _)| exchange.start_time);
+
 
         // Compute all block indices based on the restoration type
         let command_block_indices = {
@@ -1235,9 +1240,10 @@ fn command_block_indices_for_exchanges<'a>(
     exchanges: impl Iterator<Item = &'a AIAgentExchange>,
     _exchange_count: usize,
 ) -> Vec<Option<BlockIndex>> {
+    let exchanges: Vec<&AIAgentExchange> = exchanges.collect();
     let blocks = terminal_model.block_list().blocks();
 
-    // Collect shell command blocks with their timestamps
+    // 上游路径：按时间戳把命令块与交换配对（命令块 start_ts 中最早不早于交换 start_time 者）。
     let command_blocks: Vec<(BlockIndex, DateTime<Local>)> = blocks
         .iter()
         .enumerate()
@@ -1252,10 +1258,85 @@ fn command_block_indices_for_exchanges<'a>(
         .collect();
 
     let exchange_timestamps: Vec<DateTime<Local>> =
-        exchanges.map(|exchange| exchange.start_time).collect();
-    find_block_indices_for_exchange_timestamps(&command_blocks, &exchange_timestamps)
-}
+        exchanges.iter().map(|exchange| exchange.start_time).collect();
+    let by_timestamp =
+        find_block_indices_for_exchange_timestamps(&command_blocks, &exchange_timestamps);
 
+    // ── 旧会话兼容回退（本地 shim，见 history.md §43.7）───────────────────────────
+    // 本仓修复前创建的会话，其 BYOP 消息没有时间戳（`timestamp: None`），恢复出来的
+    // `exchange.start_time` 会退化成同一个值（实测 179 个交换只有 1–3 个不同值、多为
+    // 1970-01-01），时间戳配对因此丧失区分能力：所有交换都命中同一个命令块，AI 块被插到
+    // 列表最前、命令块沉底（用户实测「展开后落在所有消息块最下面」）。
+    // 仅当时间戳退化时，改用 action id 精确配对；时间戳正常（新会话）时完全走上游逻辑。
+    // 判据：`convert_conversation.rs` 在取不到 CurrentTime 与消息时间戳时用
+    // `unwrap_or_default()`（= 1970 epoch）兜底，而本仓修复前的会话持久化消息没有时间戳，
+    // 于是绝大多数交换都是 epoch。只要出现 epoch 就说明这批数据的时间戳不可信。
+    let distinct_exchange_times: HashSet<DateTime<Local>> =
+        exchange_timestamps.iter().copied().collect();
+    let has_missing_timestamps = exchange_timestamps
+        .iter()
+        .any(|timestamp| *timestamp == DateTime::<Local>::default());
+    // 判据（启发式，只在明显不可区分时启用）：平均每个不同时间值要摊到 ≥2 个交换，
+    // 或者出现 epoch（`convert_conversation.rs` 在取不到任何时间时的兜底值）。
+    // 本仓历史会话正是前者——所有交换共用「会话创建时间」（实测 186 个交换只有 2 个值），
+    // 少数旧数据则是后者（1312 个交换全为 epoch）。
+    let timestamps_degenerate = exchanges.len() > 1
+        && (has_missing_timestamps
+            || distinct_exchange_times.len() * 2 <= exchanges.len());
+    if !timestamps_degenerate {
+        return by_timestamp;
+    }
+
+    // action id → 该命令块的索引（多个同 id 时取最早）。
+    let mut index_by_action: HashMap<&AIAgentActionId, BlockIndex> = HashMap::new();
+    for (index, block) in blocks.iter().enumerate() {
+        if block.is_background() {
+            continue;
+        }
+        if let Some(action_id) = block.requested_command_action_id() {
+            let block_index = BlockIndex::from(index);
+            index_by_action
+                .entry(action_id)
+                .and_modify(|existing| {
+                    if block_index < *existing {
+                        *existing = block_index;
+                    }
+                })
+                .or_insert(block_index);
+        }
+    }
+
+    let mut result: Vec<Option<BlockIndex>> = exchanges
+        .iter()
+        .map(|exchange| {
+            let mut best: Option<BlockIndex> = None;
+            if let Some(output) = exchange.output_status.output() {
+                for message in &output.get().messages {
+                    if let AIAgentOutputMessageType::Action(action) = &message.message {
+                        if let Some(block_index) = index_by_action.get(&action.id) {
+                            best = Some(best.map_or(*block_index, |b| b.min(*block_index)));
+                        }
+                    }
+                }
+            }
+            best
+        })
+        .collect();
+
+
+    // 未配对的交换沿用「其后第一个已配对交换」的块——与上游「最早且不早于该交换的块」语义一致，
+    // 使没有命令的交换也能落在正确位置（而不是被追加到末尾）。
+    let mut next: Option<BlockIndex> = None;
+    for slot in result.iter_mut().rev() {
+        if slot.is_some() {
+            next = *slot;
+        } else {
+            *slot = next;
+        }
+    }
+
+    result
+}
 /// Pure implementation of the block-index search used by
 /// [`command_block_indices_for_exchanges`].
 ///
