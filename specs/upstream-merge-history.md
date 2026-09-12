@@ -1905,3 +1905,53 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 
 *文档版本:v2.11*
 *下次合并前必读*
+## 35. 移植记录（进行中）：2026-08-14 → 上游 HEAD 区间首轮筛选
+
+> 触发：用户要求「从最初的 fork 时间开始检查」。核实 §31：**fork 点 `c325d146` → 2026-08-13 的全量对账已于第十四轮完成**（244 fix 候选 → 59 漏合并全部移植，5 跳过）。故本轮真正未对账区间为 **2026-08-14 → 上游 HEAD**。
+
+### 35.1 区间与筛选漏斗
+
+- 上游 HEAD：`4143c09ff`（2026-09-11），区间提交 **281**
+- `git cherry HEAD upstream/master c325d146`：`2238 +` / `98 -`。**注意 `+` 是「未移植集合的上界」**，含本地手工适配（patch-id 变化）与按决策表故意跳过的全部云端/CI 提交，不可当作待移植修复数。
+
+筛选漏斗（三轮，规则见脚本）：
+
+| 轮次 | 规则 | 剩余 |
+|------|------|------|
+| — | 区间总计 | 281 |
+| 一 | 仅命中跳过目录 / 依赖 CI bump / 仅清单文件 | 254 |
+| 二 | 主题：团队/workspace/Oz/billing/graphql/共享会话/harness 等 | 165 |
+| 三 | 无关键：Windows/WSL/PowerShell · docs/贡献者 · command-signatures · WASM/TUI · Factory/release workflow | **111 待判** |
+
+### 35.2 本轮主要成本：路径漂移（评估固定前置）
+
+本轮 281 条触及上游路径 **1081** 个，其中**本地缺失 599 个（55%）**。成因四类：
+
+1. **云端/团队文件**——`app/src/workspaces/user_workspaces/`、`settings_view/teams_page.rs`、`crates/warp_graphql_schema/`（本就跳过）
+2. **本地已删 crate**——`crates/warp_tui/*`
+3. **CI**——`.github/workflows/*`
+4. **测试文件约定差异（最大陷阱）**——上游 `_tests.rs` 与源码同目录，本地亦然但目录已重排，例：
+   - `app/src/terminal/view_tests.rs` → 本地 `app/src/terminal/view/view_tests.rs`
+   - `app/src/ai/agent_sdk/driver_tests.rs` → 本地 `app/src/ai/agent_events/driver_tests.rs`
+   - `app/src/server/server_api/ai.rs` → 本地 `app/src/settings/ai.rs`
+
+### 35.3 评估规则（后续每轮固定执行）
+
+判断候选可否移植**之前**，先剔除 `cloud/team/tui/CI` 路径与 `*_tests.rs` 约定差异，
+**只看剩余非测试源码路径是否在本地存在**。否则会把所有候选误判为「前提缺失」
+（首轮 `git apply --check` 12/12 全失败即此因，该结果**不能**作为「本地缺前提」的证据）。
+
+另：`git apply --check` 失败仅说明上下文行对不上，**不等于前提缺失**。
+
+### 35.4 已完成的单条评估
+
+**`a7326f8fe` 宽字符提升崩溃 —— 裁决：可移植**
+
+| 四问 | 结论 | 证据 |
+|------|------|------|
+| ① 前置假设 | 成立 | 本地 `app/src/terminal/model/grid/ansi_handler.rs:209` 与上游修复前**逐字相同**；`push_zerowidth` 本地返回 `()` |
+| ② 已有等效解法 | 无 | 本地仍是旧签名，无守卫 |
+| ③ 消费点 | 4 处 | app ansi_handler、`grid_renderer/unicode_placeholder.rs:267`、`warp_terminal/.../row_iterator.rs:126`、`testing.rs:124`（上游同 commit 已一并更新） |
+| ④ 上游最终版 | 是 | `git log a7326f8fe..upstream/master -- cell.rs` = 0 |
+
+路径适配：上游 `crates/warp_terminal/src/model/grid/ansi_handler.rs` → 本地 `app/src/terminal/model/grid/ansi_handler.rs`（未随 `21f413b79` 搬迁）；`cell.rs` 同路径。
