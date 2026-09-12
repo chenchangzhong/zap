@@ -3,6 +3,7 @@
 use crate::terminal::model::block::BlockId;
 use crate::terminal::model::session::SessionId;
 use ordered_float::OrderedFloat;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -31,7 +32,11 @@ pub(super) const UNENCODED_KV_MARKER: char = 'k';
 pub type HookSessionId = Option<u64>;
 
 /// Enum representing all possible JSON payloads for Zap's DCS's.
-#[derive(Serialize, Debug, Deserialize)]
+///
+/// 序列化仍用派生（内部标签形式 `{"hook": "...", "value": {...}}`）；
+/// 反序列化在下方手写，必须接受完全相同的形态——这样可避免 serde 为内部标签
+/// 枚举生成的通用缓冲机制（Content/ContentRefDeserializer）带来的大范围单态化。
+#[derive(Serialize, Debug)]
 #[allow(clippy::upper_case_acronyms)]
 #[serde(tag = "hook")]
 pub(super) enum DProtoHook {
@@ -76,6 +81,93 @@ pub(super) enum DProtoHook {
     ExitShell {
         value: ExitShellValue,
     },
+}
+
+/// The variant names of [`DProtoHook`], used for unknown-variant errors.
+const DPROTO_HOOK_VARIANTS: &[&str] = &[
+    "CommandFinished",
+    "Precmd",
+    "Preexec",
+    "Bootstrapped",
+    "PreInteractiveSSHSession",
+    "SSH",
+    "InitShell",
+    "InputBuffer",
+    "Clear",
+    "InitSubshell",
+    "SourcedRcFileForWarp",
+    "FinishUpdate",
+    "ExitShell",
+];
+
+/// 序列化后的 hook 外壳：`hook` 标签 + `value` 载荷（知道标签后再解析载荷）。
+#[derive(Deserialize)]
+struct RawDProtoHook {
+    hook: String,
+    value: serde_json::Value,
+}
+
+/// 把已缓冲的 JSON 值解析为某个 hook 载荷类型。
+fn parse_hook_value<T: DeserializeOwned, E: serde::de::Error>(
+    value: serde_json::Value,
+) -> Result<T, E> {
+    serde_json::from_value(value).map_err(E::custom)
+}
+
+impl<'de> Deserialize<'de> for DProtoHook {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawDProtoHook::deserialize(deserializer)?;
+        Ok(match raw.hook.as_str() {
+            "CommandFinished" => DProtoHook::CommandFinished {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "Precmd" => DProtoHook::Precmd {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "Preexec" => DProtoHook::Preexec {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "Bootstrapped" => DProtoHook::Bootstrapped {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "PreInteractiveSSHSession" => DProtoHook::PreInteractiveSSHSession {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "SSH" => DProtoHook::SSH {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "InitShell" => DProtoHook::InitShell {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "InputBuffer" => DProtoHook::InputBuffer {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "Clear" => DProtoHook::Clear {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "InitSubshell" => DProtoHook::InitSubshell {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "SourcedRcFileForWarp" => DProtoHook::SourcedRcFileForWarp {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "FinishUpdate" => DProtoHook::FinishUpdate {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            "ExitShell" => DProtoHook::ExitShell {
+                value: parse_hook_value::<_, D::Error>(raw.value)?,
+            },
+            unknown => {
+                return Err(serde::de::Error::unknown_variant(
+                    unknown,
+                    DPROTO_HOOK_VARIANTS,
+                ));
+            }
+        })
+    }
 }
 
 impl DProtoHook {
@@ -595,100 +687,196 @@ pub struct PreexecValue {
 
 /// Received from the pty after the shell has finished executing Zap's
 /// bootstrap script.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+///
+/// 反序列化经下方的 [`RawBootstrappedValue`] 手写实现：逐字段的字符串转换集中到一处，
+/// 不再使用逐字段的 `deserialize_with` 包装（那会为每个字段生成一个包装结构）。
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct BootstrappedValue {
-    #[serde(default)]
     pub session_id: HookSessionId,
 
-    #[serde(deserialize_with = "empty_string_is_none")]
     pub histfile: Option<String>,
 
-    #[serde(deserialize_with = "trim_null_byte_deserializer", default)]
     pub shell: String,
 
-    #[serde(deserialize_with = "empty_string_is_none")]
     pub home_dir: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none")]
     pub path: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none", default)]
     pub editor: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none")]
     pub aliases: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none")]
     pub abbreviations: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none")]
     pub function_names: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none")]
     pub env_var_names: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none")]
     pub builtins: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none")]
     pub keywords: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none")]
     pub shell_version: Option<String>,
 
     /// A list of options enabled for the shell by the end of bootstrap.  Will
     /// be None if the shell doesn't support listing options via builtin.
-    #[serde(deserialize_with = "parse_shell_options_list_deserializer", default)]
     pub shell_options: Option<HashSet<String>>,
 
     /// The time at which we started sourcing the user rcfiles, measured in
     /// seconds since epoch.
-    #[serde(deserialize_with = "parse_float_from_string_deserializer", default)]
     pub rcfiles_start_time: Option<OrderedFloat<f64>>,
 
     /// The time at which we finished sourcing the user rcfiles, measured in
     /// seconds since epoch.
-    #[serde(deserialize_with = "parse_float_from_string_deserializer", default)]
     pub rcfiles_end_time: Option<OrderedFloat<f64>>,
 
     /// Tags for known shell configurations/plugins, especially ones that are
     /// incompatible with Zap.
-    #[serde(deserialize_with = "parse_shell_options_list_deserializer", default)]
     pub shell_plugins: Option<HashSet<String>>,
 
     /// Whether the shell's native vi mode implementation is on.
-    #[serde(deserialize_with = "empty_string_is_none", default)]
     pub vi_mode_enabled: Option<String>,
 
     /// The operating system category (e.g. MacOS, Linux, Windows).
-    #[serde(deserialize_with = "empty_string_is_none", default)]
     pub os_category: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none", default)]
     pub linux_distribution: Option<String>,
 
-    #[serde(deserialize_with = "empty_string_is_none", default)]
     pub wsl_name: Option<String>,
 
     /// The full path to the running shell binary (e.g. "/usr/bin/zsh").
-    #[serde(deserialize_with = "empty_string_is_none", default)]
     pub shell_path: Option<String>,
 }
 
-/// Custom serde deserializer that parses a float from a string.
-fn parse_float_from_string_deserializer<'de, D>(
-    deserializer: D,
-) -> Result<Option<OrderedFloat<f64>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    if s.is_empty() {
-        return Ok(None);
+/// [`RawBootstrappedValue`] 的可选字符串字段：区分「字段缺失」与「存在字符串」，
+/// 以便下方转换复刻原先派生反序列化器的 `#[serde(default)]` 语义。
+#[derive(Debug, Default)]
+enum RawBootstrappedField {
+    #[default]
+    Missing,
+    Present(String),
+}
+
+impl<'de> Deserialize<'de> for RawBootstrappedField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::Present)
     }
-    Ok(Some(
-        s.parse::<f64>().map_err(serde::de::Error::custom)?.into(),
-    ))
+}
+
+impl RawBootstrappedField {
+    /// 复刻 `empty_string_is_none` 字段反序列化器；缺字段映射为 `None`。
+    fn empty_string_to_none(self) -> Option<String> {
+        match self {
+            Self::Missing => None,
+            Self::Present(s) => empty_string_to_none(s),
+        }
+    }
+
+    /// 复刻 `trim_null_byte_deserializer` 字段反序列化器；缺字段映射为空串。
+    fn trimmed(self) -> String {
+        match self {
+            Self::Missing => String::new(),
+            Self::Present(s) => trim_null_byte(s),
+        }
+    }
+
+    /// 复刻 `parse_shell_options_list_deserializer`；缺字段映射为 `None`。
+    fn shell_options(self) -> Option<HashSet<String>> {
+        match self {
+            Self::Missing => None,
+            Self::Present(s) => Some(parse_shell_options_list(s)),
+        }
+    }
+
+    /// 复刻 `parse_float_from_string_deserializer`；缺字段映射为 `None`。
+    /// 非空但解析失败仍是错误，与旧字段反序列化器一致。
+    fn float_from_string<E: serde::de::Error>(self) -> Result<Option<OrderedFloat<f64>>, E> {
+        match self {
+            Self::Missing => Ok(None),
+            Self::Present(s) => {
+                if s.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(s.parse::<f64>().map_err(E::custom)?.into()))
+            }
+        }
+    }
+}
+
+/// [`BootstrappedValue`] 的线上原始形态。未标 `#[serde(default)]` 的字段为必填，
+/// 与原先的派生反序列化器一致。（本地无 `cdpath` 字段，故不在此列。）
+#[derive(Deserialize)]
+struct RawBootstrappedValue {
+    #[serde(default)]
+    session_id: HookSessionId,
+    histfile: String,
+    #[serde(default)]
+    shell: RawBootstrappedField,
+    home_dir: String,
+    path: String,
+    #[serde(default)]
+    editor: RawBootstrappedField,
+    aliases: String,
+    abbreviations: String,
+    function_names: String,
+    env_var_names: String,
+    builtins: String,
+    keywords: String,
+    shell_version: String,
+    #[serde(default)]
+    shell_options: RawBootstrappedField,
+    #[serde(default)]
+    rcfiles_start_time: RawBootstrappedField,
+    #[serde(default)]
+    rcfiles_end_time: RawBootstrappedField,
+    #[serde(default)]
+    shell_plugins: RawBootstrappedField,
+    #[serde(default)]
+    vi_mode_enabled: RawBootstrappedField,
+    #[serde(default)]
+    os_category: RawBootstrappedField,
+    #[serde(default)]
+    linux_distribution: RawBootstrappedField,
+    #[serde(default)]
+    wsl_name: RawBootstrappedField,
+    #[serde(default)]
+    shell_path: RawBootstrappedField,
+}
+
+impl<'de> Deserialize<'de> for BootstrappedValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawBootstrappedValue::deserialize(deserializer)?;
+        Ok(Self {
+            session_id: raw.session_id,
+            histfile: empty_string_to_none(raw.histfile),
+            shell: raw.shell.trimmed(),
+            home_dir: empty_string_to_none(raw.home_dir),
+            path: empty_string_to_none(raw.path),
+            editor: raw.editor.empty_string_to_none(),
+            aliases: empty_string_to_none(raw.aliases),
+            abbreviations: empty_string_to_none(raw.abbreviations),
+            function_names: empty_string_to_none(raw.function_names),
+            env_var_names: empty_string_to_none(raw.env_var_names),
+            builtins: empty_string_to_none(raw.builtins),
+            keywords: empty_string_to_none(raw.keywords),
+            shell_version: empty_string_to_none(raw.shell_version),
+            shell_options: raw.shell_options.shell_options(),
+            rcfiles_start_time: raw.rcfiles_start_time.float_from_string()?,
+            rcfiles_end_time: raw.rcfiles_end_time.float_from_string()?,
+            shell_plugins: raw.shell_plugins.shell_options(),
+            vi_mode_enabled: raw.vi_mode_enabled.empty_string_to_none(),
+            os_category: raw.os_category.empty_string_to_none(),
+            linux_distribution: raw.linux_distribution.empty_string_to_none(),
+            wsl_name: raw.wsl_name.empty_string_to_none(),
+            shell_path: raw.shell_path.empty_string_to_none(),
+        })
+    }
 }
 
 fn parse_float_from_string(s: String) -> Option<OrderedFloat<f64>> {
@@ -827,24 +1015,17 @@ fn empty_string_is_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Er
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    let trimmed = trim_null_byte(s);
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed))
-    }
+    Ok(empty_string_to_none(String::deserialize(deserializer)?))
 }
 
-fn parse_shell_options_list_deserializer<'de, D>(
-    deserializer: D,
-) -> Result<Option<HashSet<String>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    let options: HashSet<String> = parse_shell_options_list(s);
-    Ok(Some(options))
+/// 去掉 NUL 字节并 trim；结果为空则映射为 `None`。
+fn empty_string_to_none(s: String) -> Option<String> {
+    let trimmed = trim_null_byte(s);
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn parse_shell_options_list(s: String) -> HashSet<String> {
@@ -896,3 +1077,7 @@ impl PendingHook {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dcs_hooks_test.rs"]
+mod tests;
