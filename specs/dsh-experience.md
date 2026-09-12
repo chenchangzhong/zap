@@ -134,6 +134,18 @@
 - 合成已根治：`notify`自动`present`，`request_redraw`仅首跳保留，无另案。
 - 下一步：面板多项目历史/通知 `BridgeEvent::Notify` 入 `NotificationsModel` 已通，侧边多 dsh 扩展另案。
 
-## 11. 修订
+## 11. 启动失败可见性与早退检测（2026-09-12）
+
+- 早退检测：`runtime.rs wait_until_ready(child, log_path)` 每轮（500ms）先 `child.try_status()`，子进程退出立即 bail，不再空转到 `STARTUP_TIMEOUT`（120s）后把真实原因掩盖成「就绪超时」。前提：`dsh web` 不 daemonize（常驻单进程，`ps` 实测），故「退出 = 服务已死」成立；若将来改成 fork+detach（父进程 exit 0），需加「父进程 exit 0 且日志已有 ready URL 时继续探测」的宽容分支。
+- 原因提取：`extract_fatal_error` 取日志**首条**含 `Error: ` 的行（最外层，嵌套 cause 都在其后），单行截断 500 字符；日志每次启动 `File::create` 截断 ⇒ 不会串到上次运行的 Error 行。失败原因存 `DshRuntime.error`（`set_failed` 原子写原因+状态，`begin_start`/`begin_restart`/`request_stop` 清空），三条失败路径（启动失败 / 重启放弃 / 连续崩溃放弃）与「失败后新建/恢复 pane」的 attach 路径共用同一来源。崩溃放弃不再用 `repeated crashes` 占位串，`crash_failure_reason()` 取本次日志；取不到时给「无错误行 + 日志路径」。
+- pane 侧：失败覆盖层展示错误原文 + 「修复错误」（复制到剪贴板并附加到终端 Agent 输入框；命中活动输入框复用 `insert_in_input`，无终端时新开 Agent 模式 tab）；「重新启动」用 `runtime_restarting` 态立即回「启动中」，并复位 `webview_loaded`/`load_started_at`/`webview_crashed`，避免露出已死实例的旧页面；Ready/Restarted 时重新计加载时钟，避免重启 >15s 被 `WEBVIEW_LOAD_TIMEOUT` 兜底提前揭页。失败 toast 已删（面板承接原因与重启/修复入口）。
+- **测试夹具（验失败路径，验后必须还原）**：改 `~/.dsh/profiles/zap/node_modules/dsh-rewind-plugin/lib/index.js`——zap 专属 profile，**不影响终端自用 dsh 与 DSH Desktop**。
+  - ✅ 有效：`import { __zapTestMissingExport } from "@deepseek-ai/dsh-llm";` —— **链接期**缺导出 → `Error: dsh: plugin tree failed to load: ... does not provide an export named ...` → node 退出（status 1），与真实故障（rewind 插件与 dsh 版本不匹配）同形。
+  - ❌ 无效：顶层 `throw new Error(...)` —— 运行时异常被 cordis loader 吞掉，dsh 照常启动（实测 15s 内无报错、也没 ready URL，容易误判成夹具生效）。
+  - 改法：先 `cp` 备份（记 sha256）再整份覆盖，**别原地追加**：pnpm 目录若是硬链接，原地写会污染 store（本例 `lib/index.js` links=1，安全）。还原后 `shasum -a 256` 必须与备份一致。
+- 预存不对称（非本次引入）：`DshStartResult::Failed` 回调不校验 generation（`workspace/view.rs open_dsh_pane`、`lib.rs` 重启回调），慢失败的上一代启动可把新启动的 status 打成 `Failed`，改动后还会把上一代的 error 显示出来。
+
+## 12. 修订
 
 - 2026-08-20 订阅去重 + 关 pane 不误伤 + badge group 判定 + setup 回退 + 双 notify 去冗 + lib 合并 + 右面板去 local_fs。
+- 2026-09-12 启动失败立即报真实原因（早退检测 + 原因提取 + 崩溃放弃取日志）＋面板「修复错误」/重启回启动中/删失败 toast；补插件夹具两形态经验。
