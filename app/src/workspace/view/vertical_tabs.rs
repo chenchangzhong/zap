@@ -1495,11 +1495,10 @@ fn render_vertical_tabs_panel(
         super::PanelPosition::Left => DragBarSide::Right,
         super::PanelPosition::Right => DragBarSide::Left,
     };
-    let inner = Container::new(panel_with_popup)
-        .with_background(internal_colors::fg_overlay_1(theme))
-        .finish();
 
-    Resizable::new(state.resizable_state.clone(), inner)
+    // 面板不再自绘底色:整窗统一色由窗口背景层提供(见 Workspace::render 中
+    // set_window_background_color),否则侧栏会比主区亮一档。
+    Resizable::new(state.resizable_state.clone(), panel_with_popup)
         .with_dragbar_side(drag_side)
         .on_resize(|ctx, _| {
             ctx.notify();

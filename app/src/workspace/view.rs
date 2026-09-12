@@ -451,6 +451,7 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::{mpsc, Mutex};
 use std::{cmp::Ordering, sync::Arc};
+use warp_core::ui::color::blend::Blend;
 use warp_core::ui::theme::{color::internal_colors, phenomenon::PhenomenonStyle, Fill};
 use warp_core::ui::{color::coloru_with_opacity, Icon};
 use warp_editor::editor::NavigationKey;
@@ -18425,8 +18426,9 @@ impl Workspace {
         if prev_panel_added {
             panels_view.add_child(Self::render_panel_separator(app));
         }
-        // The outer workspace container in `render` already paints the terminal
-        // background fill, so don't paint it again here (see APP-4328).
+        // 主区不画底色:整窗底色(含主区)由原生背景层统一提供——surface_2 叠
+        // fg_overlay_1,见 `render` 里的 set_window_background_color;这里再垫
+        // 一层会与之 alpha 叠加而变深(同 APP-4328 先例)。
         panels_view = panels_view.with_child(Shrinkable::new(1.0, terminal_view).finish());
         prev_panel_added = true;
 
@@ -21600,9 +21602,9 @@ impl View for Workspace {
             let content = self.render_banner_and_active_tab(app, appearance);
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
-            // workspace 主背景(render 末尾的 Stack)已用 surface_2/背景图垫遍
-            // 整窗,这里不再重复垫半透明背景,否则半透明窗口下标签栏/头部
-            // 会因两层 alpha 叠加而变深(同 APP-4328 先例)。
+            // workspace 底色(render 末尾的 Stack 只负责背景图)已由原生背景层
+            // (surface_2 叠 fg_overlay_1)铺遍整窗,这里不再重复垫半透明背景,
+            // 否则半透明窗口下标签栏/头部会因两层 alpha 叠加而变深(同 APP-4328 先例)。
             outer_column.finish()
         };
         let mut stack = Stack::new();
@@ -22448,10 +22450,14 @@ impl View for Workspace {
             .background_opacity
             .effective_opacity(self.window_id, app);
 
-        // 背景层与 workspace 背景使用同一主题色(surface_2)+ 窗口背景透明度,
-        // 半透明窗口下 webview 空洞区域与 Metal 绘制区域视觉一致。有背景图时
-        // 背景层只能按单色近似,无法 1:1 反映背景图。
-        let background_color = match theme.surface_2().with_opacity(background_opacity) {
+        // 整窗底色统一:surface_2 再叠一层 fg_overlay_1(前景色 5%)——即竖排标签栏
+        // 原先自己叠的那一档。此前该层只由标签栏绘制,侧栏因此比主区亮一档;现在
+        // 由窗口底色统一承担,各区域不再各画一层底色,半透明窗口下 webview 空洞
+        // 区域与 Metal 绘制区域也保持一致。有背景图时只能按单色近似。
+        let window_surface = theme
+            .surface_2()
+            .blend(&internal_colors::fg_overlay_1(theme));
+        let background_color = match window_surface.with_opacity(background_opacity) {
             Fill::Solid(color) => color,
             Fill::VerticalGradient(gradient) => gradient.get_most_opaque(),
             Fill::HorizontalGradient(gradient) => gradient.get_most_opaque(),
@@ -22475,9 +22481,9 @@ impl View for Workspace {
             stack.add_child(workspace.finish());
         } else {
             // 窗口背景已由原生背景层(MetalBackgroundView,见 set_window_background_color)
-            // 以同一 surface_2 + 窗口透明度铺满整窗承担。这里不再重复铺 surface_2,
-            // 否则半透明窗口下每区域都被两层同色背景叠加而过深(各 tab 背景来源也不
-            // 一致)。workspace 仅承载 UI,底色由原生层提供。
+            // 以 surface_2 叠 fg_overlay_1 + 窗口透明度铺满整窗承担。这里不再重复铺
+            // 底色,否则半透明窗口下每区域都被两层同色背景叠加而过深(各 tab 背景来源
+            // 也不一致)。workspace 仅承载 UI,底色由原生层提供。
             stack.add_child(workspace.finish());
         }
 
