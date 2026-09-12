@@ -306,6 +306,11 @@ pub enum FeatureFlag {
     /// Enables fallback model load output messaging in the warping indicator.
     FallbackModelLoadOutputMessaging,
 
+    /// 在 warping 指示器里显示正在工作的模型名（如「Warping with Claude Sonnet 4.5...」）。
+    /// 上游把它放在非默认 Cargo feature + DOGFOOD 双层门控后（见 history.md §40）；
+    /// 本地改为纯运行时 flag，并在 zap_oss 入口默认开启。
+    WarpingModelName,
+
     /// Enables close button on left side of tabs
     TabCloseButtonOnLeft,
 
