@@ -121,7 +121,7 @@
 | **「复制时间戳」菜单入口** | `b4fd53118` | 上游只加了 action + 处理函数、**无任何构造点**（悬空动作）；本地在右键行菜单与三点溢出菜单都补上入口 |
 | **删除死代码** | `43417ffc8` | `AIBlock::output_model_display_name`（全仓无调用，23 行）|
 | （编译修复 / 清理）| `9355f32a7` `bbe0ba371` | 批次 1 本地能力差异适配；4.4 遗留的未使用参数与闲置 import |
-| **恢复流程：#10423** | `1d5996d5a` | `a2f586584`（修复「恢复历史会话时命令块与 AI 块错位 → 点命令行展开无效」）。新增 `load_ai_conversation_tests.rs`（14 用例全绿）；本地适配：剥离 proto 时间戳（本仓 fork 无 `start_ts/finish_ts`，「命令运行时长」未移植）、保留本地 CLI subagent 快照机制与去重、cloud mode 插桩取本地侧。详见 history §43 | 。同批 `1daed2f0a`(#10776) **评估为不适用**（本地无 cloud mode：`CloudModeSetupV2`/`create_cloud_mode_view`/`start_cloud_mode_setup_command_tracking` 均 0 命中，且无 `shared_session/viewer/terminal_manager.rs`）
+| **恢复流程：#10423** | `1d5996d5a` | `a2f586584`（修复「恢复历史会话时命令块与 AI 块错位 → 点命令行展开无效」）。新增 `load_ai_conversation_tests.rs`（14 用例全绿）；本地适配：剥离 proto 时间戳（本仓 fork 无 `start_ts/finish_ts`，「命令运行时长」未移植）、保留本地 CLI subagent 快照机制与去重、cloud mode 插桩取本地侧。详见 history §43。**后续（`173ea34e4`）**：① 数据源修复——本地 BYOP 消息此前 `timestamp: None`（12 处），已改为写入真实时间戳（新会话走上游算法）；② 旧会话兼容回退（本地 shim，仅在时间戳退化时按 action id 配对 + 后继块填充）| 。同批 `1daed2f0a`(#10776) **评估为不适用**（本地无 cloud mode：`CloudModeSetupV2`/`create_cloud_mode_view`/`start_cloud_mode_setup_command_tracking` 均 0 命中，且无 `shared_session/viewer/terminal_manager.rs`）
 | **编译期：#15517** | `3dd415c92` | `1e4b86a81`（`[profile.release-cli]` `codegen-units` 1 → 4）。上游实测约减半 release-cli 构建时间、代价二进制 +4%；本地 `script/{macos,linux}/bundle` 打 CLI 产物正是用该 profile（`release-cli-debug_assertions` / `rcli` / `rclida` 都继承它），应用包走 `release-lto` 不受影响 |
 
 ---

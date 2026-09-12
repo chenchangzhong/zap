@@ -2459,3 +2459,51 @@ not 1) roughly halves build time versus codegen-units=1 for ~4% larger stripped/
 **本地核对（全 0 命中）**：`CloudModeSetupV2` 0、`fn create_cloud_mode_view` 0、
 `start_cloud_mode_setup_command_tracking` 0，且 `app/src/terminal/shared_session/viewer/terminal_manager.rs` **不存在**
 （本仓无 cloud mode / 共享会话 viewer 体系，见 §28.2）。⇒ **不需要移植**；本仓的「命令块重复插入」风险已由 §43.3 第 3 条的去重保护覆盖。
+
+### 43.7 后续修复：为什么移植 #10423 之后仍然错位（2026-09-12 晚）
+
+**用户实测反馈**：「还是不对——上游命令展开后是在当前消息块里的，现在是在**所有消息块的最下面**」。
+
+**先对比上游，不猜**（用户明确要求）：上游 `command_block_indices_for_exchanges` /
+`find_block_indices_for_exchange_timestamps`（上游 master 已抽到 `conversation_restoration.rs`）与我们移植的
+**逐字一致**；`exchange.start_time` 的推导（`convert_conversation.rs` 的 CurrentTime → 消息时间戳 →
+`unwrap_or_default()`）也**逐字一致** ⇒ **差别在数据**。
+
+**数据级根因**（探针实测，探针已删）：
+
+| 探针 | 结果 | 含义 |
+|---|---|---|
+| P8 | 序列化每条命令块 `start_ts=None`、只有 `exchange_time` | 本地消息没有 per-message 时间戳 |
+| P9 | 会话 A「179 个交换，不同 start_time **3** 个」；会话 B「13 个交换，**1** 个」 | 交换时间戳在会话内近似常量 |
+| P11 | `CurrentTime=None 消息时间戳=None → 采用=1970-01-01`（1312 个交换） | 两类回退都取不到值，落到 epoch |
+| P6 | 同会话 76 个命令块 `start_ts` 全相同 | ⇒ 时间戳配对无区分能力 |
+| P3 | `189×Some(BlockIndex(0)) + 3×None` | 所有交换命中同一命令块 ⇒ AI 块全插到第 0 块之前、命令块沉底 |
+
+**根因**：本地 BYOP 构造 `api::Message` 时 **12 处全写 `timestamp: None`**（上游这些消息来自服务端、自带时间戳），
+且持久化 inputs 里没有 `CurrentTime` context ⇒ 恢复时 `exchange.start_time` 与命令块 `start_ts` 双双退化
+⇒ 上游那套「按时间戳把 AI 块与命令块配对」的算法在本仓数据上必然失效。
+
+**修复（提交 `173ea34e4`）**：
+
+1. **数据源修复**（对齐上游的数据前提）：`chat_stream.rs` 新增 `message_timestamp_now()`，12 处消息构造写入真实时间戳
+   ⇒ 新会话具备上游所依赖的 per-message 时间戳，**完全走上游算法**。
+   （旧会话的持久化数据无法追溯补写，故需要第 2 条。）
+2. **旧会话兼容回退**（本地 shim，用户要求；**仅在时间戳退化时启用**）：
+   - 判据：出现 epoch，或「不同时间值 × 2 ≤ 交换数」（历史会话正是「所有交换共用会话创建时间」）；
+   - 退化时：按 **action id** 精确配对命令块（命令块带 `requested_command_action_id`，交换 output 里有 `Action(id)`），
+     未配对的交换**沿用其后第一个已配对块**——与上游「最早且不早于该交换的块」语义一致，避免无命令的交换被追加到末尾；
+   - 时间戳正常时该分支不生效，仍走上游逻辑。
+   - 期间我自造的 action-id 匹配器曾**撤回**并恢复上游原样（见教训 1）。
+
+**验证**：`cargo nextest`（探针已全部删除）——`load_ai_conversation` 14/14、`terminal::model::blocks` 65/65、
+`agent_providers` **288/288**（时间戳改动无破坏）、`conversation` 150/150、`terminal::view::` 205 run → **198 passed / 7 failed**
+（与移植前基线同样 7 个既存失败）。**手动点验：用户确认历史会话里命令展开已回到当前消息块内 ✓**
+
+**教训**：
+
+1. **「参考实现」不只是代码，还包括它的数据前提**：代码逐字一致时，必须继续对比**喂给这段代码的数据**。
+   本轮的差异正是「上游消息带时间戳、本地 BYOP 全是 `None`」——只看代码会一直找不到原因（我第一轮就是自己发明了匹配器）。
+2. **写退化判据前先把数据形态量出来**：我连续写错两版判据（先 `distinct <= 1`，再 epoch 哨兵），
+   而实测数据是「186 个交换、2 个不同值、都不是 epoch（会话创建时间）」——两次都漏掉了真实形态。
+   先量（P9/P11）再写判据，能省一轮构建 + 一次用户复现。
+3. **兼容回退要显式门控 + 注释标记**：本地 shim 只在退化时生效，避免污染上游路径；`history.md` 与本提交信息都写明「本地 shim」。
