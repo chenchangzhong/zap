@@ -2362,6 +2362,7 @@ menu-block-show-containing-folder = Show containing folder
 menu-block-open-in-warp = Open in Zap
 menu-block-open-in-editor = Open in editor
 menu-block-insert-into-input = Insert into input
+menu-block-paste = Paste
 menu-block-copy-command = Copy command
 menu-block-copy-commands = Copy commands
 menu-block-find-within-block = Find within block

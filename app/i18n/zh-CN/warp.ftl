@@ -2282,6 +2282,7 @@ menu-block-show-containing-folder = 显示所在文件夹
 menu-block-open-in-warp = 在 Zap 中打开
 menu-block-open-in-editor = 在编辑器中打开
 menu-block-insert-into-input = 插入到输入框
+menu-block-paste = 粘贴
 menu-block-copy-command = 复制命令
 menu-block-copy-commands = 复制命令
 menu-block-find-within-block = 在块内查找
