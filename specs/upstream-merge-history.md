@@ -2053,6 +2053,8 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 | `4cd1c77c4`（原生 agent 工具条 File explorer chip） | 不做 | 本地**已有** `AgentToolbarItemKind::FileExplorer`（现仅 CLI agent），属重复建设；依赖本地缺失的 `server/telemetry/events.rs`；落点在自研 footer 区 |
 | `142b87102`（Attach file 调色板命令） | 不做 | 本地**已有** attach 按钮与 `EditorAction::AttachFiles`；13 hunk / 6 文件 + 依赖 shared-session 的 `file_attach_allowed_for_shared_session`（本地 0 命中） |
 
+> **⚠️ 注记（2026-09-12 晚）**：上表中 `4b894db80` 的处理已变更，见 §38——用户要求实做后，**阶段 1（`dcs_hooks.rs` 的 `DProtoHook`/`BootstrappedValue`）已落地并保留**（提交 `e11deb51e`），实测净收益为负（`warp` crate 编译 +2.1%）；阶段 2（`Artifact` + `AIAgentContext`/`AIAgentAttachment`）**不做**。上表「不做」的裁决对阶段 2 仍然成立。
+
 ### 36.3 `511b952c2`（create_file `allow_overwrite`）终局：不合
 
 专项调查（两个 proto fork 对比，只读）：
@@ -2168,9 +2170,10 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 
 ### 38.5 终局裁决
 
-- **整项 `4b894db80` 不做**；`Artifact` 与 `AIAgentContext`/`AIAgentAttachment`（阶段 2）**不再继续**。
-- 阶段 1 的提交 `e11deb51e` **可一键回滚**（`git revert e11deb51e`），若保留，其价值仅为「与上游对齐 + 机制正确」，不含可测量的构建收益。
-- 重新考虑的条件：① 上游把整个编译期栈做完且其 CI 给出可复现收益；② 本地构建时间成为实际痛点（届时按 §38.3 的方法先测基线再决定）。
+- **阶段 2 不做**：`Artifact` 与 `AIAgentContext`/`AIAgentAttachment` 不再继续（天花板见 §38.4）。
+- **阶段 1 保留（用户决定，2026-09-12）**：提交 `e11deb51e` 留在 `main`。保留理由记录为「与上游对齐 + 机制正确（减少 serde 泛型机械的实例化）」，**不含可测量的构建收益**——实测为净负（+2.1% 编译时间、−0.2% rlib 体积）。
+- 回滚路径仍然有效且成本极低：`git revert e11deb51e`（含新增测试文件）。
+- 重新考虑的条件：① 上游把整个编译期栈做完且其 CI 给出可复现收益；② 本地构建时间成为实际痛点（届时按 §38.3 的方法先测基线再决定，必要时一并重估阶段 2）。
 - **未记入 CHANGELOG**：无用户可见行为变化，仅编译期机制调整。
 
 ### 38.6 本轮教训
