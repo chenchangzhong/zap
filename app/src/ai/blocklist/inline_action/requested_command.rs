@@ -1597,15 +1597,6 @@ impl View for RequestedCommandView {
             content.add_child(Clipped::new(footer).finish());
         }
 
-        let border_color = if action_status
-            .as_ref()
-            .is_some_and(|status| status.is_blocked())
-        {
-            theme.accent()
-        } else {
-            theme.surface_2()
-        };
-
         // If the requested command state is completed and input isn't pinned to the top, we're
         // going to have a regular block directly below this one with the output of the executed
         // command. Since we can't control the top padding of the AI block that comes _after_ the
@@ -1637,7 +1628,10 @@ impl View for RequestedCommandView {
         let container = Container::new(content.finish())
             .with_margin_left(if is_rendered_above_expanded_command_block {
                 0.
-            } else if action_status.is_some_and(|status| status.is_blocked()) {
+            } else if action_status
+                .as_ref()
+                .is_some_and(|status| status.is_blocked())
+            {
                 CONTENT_HORIZONTAL_PADDING
             } else {
                 CONTENT_HORIZONTAL_PADDING + icon_size(app) + 16.
@@ -1656,9 +1650,19 @@ impl View for RequestedCommandView {
                 CornerRadius::with_top(Radius::Pixels(8.))
             } else {
                 CornerRadius::with_all(Radius::Pixels(8.))
-            })
-            .with_border(Border::all(1.).with_border_fill(border_color))
-            .finish();
+            });
+
+        // 卡片外框只在等待用户确认(阻塞)时保留——那是需要强调的状态;平时它是一条颜色与背景
+        // 无差别的 1px 线(原取 surface_2),去掉后命令卡片不再有外框。
+        let container = if action_status
+            .as_ref()
+            .is_some_and(|status| status.is_blocked())
+        {
+            container.with_border(Border::all(1.).with_border_fill(theme.accent()))
+        } else {
+            container
+        }
+        .finish();
 
         let mut root_stack = Stack::new();
         root_stack.add_child(container);
