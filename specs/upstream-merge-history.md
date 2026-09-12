@@ -2038,7 +2038,7 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 |---|---|---|
 | `0a0fd3ae1` (#15346) | 块列表右键菜单加「粘贴」 | 新增 `TerminalView::paste_menu_item`（剪贴板空则禁用、带 `terminal:paste` 标签）；块右键（含悬停链接）与三类右键来源追加，overflow / 键位菜单不加（同上游语义）；新增 ftl key `menu-block-paste`（en/zh-CN） |
 | `092c1dce9` (#13967) | 切 markdown Raw/Rendered 保持滚动位置 | editor 新增 `ScrollPosition::Fraction` + `viewport::scroll_fraction` + `LayoutAction::ScrollToFraction`（延迟到 element layout 应用、携 `minimum_version` 防陈旧高度）；code view / local code editor / notebooks file view / pane_group 切换前抓 fraction、重建 pane 时先 seed 再 open。**剔除上游夹带**的 `warp_tui` CharCell `new_tui` 与 Jupyter 分支（本地无 `FeatureFlag::JupyterNotebookRendering` / `is_jupyter_notebook_file`）；远端文件分支跳过（本地无 `file_state.path()`，沿用 `local_path()`）；`view.open(...)` → `view.open_local(...)` |
-| `b7ec0fc55` (#15605) | Agent Mode 用户提问显示时间戳 | `util/time_format` 新增 `format_message_timestamp` / `is_trustworthy_message_timestamp`（+2 测试）；block model 加 `query_sent_at`（过滤 epoch 默认值）；query 视图 Props/render_query 加时间戳 + tooltip 句柄（头像包 `overlay_tool_tip`）；新增 `AIBlockAction::CopyTimestamp`；上游 `terminal/view/context_menu.rs` 的 21 行菜单门控按**本地等价位置**落进 `terminal/view.rs`。**跳过上游夹带**的 completer v2 refactor（153 行，与时间戳无关） |
+| `b7ec0fc55` (#15605) | Agent Mode 用户提问显示时间戳 | `util/time_format` 新增 `format_message_timestamp` / `is_trustworthy_message_timestamp`（+2 测试）；block model 加 `query_sent_at`（过滤 epoch 默认值）；query 视图 Props/render_query 加时间戳 + tooltip 句柄（头像包 `overlay_tool_tip`）；新增 `AIBlockAction::CopyTimestamp`。**修正（见 §39.6）**：上游 `terminal/view/context_menu.rs` 的 21 行菜单门控**当时并未落地**——该文件本地不存在，被我从 patch 文件集中剔除，本格原先写的「按本地等价位置落进 view.rs」有误；该入口已于 §39.6 在本地补齐。**跳过上游夹带**的 completer v2 refactor（153 行，与时间戳无关） |
 
 顺带修复：§35.5 批次 1 带入的 `test_duplicate_single_file_discard_confirmation_is_ignored` 用 `&str` 调用，而本地 `TestContext::new` 要 `PathBuf`——`cargo check`（只查 lib）不编译测试故未暴露，本轮 `cargo test -p warp --lib` 才现形，已改为 `PathBuf::from("test.txt")`。
 
@@ -2217,7 +2217,7 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 
 ### 39.4 附带更正：`CopyAIBlockTimestamp` 是「悬空动作」
 
-`b7ec0fc55`（P3-b）只加了 `ContextMenuAction::CopyAIBlockTimestamp` 变体、`Debug` 分支与**处理函数**，**全仓（含 `upstream/master`）没有任何地方构造它**——即「复制时间戳」**菜单入口上游就不存在**。§36.1 记录 P3-b 时未察觉，此前给用户的手动验证步骤（「右键提问行应有复制时间戳」）因此是错的；已在对话中更正。若要该入口需**本地补齐**（上游未做），尚未落地。
+`b7ec0fc55`（P3-b）只加了 `ContextMenuAction::CopyAIBlockTimestamp` 变体、`Debug` 分支与**处理函数**，**全仓（含 `upstream/master`）没有任何地方构造它**——即「复制时间戳」**菜单入口上游就不存在**。§36.1 记录 P3-b 时未察觉，此前给用户的手动验证步骤（「右键提问行应有复制时间戳」）因此是错的；已在对话中更正。该入口属**上游未做**的本地补齐，已落地，见 §39.6。
 
 ### 39.5 教训
 
@@ -2225,6 +2225,29 @@ socket 绑定指向子会话的 socket，导致主会话模型切换静默失败
 2. **枚举展示文案的本地化范式**：返回 `String` + `crate::t!`（`t!` 有两臂，支持 `key, arg = value`）；改返回类型前先确认调用点的 trait bound（`Into<String>` / `AsRef<str>` 可免改）。
 3. **占位/时间格式也要本地化**：`%I:%M %p`、`"at"` 这类不显眼的英文最容易漏；本仓判断语言的既有方式是 `crate::i18n::current_languages()` + `starts_with("zh")`。
 4. **并行测试失败先回基线复现再定性**：`git stash` 一次即确认 `fallback_chain_works` 的并行失败为既存（全局 `init()` 竞争），避免误判为自己引入。
+
+### 39.6 本地补齐：「复制时间戳」菜单入口（上游未做）
+
+用户确认「补」。落点：`app/src/terminal/view.rs::ai_block_copying_menu_items`（AI 块「复制类」菜单的统一构造处），门控照抄上游 `context_menu.rs` 的原始 21 行：
+
+```rust
+let has_query_timestamp = self.rich_content_views.iter().any(|rich_content| {
+    rich_content.ai_block_metadata()
+        .filter(|metadata| metadata.ai_block_handle.id() == ai_block_view_id)
+        .is_some_and(|metadata| metadata.ai_block_handle.as_ref(ctx).query_sent_at(ctx).is_some())
+});
+if has_query_timestamp {
+    items.push(MenuItemFields::new(crate::t!("menu-ai-block-copy-timestamp"))
+        .with_on_select_action(TerminalAction::ContextMenu(
+            ContextMenuAction::CopyAIBlockTimestamp { ai_block_view_id }))
+        .into_item());
+}
+```
+
+- **本地偏差（有意）**：该 helper 同时服务「右键行菜单」与「三点溢出菜单」两处调用（`view.rs:14912`、`view.rs:15820`），因此本地上两处菜单都会出现「复制时间戳」；上游只在其行菜单里有。这是超集，不是遗漏。
+- ftl：`menu-ai-block-copy-timestamp`（en `Copy timestamp` / zh-CN `复制时间戳`）。
+- 至此 P3-b 的链路闭合：悬停看时间戳（tooltip）→ 右键/溢出菜单「复制时间戳」→ `AIBlockAction::CopyTimestamp` 写剪贴板。
+- 归属说明：这是**本地功能补齐**，不是上游移植；文档按「本地功能」记录，不写入上游同步的落地清单。
 
 
 

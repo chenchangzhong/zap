@@ -15702,6 +15702,32 @@ impl TerminalView {
                 .into_item(),
         ];
 
+        // Zap 本地补齐：上游 `CopyTimestamp` 动作只有「定义 + 处理函数」、没有任何入口
+        // （`upstream/master` 同样如此，见 specs/upstream-merge-history.md §39.4）。
+        // 门控与上游在行菜单里的写法一致：仅当该提问确实带时间戳时才显示。
+        // 注意：本 helper 同时服务右键行菜单与三点溢出菜单，故两处都会出现该条目（本地比上游多一处入口）。
+        let has_query_timestamp = self.rich_content_views.iter().any(|rich_content| {
+            rich_content
+                .ai_block_metadata()
+                .filter(|metadata| metadata.ai_block_handle.id() == ai_block_view_id)
+                .is_some_and(|metadata| {
+                    metadata
+                        .ai_block_handle
+                        .as_ref(ctx)
+                        .query_sent_at(ctx)
+                        .is_some()
+                })
+        });
+        if has_query_timestamp {
+            items.push(
+                MenuItemFields::new(crate::t!("menu-ai-block-copy-timestamp"))
+                    .with_on_select_action(TerminalAction::ContextMenu(
+                        ContextMenuAction::CopyAIBlockTimestamp { ai_block_view_id },
+                    ))
+                    .into_item(),
+            );
+        }
+
         if let Some(link) = hovered_link {
             match link {
                 RichContentLink::Url(url) => {

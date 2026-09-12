@@ -2335,6 +2335,7 @@ menu-input-show-hint-text = 显示输入框提示文本
 # --- AI block overflow 菜单（terminal/view.rs） ---
 menu-ai-block-copy = 复制
 menu-ai-block-copy-prompt = 复制提示词
+menu-ai-block-copy-timestamp = 复制时间戳
 menu-ai-block-copy-output-as-markdown = 复制输出为 Markdown
 menu-ai-block-copy-url = 复制 URL
 menu-ai-block-copy-path = 复制路径
