@@ -19180,20 +19180,16 @@ impl Workspace {
     /// - 否则 → 创建 Loading tab(若尚无),异步启动/重启 runtime
     fn open_dsh_pane(&mut self, ctx: &mut ViewContext<Self>) {
         let window_id = ctx.window_id();
-        // 非阻塞检查全局 dsh 更新(每会话一次):有新版仅 toast 提示,
-        // 不影响启动流程;离线/检查失败静默。
-        if crate::dsh::runtime::should_check_update_now() {
-            ctx.spawn(
-                crate::dsh::DshRuntime::check_update_future(),
-                move |me, check, ctx| {
-                    if let crate::dsh::DshUpdateCheck::UpdateAvailable { installed, latest } =
-                        check
-                    {
-                        me.show_dsh_update_toast(installed, latest, ctx);
-                    }
-                },
-            );
-        }
+        // 非阻塞检查全局 dsh 更新(每次打开 pane 触发):有新版仅 toast 提示,
+        // 不影响启动流程;离线/检查失败静默(下次打开 pane 会重查)。
+        ctx.spawn(
+            crate::dsh::DshRuntime::check_update_future(),
+            move |me, check, ctx| {
+                if let crate::dsh::DshUpdateCheck::UpdateAvailable { installed, latest } = check {
+                    me.show_dsh_update_toast(installed, latest, ctx);
+                }
+            },
+        );
         // 读当前 runtime 状态(同步,不借用 self)。
         let status = crate::dsh::DshRuntime::handle(ctx).read(ctx, |runtime, _| runtime.status());
 
@@ -19329,16 +19325,22 @@ impl Workspace {
             ctx,
         );
         ctx.notify();
-        let Some(input) = self.get_active_input_view_handle(ctx) else {
-            log::warn!("[dsh] no active terminal input for upgrade command");
+        let terminal_view = self
+            .active_tab_pane_group()
+            .read(ctx, |pane_group_view, ctx| {
+                pane_group_view.active_session_view(ctx)
+            });
+        let Some(terminal_view) = terminal_view else {
+            log::warn!("[dsh] no active terminal for upgrade command");
             return;
         };
-        input.update(ctx, |input, ctx| {
-            if input.try_execute_command(command, ctx) {
-                log::info!("[dsh] upgrade command submitted: {command}");
-            } else {
-                log::warn!("[dsh] failed to submit upgrade command");
-            }
+        // 新建 tab 的 shell 尚未 bootstrap(block_list 未就绪),此时直接
+        // `try_execute_command` 会被 NotBootstrapped 拒绝并静默丢弃。按 shell
+        // bootstrap 时序的既有约定(同 `open_ssh_terminal`),交给 pending 队列,
+        // 由 `BootstrapPrecmdDone` 事件 flush。
+        terminal_view.update(ctx, |terminal_view, ctx| {
+            terminal_view.execute_command_or_set_pending(command, ctx);
+            log::info!("[dsh] upgrade command submitted: {command}");
         });
     }
 

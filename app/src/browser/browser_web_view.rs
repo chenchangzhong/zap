@@ -118,6 +118,8 @@ impl BrowserWebViewManager {
     }
 
     /// 在 `window` 的 contentView 内创建 id 对应的 webview,初始位置 `rect`。
+    /// `incognito` 为 true 时 webview 使用非持久化数据存储(cookie 不落盘、
+    /// 不跨实例累积)——dsh 每次启动都换端口与 token,其 cookie 无需持久化。
     #[cfg(target_os = "macos")]
     pub fn create(
         &self,
@@ -126,8 +128,9 @@ impl BrowserWebViewManager {
         url: &str,
         rect: RectF,
         window_id: WindowId,
+        incognito: bool,
     ) {
-        log::info!("[browser] create webview {id} url={url} rect={rect:?}");
+        log::info!("[browser] create webview {id} url={url} rect={rect:?} incognito={incognito}");
         // wry 的 child webview 会拦截 performKeyEquivalent(Cmd 快捷键不
         // 进 webview),在页面内监听 Cmd+R 触发刷新;同时:当地址栏聚焦时
         // webview 失焦,页面活跃元素的焦点应自动释放,避免两处光标共存。
@@ -244,6 +247,7 @@ setInterval(() => {
             // 透明背景:让 WebView 透出下层 WarpUI 画面(深色主题下避免白底)。
             // 注意:页面自身背景仍需透明(如 body { background: transparent }),否则仍是白底。
             .with_transparent(true)
+            .with_incognito(incognito)
             .with_initialization_script_for_main_only(init_js, false)
             .with_on_page_load_handler(move |event, _url| {
                 if matches!(event, wry::PageLoadEvent::Finished) {
@@ -365,6 +369,7 @@ setInterval(() => {
         _url: &str,
         _rect: RectF,
         _window_id: WindowId,
+        _incognito: bool,
     ) {
     }
 

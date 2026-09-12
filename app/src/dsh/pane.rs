@@ -264,7 +264,7 @@ impl DshPaneView {
         }
         self.current_url = url.to_string();
         let browser_view = ctx.add_typed_action_view(|ctx| {
-            BrowserPaneView::new_with_options(url.to_string(), false, ctx)
+            BrowserPaneView::new_dsh(url.to_string(), ctx)
         });
         // 不抢占焦点:Loading 显示期间 webview 不可见,键盘焦点改由 pane
         // 聚焦时(on_focus)正常切换,避免按键进不可见 webview。

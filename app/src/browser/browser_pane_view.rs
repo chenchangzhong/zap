@@ -50,6 +50,11 @@ pub struct BrowserPaneView {
     needs_recreate: bool,
     /// 是否渲染地址栏+导航按钮(后退/前进/刷新)。DshPane 等内嵌场景设为 false。
     show_address_bar: bool,
+    /// webview 是否使用非持久化数据存储(不落盘、不跨实例累积 cookie)。
+    /// dsh 每次启动都换端口与 token,cookie 无需持久化——持久化会让它们在
+    /// `127.0.0.1` 上不断累积,请求头超过 dsh 服务器约 16KB 的上限后,
+    /// 所有子资源请求被 431 拒绝(页面表现为模块加载失败)。
+    incognito: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +94,23 @@ impl BrowserPaneView {
         show_address_bar: bool,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
+        Self::new_inner(url, show_address_bar, false, ctx)
+    }
+
+    /// 创建 dsh Web UI pane:无地址栏,且 webview 使用非持久化数据存储。
+    /// dsh 每次启动都生成新的端口与 token,其 cookie 不需要持久化;一旦
+    /// 持久化就会在 `127.0.0.1` 上跨实例累积,超过 dsh 的请求头上限后
+    /// 子资源(模块 bundle)全部被 431 拒绝。
+    pub fn new_dsh(url: String, ctx: &mut ViewContext<Self>) -> Self {
+        Self::new_inner(url, false, true, ctx)
+    }
+
+    fn new_inner(
+        url: String,
+        show_address_bar: bool,
+        incognito: bool,
+        ctx: &mut ViewContext<Self>,
+    ) -> Self {
         let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new("Browser"));
         let platform_view_id = BrowserWebViewManager::as_ref(ctx).allocate_id();
         let window_id = ctx.window_id();
@@ -123,6 +145,7 @@ impl BrowserPaneView {
             window_id,
             needs_recreate: false,
             show_address_bar,
+            incognito,
         };
 
         ctx.subscribe_to_view(&view.address_bar, Self::handle_address_bar_event);
@@ -166,6 +189,7 @@ impl BrowserPaneView {
                     url,
                     RectF::default(),
                     self.window_id,
+                    self.incognito,
                 );
             }
         }

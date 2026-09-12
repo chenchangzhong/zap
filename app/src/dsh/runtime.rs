@@ -178,7 +178,7 @@ pub enum DshStartResult {
 /// 全局 dsh 更新检查结果(仅提示用,不参与启动流程)。
 #[derive(Debug, Clone)]
 pub enum DshUpdateCheck {
-    /// 无更新,或检查失败/离线(静默,不打扰用户)。
+    /// 无更新,或检查失败/离线(静默,不打扰用户;下次打开 pane 会重查)。
     UpToDate,
     /// registry 有比当前已装版本更新的 semver 版本。
     UpdateAvailable {
@@ -198,14 +198,6 @@ fn is_update_available(latest: &str, installed: &str) -> bool {
         (Ok(latest), Ok(installed)) => latest > installed,
         _ => false,
     }
-}
-
-/// 本会话是否已做过 dsh 更新检查(每次打开 pane 触发,一次即可)。
-static UPDATE_CHECKED: AtomicBool = AtomicBool::new(false);
-
-/// 是否应执行本会话的 dsh 更新检查(首次调用 true 并置位,之后 false)。
-pub fn should_check_update_now() -> bool {
-    !UPDATE_CHECKED.swap(true, Ordering::Relaxed)
 }
 
 /// 每帧轮询子进程的判定结果。
