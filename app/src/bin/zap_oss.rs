@@ -32,11 +32,7 @@ fn main() -> Result<()> {
             mcp_static_config: None,
         },
     );
-    state = state.with_additional_features(&[
-        warp_core::features::FeatureFlag::OmpModelSelector,
-        // 上游把 WarpingModelName 藏在 dogfood 后面；本地明确对 Zap 开启（history.md §40）。
-        warp_core::features::FeatureFlag::WarpingModelName,
-    ]);
+    state = state.with_additional_features(&[warp_core::features::FeatureFlag::OmpModelSelector]);
     if cfg!(debug_assertions) {
         state = state.with_additional_features(DEBUG_FLAGS);
     }
