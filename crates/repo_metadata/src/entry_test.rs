@@ -1,4 +1,6 @@
 use super::path_passes_filters;
+
+use std::sync::Arc;
 use ignore::gitignore::Gitignore;
 use virtual_fs::{Stub, VirtualFS};
 
@@ -27,7 +29,7 @@ fn test_path_passes_filters_unix() {
         sandbox.with_files(vec![Stub::FileWithContent("my_repo/.gitignore", "target")]);
 
         let test_gitignore_entry = dirs.tests().join("my_repo/.gitignore");
-        let gitignores = vec![Gitignore::new(test_gitignore_entry).0];
+        let gitignores = vec![Arc::new(Gitignore::new(test_gitignore_entry).0)];
 
         // Do NOT ignore a file that does not exist (for deletions)
         assert!(path_passes_filters(
@@ -148,7 +150,7 @@ fn test_path_passes_filters_windows() {
         sandbox.with_files(vec![Stub::FileWithContent(r"my_repo\.gitignore", "target")]);
 
         let test_gitignore_entry = dirs.tests().join(r"my_repo\.gitignore");
-        let gitignores = vec![Gitignore::new(test_gitignore_entry).0];
+        let gitignores = vec![Arc::new(Gitignore::new(test_gitignore_entry).0)];
 
         assert!(path_passes_filters(
             dirs.tests().join(r"my_repo\src").as_path(),
