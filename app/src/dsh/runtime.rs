@@ -241,6 +241,9 @@ pub struct DshRuntime {
     /// 上次成功收养子进程的时刻。崩溃时若距上次成功启动已超过
     /// `CRASH_COUNT_RESET_AFTER`,视为健康运行,重置崩溃计数。
     last_success_at: Option<std::time::Instant>,
+    /// 最近一次启动/重启失败的原因(供 pane 展示与复制);成功启动或
+    /// 主动停止时清空,避免展示过期错误。
+    error: Option<String>,
 }
 
 impl Default for DshRuntime {
@@ -300,6 +303,7 @@ impl DshRuntime {
             stopping: false,
             generation: 0,
             last_success_at: None,
+            error: None,
         }
     }
 
@@ -465,10 +469,23 @@ impl DshRuntime {
         self.url.as_deref()
     }
 
+    /// 最近一次启动/重启失败的原因(无失败时为 `None`)。
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     pub fn set_status(&mut self, status: DshRuntimeStatus) {
         self.status = status;
     }
 
+    /// 记录一次启动/重启失败(原因 + `Failed` 状态)。
+    ///
+    /// 状态与原因一并写入,避免调用方先 `set_status` 再改 error 时中间态被
+    /// 订阅者读到(emit 后的订阅回调只依赖本方法的结果)。
+    pub fn set_failed(&mut self, error: String) {
+        self.error = Some(error);
+        self.set_status(DshRuntimeStatus::Failed);
+    }
 
     async fn start_inner() -> Result<(async_process::Child, String)> {
         // 1. 定位全局 dsh 命令(用户自装自升级,Zap 不做安装/版本管理)。
@@ -510,10 +527,11 @@ impl DshRuntime {
 
         // 4. 就绪探测:dsh 启动成功后会把最终 URL(含随机端口与访问 token)
         //    打到 stdout(已重定向到 zap-dsh-web.log),解析出该 URL 并 HTTP 探测。
+        //    探测同时盯着子进程,启动期退出立即失败。
         //    失败时显式清理子进程,避免 async-process 的 Child drop 不杀进程
         //    导致泄漏。
         let log_path = dsh_home.join(DSH_WEB_LOG_FILE);
-        let url = match Self::wait_until_ready(&log_path).await {
+        let url = match Self::wait_until_ready(&mut child, &log_path).await {
             Ok(url) => url,
             Err(err) => {
                 let _ = child.kill();
@@ -651,7 +669,11 @@ impl DshRuntime {
     /// 定向到 zap-dsh-web.log):`dsh web: http://127.0.0.1:<port>/?token=<token>`。
     /// 0.1.2-rc.1 起 web 端有 token 鉴权,裸地址 GET 返回 401,故必须解析
     /// 该 URL 用作探测与 webview 加载地址;URL 中的 token 随启动随机生成。
-    async fn wait_until_ready(log_path: &Path) -> Result<String> {
+    ///
+    /// 同时盯着子进程本身:启动期退出(插件加载失败、node 报错等)立即失败
+    /// 并报出日志里的真实错误,而不是空转到 `STARTUP_TIMEOUT` 后把原因
+    /// 掩盖成「就绪超时」。
+    async fn wait_until_ready(child: &mut async_process::Child, log_path: &Path) -> Result<String> {
         let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
         // 探活专用客户端,与业务 http_client 隔离:
         // - 不跟重定向:token URL 响应 303 → Location `/` 并种认证 cookie,
@@ -668,6 +690,16 @@ impl DshRuntime {
 
         let mut last_probe_log = String::new();
         loop {
+            // 子进程已退出:启动期崩溃,立刻失败(探测间隔内即可发现)。
+            if let Ok(Some(status)) = child.try_status() {
+                let log_text = std::fs::read_to_string(log_path).unwrap_or_default();
+                let error = match Self::extract_fatal_error(&log_text) {
+                    Some(detail) => format!("dsh web exited during startup ({status}): {detail}"),
+                    None => format!("dsh web exited during startup ({status})"),
+                };
+                bail!("{error}");
+            }
+
             if std::time::Instant::now() > deadline {
                 bail!("dsh web did not become ready within {STARTUP_TIMEOUT:?}");
             }
@@ -701,6 +733,45 @@ impl DshRuntime {
         }
     }
 
+    /// 从 zap-dsh-web.log 提取第一条错误行(供启动期退出时展示真实原因)。
+    ///
+    /// dsh 是 Node 程序:崩溃时把 `Error: ...` / `SyntaxError: ...` 连同嵌套
+    /// cause 一起打到 stdout/stderr(已重定向到日志)。取**第一条**含
+    /// `Error: ` 的行——它是最外层、信息量最大的那条,嵌套的重复 cause 都
+    /// 在它之后;找不到(非 Node 报错形态)返回 None,调用方只报退出状态。
+    fn extract_fatal_error(log_text: &str) -> Option<String> {
+        /// 单行错误上限:Node 的 cause 链可能把整段堆栈塞进一行。
+        const MAX_ERROR_CHARS: usize = 500;
+        log_text
+            .lines()
+            .map(str::trim)
+            .find(|line| line.contains("Error: "))
+            .map(|line| line.chars().take(MAX_ERROR_CHARS).collect())
+    }
+
+    /// 崩溃放弃重启时的失败原因(供 pane 展示与复制)。
+    ///
+    /// 崩溃日志里通常留有针对性的报错行;拿不到时给出「无错误行 + 日志路径」,
+    /// 而不是 `repeated crashes` 这类对用户与 Agent 都无信息的占位串。
+    pub fn crash_failure_reason() -> String {
+        let Ok(log_path) = Self::dsh_data_dir().map(|dir| dir.join(DSH_WEB_LOG_FILE)) else {
+            return "dsh web crashed repeatedly".to_string();
+        };
+        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        Self::crash_failure_reason_from(&log_path, &log_text)
+    }
+
+    /// [`crash_failure_reason`](Self::crash_failure_reason) 的纯函数部分(可单测)。
+    fn crash_failure_reason_from(log_path: &Path, log_text: &str) -> String {
+        match Self::extract_fatal_error(log_text) {
+            Some(detail) => format!("dsh web crashed repeatedly: {detail}"),
+            None => format!(
+                "dsh web crashed repeatedly; no error line in {}",
+                log_path.display()
+            ),
+        }
+    }
+
     /// 从 zap-dsh-web.log 读取就绪 URL(尚无输出时返回 None)。
     fn read_ready_url(log_path: &Path) -> Option<String> {
         Self::parse_ready_url(&std::fs::read_to_string(log_path).ok()?)
@@ -728,6 +799,7 @@ impl DshRuntime {
         self.stopping = false;
         self.consecutive_crashes = 0;
         self.generation += 1;
+        self.error = None;
         self.set_status(DshRuntimeStatus::Starting);
         self.generation
     }
@@ -739,6 +811,7 @@ impl DshRuntime {
     /// (崩溃路径 stopping 必为 false;保持原值避免覆盖用户刚发的停止请求)。
     pub fn begin_restart(&mut self) -> u64 {
         self.generation += 1;
+        self.error = None;
         self.set_status(DshRuntimeStatus::Starting);
         self.generation
     }
@@ -790,6 +863,7 @@ impl DshRuntime {
         self.set_status(DshRuntimeStatus::Stopped);
         self.url = None;
         self.consecutive_crashes = 0;
+        self.error = None;
     }
     ///
     /// 返回 [`PollResult`]:崩溃时置状态为 `Stopped`(等待重启调度),
@@ -849,6 +923,18 @@ impl SingletonEntity for DshRuntime {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 触碰全局隐私开关的用例须串行:`DshRuntime::new()` 会按磁盘设置重写
+    /// `TERMINAL_CONTEXT_ENABLED`(本机 dsh_settings.json 为 true 时置 true),
+    /// 并行执行会把 [`terminal_context_privacy_gate`] 断言的中间态踩掉
+    /// (实测约 1/3 概率失败)。
+    static PRIVACY_STATIC_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 构造 `DshRuntime` 的用例统一入口:构造期间持锁,与隐私开关用例互斥。
+    fn test_runtime() -> DshRuntime {
+        let _guard = PRIVACY_STATIC_TEST_LOCK.lock();
+        DshRuntime::new()
+    }
 
     /// PATH 查找:命中首个含可执行 `dsh` 的目录;无可执行时返回 None。
     /// 仅 unix:is_executable_file 的可执行判定按 unix 权限位实现。
@@ -947,6 +1033,8 @@ mod tests {
     /// 终端上下文隐私开关:关闭时返回空,开启后返回暂存命令。
     #[test]
     fn terminal_context_privacy_gate() {
+        // 全程持锁:并行用例构造 DshRuntime 会按磁盘设置重写该全局静态。
+        let _guard = PRIVACY_STATIC_TEST_LOCK.lock();
         TERMINAL_CONTEXT_ENABLED.store(false, Ordering::Relaxed);
         *TERMINAL_CONTEXT.lock() = vec!["ls".to_string(), "cd src".to_string()];
         assert!(terminal_context().is_empty(), "privacy off => empty");
@@ -1020,7 +1108,7 @@ mod tests {
     fn poll_child_detects_exit() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let mut runtime = DshRuntime::new();
+            let mut runtime = test_runtime();
             // 用 sleep 进程模拟 dsh 子进程。
             let mut cmd = command::r#async::Command::new("sleep");
             cmd.arg("30");
@@ -1051,7 +1139,7 @@ mod tests {
     fn poll_child_stopped_by_request() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let mut runtime = DshRuntime::new();
+            let mut runtime = test_runtime();
             let mut cmd = command::r#async::Command::new("sleep");
             cmd.arg("30");
             let child = cmd.spawn().expect("spawn sleep");
@@ -1079,7 +1167,7 @@ mod tests {
     fn adopt_child_after_stop_kills_child() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let mut runtime = DshRuntime::new();
+            let mut runtime = test_runtime();
             // 先请求停止(模拟关闭 pane)。
             runtime.request_stop();
 
@@ -1115,10 +1203,111 @@ mod tests {
         });
     }
 
+    /// 失败原因记录:set_failed 同时写入错误串与 Failed 状态;重新启动
+    /// 或主动停止时清空,避免展示过期错误。
+    #[test]
+    fn failed_error_is_stored_and_cleared() {
+        let mut runtime = test_runtime();
+        assert!(runtime.error().is_none());
+
+        runtime.set_failed("dsh command not found in PATH".to_string());
+        assert_eq!(runtime.status(), DshRuntimeStatus::Failed);
+        assert_eq!(runtime.error(), Some("dsh command not found in PATH"));
+
+        runtime.begin_start();
+        assert!(runtime.error().is_none(), "begin_start clears stale error");
+
+        runtime.set_failed("dsh web did not become ready".to_string());
+        runtime.request_stop();
+        assert!(runtime.error().is_none(), "request_stop clears error");
+    }
+
+    /// 启动期退出:错误提取取日志里第一条 `Error: ` 行(最外层原因),
+    /// 忽略它之前的正常输出与之后的嵌套 cause;无错误行时返回 None。
+    #[test]
+    fn extract_fatal_error_takes_first_error_line() {
+        let sample = "[dsh-wechat] session/event listener attached\n\
+                      [opencode-session-id] mounted: providers=[opencode]\n\
+                      throw new Error(`${binName}: ${stage}: ${detail}`)\n\
+                      \n\
+                      Error: dsh: plugin tree failed to load: failed to import dsh-rewind-plugin\n\
+                      \x20   at #asyncInstantiate (node:internal/modules/esm/module_job:455:21)\n\
+                      SyntaxError: The requested module '@deepseek-ai/dsh-session' does not provide ...\n";
+        assert_eq!(
+            DshRuntime::extract_fatal_error(sample).as_deref(),
+            Some("Error: dsh: plugin tree failed to load: failed to import dsh-rewind-plugin")
+        );
+
+        // 无 Node 报错形态(如正常启动输出)时不给出原因。
+        assert_eq!(
+            DshRuntime::extract_fatal_error("dsh web: http://127.0.0.1:8080/?token=abc\n"),
+            None
+        );
+    }
+
+    /// 启动期退出:wait_until_ready 立即失败(不等 STARTUP_TIMEOUT),错误里
+    /// 带上日志中的真实原因,而不是「就绪超时」。
+    #[cfg(unix)]
+    #[test]
+    fn wait_until_ready_fails_fast_on_early_exit() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!("zap-dsh-early-exit-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let log_path = dir.join("zap-dsh-web.log");
+            std::fs::write(
+                &log_path,
+                "[plugin] mounted\n\
+                 Error: dsh: plugin tree failed to load: boom\n\
+                 \x20   at #asyncInstantiate (node:internal/modules/esm/module_job:455:21)\n",
+            )
+            .unwrap();
+
+            // 立刻退出的假 dsh 子进程(模拟插件加载失败后 node 退出)。
+            let mut cmd = command::r#async::Command::new("sh");
+            cmd.arg("-c").arg("exit 1");
+            let mut child = cmd.spawn().expect("spawn fake dsh");
+
+            let started = std::time::Instant::now();
+            let err = DshRuntime::wait_until_ready(&mut child, &log_path)
+                .await
+                .expect_err("early exit must fail");
+            let message = format!("{err:#}");
+            assert!(message.contains("exited during startup"), "{message}");
+            assert!(
+                message.contains("Error: dsh: plugin tree failed to load: boom"),
+                "{message}"
+            );
+            // 一个探测周期内就发现,远早于 120s 超时。
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "took {:?}",
+                started.elapsed()
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    /// 崩溃放弃重启:原因取日志里的首条错误行;日志里没有错误行时回退到
+    /// 「无错误行 + 日志路径」,而不是占位串。
+    #[test]
+    fn crash_failure_reason_prefers_log_error_line() {
+        let log_path = Path::new("/tmp/zap-dsh-web.log");
+        assert_eq!(
+            DshRuntime::crash_failure_reason_from(log_path, "[plugin] ok\nError: boom\n"),
+            "dsh web crashed repeatedly: Error: boom"
+        );
+        assert_eq!(
+            DshRuntime::crash_failure_reason_from(log_path, "[plugin] ok\n"),
+            "dsh web crashed repeatedly; no error line in /tmp/zap-dsh-web.log"
+        );
+    }
+
     /// begin_start 复位 stopping 与崩溃计数,并置位 Starting。
     #[test]
     fn begin_start_resets_state() {
-        let mut runtime = DshRuntime::new();
+        let mut runtime = test_runtime();
         runtime.request_stop();
         runtime.consecutive_crashes = 2;
         let gen = runtime.begin_start();
@@ -1135,7 +1324,7 @@ mod tests {
     fn poll_child_gives_up_after_max_restarts() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let mut runtime = DshRuntime::new();
+            let mut runtime = test_runtime();
             // 模拟连续崩溃:每次 spawn sleep → adopt → SIGKILL → poll。
             for expected_crash in 1..=MAX_RESTARTS + 1 {
                 let mut cmd = command::r#async::Command::new("sleep");
@@ -1173,7 +1362,7 @@ mod tests {
     fn crash_after_healthy_run_resets_count() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            let mut runtime = DshRuntime::new();
+            let mut runtime = test_runtime();
 
             // 第一次崩溃(计数 1)。
             let mut cmd = command::r#async::Command::new("sleep");

@@ -1493,7 +1493,7 @@ fn initialize_app(
                                     }
                                     dsh::DshRestartResult::GiveUp { error } => {
                                         log::error!("[dsh] restart gave up: {error}");
-                                        runtime.set_status(dsh::DshRuntimeStatus::Failed);
+                                        runtime.set_failed(error.clone());
                                         // 通知 workspace 展示失败(pane 已停,提示用户)。
                                         ctx.emit(dsh::bridge::BridgeEvent::Failed { error });
                                     }
@@ -1501,11 +1501,12 @@ fn initialize_app(
                             );
                         }
                         dsh::PollResult::GiveUp => {
-                            // 连续崩溃超过上限:放弃重启,通知用户。
+                            // 连续崩溃超过上限:放弃重启,通知用户。原因取本次
+                            // 日志里的真实报错(不再用 repeated crashes 占位串)。
                             log::error!("[dsh] gave up after repeated crashes");
-                            ctx.emit(dsh::bridge::BridgeEvent::Failed {
-                                error: "repeated crashes".to_string(),
-                            });
+                            let error = dsh::DshRuntime::crash_failure_reason();
+                            runtime.set_failed(error.clone());
+                            ctx.emit(dsh::bridge::BridgeEvent::Failed { error });
                         }
                         _ => {}
                     }

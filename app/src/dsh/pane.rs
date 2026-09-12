@@ -20,11 +20,12 @@ use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::pane_group::pane::view::{self, PaneView};
 use crate::pane_group::pane::{BackingView, DetachType, PaneContent, ShareableLink, ShareableLinkError, IPaneType};
 use crate::pane_group::{PaneConfiguration, PaneGroup, PaneId};
-use crate::view_components::action_button::{ActionButton, PrimaryTheme};
+use crate::view_components::action_button::{ActionButton, PrimaryTheme, SecondaryTheme};
 use crate::workspace::WorkspaceAction;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::Vector2F;
 use warp_core::ui::icons::Icon as WarpIcon;
+use warpui::clipboard::ClipboardContent;
 use warpui::elements::*;
 use warpui::event::DispatchedEvent;
 use warpui::fonts::FamilyId;
@@ -139,6 +140,10 @@ pub enum DshPaneAction {
     /// 用户确认后重新加载已崩溃的 webview(仅重载页面,不重启 runtime:
     /// WebContent 崩溃是渲染进程问题,dsh 服务本身仍健康)。
     ReloadWebview,
+    /// 复制失败原因到剪贴板,并附加到 Zap 终端 Agent 输入框。
+    CopyErrorAsContext,
+    /// 失败态点「重新启动」:切回启动中界面并重新启动 runtime。
+    RestartRuntime,
 }
 
 enum DshPaneState {
@@ -164,8 +169,17 @@ pub struct DshPaneView {
     /// dsh runtime 失败/已停止(启动失败、崩溃放弃重启、或恢复自已停止的
     /// pane):覆盖渲染为错误态 + 重启入口,避免展示指向已死服务的僵尸页面。
     runtime_failed: bool,
+    /// 用户点了「重新启动」、runtime 尚未回来:渲染「启动中」界面,否则会一直
+    /// 停在错误页,看不出重启已经开始。Ready/Restarted/再次 Failed 时复位。
+    runtime_restarting: bool,
+    /// 最近一次启动/重启失败的原因(取自 runtime 单例,失败事件与失败后
+    /// 新建/恢复 pane 的 attach 共用):错误态展示 + 「复制错误」内容。
+    runtime_error: Option<String>,
     /// 重启按钮(ActionButton 是 Entity,需以 ChildView 渲染;进入失败态时懒创建)。
     restart_button: Option<ViewHandle<ActionButton>>,
+    /// 复制错误按钮:复制失败原因并附加到 Zap 终端 Agent 输入框
+    /// (dsh 失败态下没有可用的 dsh 输入框,故落点在 Zap 侧终端)。
+    copy_error_button: Option<ViewHandle<ActionButton>>,
     /// WebContent 渲染进程已崩溃(runtime 仍健康):覆盖渲染崩溃态 +
     /// 重新加载入口,避免展示死页/白屏。wry 的导航委托恒实现
     /// webViewWebContentProcessDidTerminate,WebKit 不会自动重载,恢复
@@ -188,6 +202,12 @@ impl DshPaneView {
                 }
                 BridgeEvent::Ready { .. } | BridgeEvent::Restarted { .. } => {
                     me.runtime_failed = false;
+                    me.runtime_restarting = false;
+                    // 重新计 webview 加载时钟:重启可能已耗时超过
+                    // WEBVIEW_LOAD_TIMEOUT,否则就绪后会被超时兜底判为「已加载」
+                    // 而提前露出 webview(此时导航尚未完成)。
+                    me.webview_loaded = false;
+                    me.load_started_at = Some(Instant::now());
                     ctx.notify();
                 }
                 BridgeEvent::Notify { .. }
@@ -206,7 +226,10 @@ impl DshPaneView {
             webview_id: None,
             focus_handle: None,
             runtime_failed: false,
+            runtime_restarting: false,
+            runtime_error: None,
             restart_button: None,
+            copy_error_button: None,
             webview_crashed: false,
             crash_reload_button: None,
         }
@@ -304,21 +327,73 @@ impl DshPaneView {
         }
     }
 
-    /// 进入 runtime 失败态:置标志并确保重启按钮视图存在(ActionButton 是
+    /// 进入 runtime 失败态:置标志并确保重启/复制按钮视图存在(ActionButton 是
     /// Entity,需以 ChildView 渲染,懒创建避免健康路径开销)。
     fn enter_runtime_failed(&mut self, ctx: &mut ViewContext<Self>) {
         // 覆盖层会换出并隐藏 webview,还原 first responder 保证按钮 hover
         // 可用(机理同 webview 崩溃态,见 restore_host_first_responder)。
         #[cfg(target_os = "macos")]
         self.restore_host_first_responder(ctx);
+        // 失败原因取自 runtime 单例:失败事件(启动失败/崩溃放弃重启)只负责
+        // 触发状态切换,错误文本由 runtime 保存,使「失败后新建/恢复 pane」
+        // 的 attach 路径同样能拿到。
+        self.runtime_error = DshRuntime::handle(ctx)
+            .read(ctx, |runtime, _| runtime.error().map(str::to_string));
         self.runtime_failed = true;
+        self.runtime_restarting = false;
         if self.restart_button.is_none() {
             self.restart_button = Some(ctx.add_typed_action_view(|_ctx| {
                 ActionButton::new("重新启动", PrimaryTheme).on_click(|ctx| {
-                    ctx.dispatch_typed_action(WorkspaceAction::OpenDshPane)
+                    ctx.dispatch_typed_action(DshPaneAction::RestartRuntime)
                 })
             }));
         }
+        // 无错误文本时不创建(「恢复自已停止的 pane」没有原因可复制,
+        // 显示一个点了没反应的按钮比不显示更糟)。
+        if self.copy_error_button.is_none() && self.runtime_error.is_some() {
+            self.copy_error_button = Some(ctx.add_typed_action_view(|_ctx| {
+                ActionButton::new(crate::t!("dsh-runtime-failed-fix-error"), SecondaryTheme)
+                    .with_tooltip(crate::t!("dsh-runtime-failed-fix-error-tooltip"))
+                    .on_click(|ctx| ctx.dispatch_typed_action(DshPaneAction::CopyErrorAsContext))
+            }));
+        }
+        ctx.notify();
+    }
+
+    /// 复制失败原因到剪贴板,并请求 workspace 把错误文本附加到 Zap 终端
+    /// Agent 输入框(dsh 失败态下 dsh 侧不可用,落点只能在 Zap 侧终端)。
+    fn copy_error_as_context(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(error) = self
+            .runtime_error
+            .clone()
+            .filter(|error| !error.is_empty())
+        else {
+            return;
+        };
+        ctx.clipboard()
+            .write(ClipboardContent::plain_text(error.clone()));
+        // 延迟派发:同步派发会在 DshPaneView 处于 update 中时触发 Workspace
+        // 对终端输入框的更新(重入),交给 effects 刷新阶段执行。
+        ctx.dispatch_typed_action_deferred(WorkspaceAction::AttachDshErrorAsContext { error });
+    }
+
+    /// 重新启动 runtime:立刻切回「启动中」界面,再请求 workspace 启动。
+    ///
+    /// 复位 webview 加载状态:旧 webview 指向的是已死实例,不重置会被判定
+    /// 「已加载」而直接露出来(闪过僵尸页面)。就绪/失败分别由 Ready 与
+    /// Failed 事件决定下一态。
+    fn restart_runtime(&mut self, ctx: &mut ViewContext<Self>) {
+        self.runtime_failed = false;
+        self.runtime_restarting = true;
+        self.runtime_error = None;
+        // webview 相关的两个标志一并复位:崩溃态覆盖层优先级高于启动中,
+        // 不清会先闪一下「页面已崩溃」;旧 webview 指向已死实例,不重置加载
+        // 记账会被判「已加载」而直接露出来。
+        self.webview_crashed = false;
+        self.webview_loaded = false;
+        self.load_started_at = Some(Instant::now());
+        // 延迟派发:同步派发会在 DshPaneView 处于 update 中时重入 Workspace。
+        ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenDshPane);
         ctx.notify();
     }
 
@@ -413,6 +488,38 @@ impl DshPaneView {
         }
     }
 
+    /// 「启动中」界面:图标 + 省略号打字动画(省略号递增,避免静态文字让
+    /// 用户误以为卡死)。Loading 态、webview 加载中、重启中三种情况共用。
+    fn render_starting(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        Align::new(
+            Flex::column()
+                .with_main_axis_alignment(MainAxisAlignment::Center)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(Box::new(
+                    ConstrainedBox::new(Box::new(Icon::new(
+                        WarpIcon::DeepSeek.into(),
+                        appearance.theme().foreground(),
+                    )))
+                    .with_width(40.)
+                    .with_height(40.),
+                ))
+                .with_child(
+                    Container::new(Box::new(EllipsisText::new(
+                        "DeepSeek Harness 启动中",
+                        appearance.ui_font_family(),
+                        16.,
+                        appearance.theme().foreground(),
+                        self.loading_anim_start.clone(),
+                    )))
+                    .with_margin_top(16.)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .finish()
+    }
+
     /// runtime 失败态:图标 + 说明 + 重启入口(布局与 Loading 态一致)。
     /// 重启复用 WorkspaceAction::OpenDshPane(Stopped/Failed 态下 begin_start,
     /// 就绪后 workspace 会把本 pane 导航到新 URL)。
@@ -441,9 +548,46 @@ impl DshPaneView {
                 .with_margin_top(16.)
                 .finish(),
             );
-        if let Some(button) = &self.restart_button {
+        // 失败原因(如命令缺失、就绪超时):原样展示,便于用户判断是环境
+        // 问题还是 dsh 自身问题;受限宽软换行,长错误不撑破布局。
+        if let Some(error) = &self.runtime_error {
             column = column.with_child(
+                Container::new(
+                    ConstrainedBox::new(
+                        Shrinkable::new(
+                            1.,
+                            Text::new(error.clone(), appearance.ui_font_family(), 13.)
+                                .with_color(
+                                    appearance
+                                        .theme()
+                                        .sub_text_color(appearance.theme().background())
+                                        .into(),
+                                )
+                                .finish(),
+                        )
+                        .finish(),
+                    )
+                    .with_max_width(420.)
+                    .finish(),
+                )
+                .with_margin_top(8.)
+                .finish(),
+            );
+        }
+        let mut buttons = Flex::row();
+        if let Some(button) = &self.restart_button {
+            buttons = buttons.with_child(Box::new(ChildView::new(button)));
+        }
+        if let Some(button) = &self.copy_error_button {
+            buttons = buttons.with_child(
                 Container::new(Box::new(ChildView::new(button)))
+                    .with_margin_left(8.)
+                    .finish(),
+            );
+        }
+        if self.restart_button.is_some() || self.copy_error_button.is_some() {
+            column = column.with_child(
+                Container::new(buttons.finish())
                     .with_margin_top(16.)
                     .finish(),
             );
@@ -520,6 +664,10 @@ impl View for DshPaneView {
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
+        // 用户点了「重新启动」:立刻回到启动中界面(错误页会让人以为没反应)。
+        if self.runtime_restarting {
+            return self.render_starting(app);
+        }
         // runtime 失败/已停止:显示错误态 + 重启入口,而非指向已死服务的
         // 僵尸页面或无限转圈。
         if self.runtime_failed {
@@ -540,66 +688,8 @@ impl View for DshPaneView {
             DshPaneState::Ready(browser_view) if show_webview => {
                 ChildView::new(browser_view).finish()
             }
-            DshPaneState::Ready(_) => {
-                // webview 加载中或未达超时兜底:显示省略号动画(与 Loading 一致,
-                // 避免"启动中"静态文字让用户误以为卡死)。
-                let appearance = Appearance::as_ref(app);
-                Align::new(
-                    Flex::column()
-                        .with_main_axis_alignment(MainAxisAlignment::Center)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_child(Box::new(
-                            ConstrainedBox::new(Box::new(Icon::new(
-                                WarpIcon::DeepSeek.into(),
-                                appearance.theme().foreground(),
-                            )))
-                            .with_width(40.)
-                            .with_height(40.),
-                        ))
-                        .with_child(
-                            Container::new(Box::new(EllipsisText::new(
-                                "DeepSeek Harness 启动中",
-                                appearance.ui_font_family(),
-                                16.,
-                                appearance.theme().foreground(),
-                                self.loading_anim_start.clone(),
-                            )))
-                            .with_margin_top(16.)
-                            .finish(),
-                        )
-                        .finish(),
-                )
-                .finish()
-            }
-            DshPaneState::Loading => {
-                let appearance = Appearance::as_ref(app);
-                Align::new(
-                    Flex::column()
-                        .with_main_axis_alignment(MainAxisAlignment::Center)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_child(Box::new(
-                            ConstrainedBox::new(Box::new(Icon::new(
-                                WarpIcon::DeepSeek.into(),
-                                appearance.theme().foreground(),
-                            )))
-                            .with_width(40.)
-                            .with_height(40.),
-                        ))
-                        .with_child(
-                            Container::new(Box::new(EllipsisText::new(
-                                "DeepSeek Harness 启动中",
-                                appearance.ui_font_family(),
-                                16.,
-                                appearance.theme().foreground(),
-                                self.loading_anim_start.clone(),
-                            )))
-                            .with_margin_top(16.)
-                            .finish(),
-                        )
-                        .finish(),
-                )
-                .finish()
-            }
+            // webview 未就绪(创建中/加载中/未达超时兜底):显示省略号动画。
+            DshPaneState::Ready(_) | DshPaneState::Loading => self.render_starting(app),
         }
     }
 }
@@ -610,6 +700,8 @@ impl TypedActionView for DshPaneView {
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
             DshPaneAction::ReloadWebview => self.recreate_webview(ctx),
+            DshPaneAction::CopyErrorAsContext => self.copy_error_as_context(ctx),
+            DshPaneAction::RestartRuntime => self.restart_runtime(ctx),
         }
     }
 }

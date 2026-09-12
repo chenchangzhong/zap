@@ -426,6 +426,11 @@ pub enum WorkspaceAction {
     },
     /// Open the DeepSeek Harness web UI pane (dsh runtime + embedded webview).
     OpenDshPane,
+    /// 把 dsh 启动错误附加到 Zap 终端 Agent 输入框(dsh 失败态的「复制错误」按钮;
+    /// 文本已由 pane 写入剪贴板,这里只负责落进输入框)。
+    AttachDshErrorAsContext {
+        error: String,
+    },
     OpenNotebook {
         id: SyncId,
     },
@@ -707,6 +712,7 @@ impl WorkspaceAction {
             | OpenFileInNewTab { .. }
             | OpenBrowserPreview { .. }
             | OpenDshPane
+            | AttachDshErrorAsContext { .. }
             | RestoreOrNavigateToConversation { .. }
             | NewCodeFile
             | ForkAIConversation { .. }

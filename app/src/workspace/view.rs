@@ -2626,18 +2626,9 @@ impl Workspace {
                         // 崩溃后自动重启完成:导航已有 dsh pane 到新 URL。
                         me.navigate_existing_dsh_pane(url, ctx);
                     }
-                    crate::dsh::bridge::BridgeEvent::Failed { error } => {
-                        log::error!("[dsh] runtime failed: {error}");
-                        // 提示用户:runtime 已停止,可重新打开。
-                        let window_id = ctx.window_id();
-                        WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
-                            stack.add_persistent_toast(
-                                DismissibleToast::error(crate::t!("dsh-runtime-failed-toast")),
-                                window_id,
-                                ctx,
-                            );
-                        });
-                    }
+                    // 失败不再弹 toast:pane 自身已覆盖渲染失败原因 +
+                    // 重新启动/修复错误入口,toast 文案(「连续崩溃已停止」)
+                    // 对启动失败还会误导。
                     _ => {}
                 }
             });
@@ -14590,6 +14581,38 @@ impl Workspace {
         }
     }
 
+    /// dsh 启动失败:把错误文本附加到 Zap 终端 Agent 输入框(dsh 失败态的
+    /// 「修复错误」按钮;剪贴板已由 pane 写入,这里只负责落进输入框)。
+    ///
+    /// 优先复用当前 tab 的活动终端输入框;dsh 独立 tab 下没有终端时新开一个
+    /// Agent 模式 tab——失败说明就在当前 tab,就地拆 pane 会把它挤掉。
+    fn attach_dsh_error_as_context(&mut self, error: &str, ctx: &mut ViewContext<Self>) {
+        // 落点 1:活动终端输入框。复用既有 insert_in_input(追加而非替换,
+        // 保留用户草稿 + 切 Agent 模式),避免同一行为两处实现。
+        if self.get_active_input_view_handle(ctx).is_some() {
+            self.insert_in_input(error, false, false, true, ctx);
+            return;
+        }
+        // 落点 2:新开 Agent 模式 tab 后追加。新 tab 刚建好时 active session
+        // 未必已切换,故直接取 focused session(与 add_terminal_tab_in_ai_mode
+        // 内部取法一致)。
+        self.add_terminal_tab_in_ai_mode(None, ctx);
+        let Some(input) = self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .focused_session_view(ctx)
+            .map(|terminal_view| terminal_view.as_ref(ctx).input().clone())
+        else {
+            return;
+        };
+        input.update(ctx, |input, ctx| {
+            input.append_to_buffer(error, ctx);
+            // 错误文本落进 Agent 模式输入框(而非 shell 命令)。
+            input.ensure_agent_mode_for_ai_features(true, ctx);
+            ctx.notify();
+        });
+    }
+
     fn invoke_environment_variables(
         &mut self,
         env_var_collection: EnvVarCollectionObject,
@@ -19225,7 +19248,7 @@ impl Workspace {
                     }
                     crate::dsh::DshStartResult::Failed { error } => {
                         log::error!("[dsh] start failed: {error}");
-                        runtime.set_status(crate::dsh::DshRuntimeStatus::Failed);
+                        runtime.set_failed(error.clone());
                         ctx.emit(crate::dsh::bridge::BridgeEvent::Failed { error });
                     }
                 },
@@ -20698,6 +20721,9 @@ impl TypedActionView for Workspace {
                     return;
                 }
                 self.open_dsh_pane(ctx);
+            }
+            AttachDshErrorAsContext { error } => {
+                self.attach_dsh_error_as_context(error, ctx);
             }
             TabHoverWidthStart { width } => {
                 // Store the fixed width value for the tab to maintain consistent size during hover
