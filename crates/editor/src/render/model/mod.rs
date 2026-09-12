@@ -2658,7 +2658,7 @@ impl RenderState {
             let EditDelta {
                 old_offset, new_lines, ..
             } = delta;
-            let mut new_lines = new_lines.into_iter();
+            let mut new_lines = Arc::unwrap_or_clone(new_lines).into_iter();
             let first_rows: Vec<_> = new_lines.by_ref().take(ROWS_PER_FLUSH).collect();
             let rest_rows: Vec<_> = new_lines.collect();
             let chunk_count = 1 + rest_rows.len().div_ceil(ROWS_PER_FLUSH);
@@ -2669,7 +2669,7 @@ impl RenderState {
                 // 且在入渲染队列之前;渲染侧的 layout_delta 从不读它。
                 precise_deltas: Arc::new(Vec::new()),
                 old_offset: old_offset.clone(),
-                new_lines: first_rows,
+                new_lines: Arc::new(first_rows),
             };
             let layout_context = self.layout_context(app);
             let (mut laid_out, collect_dur, build_dur, parallel_dur, fold_dur) =
@@ -2711,7 +2711,7 @@ impl RenderState {
                 let rest = EditDelta {
                     precise_deltas: Arc::new(Vec::new()),
                     old_offset: at..at,
-                    new_lines: rest_rows,
+                    new_lines: Arc::new(rest_rows),
                 };
                 self.pending_edits
                     .lock()
