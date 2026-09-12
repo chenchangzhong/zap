@@ -104,7 +104,6 @@ use crate::view_components::action_button::ButtonSize;
 use crate::view_components::action_button::KeystrokeSource;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 use crate::Appearance;
-use crate::LLMPreferences;
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
 use pathfinder_geometry::vector::vec2f;
@@ -4778,33 +4777,6 @@ impl AIBlock {
                     .is_some_and(|status| status.is_running())
                     && requested_command.view.as_ref(app).is_header_expanded()
             })
-    }
-
-    pub fn output_model_display_name(&self, app: &AppContext) -> String {
-        let Some(base_model_id) = self.model.base_model(app) else {
-            log::warn!("No base model found for output model display name");
-            return String::default();
-        };
-
-        // Get the model name from the input metadata.
-        let mut model_name = LLMPreferences::as_ref(app)
-            .get_llm_info(base_model_id)
-            .map(|info| info.display_name.clone())
-            .unwrap_or_default();
-
-        // If the input model is "auto", always display that, otherwise use the actual output model if available.
-        if model_name != "auto" {
-            let model_id = self.model.model_id(app);
-            if let Some(model_id) = model_id {
-                if let Some(output_model_name) = LLMPreferences::as_ref(app)
-                    .get_llm_info(&model_id)
-                    .map(|info| info.display_name.clone())
-                {
-                    model_name = output_model_name;
-                }
-            }
-        }
-        model_name
     }
 
     #[cfg(feature = "agent_mode_debug")]
