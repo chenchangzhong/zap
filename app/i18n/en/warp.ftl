@@ -1894,6 +1894,7 @@ keybinding-desc-workspace-link-to-privacy-policy = View privacy policy (opens ex
 # Input / terminal / project bindings (registered outside workspace/mod.rs)
 keybinding-desc-input-edit-prompt = Edit Prompt
 keybinding-desc-terminal-attach-block-as-context = Attach Selected Block as Agent Context
+keybinding-desc-terminal-attach-file = Attach file to agent conversation
 keybinding-desc-terminal-attach-text-as-context = Attach Selected Text as Agent Context
 keybinding-desc-terminal-attach-as-context-menu = Attach Selection as Agent Context
 keybinding-desc-workspace-init-project = Initiate project for warp

@@ -2787,6 +2787,19 @@ pub struct BlockSelectionDetails {
     is_shift_down: bool,
 }
 
+pub(crate) fn file_attach_allowed_for_shared_session(
+    shared_session_status: &SharedSessionStatus,
+    ambient_agent_view_model: Option<&ModelHandle<ambient_agent::AmbientAgentViewModel>>,
+    ctx: &AppContext,
+) -> bool {
+    // 本地适配：上游用 FeatureFlag::CloudModeImageContext 判定 cloud 模式，
+    // 本仓无该 flag（无云端 Agent），直接以 ambient agent 面板为判据。
+    let is_cloud_mode =
+        ambient_agent_view_model.is_some_and(|model| model.as_ref(ctx).is_ambient_agent());
+    AgentToolbarItemKind::FileAttach
+        .available_to_session_viewer(shared_session_status, is_cloud_mode)
+}
+
 impl TerminalView {
     /// Returns the path to the current repository, if any.
     pub fn current_repo_path(&self) -> Option<&PathBuf> {
@@ -6994,6 +7007,29 @@ impl TerminalView {
 
     pub fn ambient_agent_view_model(&self) -> &ModelHandle<ambient_agent::AmbientAgentViewModel> {
         &self.ambient_agent_view_model
+    }
+
+    /// 当前面板是否处于 agent / CLI-agent 的附加文件语境。
+    fn is_in_agent_or_cli_attach_context(&self, app: &AppContext) -> bool {
+        let agent_view_state = self.agent_view_controller.as_ref(app).agent_view_state();
+        agent_view_state.is_fullscreen()
+            || agent_view_state.is_inline()
+            || CLIAgentSessionsModel::as_ref(app)
+                .session(self.view_id)
+                .is_some()
+    }
+
+    /// 附加文件是否可用：需在 agent 语境且共享会话允许（本地 `ambient_agent_view_model`
+    /// 是非 Option 字段，故此处包一层 Some，与上游签名保持一致）。
+    fn can_attach_file(&self, app: &AppContext) -> bool {
+        self.is_in_agent_or_cli_attach_context(app) && {
+            let status = self.model.lock().shared_session_status().clone();
+            file_attach_allowed_for_shared_session(
+                &status,
+                Some(self.ambient_agent_view_model()),
+                app,
+            )
+        }
     }
 
     fn ambient_agent_task_id_for_details_panel_from_model(
@@ -24403,6 +24439,7 @@ impl TypedActionView for TerminalView {
             | SelectAgenticSuggestion(_)
             | LoadAgentModeConversation
             | DeleteAttachment { .. }
+            | AttachFile
             | ToggleAutoexecuteMode
             | ToggleQueueNextPrompt
             | ToggleTodoPopup
@@ -25049,6 +25086,14 @@ impl TypedActionView for TerminalView {
             DeleteAttachment { index } => {
                 self.ai_context_model.update(ctx, |context_model, ctx| {
                     context_model.remove_pending_attachment(*index, ctx);
+                });
+            }
+            AttachFile => {
+                if !self.can_attach_file(ctx) {
+                    return;
+                }
+                self.input.update(ctx, |input, ctx| {
+                    input.attach_file(ctx);
                 });
             }
             ToggleAutoexecuteMode => {
@@ -25966,6 +26011,14 @@ impl View for TerminalView {
             } else if agent_view_state.is_inline() {
                 context.set.insert(flags::ACTIVE_INLINE_AGENT_VIEW);
             }
+        }
+
+        if file_attach_allowed_for_shared_session(
+            model_lock.shared_session_status(),
+            Some(&self.ambient_agent_view_model),
+            app,
+        ) {
+            context.set.insert(init::CAN_ATTACH_FILE_KEY);
         }
 
         let ambient_agent_view_model = self.ambient_agent_view_model.as_ref(app);

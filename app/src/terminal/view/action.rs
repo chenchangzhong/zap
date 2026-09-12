@@ -345,6 +345,7 @@ pub enum TerminalAction {
     DeleteAttachment {
         index: usize,
     },
+    AttachFile,
     ToggleAutoexecuteMode,
     ToggleQueueNextPrompt,
     AgentModeSetupSpeedbumpBanner(AgentModeSetupSpeedbumpBannerAction),
@@ -605,6 +606,7 @@ impl fmt::Debug for TerminalAction {
             ShowWarpifySettings => write!(f, "ShowWarpifySettings"),
             DeleteAttachment { index } => write!(f, "DeleteAttachment({index:?})"),
             ToggleAutoexecuteMode => write!(f, "ToggleAutoexecuteMode"),
+            AttachFile => write!(f, "AttachFile"),
             ToggleQueueNextPrompt => write!(f, "ToggleQueueNextPrompt"),
             AgentModeSetupSpeedbumpBanner(action) => {
                 write!(f, "AgentModeSetupSpeedbumpBanner({action:?})")

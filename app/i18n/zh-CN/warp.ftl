@@ -1813,6 +1813,7 @@ keybinding-desc-workspace-link-to-privacy-policy = 查看隐私政策（打开�
 # 输入 / 终端 / 项目相关 binding（注册在 workspace/mod.rs 之外）
 keybinding-desc-input-edit-prompt = 编辑 Prompt
 keybinding-desc-terminal-attach-block-as-context = 将所选块作为 Agent 上下文附加
+keybinding-desc-terminal-attach-file = 向 Agent 对话附加文件
 keybinding-desc-terminal-attach-text-as-context = 将所选文本作为 Agent 上下文附加
 keybinding-desc-terminal-attach-as-context-menu = 将所选内容作为 Agent 上下文附加
 keybinding-desc-workspace-init-project = 为 Zap 初始化项目

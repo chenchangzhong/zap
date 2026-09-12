@@ -40,7 +40,7 @@ use crate::{
         session_settings::{SessionSettings, SessionSettingsChangedEvent, ToolbarChipSelection},
         shared_session::SharedSessionStatus,
         view::ambient_agent::{AmbientAgentViewModel, ModelSelector},
-        view::init::OPEN_CLI_AGENT_RICH_INPUT_KEYBINDING,
+        view::init::{ATTACH_FILE_KEYBINDING, OPEN_CLI_AGENT_RICH_INPUT_KEYBINDING},
         view::TerminalAction,
         CLIAgent, TerminalModel,
     },
@@ -320,6 +320,7 @@ impl AgentInputFooter {
             ActionButton::new("", AgentInputButtonTheme)
                 .with_icon(Icon::Plus)
                 .with_tooltip(crate::t!("terminal-attach-file-tooltip"))
+                .with_tooltip_keybinding(ATTACH_FILE_KEYBINDING)
                 .with_size(button_size)
                 .with_tooltip_alignment(TooltipAlignment::Left)
                 .on_click(|ctx| {
@@ -804,6 +805,14 @@ impl AgentInputFooter {
         CLIAgentSessionsModel::as_ref(app)
             .session(self.terminal_view_id)
             .is_some()
+    }
+
+    pub(crate) fn select_file(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.is_cli_agent_session_active(ctx) {
+            self.select_cli_file(ctx);
+        } else {
+            ctx.emit(AgentInputFooterEvent::SelectFile);
+        }
     }
 
     fn select_cli_file(&mut self, ctx: &mut ViewContext<Self>) {
@@ -2080,14 +2089,7 @@ impl TypedActionView for AgentInputFooter {
                 }
             }
             AgentInputFooterAction::SelectFile => {
-                // Fork based on CLI agent session: in CLI mode, open a file
-                // picker and insert/write the path; in normal mode, use the
-                // standard AI file attachment flow.
-                if self.is_cli_agent_session_active(ctx) {
-                    self.select_cli_file(ctx);
-                } else {
-                    ctx.emit(AgentInputFooterEvent::SelectFile);
-                }
+                self.select_file(ctx);
             }
             AgentInputFooterAction::InsertFilePath(path) => {
                 if let Some(agent) = self.cli_agent(ctx) {

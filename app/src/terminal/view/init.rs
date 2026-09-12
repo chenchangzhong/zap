@@ -42,6 +42,7 @@ use warpui::{
 pub const TOGGLE_BLOCK_FILTER_KEYBINDING: &str =
     "terminal:toggle_block_filter_on_selected_or_last_block";
 
+pub const ATTACH_FILE_KEYBINDING: &str = "terminal:attach_file";
 pub const CANCEL_COMMAND_KEYBINDING: &str = "terminal:cancel_command";
 pub const TOGGLE_AUTOEXECUTE_MODE_KEYBINDING: &str = "terminal:toggle_autoexecute_mode";
 pub const TOGGLE_QUEUE_NEXT_PROMPT_KEYBINDING: &str = "terminal:toggle_queue_next_prompt";
@@ -51,6 +52,8 @@ pub const OPEN_CLI_AGENT_RICH_INPUT_KEYBINDING: &str = "terminal:open_cli_agent_
 const SELECT_NEXT_BLOCK_ACTION_NAME: &str = "terminal:select_next_block";
 pub const SELECT_PREVIOUS_BLOCK_ACTION_NAME: &str = "terminal:select_previous_block";
 
+/// Shared-session availability for attach-file（含 FileAttach 的 cloud-viewer 例外）。
+pub const CAN_ATTACH_FILE_KEY: &str = "CanAttachFile";
 pub const CAN_RESUME_CONVERSATION_KEY: &str = "CanResumeConversation";
 pub const CAN_FORK_FROM_LAST_KNOWN_GOOD_STATE_KEY: &str = "CanForkFromLastKnownGoodState";
 
@@ -952,6 +955,19 @@ pub fn init(app: &mut AppContext) {
     .with_context_predicate(id!("Terminal"))]);
 
     app.register_editable_bindings([
+        EditableBinding::new(
+            ATTACH_FILE_KEYBINDING,
+            crate::t!("keybinding-desc-terminal-attach-file"),
+            TerminalAction::AttachFile,
+        )
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
+        .with_context_predicate(
+            (id!("Input") | id!("Terminal"))
+                & (id!(flags::ACTIVE_AGENT_VIEW)
+                    | id!(flags::ACTIVE_INLINE_AGENT_VIEW)
+                    | id!(CLI_AGENT_SESSION_ACTIVE_KEY))
+                & id!(CAN_ATTACH_FILE_KEY),
+        ),
         EditableBinding::new(
             TOGGLE_AUTOEXECUTE_MODE_KEYBINDING,
             crate::t!("keybinding-desc-terminal-toggle-autoexecute-mode"),

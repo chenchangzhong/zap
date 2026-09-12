@@ -91,7 +91,8 @@ use crate::terminal::universal_developer_input::AtContextMenuDisabledReason;
 use crate::terminal::view::queued_prompts_panel::{
     QueuedPromptsPanelAction, QueuedPromptsPanelEvent, QueuedPromptsPanelView,
 };
-use crate::terminal::view::CodeDiffAction;
+use crate::terminal::view::init::{CAN_ATTACH_FILE_KEY, CLI_AGENT_SESSION_ACTIVE_KEY};
+use crate::terminal::view::{file_attach_allowed_for_shared_session, CodeDiffAction};
 use crate::terminal::CLIAgent;
 use crate::util::bindings::keybinding_name_to_normalized_string;
 #[cfg(feature = "local_fs")]
@@ -5369,6 +5370,12 @@ impl Input {
         if did_start_listening {
             self.focus_input_box(ctx);
         }
+    }
+
+    pub(crate) fn attach_file(&mut self, ctx: &mut ViewContext<Self>) {
+        self.agent_input_footer.update(ctx, |footer, ctx| {
+            footer.select_file(ctx);
+        });
     }
 
     fn select_image(&mut self, ctx: &mut ViewContext<Self>) {
@@ -14148,6 +14155,13 @@ impl View for Input {
             }
         }
 
+        if CLIAgentSessionsModel::as_ref(app)
+            .session(self.terminal_view_id)
+            .is_some()
+        {
+            ctx.set.insert(CLI_AGENT_SESSION_ACTIVE_KEY);
+        }
+
         if self.buffer_text(app).is_empty() {
             ctx.set.insert(flags::EMPTY_INPUT_BUFFER);
         }
@@ -14238,6 +14252,13 @@ impl View for Input {
         let model_lock = self.model.lock();
         ctx.set
             .insert(model_lock.shared_session_status().as_keymap_context());
+        if file_attach_allowed_for_shared_session(
+            model_lock.shared_session_status(),
+            Some(&self.ambient_agent_view_model),
+            app,
+        ) {
+            ctx.set.insert(CAN_ATTACH_FILE_KEY);
+        }
 
         if model_lock
             .block_list()
