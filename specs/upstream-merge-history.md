@@ -2248,6 +2248,7 @@ if has_query_timestamp {
 - ftl：`menu-ai-block-copy-timestamp`（en `Copy timestamp` / zh-CN `复制时间戳`）。
 - 至此 P3-b 的链路闭合：悬停看时间戳（tooltip）→ 右键/溢出菜单「复制时间戳」→ `AIBlockAction::CopyTimestamp` 写剪贴板。
 - 归属说明：这是**本地功能补齐**，不是上游移植；文档按「本地功能」记录，不写入上游同步的落地清单。
+- **验证（2026-09-12）**：`cargo check -p warp` 0 error；重建后用户手动点验**通过**——悬停显示时间戳、右键/溢出菜单出现「复制时间戳」、点击后剪贴板写入时间文本、无时间戳的块不显示该条目（门控生效）。
 
 
 
