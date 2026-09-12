@@ -328,7 +328,7 @@ fn test_layout_mermaid_block_uses_loaded_svg_aspect_ratio() {
             let mermaid_diagram = mermaid_diagram_layout(content, &text_layout, spacing, ctx);
 
             let (item, _has_trailing_newline) = layout_mermaid_diagram_block(
-                block,
+                &block,
                 mermaid_diagram.0,
                 mermaid_diagram.1,
                 BlockLocation::Middle,
@@ -413,7 +413,7 @@ fn test_layout_text_block_uses_rich_table_when_flag_enabled() {
             };
 
             let (item, has_trailing_newline) =
-                layout_text_block(block, &text_layout, BlockLocation::Middle, false)
+                layout_text_block(&block, &text_layout, BlockLocation::Middle, false)
                     .expect("table layout should succeed");
 
             assert!(matches!(item, BlockItem::Table(_)));
@@ -444,7 +444,7 @@ fn test_layout_text_block_uses_plain_text_when_flag_disabled() {
             };
 
             let (item, _has_trailing_newline) =
-                layout_text_block(block, &text_layout, BlockLocation::Middle, false)
+                layout_text_block(&block, &text_layout, BlockLocation::Middle, false)
                     .expect("table layout should succeed");
 
             assert!(matches!(item, BlockItem::Paragraph(_)));
@@ -473,7 +473,7 @@ fn test_layout_table_block_caches_cell_text_frames() {
             };
 
             let table = match layout_table_block(
-                block,
+                &block,
                 &text_layout,
                 TEST_STYLES
                     .block_spacings
@@ -524,7 +524,7 @@ fn test_layout_table_block_clamps_cell_width_to_max() {
             };
 
             let table = match layout_table_block(
-                block,
+                &block,
                 &text_layout,
                 TEST_STYLES
                     .block_spacings
