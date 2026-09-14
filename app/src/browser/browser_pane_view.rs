@@ -33,6 +33,11 @@ use crate::{
 pub struct BrowserPaneModel {
     pub url: String,
     pub platform_view_id: u64,
+    /// 重建 webview 时优先加载的认证 URL(如 dsh 的带 token 启动地址)。
+    /// dsh pane 是非持久化存储:webview 一旦重建(渲染进程崩溃/Moved),
+    /// 原进程里的认证 cookie 即丢失,以漂移后的裸地址重建会被 dsh 服务器
+    /// 401 拒绝。`None` 表示无认证地址(普通浏览器 pane),重建用 `url`。
+    pub auth_url: Option<String>,
 }
 
 /// View for a web preview pane:一个地址栏 + 一个嵌入式 webview。
@@ -102,7 +107,11 @@ impl BrowserPaneView {
     /// 持久化就会在 `127.0.0.1` 上跨实例累积,超过 dsh 的请求头上限后
     /// 子资源(模块 bundle)全部被 431 拒绝。
     pub fn new_dsh(url: String, ctx: &mut ViewContext<Self>) -> Self {
-        Self::new_inner(url, false, true, ctx)
+        let mut view = Self::new_inner(url.clone(), false, true, ctx);
+        // 首建 URL 即带 token 的认证地址:任何后续 webview 重建(渲染崩溃、
+        // Moved 换窗)都重新走 token 换 cookie,见 model.auth_url 文档。
+        view.model.auth_url = Some(url);
+        view
     }
 
     fn new_inner(
@@ -136,6 +145,7 @@ impl BrowserPaneView {
             model: BrowserPaneModel {
                 url: url.clone(),
                 platform_view_id,
+                auth_url: Option::default(),
             },
             address_bar,
             back_button: MouseStateHandle::default(),
@@ -253,7 +263,12 @@ impl BrowserPaneView {
         if self.needs_recreate || !webview_exists {
             self.needs_recreate = false;
             self.window_id = ctx.window_id();
-            self.create_webview(&self.model.url, ctx);
+            // 重建时优先用认证 URL:重建出的 webview 是全新数据存储,原进程
+            // cookie 已丢,以漂移后的裸地址加载会被 dsh 401(见 auth_url)。
+            self.create_webview(
+                self.model.auth_url.as_deref().unwrap_or(&self.model.url),
+                ctx,
+            );
             self.register_platform_view_handler(ctx);
         } else {
             manager.set_visible(self.model.platform_view_id, true);
@@ -287,6 +302,11 @@ impl BrowserPaneView {
     fn navigate(&mut self, url: String, ctx: &mut ViewContext<Self>) {
         BrowserWebViewManager::as_ref(ctx).navigate(self.model.platform_view_id, &url);
         self.model.url = url.clone();
+        // dsh pane(auth_url 已设)被导航到新实例 URL 时(runtime 重启换新
+        // token),认证地址随之更新,保证后续重建仍能带走有效 token。
+        if self.model.auth_url.is_some() {
+            self.model.auth_url = Some(url.clone());
+        }
         self.pane_configuration.update(ctx, |pane_config, ctx| {
             pane_config.set_title(url.clone(), ctx);
         });
