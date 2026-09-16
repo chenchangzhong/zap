@@ -22,6 +22,7 @@ use crate::notifications::item_rendering::{
     create_notification_artifact_buttons_view, handle_notification_artifact_buttons_event,
     render_notification_item_content, NotificationRenderContext, OnExpandClick,
 };
+use crate::notifications::item::NotificationSourceAgent;
 use crate::notifications::model::{NotificationsEvent, NotificationsModel};
 use crate::notifications::{NotificationId, NotificationItem};
 use crate::terminal::session_settings::SessionSettings;
@@ -243,16 +244,26 @@ impl TypedActionView for AgentNotificationToastStack {
                 self.start_dismissal_timeout(*id, ctx);
             }
             AgentNotificationToastAction::Click(id) => {
-                let terminal_view_id = NotificationsModel::as_ref(ctx)
+                let item = NotificationsModel::as_ref(ctx)
                     .notifications()
-                    .get_by_id(*id)
-                    .map(|item| item.terminal_view_id);
+                    .get_by_id(*id);
+                let terminal_view_id = item.map(|item| item.terminal_view_id);
+                // dsh 通知:切 dsh pane 并切到对应会话;其余终端通知走原逻辑。
+                let dsh_target = item.and_then(|item| {
+                    matches!(item.agent, NotificationSourceAgent::Dsh)
+                        .then(|| (item.terminal_view_id, item.dsh_session_id.clone()))
+                });
 
                 NotificationsModel::handle(ctx).update(ctx, |model, ctx| {
                     model.mark_item_read(*id, ctx);
                 });
 
-                if let Some(terminal_view_id) = terminal_view_id {
+                if let Some((pane_view_id, session_id)) = dsh_target {
+                    ctx.dispatch_typed_action(&WorkspaceAction::FocusDshSession {
+                        pane_view_id,
+                        session_id: session_id.unwrap_or_default(),
+                    });
+                } else if let Some(terminal_view_id) = terminal_view_id {
                     ctx.dispatch_typed_action(&WorkspaceAction::FocusTerminalViewInWorkspace {
                         terminal_view_id,
                     });

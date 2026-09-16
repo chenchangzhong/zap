@@ -78,6 +78,9 @@ pub struct NotificationItem {
     pub is_read: bool,
     pub created_at: Instant,
     pub terminal_view_id: EntityId,
+    /// dsh 通知携带的会话 id(非 dsh 通知为 None)。点击通知后用于在 dsh 内
+    /// 切到对应会话。
+    pub dsh_session_id: Option<String>,
     pub artifacts: Vec<Artifact>,
     /// 通知关联的 git 分支。
     /// 有值时按"rich"布局渲染(头部多一行 branch);无值时回退到"simple"布局。
@@ -103,6 +106,7 @@ impl NotificationItem {
         origin: NotificationOrigin,
         is_read: bool,
         terminal_view_id: EntityId,
+        dsh_session_id: Option<String>,
         artifacts: Vec<Artifact>,
         branch: Option<String>,
     ) -> Self {
@@ -116,6 +120,7 @@ impl NotificationItem {
             is_read,
             created_at: Instant::now(),
             terminal_view_id,
+            dsh_session_id,
             artifacts,
             branch,
         }

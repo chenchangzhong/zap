@@ -20,10 +20,13 @@ use crate::notifications::item::NotificationCategory;
 #[derive(Debug, Clone)]
 pub enum BridgeEvent {
     /// dsh 插件请求发送通知(任务完成/出错/需确认)。
+    /// `session_id` 为通知来源的 dsh 会话 id(插件侧按会话检测终态,基本必有;
+    /// 旧版插件缺失时为 None),点击通知后用于在 dsh 内切到对应会话。
     Notify {
         title: String,
         body: String,
         category: NotificationCategory,
+        session_id: Option<String>,
     },
     /// dsh 侧切换了当前项目目录(通知类,无回复)。
     SwitchProject { path: PathBuf },
@@ -145,6 +148,11 @@ pub(crate) fn handle_zap_ipc(payload: &str) -> Option<BridgeEvent> {
                 title,
                 body,
                 category,
+                session_id: params
+                    .get("session_id")
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(Into::into),
             }))
         }
         _ => {

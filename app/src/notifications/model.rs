@@ -445,6 +445,7 @@ impl NotificationsModel {
             origin,
             is_visible,
             terminal_view_id,
+            None, // dsh_session_id: 非 dsh 通知无此上下文
             artifacts,
             branch,
         );
@@ -470,6 +471,7 @@ impl NotificationsModel {
         message: String,
         category: NotificationCategory,
         origin_id: EntityId,
+        session_id: Option<String>,
         is_visible: bool,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
@@ -485,6 +487,7 @@ impl NotificationsModel {
             NotificationOrigin::DshSession(origin_id),
             is_visible, // dsh pane 可见时直接视为已读,不再弹 toast
             origin_id,
+            session_id,
             vec![], // artifacts: DSH 不是终端 agent，无此上下文
             None,   // branch: 同上
         );

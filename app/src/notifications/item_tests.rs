@@ -16,6 +16,7 @@ fn make_conversation_notification(
         NotificationOrigin::Conversation(conversation_id),
         false,
         terminal_view_id,
+        None,
         vec![],
         None,
     )
@@ -30,6 +31,7 @@ fn make_cli_session_notification(terminal_view_id: EntityId) -> NotificationItem
         NotificationOrigin::CLISession(terminal_view_id),
         false,
         terminal_view_id,
+        None,
         vec![],
         None,
     )

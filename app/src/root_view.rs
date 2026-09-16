@@ -89,7 +89,7 @@ use warpui::elements::{
     Border, ChildAnchor, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Stack,
 };
 use warpui::rendering::OnGPUDeviceSelected;
-use warpui::{id, AddWindowOptions, DisplayId, SingletonEntity};
+use warpui::{id, AddWindowOptions, DisplayId, EntityId, SingletonEntity};
 use warpui::{
     platform::{WindowBounds, WindowStyle},
     presenter::ChildView,
@@ -269,6 +269,10 @@ pub fn init(app: &mut AppContext) {
     app.add_action(
         "root_view:handle_notification_click",
         RootView::handle_notification_click,
+    );
+    app.add_action(
+        "root_view:handle_dsh_notification_click",
+        RootView::handle_dsh_notification_click,
     );
     app.add_action(
         "root_view:handle_pane_navigation_event",
@@ -1937,6 +1941,27 @@ impl RootView {
     ) -> bool {
         // Focus the pane that the notification originated from.
         self.focus_pane(pane_view_locator, ctx);
+        send_telemetry_from_ctx!(TelemetryEvent::NotificationClicked, ctx);
+        true
+    }
+
+    /// dsh 插件通知的系统通知点击:把 app 带到前台后,切到 dsh pane 并在 dsh 内
+    /// 切到对应会话(经 WorkspaceAction::FocusDshSession)。
+    fn handle_dsh_notification_click(
+        &mut self,
+        args: &(EntityId, String),
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let (pane_view_id, session_id) = args;
+        ctx.windows().show_window_and_focus_app(ctx.window_id());
+        if let AuthOnboardingState::Terminal(handle) = &self.auth_onboarding_state {
+            handle.update(ctx, |_, ctx| {
+                ctx.dispatch_typed_action(&WorkspaceAction::FocusDshSession {
+                    pane_view_id: *pane_view_id,
+                    session_id: session_id.clone(),
+                });
+            });
+        }
         send_telemetry_from_ctx!(TelemetryEvent::NotificationClicked, ctx);
         true
     }

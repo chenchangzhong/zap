@@ -12,11 +12,25 @@ fn switch_project_payload(path: &str, id: u64) -> String {
 
 /// 构造 `zap.notify` 的 IPC payload。
 fn notify_payload(title: &str, body: &str, category: Option<&str>, id: u64) -> String {
+    notify_payload_with_session(title, body, category, None, id)
+}
+
+/// 构造 `zap.notify` 的 IPC payload(可携带 session_id)。
+fn notify_payload_with_session(
+    title: &str,
+    body: &str,
+    category: Option<&str>,
+    session_id: Option<&str>,
+    id: u64,
+) -> String {
     let mut params = serde_json::Map::new();
     params.insert("title".into(), serde_json::json!(title));
     params.insert("body".into(), serde_json::json!(body));
     if let Some(c) = category {
         params.insert("category".into(), serde_json::json!(c));
+    }
+    if let Some(s) = session_id {
+        params.insert("session_id".into(), serde_json::json!(s));
     }
     format!(
         "zap.notify\n{id}\n{}",
@@ -107,10 +121,12 @@ fn notify_ok() {
             title,
             body,
             category,
+            session_id,
         } => {
             assert_eq!(title, "Task done");
             assert_eq!(body, "Completed");
             assert_eq!(category, NotificationCategory::Complete);
+            assert_eq!(session_id, None);
         }
         other => panic!("expected Notify, got {other:?}"),
     }
@@ -142,6 +158,26 @@ fn notify_category_mapping() {
     match handle_zap_ipc(&notify_payload("C", "b", Some("confirm"), 1)).unwrap() {
         BridgeEvent::Notify { category, .. } => {
             assert_eq!(category, NotificationCategory::Request);
+        }
+        other => panic!("expected Notify, got {other:?}"),
+    }
+}
+
+/// zap.notify:session_id 透传为 Notify.session_id;空串视为缺失。
+#[test]
+fn notify_session_id_passthrough() {
+    PENDING_EVENTS.lock().clear();
+    match handle_zap_ipc(&notify_payload_with_session("T", "b", None, Some("sess-1"), 1)).unwrap() {
+        BridgeEvent::Notify { session_id, .. } => {
+            assert_eq!(session_id.as_deref(), Some("sess-1"));
+        }
+        other => panic!("expected Notify, got {other:?}"),
+    }
+
+    PENDING_EVENTS.lock().clear();
+    match handle_zap_ipc(&notify_payload_with_session("T", "b", None, Some(""), 1)).unwrap() {
+        BridgeEvent::Notify { session_id, .. } => {
+            assert_eq!(session_id, None);
         }
         other => panic!("expected Notify, got {other:?}"),
     }

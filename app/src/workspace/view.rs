@@ -2642,6 +2642,7 @@ impl Workspace {
                         ref title,
                         ref body,
                         category,
+                        ref session_id,
                     } => {
                         if me.has_dsh_pane(ctx) {
                             let dsh_view_id = me
@@ -2670,21 +2671,32 @@ impl Workspace {
                                         body.clone(),
                                         *category,
                                         dsh_view_id,
+                                        session_id.clone(),
                                         dsh_pane_visible,
                                         ctx,
                                     )
                                 });
                             // 用户离开窗口时应用内 toast 不弹（toast_stack 只在窗口
                             // 活跃时显示），补发系统通知，行为对齐终端 block 通知。
+                            // data 携带 DshSession 上下文,点击系统通知可切回 dsh
+                            // 页面并切到对应会话。
                             if added && ctx.windows().active_window() != Some(ctx.window_id()) {
                                 let play_sound = SessionSettings::as_ref(ctx)
                                     .notifications
                                     .play_notification_sound;
+                                let notification_data = serde_json::to_string(
+                                    &NotificationContext::DshSession {
+                                        window_id: ctx.window_id(),
+                                        pane_view_id: dsh_view_id,
+                                        session_id: session_id.clone().unwrap_or_default(),
+                                    },
+                                )
+                                .ok();
                                 ctx.send_desktop_notification(
                                     UserNotification::new_with_sound(
                                         title.clone(),
                                         body.clone(),
-                                        None,
+                                        notification_data,
                                         play_sound,
                                     ),
                                     |_, error, _| {
@@ -2801,19 +2813,34 @@ impl Workspace {
         let notification_mailbox_view = if FeatureFlag::HOANotifications.is_enabled() {
             let view = ctx.add_typed_action_view(NotificationMailboxView::new);
             ctx.subscribe_to_view(&view, move |me, _, event, ctx| match event {
-                NotificationMailboxViewEvent::NavigateToTerminal { terminal_view_id } => {
+                NotificationMailboxViewEvent::NavigateToTerminal {
+                    terminal_view_id,
+                    dsh_session_id,
+                } => {
                     me.current_workspace_state.is_notification_mailbox_open = false;
                     me.tab_bar_pinned_by_popup = false;
                     me.sync_window_button_visibility(ctx);
                     if let Some(stack) = &me.notification_toast_stack {
                         stack.update(ctx, |stack, ctx| stack.set_mailbox_open(false, ctx));
                     }
-                    me.handle_action(
-                        &WorkspaceAction::FocusTerminalViewInWorkspace {
-                            terminal_view_id: *terminal_view_id,
-                        },
-                        ctx,
-                    );
+                    // dsh 通知:切 dsh pane 并切到对应会话(session id 缺失(旧版
+                    // 插件)时 session_id 传空串,FocusDshSession 内仅聚焦 pane)。
+                    if dsh_session_id.is_some() {
+                        me.handle_action(
+                            &WorkspaceAction::FocusDshSession {
+                                pane_view_id: *terminal_view_id,
+                                session_id: dsh_session_id.clone().unwrap_or_default(),
+                            },
+                            ctx,
+                        );
+                    } else {
+                        me.handle_action(
+                            &WorkspaceAction::FocusTerminalViewInWorkspace {
+                                terminal_view_id: *terminal_view_id,
+                            },
+                            ctx,
+                        );
+                    }
                     ctx.notify();
                 }
                 NotificationMailboxViewEvent::Dismissed => {
@@ -5006,6 +5033,64 @@ impl Workspace {
         }
         false
     }
+
+    /// 在 dsh 内切到指定会话。`pane_view_id` 是 dsh pane 的 creation_order_id,
+    /// 用于定位 dsh webview;经 evaluate_script 调插件(zap-bridge-client)暴露的
+    /// `window.__zapActivateSession(sid)`,最终落到 dsh sessions 服务的 `open(sid)`。
+    /// 会话切换独立于 pane 聚焦:webview 未就绪/插件未就绪时仅记日志,不影响切页。
+    #[cfg(not(target_family = "wasm"))]
+    fn activate_dsh_session(
+        &self,
+        pane_view_id: EntityId,
+        session_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::pane_group::pane::PaneContent;
+        if session_id.is_empty() {
+            return;
+        }
+        for tab in self.tabs.iter() {
+            let found_pane_id = tab.pane_group.as_ref(ctx).dsh_panes().find_map(|dsh_pane| {
+                (dsh_pane.id().creation_order_id() == pane_view_id).then(|| dsh_pane.dsh_view(ctx))
+            });
+            let Some(dsh_view) = found_pane_id else {
+                continue;
+            };
+            let Some(bv) = dsh_view.as_ref(ctx).get_browser_view() else {
+                log::warn!("[dsh] activate_dsh_session: webview not ready");
+                return;
+            };
+            let webview_id = bv.as_ref(ctx).model().platform_view_id;
+            let Ok(escaped) = serde_json::to_string(&session_id.to_string()) else {
+                log::warn!("[dsh] activate_dsh_session: failed to escape session id, skipping");
+                return;
+            };
+            let js = format!(
+                r#"
+                (function() {{
+                    var sid = {escaped};
+                    if (window.__zapActivateSession) {{
+                        try {{
+                            window.__zapActivateSession(sid);
+                            console.log("[zap-bridge-client] activate_session ->", sid);
+                        }} catch (err) {{
+                            console.error("[zap-bridge-client] activate_session failed:", err);
+                        }}
+                        return;
+                    }}
+                    console.warn("[zap-bridge-client] __zapActivateSession unavailable");
+                }})()
+                "#
+            );
+            BrowserWebViewManager::as_ref(ctx).evaluate_script_on(webview_id, &js);
+            return;
+        }
+        log::warn!("[dsh] activate_dsh_session: dsh pane not found for view id {pane_view_id:?}");
+    }
+
+    /// wasm 无 webview 桥,会话切换不可用;stub 保证 FocusDshSession 调用点无需 cfg。
+    #[cfg(target_family = "wasm")]
+    fn activate_dsh_session(&self, _pane_view_id: EntityId, _session_id: &str) {}
 
     /// Searches other windows for the given terminal view and focuses it there.
     /// (Uses the same cross-window dispatch pattern as open_notebook/open_workflow.)
@@ -20750,6 +20835,14 @@ impl TypedActionView for Workspace {
                     && !self.focus_dsh_pane_locally(*terminal_view_id, ctx)
                 {
                     self.focus_terminal_view_in_other_window(*terminal_view_id, ctx);
+                }
+            }
+            FocusDshSession {
+                pane_view_id,
+                session_id,
+            } => {
+                if self.focus_dsh_pane_locally(*pane_view_id, ctx) {
+                    self.activate_dsh_session(*pane_view_id, session_id, ctx);
                 }
             }
             FocusPane(locator) => {

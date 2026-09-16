@@ -12,6 +12,7 @@
 // - 为侧边栏每个项目行注入"打开文件浏览器"按钮(hover 显示,右侧第一位)
 // - 暴露 `window.__zapInsertFileReference`:「附加为上下文」末端,把文件路径以 dsh `@`
 //   引用芯片(ReferenceChipNode)形态插入当前会话输入框(Rust 侧 evaluate_script 调用)
+// - 暴露 `window.__zapActivateSession`:通知点击后切到指定会话(调 sessions.open)
 //
 // 通信方式:webview IPC(webkit.messageHandlers.ipc.postMessage)。
 // 不再使用 WebSocket 桥(端口每次启动随机分配导致连接不稳定)。
@@ -138,10 +139,14 @@ window.__ModuleLoader__.load({
 
 		/// 上报终态通知给 Zap(经 IPC 发 zap.notify)。
 		/// category 仅三值 "complete"|"error"|"confirm",对应 Rust bridge.rs 映射。
-		function reportNotify(title, body, category) {
+		/// sessionId 用于点击通知后在 dsh 内切到对应会话(bridge 透传 →
+		/// NotificationItem → __zapActivateSession)。
+		function reportNotify(title, body, category, sessionId) {
 			if (!title) return;
 			const cat = category || "complete";
-			zapRpc('zap.notify', { title, body: body || "", category: cat }).catch(err => {
+			const params = { title, body: body || "", category: cat };
+			if (sessionId) params.session_id = sessionId;
+			zapRpc('zap.notify', params).catch(err => {
 				console.error("[zap-bridge-client] notify failed:", err);
 			});
 			console.log("[zap-bridge-client] notify ->", title, cat);
@@ -193,7 +198,7 @@ window.__ModuleLoader__.load({
 					if (lastNotifiedKeys.get(sid) === key) continue;
 					lastNotifiedKeys.set(sid, key);
 					const title = entry.title || cwdBasename(entry.cwd) || "DSH task";
-					reportNotify(title, bodyText, "confirm");
+					reportNotify(title, bodyText, "confirm", sid);
 					continue;
 				}
 
@@ -203,7 +208,7 @@ window.__ModuleLoader__.load({
 				if (runningEdge || completedEdge || catchUp) {
 					const title = entry.title || cwdBasename(entry.cwd) || "DSH task";
 					const bodyText = entry.title ? "" : (entry.cwd || "");
-					reportNotify(title, bodyText, "complete");
+					reportNotify(title, bodyText, "complete", sid);
 				}
 			}
 			for (const sid of [...prevRunning.keys()]) {
@@ -479,6 +484,12 @@ window.__ModuleLoader__.load({
 			workspacesRef = workspaces;
 			// 「附加为上下文」末端:暴露结构化 @ 引用芯片插入,供 Rust 侧 evaluate_script 调用。
 			installFileReferenceInjection(ctx, sessions);
+			// 会话切换末端:Rust 侧通知点击经 evaluate_script 调用,落到 sessions.open(sid)
+			// (dsh-api-session-controller 的 ClientSessions.open,侧边栏点击切换同源)。
+			window.__zapActivateSession = function (sessionId) {
+				if (!sessionId || !sessionsRef || typeof sessionsRef.open !== "function") return;
+				sessionsRef.open(sessionId);
+			};
 			// 文件链接拦截:sidebarRight.openResource → Zap 内打开。
 			installOpenFileInterceptor(ctx);
 
@@ -503,6 +514,7 @@ window.__ModuleLoader__.load({
 					document.querySelectorAll('[data-zap-file-explorer]').forEach(el => el.remove());
 					delete window.__onZapResponse;
 					delete window.__zapInsertFileReference;
+					delete window.__zapActivateSession;
 				};
 			});
 		}

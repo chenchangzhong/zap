@@ -2058,6 +2058,23 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
                             );
                         }
                     }
+                } else if let Ok(NotificationContext::DshSession {
+                    window_id,
+                    pane_view_id,
+                    session_id,
+                }) = context
+                {
+                    if ctx.window_ids().contains(&window_id) {
+                        if let Some(root_view_id) = ctx.root_view_id(window_id) {
+                            ctx.dispatch_action(
+                                window_id,
+                                &[root_view_id],
+                                "root_view:handle_dsh_notification_click",
+                                &(pane_view_id, session_id),
+                                log::Level::Info,
+                            );
+                        }
+                    }
                 }
             }
         })),

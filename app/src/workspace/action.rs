@@ -406,6 +406,12 @@ pub enum WorkspaceAction {
     FocusTerminalViewInWorkspace {
         terminal_view_id: EntityId,
     },
+    /// 聚焦 dsh 通知对应的 dsh pane(按 pane 的 creation_order_id 定位)并在
+    /// dsh 内切到 `session_id` 会话;session_id 为空仅聚焦 pane。
+    FocusDshSession {
+        pane_view_id: EntityId,
+        session_id: String,
+    },
     /// Focus a specific pane by its locator (pane_group_id and pane_id).
     FocusPane(PaneViewLocator),
     /// Start a new AI conversation in a terminal view. This sets the pending query state
@@ -843,6 +849,7 @@ impl WorkspaceAction {
             | OpenAIFactCollection
             | OpenMCPServerCollection
             | FocusTerminalViewInWorkspace { .. }
+            | FocusDshSession { .. }
             | FocusPane(..)
             | StartNewConversation { .. }
             | UndoRevertInCodeReviewPane { .. }

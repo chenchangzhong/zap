@@ -54,7 +54,11 @@ impl Entity for NotificationMailboxView {
 
 #[derive(Debug, Clone)]
 pub enum NotificationMailboxViewEvent {
-    NavigateToTerminal { terminal_view_id: warpui::EntityId },
+    NavigateToTerminal {
+        terminal_view_id: warpui::EntityId,
+        /// dsh 通知携带的会话 id;非 dsh 通知为 None。
+        dsh_session_id: Option<String>,
+    },
     Dismissed,
 }
 
@@ -164,17 +168,21 @@ impl NotificationMailboxView {
     }
 
     fn activate_notification(&mut self, id: NotificationId, ctx: &mut ViewContext<Self>) {
-        let terminal_view_id = NotificationsModel::as_ref(ctx)
+        let (terminal_view_id, dsh_session_id) = NotificationsModel::as_ref(ctx)
             .notifications()
             .get_by_id(id)
-            .map(|item| item.terminal_view_id);
+            .map(|item| (Some(item.terminal_view_id), item.dsh_session_id.clone()))
+            .unwrap_or((None, None));
 
         NotificationsModel::handle(ctx).update(ctx, |model, ctx| {
             model.mark_item_read(id, ctx);
         });
 
         if let Some(terminal_view_id) = terminal_view_id {
-            ctx.emit(NotificationMailboxViewEvent::NavigateToTerminal { terminal_view_id });
+            ctx.emit(NotificationMailboxViewEvent::NavigateToTerminal {
+                terminal_view_id,
+                dsh_session_id,
+            });
         }
     }
 
