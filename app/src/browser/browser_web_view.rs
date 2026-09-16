@@ -270,7 +270,9 @@ window.__restoreFocused = function() {
   tryFocus();
 };
 setInterval(() => {
-  if (!document.hasFocus() || !document.activeElement || document.activeElement === document.body) {
+  // 仅在页面已失焦时记录并 blur。hasFocus 为真时绝不能动:否则每 100ms 把
+  // 有焦点的输入框 blur 一次,输入法组合被反复打断(中文候选上屏后失效)。
+  if (document.hasFocus() || !document.activeElement || document.activeElement === document.body) {
     return;
   }
   var el = document.activeElement;
