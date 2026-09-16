@@ -640,7 +640,12 @@ void warp_marked_text_cleared(WarpHostView *);
 - (NSView *)hitTest:(NSPoint)point {
     WarpHostView *host = (WarpHostView *)self.superview;
     if (!host || !host.readyForWarp) return [super hitTest:point];
-    if (warp_overlay_hit_test(host, point.x, point.y)) return host;
+    // overlay_rects 存储的是场景坐标(top-left 原点,y 向下);而 NSView 元素
+    // hitTest 收到的 point 在宿主视图坐标内(底部原点,y 向上)。未翻转时
+    // webview 覆盖区上的 overlay UI(如通知 toast)永远命中失败,点击
+    // 会被 webview 吃掉。翻转回 scene 坐标后再判定。
+    NSPoint flipped = {point.x, self.bounds.size.height - point.y};
+    if (warp_overlay_hit_test(host, flipped.x, flipped.y)) return host;
     return nil;
 }
 
