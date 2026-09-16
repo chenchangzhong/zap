@@ -48,7 +48,12 @@ window.__ModuleLoader__.load({
 			var style = document.createElement("style");
 			style.dataset.zapBridgeCss = "sidebar-divider";
 			style.textContent = '[class*="sidebarCol"]{border-right-color:rgb(17 17 17 / 9.8%)}' +
-				'body[data-ds-dark-theme] [class*="sidebarCol"]{border-right-color:#333536}';
+				'body[data-ds-dark-theme] [class*="sidebarCol"]{border-right-color:#333536}' +
+				// 聊天页头部(dsh-client-ui-conversation ConversationRoot 的
+				// .wSkVaW_header)border-bottom 亦为 .5px l3,同套取值;
+				// "_header" 前缀是构建 hash,故用子串匹配(与 sidebarCol 同法)。
+				'[class*="_header"]{border-bottom-color:rgb(17 17 17 / 9.8%)}' +
+				'body[data-ds-dark-theme] [class*="_header"]{border-bottom-color:#333536}';
 			document.head.appendChild(style);
 		})();
 
