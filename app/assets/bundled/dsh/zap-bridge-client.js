@@ -34,6 +34,23 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
+		// 侧边栏分割线(dsh-client-ui-layout 的 .sidebarCol border-right,
+		// 0.5px solid var(--dsw-alias-border-l3))颜色对齐 Zap 左侧边栏
+		// outline() 的取值,随 dsh 界面亮暗两套:
+		// - 暗色 = Zap 内置 VS Code 2026 Dark 主题 ui.border = #333536(不透明);
+		// - 亮色 = Zap 内置 Light 主题无 ui.border,回退 fg_overlay_2 =
+		//   foreground #111111 @ 10%(ColorU alpha = 25/255 ≈ 9.8%)。
+		// 直接注入 <style>,加载即生效,不依赖 cordis apply 的服务注入。
+		(function () {
+			if (typeof document === "undefined" || !document.head) return;
+			if (document.querySelector('style[data-zap-bridge-css="sidebar-divider"]')) return;
+			var style = document.createElement("style");
+			style.dataset.zapBridgeCss = "sidebar-divider";
+			style.textContent = '[class*="sidebarCol"]{border-right-color:rgb(17 17 17 / 9.8%)}' +
+				'body[data-ds-dark-theme] [class*="sidebarCol"]{border-right-color:#333536}';
+			document.head.appendChild(style);
+		})();
+
 		// 依赖 sessions/workspaces 服务(dsh-client-runtime 用 reflect.provide
 		// 注册;框架保证 apply 时已就绪)。sidebarRight 是 dsh-client-ui-sidebar-right
 		// 提供的右侧栏导航 face——dsh 0.1.5 起聊天内文件入口全部收敛到它的
