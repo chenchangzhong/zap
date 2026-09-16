@@ -47,6 +47,12 @@ pub struct NotificationsModel {
     pub(crate) pending_artifacts: HashMap<AIConversationId, Vec<Artifact>>,
 }
 
+/// agent 成功通知的延迟复查窗口。BYOP 本地协议下命令结果流会把对话状态短暂打为
+/// Success(随后下一轮请求打回 InProgress),消费端须等这个窗口后再确认是否真终态,
+/// 避免每执行一条命令就弹一次「finished」。
+pub const AGENT_NOTIFICATION_COALESCE_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
 impl Entity for NotificationsModel {
     type Event = NotificationsEvent;
 }
@@ -303,16 +309,18 @@ impl NotificationsModel {
                 if QueuedQueryModel::as_ref(ctx).has_autofireable_prompt(conversation_id) {
                     return;
                 }
-                let artifacts = self.flush_pending_artifacts(conversation_id);
-                self.add_notification(
-                    title,
-                    "Task completed.".to_owned(),
-                    NotificationCategory::Complete,
-                    NotificationSourceAgent::Oz,
-                    origin,
-                    terminal_view_id,
-                    artifacts,
-                    ctx,
+                // 同系统桌面通知:延迟复查,过滤命令结果流造成的中间态 Success。
+                ctx.spawn(
+                    async move {
+                        warpui::r#async::Timer::after(AGENT_NOTIFICATION_COALESCE_DELAY).await;
+                    },
+                    move |me, (), ctx| {
+                        me.add_success_notification_after_coalesce(
+                            conversation_id,
+                            terminal_view_id,
+                            ctx,
+                        );
+                    },
                 );
             }
             ConversationStatus::Cancelled => {
@@ -354,6 +362,40 @@ impl NotificationsModel {
                 );
             }
         }
+    }
+
+    /// 延迟复查窗口到期后的成功通知入列:仍处于 Success(真正的终态)才入,
+    /// 中间态 Success(命令结果流造成,随后翻回 InProgress)直接丢弃。
+    fn add_success_notification_after_coalesce(
+        &mut self,
+        conversation_id: AIConversationId,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(updated_conversation) =
+            BlocklistAIHistoryModel::as_ref(ctx).conversation(&conversation_id)
+        else {
+            return;
+        };
+        if !matches!(updated_conversation.status(), ConversationStatus::Success)
+            || updated_conversation.should_exclude_from_navigation()
+        {
+            return;
+        }
+        let title = updated_conversation
+            .latest_user_query()
+            .unwrap_or_else(|| "Agent task".to_owned());
+        let artifacts = self.flush_pending_artifacts(conversation_id);
+        self.add_notification(
+            title,
+            "Task completed.".to_owned(),
+            NotificationCategory::Complete,
+            NotificationSourceAgent::Oz,
+            NotificationOrigin::Conversation(conversation_id),
+            terminal_view_id,
+            artifacts,
+            ctx,
+        );
     }
 
     /// 删除指定 source 的现有通知(若有),并 emit 更新事件。

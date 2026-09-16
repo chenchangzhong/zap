@@ -13769,6 +13769,33 @@ impl TerminalView {
         conversation_id: &AIConversationId,
         ctx: &mut ViewContext<Self>,
     ) {
+        // BYOP 本地协议下，一轮 Oz 会话由多条本地 response stream 组成：命令结果流
+        // 完成时 `mark_request_completed` 会把状态短暂打为 Success，随后下一轮请求
+        // 派发时又打回 InProgress（见 controller
+        // `update_conversation_for_new_request_input`）。若此处在 Success 到达时立即
+        // 弹系统通知，Oz 每执行完一条命令就会弹一次「finished」。因此延迟一个小窗口
+        // 后复查状态，仍是 Success（真正的终态）才发。
+        let conversation_id = *conversation_id;
+        ctx.spawn(
+            async move {
+                warpui::r#async::Timer::after(crate::notifications::AGENT_NOTIFICATION_COALESCE_DELAY).await;
+            },
+            move |view, (), ctx| {
+                view.send_agent_mode_desktop_notification_if_terminal(&conversation_id, ctx);
+            },
+        );
+    }
+
+    /// Send a desktop notification that agent mode needs attention or has finished,
+    /// otherwise insert a callout banner if notifications are unset.
+    /// May become separate triggers if we show sub-tasks in the UI.
+    /// Note that this does NOT handle agent mode toast notifications in-app.
+    /// Those are handled in the workspace view on AgentManagementEvent::ConversationNeedsAttention.
+    fn send_agent_mode_desktop_notification_if_terminal(
+        &mut self,
+        conversation_id: &AIConversationId,
+        ctx: &mut ViewContext<Self>,
+    ) {
         if !self.is_navigated_away_from_window(ctx) {
             return;
         }

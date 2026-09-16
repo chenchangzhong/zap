@@ -25,6 +25,7 @@ pub(crate) use item::{
 };
 pub use toast_stack::AgentNotificationToastStack;
 pub use view::{NotificationMailboxView, NotificationMailboxViewEvent};
+pub use model::AGENT_NOTIFICATION_COALESCE_DELAY;
 
 pub fn init(app: &mut warpui::AppContext) {
     NotificationMailboxView::init(app);
