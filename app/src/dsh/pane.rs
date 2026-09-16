@@ -255,6 +255,20 @@ impl DshPaneView {
         }
     }
 
+    /// webview 当前是否真正可见:未被重启/失败/崩溃覆盖层换出,且已加载
+    /// 完成(或加载超时兜底)。render 的 `show_webview` 与 focus_contents 共用
+    /// 同一判据,避免"可见才渲染"与"可见才抢 first responder"各自漂移。
+    fn webview_visible(&self) -> bool {
+        matches!(self.state, DshPaneState::Ready(_))
+            && !self.runtime_restarting
+            && !self.runtime_failed
+            && !self.webview_crashed
+            && (self.webview_loaded
+                || self
+                    .load_started_at
+                    .is_some_and(|t| t.elapsed() > WEBVIEW_LOAD_TIMEOUT))
+    }
+
     /// Runtime 就绪后:创建无地址栏的 webview pane,切换状态。
     /// 返回 BrowserPaneView 句柄。
     pub fn set_ready(&mut self, url: &str, ctx: &mut ViewContext<Self>) -> ViewHandle<BrowserPaneView> {
@@ -289,7 +303,9 @@ impl DshPaneView {
                         // 期间焦点未转移、on_focus 不会再次触发,若不补,用户
                         // 加载完成后直接打字会进 Warp 而非页面。焦点已离开本
                         // pane(用户切走)则不抢,由切回时 on_focus 正常切换。
-                        if ctx.is_self_focused() {
+                        // 判据含子视图:pane 内容的焦点由 focus_contents 下传给
+                        // BrowserPaneView,严格 is_self_focused 会漏判。
+                        if ctx.is_self_or_child_focused() {
                             BrowserWebViewManager::as_ref(ctx).focus_webview(webview_id);
                         }
                         // 页面(重)加载完成:清除崩溃态。wry 的导航委托恒实现
@@ -678,12 +694,8 @@ impl View for DshPaneView {
         if self.webview_crashed {
             return self.render_webview_crashed(app);
         }
-        // webview 已加载完成(或加载超时兜底)才显示 webview;否则保持 spinner。
-        let show_webview = matches!(self.state, DshPaneState::Ready(_))
-            && (self.webview_loaded
-                || self
-                    .load_started_at
-                    .is_some_and(|t| t.elapsed() > WEBVIEW_LOAD_TIMEOUT));
+        // webview 可见(已加载完成或加载超时兜底)才显示 webview;否则保持 spinner。
+        let show_webview = self.webview_visible();
         match &self.state {
             DshPaneState::Ready(browser_view) if show_webview => {
                 ChildView::new(browser_view).finish()
@@ -731,8 +743,21 @@ impl BackingView for DshPaneView {
         });
     }
 
-    fn focus_contents(&mut self, _ctx: &mut ViewContext<Self>) {
-        // 无特殊 focus 行为;PaneView 已处理 pane 级别 focus。
+    fn focus_contents(&mut self, ctx: &mut ViewContext<Self>) {
+        // 把焦点下传给 webview 视图,而不是停在本层:first responder 由
+        // BrowserPaneView::on_focus(SelfFocused) 交接;更关键的是让 warp 焦点
+        // 真正落进 dsh 的视图树——否则切走时 BrowserPaneView 收不到 on_blur
+        // (blur 只通知旧焦点自身与其祖先,后代不在链上),on_blur 的归还失效,
+        // 新 tab 的键盘又被吞。与普通 browser pane 同构:它的 BackingView 就是
+        // BrowserPaneView,focus_contents 即 focus_self。
+        // 覆盖层态/加载中不抢(同 webview_visible),避免焦点进不可见 webview。
+        if !self.webview_visible() {
+            return;
+        }
+        let Some(browser_view) = self.get_browser_view().cloned() else {
+            return;
+        };
+        ctx.focus(&browser_view);
     }
 
     fn render_header_content(

@@ -12,7 +12,7 @@ use warpui::{
     },
     platform::Cursor,
     ui_components::components::UiComponent,
-    AppContext, Element, Entity, FocusContext, ModelHandle, SingletonEntity,
+    AppContext, BlurContext, Element, Entity, FocusContext, ModelHandle, SingletonEntity,
     TypedActionView, View, ViewContext, ViewHandle, WindowId,
 };
 
@@ -382,6 +382,22 @@ impl View for BrowserPaneView {
             BrowserWebViewManager::as_ref(ctx)
                 .blur_webview_page(self.model.platform_view_id);
         }
+    }
+
+    /// 焦点离开本 pane(新建 tab、切 tab、快捷键切 pane)时,把 AppKit first
+    /// responder 从 WKWebView 还给 host view。on_focus 只做了抢占方向的交接,
+    /// 不还则键盘事件仍进这个(切走后已被隐藏的)webview:warp 侧新焦点(如新 tab
+    /// 的终端)有光标却收不到输入,须鼠标点击 host view 才恢复(mouseDown 里
+    /// makeFirstResponder:self)。
+    /// 守卫 `is_self_or_child_focused`:焦点只是在本 pane 内部移到子视图(页面
+    /// focusin ↔ 地址栏)时不越权交接 window 级 first responder。
+    fn on_blur(&mut self, _blur_ctx: &BlurContext, ctx: &mut ViewContext<Self>) {
+        #[cfg(target_os = "macos")]
+        if !ctx.is_self_or_child_focused() {
+            warpui::platform::mac::Window::focus_host_view(ctx.window_id());
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = ctx;
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {

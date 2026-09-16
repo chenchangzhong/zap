@@ -206,29 +206,88 @@ window.open = function(url) {
 // 记录元素供重新聚焦时(__restoreFocused)恢复:WKWebView 失焦再聚焦不会自动
 // 恢复页面 activeElement,不恢复则切走再切回 tab 时输入框焦点丢失。
 window.__lastFocused = null;
+// 同时记录光标位置:blur→focus 往返会让 WebKit 把 caret 复位到输入框开头。
+// textarea/input 用 selectionStart/End;contenteditable(dsh 输入框是
+// contenteditable DIV,没有这两个属性)必须用 Range。
+window.__lastSelection = null;
+window.__lastRange = null;
 window.__restoreFocused = function() {
   var el = window.__lastFocused;
-  if (!el || !el.isConnected) { window.__lastFocused = null; return; }
+  if (!el || !el.isConnected) {
+    window.__lastFocused = null;
+    window.__lastSelection = null;
+    window.__lastRange = null;
+    return;
+  }
   var attempts = 0;
   var tryFocus = function() {
     // makeFirstResponder 后页面 hasFocus 需等 AppKit 事件循环才变 true,
     // 故轮询等待,有限次避免死循环。
     if (el.isConnected && document.hasFocus()) {
       el.focus();
+      var sel = window.__lastSelection;
+      if (sel && typeof el.setSelectionRange === 'function') {
+        // 值可能已被页面改动导致越界,故兜住异常。
+        try { el.setSelectionRange(sel[0], sel[1]); } catch (e) {}
+      } else {
+        var applied = false;
+        var range = window.__lastRange;
+        if (range) {
+          try {
+            // 页面重建过节点时 Range 会脱离文档,必须先验 isConnected。
+            if (range.startContainer && range.startContainer.isConnected) {
+              var s = window.getSelection();
+              s.removeAllRanges();
+              s.addRange(range);
+              applied = true;
+            }
+          } catch (e) {}
+        }
+        // 无可用 Range(节点被页面重建/首次未记录)时兜底折叠到内容末尾:
+        // 切回后用户要接着输入,末尾比 WebKit 默认的开头更符合预期。
+        if (!applied && el.isContentEditable) {
+          try {
+            var endRange = document.createRange();
+            endRange.selectNodeContents(el);
+            endRange.collapse(false);
+            var endSel = window.getSelection();
+            endSel.removeAllRanges();
+            endSel.addRange(endRange);
+          } catch (e) {}
+        }
+      }
       window.__lastFocused = null;
+      window.__lastSelection = null;
+      window.__lastRange = null;
     } else if (el.isConnected && attempts++ < 20) {
       setTimeout(tryFocus, 30);
     } else {
       window.__lastFocused = null;
+      window.__lastSelection = null;
+      window.__lastRange = null;
     }
   };
   tryFocus();
 };
 setInterval(() => {
-  if (!document.hasFocus() && document.activeElement && document.activeElement !== document.body) {
-    window.__lastFocused = document.activeElement;
-    document.activeElement.blur();
+  if (!document.hasFocus() || !document.activeElement || document.activeElement === document.body) {
+    return;
   }
+  var el = document.activeElement;
+  window.__lastFocused = el;
+  // 必须在 blur 之前读:blur 后 Range/selection 不再可信。
+  if (typeof el.selectionStart === 'number') {
+    window.__lastSelection = [el.selectionStart, el.selectionEnd];
+    window.__lastRange = null;
+  } else if (el.isContentEditable) {
+    var savedSel = window.getSelection();
+    window.__lastRange = (savedSel && savedSel.rangeCount > 0) ? savedSel.getRangeAt(0).cloneRange() : null;
+    window.__lastSelection = null;
+  } else {
+    window.__lastSelection = null;
+    window.__lastRange = null;
+  }
+  el.blur();
 }, 100);
 "#;
         let current_url = std::sync::Arc::new(parking_lot::Mutex::new(Some(url.to_string())));
@@ -542,6 +601,12 @@ setInterval(() => {
                     el.focus();
                     document.execCommand('insertText', false, text);
                 }}
+                // 光标位置由本次插入决定:清掉切走时留下的记录,否则随后的
+                // focus_webview → __restoreFocused 会把光标挪回旧位置,盖掉
+                // 刚插入的位置。
+                window.__lastFocused = null;
+                window.__lastSelection = null;
+                window.__lastRange = null;
             }})()
             "#
         );
