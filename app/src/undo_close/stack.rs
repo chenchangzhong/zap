@@ -10,6 +10,7 @@ use crate::{
     send_telemetry_from_app_ctx,
     server::telemetry::{TelemetryEvent, UndoCloseItemType},
     tab::TabData,
+    window_settings::WindowSettings,
     workspace::Workspace,
 };
 
@@ -279,7 +280,17 @@ impl UndoCloseStack {
                 );
 
                 let window_id = data.window_id;
-                ctx.reopen_closed_window(*data);
+                // 恢复原生窗口时要带上当前的外观设置:背景模糊只在窗口创建那一刻
+                // 应用(`AddWindowOptions`),漏掉就会得到「保留了透明度、丢了磨砂」
+                // 的窗口——看起来比正常窗口透明得多。
+                let (blur_radius_pixels, blur_texture) = {
+                    let settings = WindowSettings::handle(ctx).as_ref(ctx);
+                    (
+                        Some(*settings.background_blur_radius),
+                        *settings.background_blur_texture,
+                    )
+                };
+                ctx.reopen_closed_window(*data, blur_radius_pixels, blur_texture);
 
                 if let Some(workspace) = window_workspace(window_id, ctx) {
                     workspace.update(ctx, |workspace, ctx| {

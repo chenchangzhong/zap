@@ -2648,7 +2648,20 @@ impl AppContext {
         result
     }
 
-    pub fn reopen_closed_window(&mut self, data: ClosedWindowData) {
+    /// Reopens a window previously closed and cached via [`Self::close_window`].
+    ///
+    /// `background_blur_radius_pixels` / `background_blur_texture` are supplied
+    /// by the caller because they live in application-level appearance settings
+    /// rather than in the cached window data. The background blur is applied
+    /// only when the native window is created, so omitting it produces a window
+    /// that still honours the user's background *opacity* but has lost the blur
+    /// — i.e. it looks noticeably more transparent than a normally created one.
+    pub fn reopen_closed_window(
+        &mut self,
+        data: ClosedWindowData,
+        background_blur_radius_pixels: Option<u8>,
+        background_blur_texture: bool,
+    ) {
         let ClosedWindowData {
             window_id,
             window,
@@ -2675,9 +2688,8 @@ impl AppContext {
         }
 
         let add_window_options = AddWindowOptions {
-            // TODO(vorporeal): what's the right value here?
-            background_blur_radius_pixels: None,
-            background_blur_texture: false,
+            background_blur_radius_pixels,
+            background_blur_texture,
             window_bounds: WindowBounds::ExactPosition(bounds),
             // TODO(alokedesai): Determine if, and how, we want to pass the on_gpu_driver_reported
             // callback from the original window back to this window.
