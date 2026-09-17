@@ -19340,15 +19340,33 @@ impl Workspace {
                 },
             );
         });
-        // 3. 无可用 DshPane tab → 创建 Loading tab(已有 stale pane 时复用,不重复建)
+        // 3. 无可用 DshPane tab → 优先恢复宽限期内已关闭的 dsh tab,否则新建。
         if !self.has_dsh_pane(ctx) {
-            let pane = crate::dsh::DshPane::new(ctx);
-            let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
-            let new_idx = match new_tab_placement_setting {
-                NewTabPlacement::AfterAllTabs => self.tab_count(),
-                NewTabPlacement::AfterCurrentTab => self.active_tab_index + 1,
-            };
-            self.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
+            // 已关闭的 dsh tab 仍在 undo 宽限期内时恢复它(等价于自动执行一次
+            // 撤销):复用原 pane 与原 webview,回到原会话。若新建 pane,会创建
+            // 新 webview 重新加载页面(且 dsh pane 用非持久化存储,前端状态为空),
+            // 观感像「重启」。
+            let workspace_id = ctx.view_id();
+            let closed_dsh_tab = UndoCloseStack::handle(ctx)
+                .update(ctx, |stack, ctx| stack.take_closed_dsh_tab(workspace_id, ctx));
+            if let Some((tab_index, tab_data)) = closed_dsh_tab {
+                // 索引是关闭时的快照,期间可能有其他 tab 关闭/新增;clamp 到当前
+                // 长度避免 `Vec::insert` 越界 panic。
+                let tab_index = tab_index.min(self.tabs.len());
+                self.restore_closed_tab(tab_index, tab_data, ctx);
+                // 与撤销关闭一致:刷新会话恢复状态。
+                // 注意:`ViewContext::dispatch_global_action` 按值取参(不同于
+                // `AppContext` 的 `&dyn Any`),这里必须传 `()` 而非 `&()`。
+                ctx.dispatch_global_action("workspace:save_app", ());
+            } else {
+                let pane = crate::dsh::DshPane::new(ctx);
+                let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
+                let new_idx = match new_tab_placement_setting {
+                    NewTabPlacement::AfterAllTabs => self.tab_count(),
+                    NewTabPlacement::AfterCurrentTab => self.active_tab_index + 1,
+                };
+                self.add_tab_from_existing_pane(Box::new(pane), new_idx, ctx);
+            }
         }
         // 初始化 dsh 项目的 git status 订阅与文件浏览器（首次打开时无 SwitchProject）。
         // 仅在有 DshPane 时才订阅，避免无 pane 时创建无用 watcher。

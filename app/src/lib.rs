@@ -1472,9 +1472,16 @@ fn initialize_app(
                 manager.drain_pending_webview_focus(ctx);
             });
             if FeatureFlag::DshPane.is_enabled() {
+                // 待停止判定必须在本层(AppContext 级)先算好:在 pane 的 detach
+                // 现场遍历会漏计正处于 update 中的那个 PaneGroup(它不在
+                // window.views 里),把「还有 pane」误判成「无 pane」而误停进程。
+                let has_dsh_pane = dsh::runtime::has_reachable_dsh_pane(ctx);
                 dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
                     // 阶段3:提取活动终端最近命令(受隐私开关,节流)。
                     dsh::runtime::update_terminal_context_from_active(ctx, window_id);
+                    // 先处理待停请求:确认无 dsh pane 时它会终止子进程,后续
+                    // poll_child 便拿不到 child,不会误触发崩溃重启。
+                    runtime.poll_pending_stop(has_dsh_pane);
                     match runtime.poll_child() {
                         dsh::PollResult::Crashed => {
                             // 崩溃:标记重启(保留崩溃计数,使 MAX_RESTARTS 上限可达),

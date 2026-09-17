@@ -15,7 +15,7 @@ use crate::appearance::Appearance;
 use crate::app_state::LeafContents;
 use crate::browser::{BrowserPaneAction, BrowserPaneView, BrowserWebViewEvent, BrowserWebViewManager};
 use crate::dsh::bridge::BridgeEvent;
-use crate::dsh::{DshRuntime, DshRuntimeStatus};
+use crate::dsh::{runtime::has_reachable_dsh_pane, DshRuntime, DshRuntimeStatus};
 use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::pane_group::pane::view::{self, PaneView};
 use crate::pane_group::pane::{BackingView, DetachType, PaneContent, ShareableLink, ShareableLinkError, IPaneType};
@@ -736,11 +736,11 @@ impl BackingView for DshPaneView {
         false
     }
 
-    fn close(&mut self, ctx: &mut ViewContext<Self>) {
-        // 关闭 pane 时停止 dsh runtime,避免子进程泄漏。
-        crate::dsh::DshRuntime::handle(ctx).update(ctx, |runtime, _ctx| {
-            runtime.request_stop();
-        });
+    fn close(&mut self, _ctx: &mut ViewContext<Self>) {
+        // 关闭 pane 不在此刻停止 runtime:pane 关闭会先进入 undo 宽限期
+        // (可撤销),而 dsh 是全局单例子进程——立刻停止会让撤销/菜单恢复
+        // 指向已死服务,并可能误伤宽限期内新开的实例。停止统一由 detach
+        // 登记待停、poll_pending_stop 判定(见 detach 内的说明)。
     }
 
     fn focus_contents(&mut self, ctx: &mut ViewContext<Self>) {
@@ -870,9 +870,10 @@ impl PaneContent for DshPane {
                 self.attach_webview(false, ctx);
             }
             DshRuntimeStatus::Stopped | DshRuntimeStatus::Failed => {
-                // undo 恢复/复用既有 pane 而 runtime 已停止(detach 时
-                // request_stop):置失败态显示重启入口,避免展示指向已死服务
-                // 的僵尸页面或永久转圈(Loading 态无 webview 也一并覆盖)。
+                // 复用既有 pane 而 runtime 已停止(窗口关闭后撤销恢复窗口、
+                // app 退出前的 request_stop,或崩溃放弃重启):置失败态显示重启
+                // 入口,避免展示指向已死服务的僵尸页面或永久转圈(Loading 态
+                // 无 webview 也一并覆盖)。
                 // 新建 pane 的 attach 发生在 open_dsh_pane 的 begin_start 之后,
                 // 正常启动流程不会走到这里。webview 仍以无焦点方式 attach:
                 // Moved/窗口清理销毁后在这里重建(保持 lib.rs「undo 恢复时
@@ -913,10 +914,25 @@ impl PaneContent for DshPane {
                 view.webview_loaded = false;
             });
         }
-        if matches!(detach_type, DetachType::Closed | DetachType::HiddenForClose) {
-            log::info!("[dsh] DshPane detached; requesting runtime stop");
-            DshRuntime::handle(ctx).update(ctx, |runtime, _ctx| {
-                runtime.request_stop();
+        // 只在真正销毁(Closed)时登记「待停止」;HiddenForClose 与 Moved 一律
+        // 保留进程,因为此刻 pane 仍可恢复:
+        // - 关 tab:pane 只是被隐藏,在 undo 宽限期内可撤销、也可被菜单复用;
+        // - 关窗口:窗口本身在宽限期内可撤销恢复(⌘⇧T),其 dsh pane 随之复活;
+        // - Moved:同一个 app 内的迁移。
+        // 关键:关窗口此后不会再产生 Closed detach(见 lib.rs 窗口关闭处的说明),
+        // 所以「窗口确认不恢复」时的停止改由 undo 条目过期时兜底登记
+        // (见 stack.rs 的 ClosedItem::Window::discard)。
+        if matches!(detach_type, DetachType::Closed) {
+            log::info!("[dsh] DshPane destroyed; registering pending runtime stop");
+            DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
+                runtime.mark_stop_pending();
+                // 不依赖帧绘制的兜底判定:窗口全部最小化/关闭时 on_frame_drawn
+                // 不再触发,只等下一帧会让停止无限期推迟。判定是幂等的,若此刻
+                // 仍看到尚未被回收的 dsh pane,只会保持待停,不会漏停。
+                ctx.spawn(async {}, |runtime, _, ctx| {
+                    let has_dsh_pane = has_reachable_dsh_pane(ctx);
+                    runtime.poll_pending_stop(has_dsh_pane);
+                });
             });
         }
     }

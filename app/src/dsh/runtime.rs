@@ -21,9 +21,12 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use command::r#async::Command;
 use parking_lot::Mutex;
-use warpui::{Entity, ModelContext, SingletonEntity, WindowId};
+use warpui::{AppContext, Entity, ModelContext, SingletonEntity, WindowId};
 
-use crate::terminal::omp_models::get_user_env;
+use crate::{
+    features::FeatureFlag, pane_group::PaneGroup, terminal::omp_models::get_user_env,
+    undo_close::UndoCloseStack,
+};
 
 /// Zap 专属 dsh profile 名(`$DSH_HOME/profiles/<name>`;由 desktop profile
 /// 复制而来,与用户终端自用的 web profile、DSH Desktop 的 desktop profile
@@ -304,6 +307,15 @@ pub struct DshRuntime {
     /// 最近一次启动/重启失败的原因(供 pane 展示与复制);成功启动或
     /// 主动停止时清空,避免展示过期错误。
     error: Option<String>,
+    /// 是否已登记「待停止」(`DshPane::detach(Closed)` 或 undo 条目过期时置位,
+    /// 见 `mark_stop_pending` / `stop_if_no_dsh_pane`)。
+    ///
+    /// 不在此刻直接终止子进程:dsh 是全局单例,而 pane 被关闭后仍可能在 undo
+    /// 宽限期内被撤销恢复(关 tab 或关窗口两条路径),关窗时机也可能早于/晚于
+    /// 新实例的启动——`open_dsh_pane` 会复用现有实例,直接杀会误伤。真正的终止
+    /// 由 `poll_pending_stop` 在确认「已无任何**可达**的 dsh pane」
+    /// (`has_reachable_dsh_pane`)后执行。
+    stop_pending: bool,
 }
 
 impl Default for DshRuntime {
@@ -364,6 +376,7 @@ impl DshRuntime {
             generation: 0,
             last_success_at: None,
             error: None,
+            stop_pending: false,
         }
     }
 
@@ -884,6 +897,9 @@ impl DshRuntime {
     /// 返回本次启动的代次,供异步启动回调校验。
     pub fn begin_start(&mut self) -> u64 {
         self.stopping = false;
+        // 新一轮启动意图 = 撤销待停:否则 `open_dsh_pane`「先启动、后建 pane」
+        // 之间的间隙里,上一轮遗留的待停会在下一帧把刚起的实例停掉。
+        self.stop_pending = false;
         self.consecutive_crashes = 0;
         self.generation += 1;
         self.error = None;
@@ -944,6 +960,7 @@ impl DshRuntime {
     pub fn request_stop(&mut self) {
         log::info!("[dsh] request_stop: child={}", self.child.is_some());
         self.stopping = true;
+        self.stop_pending = false;
         if let Some(mut child) = self.child.take() {
             Self::terminate_child(&mut child);
         }
@@ -951,6 +968,38 @@ impl DshRuntime {
         self.url = None;
         self.consecutive_crashes = 0;
         self.error = None;
+    }
+
+    /// 登记「待停止」(`DshPane::detach` 只在 `DetachType::Closed` 时调用)。
+    ///
+    /// 只置位,不在此刻终止子进程:原因见 `stop_pending` 字段说明。之所以
+    /// 不能在 pane 的 detach 现场直接判定「还有没有别的 dsh pane」,是因为
+    /// 那一刻该 PaneGroup 正处于 `update` 中、不在 `window.views` 里,遍历会
+    /// **漏计**它自己(仍隐藏着 dsh pane),从而误判「无 pane」而误停进程。
+    pub fn mark_stop_pending(&mut self) {
+        log::info!("[dsh] mark_stop_pending (child={})", self.child.is_some());
+        self.stop_pending = true;
+    }
+
+    /// 判定待停止请求(由 lib.rs 每帧调用,并在 detach 登记后即时调用一次)。
+    ///
+    /// `has_dsh_pane` 为 `any_dsh_pane` 的结果。只有确认一个 dsh pane 都不剩
+    /// 时才真正停止:关 tab 后 pane 只是被隐藏(仍在该窗口的 `pane_contents`
+    /// 中),撤销与菜单恢复还要靠它,所以那时不会停;而关窗口后该窗口不再被
+    /// `any_dsh_pane` 枚举(其视图只留在 undo 栈的 `ClosedWindowData` 里),
+    /// 于是关窗会直接停止——与 `c2efed09d` 确立的既有行为一致。
+    ///
+    /// 仍有 pane 时**保持待停**(不清除标志):这正是「关掉旧 tab 后立刻重开」
+    /// 不误杀新实例的原因(标志留着,下次判定依然不会停),同时避免「先看到
+    /// 尚未被回收的旧 pane、pane 随后才消失」的时序竞态被误判成取消——
+    /// pane 的销毁只发生一次,清掉标志就再没有补判的机会,会永久漏停。
+    pub fn poll_pending_stop(&mut self, has_dsh_pane: bool) {
+        if !self.stop_pending || has_dsh_pane {
+            return;
+        }
+        self.stop_pending = false;
+        log::info!("[dsh] pending stop confirmed: no dsh pane left, stopping");
+        self.request_stop();
     }
     ///
     /// 返回 [`PollResult`]:崩溃时置状态为 `Stopped`(等待重启调度),
@@ -999,6 +1048,74 @@ impl DshRuntime {
             DshStartResult::Failed { error } => DshRestartResult::GiveUp { error },
         }
     }
+}
+
+/// 当前 app 内**打开窗口**里是否还存在 dsh pane。
+///
+/// 关 tab 后被隐藏的 pane 仍在所属窗口的 `pane_contents` 中,会被数到(撤销
+/// 与菜单恢复都靠它);但**已关闭、仍可撤销恢复的窗口**里的 dsh pane 数不到
+/// (其视图只留在 undo 栈的 `ClosedWindowData` 里,窗口已不在 `windows` 表)。
+/// 所以它不是停止判据——判据见 `has_reachable_dsh_pane`。
+///
+/// 遍历方式与 `quit_warning` 中 dsh 的判定同构(沿用既有做法)。
+///
+/// 只能在 AppContext 级调用:在 pane 的 detach 现场内联调用会**漏计**正处于
+/// `update` 中的那个 PaneGroup(`update_view` 期间它不在 `window.views` 里,
+/// `views_of_type` 枚举不到),从而把「还有 pane」误判成「无 pane」。
+/// 这里不会 panic,但会误停,所以登记与判定必须分开。
+pub(crate) fn any_dsh_pane(ctx: &AppContext) -> bool {
+    ctx.window_ids().any(|window_id| {
+        ctx.views_of_type::<PaneGroup>(window_id).is_some_and(|views| {
+            views
+                .into_iter()
+                .any(|view| view.as_ref(ctx).dsh_panes().next().is_some())
+        })
+    })
+}
+
+/// 是否还有「用户能再拿回来」的 dsh pane —— **停止判据统一用它**。
+///
+/// = 打开窗口里的 dsh pane(`any_dsh_pane`) ∪ undo 栈里仍有可恢复窗口。
+///
+/// 后者必须算上:关窗口在宽限期内可 ⌘⇧T 撤销恢复,其 dsh pane 随之复活,而
+/// `any_dsh_pane` 看不到它。只看 `any_dsh_pane` 会在「先关的窗口撤销项过期时」
+/// 或「关窗口后的那一帧」把「已无 pane」当成事实,提前杀掉子进程,恢复出来就是
+/// 死会话。窗口条目无法逐个探测是否含 dsh pane,故按「还有窗口可恢复」保守
+/// 保留——代价只是多留一会儿,不会泄漏。
+///
+/// **只能在 `UndoCloseStack` 的 update 之外调用**(内部会读该单例,重入读会
+/// panic);栈内部改用 `stop_if_no_dsh_pane` 并显式传入该布尔值。
+pub(crate) fn has_reachable_dsh_pane(ctx: &AppContext) -> bool {
+    has_reachable_dsh_pane_with(ctx, UndoCloseStack::as_ref(ctx).has_restorable_window())
+}
+
+/// [`has_reachable_dsh_pane`] 的参数化形式:「undo 栈里还有可恢复窗口」由调用方
+/// 给出,供无法回读 `UndoCloseStack` 的场合(栈自己的 update 内)使用。
+pub(crate) fn has_reachable_dsh_pane_with(
+    ctx: &AppContext,
+    has_restorable_window: bool,
+) -> bool {
+    any_dsh_pane(ctx) || has_restorable_window
+}
+
+/// 登记一次「待停止」并立即判定一次(供「窗口确认不恢复」的兜底路径调用)。
+///
+/// 关窗口只产生 `HiddenForClose`,且此后不会再产生 `Closed`(见 lib.rs 窗口关闭
+/// 处的说明);而 `HiddenForClose` 不登记待停(为了让撤销恢复能连回活进程)。
+/// 因此必须在窗口的 undo 条目真正过期时补登记,否则子进程会一直活到 app 退出。
+///
+/// `has_restorable_window` 由调用方给出:本函数会被 `UndoCloseStack` 内部调用
+/// (窗口条目过期时),那里回读该单例会 panic。
+pub(crate) fn stop_if_no_dsh_pane(ctx: &mut AppContext, has_restorable_window: bool) {
+    // `DshRuntime` 只在 DshPane flag 打开时注册为单例,未打开时 handle 会 panic。
+    if !FeatureFlag::DshPane.is_enabled() {
+        return;
+    }
+    let has_dsh_pane = has_reachable_dsh_pane_with(ctx, has_restorable_window);
+    DshRuntime::handle(ctx).update(ctx, |runtime, _ctx| {
+        runtime.mark_stop_pending();
+        runtime.poll_pending_stop(has_dsh_pane);
+    });
 }
 
 impl Entity for DshRuntime {
@@ -1147,6 +1264,59 @@ mod tests {
         assert!(workspace_dir().is_none(), "default should be None");
         set_workspace_dir(PathBuf::from("/tmp/zap-foo"));
         assert_eq!(workspace_dir(), Some(PathBuf::from("/tmp/zap-foo")));
+    }
+
+    /// 待停判定:无 dsh pane 才真正停止;仍有 pane(含 undo 宽限期内隐藏的
+    /// pane)则保持待停、既不停也不清除标志。这是「关掉旧 tab 后立刻重开不再
+    /// 误杀新实例」的核心状态机。
+    #[test]
+    fn poll_pending_stop_respects_live_pane() {
+        let mut runtime = DshRuntime::new();
+
+        // 未登记待停:任何输入都不动作。
+        runtime.set_status(DshRuntimeStatus::Ready);
+        runtime.poll_pending_stop(false);
+        assert_eq!(runtime.status(), DshRuntimeStatus::Ready);
+        assert!(!runtime.stop_pending);
+
+        // 登记待停但仍有 pane:保持待停(不清除),不停止。
+        runtime.mark_stop_pending();
+        assert!(runtime.stop_pending);
+        runtime.poll_pending_stop(true);
+        assert!(
+            runtime.stop_pending,
+            "a live dsh pane must keep the pending stop armed, not clear it"
+        );
+        assert_eq!(runtime.status(), DshRuntimeStatus::Ready);
+
+        // pane 全部消失后才真正停止(标志可能是更早一轮遗留的)。
+        runtime.poll_pending_stop(false);
+        assert!(!runtime.stop_pending);
+        assert_eq!(runtime.status(), DshRuntimeStatus::Stopped);
+    }
+
+    /// 新一轮启动清掉待停意图:否则 open_dsh_pane「先启动、后建 pane」的
+    /// 间隙里,上一轮遗留的待停会在下一帧停掉刚起的实例。
+    #[test]
+    fn begin_start_clears_pending_stop() {
+        let mut runtime = DshRuntime::new();
+        runtime.mark_stop_pending();
+        runtime.begin_start();
+        assert!(
+            !runtime.stop_pending,
+            "begin_start must clear the pending stop"
+        );
+        assert_eq!(runtime.status(), DshRuntimeStatus::Starting);
+    }
+
+    /// 主动停止同样清掉待停意图,避免停止后残留标记。
+    #[test]
+    fn request_stop_clears_pending_stop() {
+        let mut runtime = DshRuntime::new();
+        runtime.mark_stop_pending();
+        runtime.request_stop();
+        assert!(!runtime.stop_pending);
+        assert_eq!(runtime.status(), DshRuntimeStatus::Stopped);
     }
 
     /// 终端上下文隐私开关:关闭时返回空,开启后返回暂存命令。
