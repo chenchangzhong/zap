@@ -43,10 +43,25 @@ pub enum AboutPageAction {
     /// 由 `WorkspaceAction::ExportLogsToPath` 负责实现。
     #[cfg(not(target_family = "wasm"))]
     ExportLogs,
+    /// 用户点击 DSH 区块的"检查更新":并行读已装版本 + registry 各启用
+    /// 渠道版本,结果存入 view 并刷新展示。见
+    /// `crate::dsh::DshRuntime::check_channels_future`。
+    #[cfg(not(target_family = "wasm"))]
+    DshCheckChannels,
+    /// 用户拨动 DSH 渠道开关:写入 dsh_settings.json(影响 toast 与 About
+    /// 页之后的渠道检查范围)。
+    #[cfg(not(target_family = "wasm"))]
+    DshToggleChannel(String),
 }
 
 pub struct AboutPageView {
     page: PageType<Self>,
+    /// DSH 渠道检查进行中(About 页 DSH 区块按钮态)。
+    #[cfg(not(target_family = "wasm"))]
+    dsh_checking: bool,
+    /// 最近一次 DSH 渠道检查结果;未检查过为 `None`。
+    #[cfg(not(target_family = "wasm"))]
+    dsh_snapshot: Option<crate::dsh::DshChannelsSnapshot>,
 }
 
 impl AboutPageView {
@@ -59,6 +74,10 @@ impl AboutPageView {
 
         AboutPageView {
             page: PageType::new_monolith(AboutPageWidget::default(), None, false),
+            #[cfg(not(target_family = "wasm"))]
+            dsh_checking: false,
+            #[cfg(not(target_family = "wasm"))]
+            dsh_snapshot: None,
         }
     }
 }
@@ -101,6 +120,30 @@ impl TypedActionView for AboutPageView {
                 // 后完成打包与 toast 反馈。
                 ctx.dispatch_typed_action(&WorkspaceAction::ExportLogsToPath);
             }
+            #[cfg(not(target_family = "wasm"))]
+            AboutPageAction::DshCheckChannels => {
+                self.dsh_checking = true;
+                ctx.notify();
+                ctx.spawn(
+                    crate::dsh::DshRuntime::check_channels_future(),
+                    |me, snapshot, ctx| {
+                        me.dsh_checking = false;
+                        me.dsh_snapshot = Some(snapshot);
+                        ctx.notify();
+                    },
+                );
+            }
+            #[cfg(not(target_family = "wasm"))]
+            AboutPageAction::DshToggleChannel(channel) => {
+                // 翻转开关:关闭渠道后 toast 与 About 页检查都不再包含它。
+                let enabled = crate::dsh::runtime::dsh_channel_enabled(channel);
+                if let Err(err) =
+                    crate::dsh::runtime::set_dsh_channel_enabled(&channel, !enabled)
+                {
+                    log::warn!("[dsh] failed to persist channel toggle: {err:#}");
+                }
+                ctx.notify();
+            }
         }
     }
 }
@@ -123,13 +166,30 @@ struct AboutPageWidget {
     /// "导出日志"链接的悬停 / 按下状态。
     #[cfg(not(target_family = "wasm"))]
     export_logs_link_mouse_state: MouseStateHandle,
+    /// DSH 区块"检查更新"链接的悬停 / 按下状态。
+    #[cfg(not(target_family = "wasm"))]
+    dsh_check_link_mouse_state: MouseStateHandle,
+    /// DSH 各渠道开关的 switch 交互状态(仅接交互反馈,实际值读盘)。
+    #[cfg(not(target_family = "wasm"))]
+    dsh_latest_switch_state: SwitchStateHandle,
+    #[cfg(not(target_family = "wasm"))]
+    dsh_next_switch_state: SwitchStateHandle,
+    #[cfg(not(target_family = "wasm"))]
+    dsh_alpha_switch_state: SwitchStateHandle,
+    /// DSH 渠道"立即升级"链接的悬停 / 按下状态(每渠道独立跟踪)。
+    #[cfg(not(target_family = "wasm"))]
+    dsh_latest_upgrade_link_mouse_state: MouseStateHandle,
+    #[cfg(not(target_family = "wasm"))]
+    dsh_next_upgrade_link_mouse_state: MouseStateHandle,
+    #[cfg(not(target_family = "wasm"))]
+    dsh_alpha_upgrade_link_mouse_state: MouseStateHandle,
 }
 
 impl SettingsWidget for AboutPageWidget {
     type View = AboutPageView;
 
     fn search_terms(&self) -> &str {
-        "about warp version automatic updates auto update 自动更新 检查更新 新版本"
+        "about warp version automatic updates auto update 自动更新 检查更新 新版本 dsh deepseek harness 更新渠道 next alpha预览版 内测"
     }
 
     fn render(
@@ -278,6 +338,13 @@ impl SettingsWidget for AboutPageWidget {
                 .finish(),
             );
         }
+
+        #[cfg(not(target_family = "wasm"))]
+        content.add_child(
+            Container::new(self.render_dsh_section(_view, appearance, app))
+                .with_margin_top(24.)
+                .finish(),
+        );
 
         Align::new(content.finish()).finish()
     }
@@ -462,6 +529,182 @@ impl AboutPageWidget {
         }
 
         row.finish()
+    }
+
+    /// About 页 DSH 更新区块:已装版本 + 各启用渠道的最新版本 + "检查更新"
+    /// 链接 + latest/next/alpha 渠道开关。渠道开关读改写 dsh_settings.json,
+    /// 同时约束 toast 检查与这里的检查范围。
+    #[cfg(not(target_family = "wasm"))]
+    fn render_dsh_section(
+        &self,
+        view: &AboutPageView,
+        appearance: &Appearance,
+        _app: &AppContext,
+    ) -> Box<dyn Element> {
+        let ui_builder = appearance.ui_builder();
+
+        let mut section = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            // 标题用固定品牌名,与上方 "Zap"/"Zap 检查更新" 风格区分开。
+            .with_child(
+                ui_builder
+                    .span(crate::t!("settings-about-dsh-title"))
+                    .build()
+                    .finish(),
+            )
+            .with_child(
+                ui_builder
+                    .span(crate::t!("settings-about-dsh-description"))
+                    .with_soft_wrap()
+                    .build()
+                    .finish(),
+            );
+
+        // 状态行:检查中 > 未检查过提示 > 已装版本(+ 检查更新链接)。
+        let status_text = if view.dsh_checking {
+            crate::t!("settings-about-update-checking")
+        } else {
+            match view.dsh_snapshot.as_ref().map(|s| s.installed.clone()) {
+                Some(Some(installed)) => {
+                    crate::t!("settings-about-dsh-installed", version = installed.as_str())
+                }
+                Some(None) => crate::t!("settings-about-dsh-not-installed"),
+                None => crate::t!("settings-about-dsh-check-hint"),
+            }
+        };
+        let mut status_row = Flex::row()
+            .with_main_axis_alignment(MainAxisAlignment::Center)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(ui_builder.span(status_text).with_soft_wrap().build().finish());
+        if !view.dsh_checking {
+            // 复用 Zap 自动更新区的"检查更新"链接文案。
+            status_row.add_child(
+                Container::new(
+                    ui_builder
+                        .link(
+                            crate::t!("settings-about-update-check-now"),
+                            None,
+                            Some(Box::new(|ctx| {
+                                ctx.dispatch_typed_action(AboutPageAction::DshCheckChannels);
+                            })),
+                            self.dsh_check_link_mouse_state.clone(),
+                        )
+                        .soft_wrap(false)
+                        .build()
+                        .finish(),
+                )
+                .with_padding_left(8.)
+                .finish(),
+            );
+        }
+        section.add_child(status_row.finish());
+
+        // 渠道版本行:检查完成后,逐启用渠道展示 registry 最新版本与新旧。
+        if let Some(snapshot) = view.dsh_snapshot.as_ref() {
+            for (channel, version) in &snapshot.channels {
+                let channel: &str = channel;
+                let has_update = snapshot
+                    .installed
+                    .as_deref()
+                    .map(|installed| crate::dsh::runtime::is_update_available(version, installed))
+                    .unwrap_or(false);
+                // i18n 按有无更新挑字面 key,不能动态传 key。
+                let text = if has_update {
+                    crate::t!("settings-about-dsh-channel-update",
+                        channel = channel, latest = version.as_str())
+                } else {
+                    crate::t!("settings-about-dsh-channel-current",
+                        channel = channel, latest = version.as_str())
+                };
+                let mut channel_row = Flex::row()
+                    .with_main_axis_alignment(MainAxisAlignment::Center)
+                    .with_child(ui_builder.span(text).with_soft_wrap().build().finish());
+                // 有更新时加"立即升级"链接:与新版 toast 点击等价,开终端 tab
+                // 执行该渠道的 npm install -g(WorkspaceAction::UpgradeDshChannel)。
+                if has_update {
+                    let channel_owned = channel.to_string();
+                    channel_row.add_child(
+                        Container::new(
+                            ui_builder
+                                .link(
+                                    crate::t!("settings-about-dsh-upgrade-now"),
+                                    None,
+                                    Some(Box::new(move |ctx| {
+                                        ctx.dispatch_typed_action(
+                                            WorkspaceAction::UpgradeDshChannel(
+                                                channel_owned.clone(),
+                                            ),
+                                        );
+                                    })),
+                                    self.dsh_upgrade_link_state(channel),
+                                )
+                                .soft_wrap(false)
+                                .build()
+                                .finish(),
+                        )
+                        .with_padding_left(8.)
+                        .finish(),
+                    );
+                }
+                section.add_child(channel_row.finish());
+            }
+        }
+
+        // 渠道开关:每个渠道一行,复用"自动更新"开关的行式布局。
+        for channel in crate::dsh::runtime::UPDATE_CHANNELS {
+            let label = match channel {
+                "latest" => crate::t!("settings-about-dsh-channel-latest-label"),
+                "next" => crate::t!("settings-about-dsh-channel-next-label"),
+                "alpha" => crate::t!("settings-about-dsh-channel-alpha-label"),
+                _ => unreachable!("unknown dsh update channel: {channel}"),
+            };
+            let switch = ui_builder
+                .switch(self.dsh_switch_state(channel))
+                .check(crate::dsh::runtime::dsh_channel_enabled(channel))
+                .build()
+                .on_click(move |ctx, _, _| {
+                    let channel = channel.to_string();
+                    ctx.dispatch_typed_action(AboutPageAction::DshToggleChannel(channel));
+                })
+                .finish();
+            section.add_child(
+                ConstrainedBox::new(render_body_item::<AboutPageAction>(
+                    label,
+                    None,
+                    LocalOnlyIconState::Hidden,
+                    ToggleState::Enabled,
+                    appearance,
+                    switch,
+                    None,
+                ))
+                .with_max_width(520.)
+                .finish(),
+            );
+        }
+
+        section.finish()
+    }
+
+    /// DSH 渠道名 → 该渠道开关的 switch 交互状态。
+    #[cfg(not(target_family = "wasm"))]
+    fn dsh_switch_state(&self, channel: &str) -> SwitchStateHandle {
+        match channel {
+            "latest" => self.dsh_latest_switch_state.clone(),
+            "next" => self.dsh_next_switch_state.clone(),
+            "alpha" => self.dsh_alpha_switch_state.clone(),
+            _ => unreachable!("unknown dsh update channel: {channel}"),
+        }
+    }
+
+    /// DSH 渠道名 → 该渠道"立即升级"链接的 mouse 状态。
+    #[cfg(not(target_family = "wasm"))]
+    fn dsh_upgrade_link_state(&self, channel: &str) -> MouseStateHandle {
+        match channel {
+            "latest" => self.dsh_latest_upgrade_link_mouse_state.clone(),
+            "next" => self.dsh_next_upgrade_link_mouse_state.clone(),
+            "alpha" => self.dsh_alpha_upgrade_link_mouse_state.clone(),
+            _ => unreachable!("unknown dsh update channel: {channel}"),
+        }
     }
 }
 

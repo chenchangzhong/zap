@@ -13,5 +13,6 @@ pub(crate) mod runtime;
 
 pub use pane::DshPane;
 pub use runtime::{
-    DshRestartResult, DshRuntime, DshRuntimeStatus, DshStartResult, DshUpdateCheck, PollResult,
+    DshChannelsSnapshot, DshRestartResult, DshRuntime, DshRuntimeStatus, DshStartResult,
+    DshUpdateCheck, PollResult,
 };

@@ -19270,8 +19270,11 @@ impl Workspace {
         ctx.spawn(
             crate::dsh::DshRuntime::check_update_future(),
             move |me, check, ctx| {
-                if let crate::dsh::DshUpdateCheck::UpdateAvailable { installed, latest } = check {
-                    me.show_dsh_update_toast(installed, latest, ctx);
+                if let crate::dsh::DshUpdateCheck::UpdateAvailable { installed, available } = check {
+                    // 每个渠道各弹一条 toast,让用户自选升级哪个渠道。
+                    for (channel, latest) in available {
+                        me.show_dsh_update_toast(&installed, &latest, channel, ctx);
+                    }
                 }
             },
         );
@@ -19364,21 +19367,26 @@ impl Workspace {
         }
     }
 
-    /// dsh 有新版本:toast 提示,点击后打开终端 tab 并自动执行升级命令。
+    /// dsh 某发布渠道(latest/next/alpha)有新版本:每渠道一条 toast,点击后
+    /// 打开终端并自动执行该渠道的升级命令(`latest` 走默认,预览渠道带 @tag)。
     fn show_dsh_update_toast(
         &mut self,
-        installed: String,
-        latest: String,
+        installed: &str,
+        latest: &str,
+        channel: &'static str,
         ctx: &mut ViewContext<Self>,
     ) {
-        let upgrade_command = format!("npm install -g {}", crate::dsh::runtime::DSH_NPM_PACKAGE);
+        let upgrade_command = crate::dsh::runtime::upgrade_command(channel);
+        let message = if channel == "latest" {
+            crate::t!("dsh-update-available-toast",
+                installed = installed, latest = latest)
+        } else {
+            crate::t!("dsh-update-prerelease-toast",
+                installed = installed, latest = latest, channel = channel)
+        };
         let window_id = ctx.window_id();
-        let toast = DismissibleToast::default(crate::t!(
-            "dsh-update-available-toast",
-            installed = installed.as_str(),
-            latest = latest.as_str()
-        ))
-        .with_object_id("dsh-update-available".to_string())
+        let toast = DismissibleToast::default(message)
+            .with_object_id(format!("dsh-update-available-{channel}"))
         .with_on_body_click(move |toast_ctx| {
             let Some(workspace) =
                 WorkspaceRegistry::as_ref(toast_ctx).get(toast_ctx.window_id(), toast_ctx)
@@ -19392,6 +19400,13 @@ impl Workspace {
         WorkspaceToastStack::handle(ctx).update(ctx, |stack, ctx| {
             stack.add_persistent_toast(toast, window_id, ctx);
         });
+    }
+
+    /// 升级全局 dsh 到 `channel`(latest/next/alpha):About 页"立即升级"
+    /// 链接用,与 dsh 更新 toast 点击共用同一套终端执行流程。
+    fn upgrade_dsh_channel(&mut self, channel: &str, ctx: &mut ViewContext<Self>) {
+        let upgrade_command = crate::dsh::runtime::upgrade_command(channel);
+        self.upgrade_dsh_in_terminal(&upgrade_command, ctx);
     }
 
     /// 打开新的终端 tab 并执行 `command`(等价于用户敲命令后按回车)。
@@ -19985,6 +20000,7 @@ impl TypedActionView for Workspace {
             }
             AutoupdateFailureLink => self.open_autoupdate_failure_link(ctx),
             ApplyUpdate => self.apply_update(ctx),
+            UpgradeDshChannel(channel) => self.upgrade_dsh_channel(channel, ctx),
             // 去中心化分支:`LogOut` 已删除。
             ExportAllWarpDriveObjects => {
                 self.export_all_warp_drive_objects(ctx);

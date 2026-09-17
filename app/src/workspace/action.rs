@@ -176,6 +176,9 @@ pub enum WorkspaceAction {
     SelectNewSessionMenuItem(NewSessionMenuItem),
     AutoupdateFailureLink,
     ApplyUpdate,
+    /// 升级全局 dsh 到指定渠道(latest/next/alpha):About 页渠道升级链接
+    /// 用,与 dsh 更新 toast 点击等价(开终端 tab 执行 npm install -g)。
+    UpgradeDshChannel(String),
     // 去中心化分支:`LogOut` 已删除。
     CopyVersion(&'static str),
     DownloadNewVersion,
@@ -765,6 +768,7 @@ impl WorkspaceAction {
             | SelectNewSessionMenuItem(_)
             | ToggleTabBarOverflowMenu
             | CheckForUpdate
+            | UpgradeDshChannel(_)
             | SetA11yVerbosityLevel(_)
             | ToggleNotifications
             | DispatchToSettingsTab { .. }

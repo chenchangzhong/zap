@@ -34,6 +34,10 @@ const DSH_PROFILE: &str = "zap";
 const DSH_WEB_LOG_FILE: &str = "zap-dsh-web.log";
 /// dsh npm 包名(升级命令与 registry 查询共用)。
 pub(crate) const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh";
+/// 参与更新检查的发布渠道(dist-tag);`next` 为 rc 预览、`alpha` 为内测,
+/// 均不占用 `latest`。toast 按此顺序逐渠道提示,哪个渠道升级由用户自选;
+/// 渠道开关(About 页)可关掉部分渠道。
+pub(crate) const UPDATE_CHANNELS: [&str; 3] = ["latest", "next", "alpha"];
 /// 就绪探测超时。
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// 就绪探测间隔。
@@ -93,6 +97,38 @@ fn terminal_context_enabled_from_disk() -> bool {
 /// dsh 设置文件路径(隐私开关持久化)。正规 settings 框架 UI 后续接入。
 fn dsh_settings_path() -> Result<PathBuf> {
     Ok(DshRuntime::dsh_data_dir()?.join("dsh_settings.json"))
+}
+
+/// 各更新渠道的启用开关(持久化在 `dsh_settings.json` 的
+/// `dsh_update_channels` 对象;缺省全开)。关闭后 toast 检查与 About 页
+/// 渠道检查都不再包含该渠道。
+pub(crate) fn dsh_channel_enabled(channel: &str) -> bool {
+    dsh_settings_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| {
+            v.get("dsh_update_channels")
+                .and_then(|c| c.get(channel))
+                .and_then(|b| b.as_bool())
+        })
+        .unwrap_or(true)
+}
+
+/// 写入单个更新渠道开关(读改写 settings JSON,保留其它键)。
+pub(crate) fn set_dsh_channel_enabled(channel: &str, enabled: bool) -> Result<()> {
+    let path = dsh_settings_path()?;
+    let mut root: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    root["dsh_update_channels"][channel] = serde_json::Value::Bool(enabled);
+    std::fs::write(&path, serde_json::to_string_pretty(&root)?)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
 }
 
 /// 主线程每帧提取活动终端最近命令到暂存(节流 1s)。隐私关闭时跳过更新。
@@ -175,22 +211,33 @@ pub enum DshStartResult {
     Failed { error: String },
 }
 
+/// 一次 dsh 渠道检查的完整快照(About 页"检查更新"用)。
+#[derive(Debug, Clone, Default)]
+pub struct DshChannelsSnapshot {
+    /// 已装版本(`dsh --version`);dsh 不在 PATH 或命令失败时为 `None`。
+    pub installed: Option<String>,
+    /// 启用渠道的 (渠道, registry 最新版本),渠道顺序同 [`UPDATE_CHANNELS`];
+    /// registry 查询失败/超时/全渠道关闭时为空。
+    pub channels: Vec<(&'static str, String)>,
+}
+
 /// 全局 dsh 更新检查结果(仅提示用,不参与启动流程)。
 #[derive(Debug, Clone)]
 pub enum DshUpdateCheck {
     /// 无更新,或检查失败/离线(静默,不打扰用户;下次打开 pane 会重查)。
     UpToDate,
-    /// registry 有比当前已装版本更新的 semver 版本。
+    /// registry 至少一个渠道(dist-tag)有比当前已装版本更新的 semver 版本。
     UpdateAvailable {
         installed: String,
-        latest: String,
+        /// 有更新的 (渠道, 版本) 列表,渠道顺序同 [`UPDATE_CHANNELS`]。
+        available: Vec<(&'static str, String)>,
     },
 }
 
 /// registry 版本是否比已装版本新。两边都需为合法 semver(预发布号按
 /// semver 规则排序,如 0.1.2-rc.1 < 0.1.2);任一不可解析则视为无法
 /// 比较,静默不提示。
-fn is_update_available(latest: &str, installed: &str) -> bool {
+pub(crate) fn is_update_available(latest: &str, installed: &str) -> bool {
     match (
         semver::Version::parse(latest),
         semver::Version::parse(installed),
@@ -198,6 +245,27 @@ fn is_update_available(latest: &str, installed: &str) -> bool {
         (Ok(latest), Ok(installed)) => latest > installed,
         _ => false,
     }
+}
+
+/// 指定渠道(latest/next/alpha)的全局 dsh 升级命令:`latest` 走默认 tag,
+/// 预览渠道显式带 `@tag`。About 页升级链接与 toast 点击共用。
+pub(crate) fn upgrade_command(channel: &str) -> String {
+    if channel == "latest" {
+        format!("npm install -g {DSH_NPM_PACKAGE}")
+    } else {
+        format!("npm install -g {DSH_NPM_PACKAGE}@{channel}")
+    }
+}
+
+/// 从 dist-tags 查询结果中选出已装版本落后的渠道及其版本(渠道顺序同
+/// [`UPDATE_CHANNELS`];该渠道缺失或版本比对不通过时跳过)。
+fn channel_updates(installed: &str, tags: &[(&'static str, String)]) -> Vec<(&'static str, String)> {
+    tags.iter()
+        .filter(|(channel, latest)| {
+            UPDATE_CHANNELS.contains(channel) && is_update_available(latest, installed)
+        })
+        .map(|(channel, latest)| (*channel, latest.clone()))
+        .collect()
 }
 
 /// 每帧轮询子进程的判定结果。
@@ -342,27 +410,43 @@ impl DshRuntime {
         }
     }
 
-    /// 非阻塞检查全局 dsh 是否有新版本(仅提示,不参与启动流程)。
+    /// 非阻塞检查全局 dsh 各发布渠道是否有新版本(仅提示,不参与启动流程)。
     ///
-    /// 比较 `dsh --version` 与 npm registry latest(并行执行,registry 查询
-    /// 5s 超时)。dsh 不存在、命令失败、离线或版本不可解析时一律返回
-    /// `UpToDate`(静默;dsh 不存在时启动路径已有明确报错)。
+    /// 比较 `dsh --version` 与 npm registry 上已启用渠道(latest/next/alpha,
+    /// 渠道开关见 [`dsh_channel_enabled`])的版本(并行执行,registry 查询
+    /// 5s 超时)。任一启用渠道有更新即列入结果,每个渠道各弹一条 toast,
+    /// 升不升级、走哪个渠道由用户自选。dsh 不存在、命令失败、离线或版本
+    /// 不可解析时一律返回 `UpToDate`(静默;dsh 不存在时启动路径已有明确报错)。
     pub async fn check_update_future() -> DshUpdateCheck {
-        let Ok(dsh_bin) = Self::find_global_dsh() else {
+        let snapshot = Self::check_channels_future().await;
+        let Some(installed) = snapshot.installed else {
             return DshUpdateCheck::UpToDate;
         };
-        let (latest, installed) = tokio::join!(
-            Self::query_latest_version(),
-            Self::installed_version(&dsh_bin)
-        );
-        let (Some(latest), Ok(installed)) = (latest, installed) else {
-            return DshUpdateCheck::UpToDate;
-        };
-        if is_update_available(&latest, &installed) {
-            log::info!("[dsh] update available: {installed} -> {latest}");
-            DshUpdateCheck::UpdateAvailable { installed, latest }
-        } else {
+        let available = channel_updates(&installed, &snapshot.channels);
+        if available.is_empty() {
             DshUpdateCheck::UpToDate
+        } else {
+            log::info!("[dsh] update available: {installed} -> {available:?}");
+            DshUpdateCheck::UpdateAvailable { installed, available }
+        }
+    }
+
+    /// 一次完整的 dsh 渠道检查快照(About 页"检查更新"展示用):已装版本
+    /// + 各启用渠道的 registry 最新版本。与 toast 检查共用同一次查询。
+    pub async fn check_channels_future() -> DshChannelsSnapshot {
+        let dsh_bin = Self::find_global_dsh().ok();
+        let (tags, installed) = tokio::join!(
+            Self::query_dist_tags(),
+            async move {
+                match dsh_bin {
+                    Some(bin) => Self::installed_version(&bin).await.ok(),
+                    None => None,
+                }
+            }
+        );
+        DshChannelsSnapshot {
+            installed,
+            channels: tags.into_iter().filter(|(c, _)| dsh_channel_enabled(c)).collect(),
         }
     }
 
@@ -380,14 +464,15 @@ impl DshRuntime {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// 查询 npm registry 上 dsh 的最新版本号。
+    /// 查询 npm registry 上 dsh 各发布渠道(latest/next/alpha)的版本号。
     ///
-    /// 失败(网络不可达 / 响应异常 / 超时)返回 `None`,调用方静默跳过。
-    /// reqwest 默认无总超时,故用 `tokio::time::timeout` 兜底。
-    async fn query_latest_version() -> Option<String> {
+    /// 走官方 dist-tags 端点(`/-/package/<pkg>/dist-tags`),一次拿全部
+    /// 渠道且响应极小。失败(网络不可达 / 响应异常 / 超时)返回空列表,
+    /// 调用方静默跳过。reqwest 默认无总超时,故用 `tokio::time::timeout` 兜底。
+    async fn query_dist_tags() -> Vec<(&'static str, String)> {
         const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
         let client = http_client::Client::new();
-        let url = format!("https://registry.npmjs.org/{DSH_NPM_PACKAGE}/latest");
+        let url = format!("https://registry.npmjs.org/-/package/{DSH_NPM_PACKAGE}/dist-tags");
         let result = tokio::time::timeout(CHECK_TIMEOUT, async {
             let resp = client.get(&url).send().await.ok()?;
             if !resp.status().is_success() {
@@ -395,14 +480,24 @@ impl DshRuntime {
                 return None;
             }
             let body: serde_json::Value = resp.json().await.ok()?;
-            body.get("version").and_then(|v| v.as_str()).map(str::to_string)
+            let tags = body.as_object()?;
+            Some(
+                UPDATE_CHANNELS
+                    .iter()
+                    .filter_map(|channel| {
+                        tags.get(*channel)
+                            .and_then(|v| v.as_str())
+                            .map(|v| (*channel, v.to_string()))
+                    })
+                    .collect::<Vec<_>>(),
+            )
         })
         .await;
         match result {
-            Ok(version) => version,
+            Ok(tags) => tags.unwrap_or_default(),
             Err(_) => {
                 log::warn!("[dsh] update check timed out after {CHECK_TIMEOUT:?}");
-                None
+                Vec::new()
             }
         }
     }
@@ -1009,6 +1104,38 @@ mod tests {
         assert!(!is_update_available("0.1.1", "0.1.2-rc.1"));
         assert!(!is_update_available("not-semver", "0.1.2"));
         assert!(!is_update_available("0.1.2", "not-semver"));
+    }
+
+    /// 渠道筛选:各渠道独立与已装版本比对,顺序保持 UPDATE_CHANNELS;
+    /// 落后于该渠道(含同版)的渠道不提示。
+    #[test]
+    fn channel_updates_filtering() {
+        let tags = vec![
+            ("latest", "0.1.5-rc.1".to_string()),
+            ("next", "0.1.5-rc.2".to_string()),
+            ("alpha", "0.1.6-alpha.1".to_string()),
+        ];
+        // 落后于全部渠道 → 三条都提示。
+        let got = channel_updates("0.1.4", &tags);
+        assert_eq!(
+            got,
+            vec![
+                ("latest", "0.1.5-rc.1".to_string()),
+                ("next", "0.1.5-rc.2".to_string()),
+                ("alpha", "0.1.6-alpha.1".to_string()),
+            ]
+        );
+        // 已装 latest 同版 → 只提示 next/alpha(预览渠道)。
+        let got = channel_updates("0.1.5-rc.1", &tags);
+        assert_eq!(
+            got,
+            vec![
+                ("next", "0.1.5-rc.2".to_string()),
+                ("alpha", "0.1.6-alpha.1".to_string()),
+            ]
+        );
+        // 全程已是最新 → 空。
+        assert!(channel_updates("0.1.6-alpha.1", &tags).is_empty());
     }
 
     /// 已移除安装/版本管理:dsh 由用户全局安装,Zap 仅定位 PATH 中的命令。
