@@ -641,6 +641,31 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
                     return YES;
                 }
             }
+
+            // Webview 支路同样让"已绑定的键归 warp":终端路径在下方对
+            // keystrokeIsAssigned 查询后经 keyDownImpl 分发,而 webview 作为
+            // first responder 时若直接 return super,这条查询整个被跳过,
+            // Cmd+1~9 这类 keybinding 快捷键落进页面被 WebKit 吞掉(菜单里
+            // 有 keyEquivalent 的如 Cmd+T 不受影响)。
+            // IME 守卫:WKContentView 实现 NSTextInputClient,它的 hasMarkedText
+            // 为真说明输入法组合中,按键必须留给输入法,不得拦截——否则
+            // 中文输入再次被打断。
+            BOOL composing = [firstResponder respondsToSelector:@selector(hasMarkedText)]
+                && [(id<NSTextInputClient>)firstResponder hasMarkedText];
+            if (!composing) {
+                NSApplication *application = [NSApplication sharedApplication];
+                BOOL keystrokeIsAssigned =
+                    warp_app_has_binding_for_keystroke(application, event);
+                BOOL keyBindingsDisabled =
+                    warp_app_are_key_bindings_disabled_for_window(application, self);
+                BOOL triggersCustomAction =
+                    warp_app_has_custom_action_for_keystroke(application, event);
+                if (keyBindingsDisabled || (keystrokeIsAssigned && !triggersCustomAction)) {
+                    if ([self.contentView keyDownImpl:event]) {
+                        return YES;
+                    }
+                }
+            }
             return [super performKeyEquivalent:event];
         }
 
