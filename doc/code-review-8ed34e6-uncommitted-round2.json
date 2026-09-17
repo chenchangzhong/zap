@@ -1,0 +1,7 @@
+{
+  "scope": "uncommitted changes (5 files: app/src/dsh/pane.rs, app/src/dsh/runtime.rs, app/src/lib.rs, app/src/undo_close/stack.rs, app/src/workspace/view.rs) - review of the third-round dsh lifecycle fix",
+  "commit": "8ed34e6",
+  "date": "2026-09-17",
+  "threshold": 80,
+  "issues": []
+}

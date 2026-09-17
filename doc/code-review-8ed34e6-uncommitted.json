@@ -1,0 +1,16 @@
+{
+  "scope": "uncommitted changes (5 files: app/src/dsh/pane.rs, app/src/dsh/runtime.rs, app/src/lib.rs, app/src/undo_close/stack.rs, app/src/workspace/view.rs) - dsh pane stop-registration + undo-restore fix",
+  "commit": "8ed34e6",
+  "date": "2026-09-17",
+  "threshold": 80,
+  "issues": [
+    {
+      "file": "app/src/dsh/pane.rs",
+      "line": 919,
+      "severity": "major",
+      "confidence": 85,
+      "title": "Window teardown never registers a pending stop, so the dsh child process leaks until app quit",
+      "description": "DshPane::detach now calls mark_stop_pending() only for DetachType::Closed, but closing a window only ever produces HiddenForClose: Workspace::on_window_closed (app/src/workspace/view.rs:22783-22788) calls pane_group.detach_panes(), which detaches every pane with DetachType::HiddenForClose (app/src/pane_group/mod.rs:5821). Nothing later emits Closed for that window, because ClosedItem::Window::discard is a no-op once the window is gone (window_workspace() -> None, app/src/undo_close/stack.rs:76 and :419) and clean_up_pane_group early-returns on !ctx.is_window_open (app/src/undo_close/stack.rs:135-140). mark_stop_pending is therefore never called, and the only remaining stop is the app-exit fallback on_will_terminate (app/src/lib.rs:1899-1902). Impact: a local Node agent service able to execute shell commands keeps running, bound to a port, holding a valid access token, while invisible in the UI; it also contradicts the close-confirmation dialog (app/src/quit_warning/mod.rs:206-209). This is a regression - before the change HiddenForClose called request_stop(), and commit c2efed09d ('fix: 关闭 tab 后 dsh 进程残留(HiddenForClose 未触发停止)') fixed this same class of leak. Trigger: dsh pane as the only tab + Cmd+W -> ctx.close_window(); the app stays alive on macOS. Suggested fix: also register the pending stop for HiddenForClose in DshPane::detach (if matches!(detach_type, DetachType::Closed | DetachType::HiddenForClose) { runtime.mark_stop_pending() }). Because the decision is deferred to the per-frame poll_pending_stop(has_dsh_pane), this does not reintroduce the original bug: a closed tab keeps its pane in the current window's pane_contents so any_dsh_pane still reports true and the pending stop is cancelled (process preserved), whereas a closed window is gone from window_ids() so the child is actually stopped. Optionally add a matching fallback next to BrowserWebViewManager::cleanup_window in on_window_will_close (app/src/lib.rs:2137-2147)."
+    }
+  ]
+}
