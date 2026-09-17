@@ -583,6 +583,13 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
 /// AppKit 菜单。V/X/A 发送 paste:/cut:/selectAll: 给 first responder;
 /// C 用 evaluateJavaScript 读页面选中文本写系统 NSPasteboard。避免 wry
 /// child webview 的 performKeyEquivalent 返回 NO 后编辑命令被丢弃的问题。
+///
+/// 功能键区(0xF700-0xF8FF,含 Cmd+功能键组合)不进 keyDownImpl,原样交回
+/// [super performKeyEquivalent:] 走普通 AppKit 路径——注意即使经过 4cdb5a8d5
+/// 的二次分发路径,0xF70x 也会被 WebKit 编辑兜底路径当文本插入(U+FFFC/U+001D,
+/// 三种投递方式均验证复现),故有意的取舍:keyDownImpl 只放行数字等功能键区
+/// 之外的 Command 组合键(Cmd+1~9 等用户绑定),Cmd+方向键/Home/F1 等绑定在
+/// webview 页面暂不支持。
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
     if ([event type] == NSEventTypeKeyDown) {
         // Skip the key-equivalent priority path while the IME has marked text. Arrow keys carry
@@ -652,7 +659,22 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
             // 中文输入再次被打断。
             BOOL composing = [firstResponder respondsToSelector:@selector(hasMarkedText)]
                 && [(id<NSTextInputClient>)firstResponder hasMarkedText];
-            if (!composing) {
+            // 功能键区(0xF700-0xF8FF:方向键、Home/End/F1-F12 等)不进 keyDownImpl,
+            // 原样交回 [super performKeyEquivalent:](与 4cdb5a8d5 之前的原始
+            // 路径一致,实测无 U+FFFC):该 commit 给功能键增补的 keyDownImpl
+            // 调用会让同一事件先过终端 Rust 分发再落 WebKit,页面输入框出现
+            // U+FFFC(对象替换字符)。
+            NSString *fnChars = [event charactersIgnoringModifiers];
+            if (fnChars != nil && [fnChars length] > 0) {
+                unichar fnChar = [fnChars characterAtIndex:0];
+                if (fnChar >= 0xF700 && fnChar <= 0xF8FF) {
+                    return [super performKeyEquivalent:event];
+                }
+            }
+            // 只放行 Command 组合键继续走 keyDownImpl 分发(Cmd+1~9 等用户绑定);
+            // 不含 Command 的键(字母/Enter/功能键等)不允许被 webview 支路拦截,
+            // 维持 super 原路径,避免破坏页面内正常文本输入。
+            if (!composing && (mods & NSEventModifierFlagCommand) != 0) {
                 NSApplication *application = [NSApplication sharedApplication];
                 BOOL keystrokeIsAssigned =
                     warp_app_has_binding_for_keystroke(application, event);

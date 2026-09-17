@@ -165,6 +165,27 @@ document.addEventListener('focusin', () => {
     window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-focusin');
   }
 });
+// 方向键修字符插入:DSH 输入框是 contenteditable div(DIV.uV2eYG_input,
+// contenteditable 由容器继承)。实测按方向键会经 WebKit 编辑兜底路径向光标
+// 处插入 U+001D(Group Separator,渲染为方块、复制后不可见),且不触发
+// beforeinput/input;与输入法无关,普通浏览器无此问题(Chromium 不走该
+// 兜底)。此处对 contenteditable 内的方向键 preventDefault 并用
+// Selection.modify()(WebKit 扩展 API)移动光标,完全绕开 WebKit 的字符插入路径。
+document.addEventListener('keydown', function(e) {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  if (e.isComposing) return;
+  if (e.defaultPrevented) return;
+  // 修饰键组合(Cmd+← 行首/尾、Option+← 词跳、Shift+← 扩选)交回原生路径:
+  // 兜底插入只在无修饰的裸方向键上出现,且单字符 move 会丢失词跳/扩选语义。
+  if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+  var ae = document.activeElement;
+  if (!ae || ae.tagName !== 'DIV' || !ae.isContentEditable) return;
+  e.preventDefault();
+  var sel = window.getSelection();
+  if (sel && sel.anchorNode) {
+    sel.modify('move', e.key === 'ArrowRight' ? 'forward' : 'backward', 'character');
+  }
+}, true);
 // 点击页面任意位置上报 Rust,让 WKWebView 同步成为 first responder。
 document.addEventListener('mousedown', () => {
   window.focus();
