@@ -283,6 +283,10 @@ window.__restoreFocused = function() {
             // 注意:页面自身背景仍需透明(如 body { background: transparent }),否则仍是白底。
             .with_transparent(true)
             .with_incognito(incognito)
+            // 启用右键菜单"检查元素"(WebKit Web Inspector)。wry 默认值
+            // debug=true/release=false,这里显式打开;release 下还需
+            // wry 的 "devtools" feature 才会编译启用路径(见 app/Cargo.toml)。
+            .with_devtools(true)
             .with_initialization_script_for_main_only(init_js, false)
             .with_on_page_load_handler(move |event, _url| {
                 if matches!(event, wry::PageLoadEvent::Finished) {

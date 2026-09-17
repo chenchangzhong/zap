@@ -243,7 +243,9 @@ zap_sync = { path = "../crates/zap_sync" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # 嵌入式 WebView(WKWebView),用于 Web preview pane。仅 macOS 编译。
-wry = "0.56.1"
+# devtools feature:release 构建也启用"检查元素"(debug 构建默认已启用)。
+# 注意:macOS 上 wry 依赖私有 API(developerExtrasEnabled)实现,见 wry 文档。
+wry = { version = "0.56.1", features = ["devtools"] }
 block.workspace = true
 cocoa.workspace = true
 core-foundation.workspace = true
