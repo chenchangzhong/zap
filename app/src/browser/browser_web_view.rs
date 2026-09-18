@@ -162,6 +162,10 @@ document.addEventListener('keydown', (e) => {
 });
 document.addEventListener('focusin', () => {
   if (document.activeElement && document.activeElement !== document.body) {
+    // 页面已持有文档焦点时不再上报:此时上报只会触发重复的 makeFirstResponder,
+    // 而 WebKit 在该过程中会把当前聚焦元素 blur 到 body(relatedTarget=null),
+    // 模型菜单等弹层 onBlur 即被关闭,点击落空(表现为切换模型失败)。
+    if (document.hasFocus()) return;
     window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-focusin');
   }
 });
@@ -187,7 +191,11 @@ document.addEventListener('keydown', function(e) {
   }
 }, true);
 // 点击页面任意位置上报 Rust,让 WKWebView 同步成为 first responder。
+// 仅在页面尚未持有文档焦点时上报(首次从 Warp 侧点进页面);页面已持焦时
+// 重复的 makeFirstResponder 会让 WebKit 把当前聚焦元素 blur 到 body
+// (relatedTarget=null),弹层 onBlur 即关、点击落空。
 document.addEventListener('mousedown', () => {
+  if (document.hasFocus()) return;
   window.focus();
   window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-mousedown');
 });
@@ -265,6 +273,16 @@ window.__restoreFocused = function() {
   };
   tryFocus();
 };
+// WebKit 兼容:菜单内 mousedown 的默认动作会把当前聚焦元素 blur 到 body
+// (relatedTarget=null;Chromium 同场景是把焦点移入被点的按钮,故浏览器无此
+// 问题)。官方模型菜单的 onBlur 见到焦点落到 body 即收起菜单,导致「焦点已
+// 在菜单项上」的第二次点击必然先触发 focusout → 菜单卸载 → click 落空
+// (表现为切换模型失败)。对菜单内 mousedown preventDefault 阻止该默认
+// blur;click 照常派发,菜单项选择不受影响。
+document.addEventListener('mousedown', function (e) {
+  if (!e.target || !e.target.closest || !e.target.closest('[role="menu"]')) return;
+  e.preventDefault();
+}, true);
 "#;
         let current_url = std::sync::Arc::new(parking_lot::Mutex::new(Some(url.to_string())));
         let handler_url = current_url.clone();
@@ -341,6 +359,11 @@ window.__restoreFocused = function() {
                 ) {
                     log::debug!("[browser] ipc -> PENDING_WEBVIEW_FOCUS_EVENTS id={}", ipc_id);
                     PENDING_WEBVIEW_FOCUS_EVENTS.lock().insert(ipc_id);
+                    // 立即请求重绘,让 PENDING 事件在本帧被 drain:否则事件要等
+                    // 下一次自然重绘(实测可延迟 1-2s),延迟执行的焦点恢复会落在
+                    // 用户后续交互中间(如刚打开的弹层被抢焦关闭)。
+                    #[cfg(target_os = "macos")]
+                    warpui::platform::mac::Window::request_redraw_all_windows();
                     let ptr = *holder.lock();
                     if !ptr.is_null() {
                         let _ = unsafe { (*ptr).focus() };
@@ -534,13 +557,24 @@ window.__restoreFocused = function() {
     }
 
     /// 让 webview 成为窗口的 first responder(键盘输入进页面)。
-    /// pane 获得焦点/attach 时调用,确保默认焦点在 webview。
+    /// 仅做 AppKit 层抢占,不改页面内 DOM 焦点:页面内每次 focusin/mousedown
+    /// 都会经 IPC 走到这里,若在此恢复输入框焦点,会把用户正开着的模型菜单等
+    /// 弹层的焦点抢走(菜单 onBlur 即关,点击落空,表现为切换失败)。
     pub fn focus_webview(&self, id: u64) {
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             let _ = entry.webview.focus();
-            // 恢复之前被 setInterval blur 的页面输入框焦点(WKWebView 失焦再
-            // 聚焦不会自动恢复页面 activeElement)。
+        }
+    }
+
+    /// [`Self::focus_webview`] + 恢复页面输入框焦点(WKWebView 失焦再聚焦
+    /// 不会自动恢复页面 activeElement,`__restoreFocused` 按约定把光标折叠
+    /// 到内容末尾)。只在可见性/焦点转变时机调用(attach、pane 获得焦点、
+    /// 页面加载完成),不用于页面内的点击路径。
+    pub fn focus_webview_restoring_input(&self, id: u64) {
+        #[cfg(target_os = "macos")]
+        if let Some(entry) = self.webviews.borrow().get(&id) {
+            let _ = entry.webview.focus();
             let _ = entry
                 .webview
                 .evaluate_script("window.__restoreFocused && window.__restoreFocused();");
@@ -581,13 +615,13 @@ window.__restoreFocused = function() {
                     el.focus();
                     document.execCommand('insertText', false, text);
                 }}
-                // 光标由此处决定;随后的 focus_webview → __restoreFocused 统一
-                // 折叠到内容末尾,与「追加到末尾」的插入场景一致。
+                // 光标由此处决定;随后的 focus_webview_restoring_input →
+                // __restoreFocused 统一折叠到内容末尾,与「追加到末尾」的插入场景一致。
             }})()
             "#
         );
         self.evaluate_script_on(id, &js);
-        self.focus_webview(id);
+        self.focus_webview_restoring_input(id);
     }
 
     /// 在指定 webview 中执行 JavaScript。

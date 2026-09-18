@@ -285,9 +285,11 @@ impl BrowserPaneView {
 
     /// Pane 挂载完成后的收尾:默认焦点在 webview,把 AppKit first responder
     /// 切到 webview,键盘输入进页面(地址栏无光标)。pane 的 Warp 焦点由
-    /// `focus_contents` 触发(on_focus 不再转移到地址栏)。
+    /// `focus_contents` 触发(on_focus 不再转移到地址栏)。挂载属于可见性
+    /// 转变,同时恢复页面输入框焦点。
     fn focus_webview(&self, ctx: &mut ViewContext<Self>) {
-        BrowserWebViewManager::as_ref(ctx).focus_webview(self.model.platform_view_id);
+        BrowserWebViewManager::as_ref(ctx)
+            .focus_webview_restoring_input(self.model.platform_view_id);
     }
 
     /// 让地址栏显示 `url`(创建时与每次导航后调用)。
@@ -374,7 +376,11 @@ impl View for BrowserPaneView {
         // focusin 释放地址栏后)时,把 AppKit first responder 切到 webview,
         // 键盘输入进页面。
         if focus_ctx.is_self_focused() {
-            BrowserWebViewManager::as_ref(ctx).focus_webview(self.model.platform_view_id);
+            // pane 获得焦点属于可见性/焦点转变,除 AppKit first responder 外
+            // 同时恢复页面输入框焦点;页面内的点击路径(handle_webview_event)
+            // 不能走这里,否则弹层(如模型菜单)的焦点会被抢走。
+            BrowserWebViewManager::as_ref(ctx)
+                .focus_webview_restoring_input(self.model.platform_view_id);
         } else {
             // pane 的子视图(地址栏)获得焦点时,blur 掉 webview 页面内的活跃
             // 元素(如文本输入框),避免两个光标共存。地址栏自己的 callback 也

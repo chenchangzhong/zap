@@ -7472,7 +7472,7 @@ impl Workspace {
         );
 
         BrowserWebViewManager::as_ref(ctx).evaluate_script_on(webview_id, &js);
-        BrowserWebViewManager::as_ref(ctx).focus_webview(webview_id);
+        BrowserWebViewManager::as_ref(ctx).focus_webview_restoring_input(webview_id);
     }
 
     fn cd_to_directory(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {

@@ -298,7 +298,7 @@ impl DshPaneView {
                 match event {
                     BrowserWebViewEvent::UrlChanged(id) if *id == webview_id => {
                         view.webview_loaded = true;
-                        // 加载完成且本 pane 仍持焦点时补一次 focus_webview:
+                        // 加载完成且本 pane 仍持焦点时补一次 focus_webview_restoring_input:
                         // on_focus 只在焦点转移时触发,set_ready(without_focus)
                         // 期间焦点未转移、on_focus 不会再次触发,若不补,用户
                         // 加载完成后直接打字会进 Warp 而非页面。焦点已离开本
@@ -306,7 +306,8 @@ impl DshPaneView {
                         // 判据含子视图:pane 内容的焦点由 focus_contents 下传给
                         // BrowserPaneView,严格 is_self_focused 会漏判。
                         if ctx.is_self_or_child_focused() {
-                            BrowserWebViewManager::as_ref(ctx).focus_webview(webview_id);
+                            BrowserWebViewManager::as_ref(ctx)
+                                .focus_webview_restoring_input(webview_id);
                         }
                         // 页面(重)加载完成:清除崩溃态。wry 的导航委托恒实现
                         // webViewWebContentProcessDidTerminate,WebKit 视为
