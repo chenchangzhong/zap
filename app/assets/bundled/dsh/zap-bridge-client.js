@@ -28,15 +28,13 @@
 // "当前主会话"改由 `SessionSummary.retainedBy.mainView` 标记。故先读 `current`
 // (≤0.1.6-alpha.1),未命中再按 `retainedBy.mainView > 0` 找主会话。
 //
-// 终态判定:基于 `sessions` 服务快照(0.1.5-alpha.2 与 0.1.6-alpha.2 实测均由
-// dsh-api-session-controller 经 `ctx.reflect.provide("sessions")` 注册)。
-// 快照形状:`{ ids, byId: { [sessionId]: SessionEntry }, phase, ... }`(≤0.1.6-alpha.1
-// 另带 `current`/`currentAddress`)。SessionEntry 实测含 `running`, `title`, `cwd`,
-// `blank`, `retainedBy` 等;`completed` 仅 ≤0.1.6-alpha.1 存在,`pendingInteraction`
-// 三个版本的 SessionSummary 上都没有(详见 checkNotify 的注记)。
-// 终态映射:`pendingInteraction` -> confirm(需确认), `completed` 或
-// `running:true -> false` 边沿 -> complete。无专用 `notifications` 服务时以
-// `sessions` 状态变迁代理,符合 cordis `inject + ctx.effect` 模型。
+// 终态判定:会话 UI 状态(`running` / `pendingInteraction` / `completionUnread`)取自公开的
+// `uiSession.sessionStatus`(0.1.6-alpha.2+;旧版两个版本回退公开的
+// `uiSession.pendingInteractions` 与 sessions 快照字段),`sessions` 快照另提供
+// `title`/`cwd`/`current`/`retainedBy` 等(见 checkNotify 的注记)。
+// 终态映射:`pendingInteraction` -> confirm(需确认);complete 由 `running:true -> false`
+// 边沿触发(`completionUnread` 仅在观测不到 running 时兜底,旧版则为 `completed`)。
+// 无专用 `notifications` 服务时以会话状态变迁代理,符合 cordis `inject + ctx.effect` 模型。
 window.__ModuleLoader__.load({
 	id: "@zap/zap-bridge-client",
 	factory: (require) => {
@@ -82,10 +80,17 @@ window.__ModuleLoader__.load({
 		/// 供上报的 sessions/workspaces 引用(apply 时赋值)。
 		let sessionsRef = undefined;
 		let workspacesRef = undefined;
+		/// apply 期保存的插件上下文:供只在运行期才需要解析的服务(uiSession)
+		/// 惰性查找,避免 apply 期的装载顺序依赖。
+		let bridgeCtx = undefined;
 		/// 上一次 running 状态(检测 running:true -> false 边沿)。
 		let prevRunning = new Map();
 		/// 上一次 completed 状态(检测 completed:false -> true 边沿;undefined=未观察)。
 		let lastCompleted = new Map();
+		/// 上一次「后台完成未读」状态(0.1.6-alpha.2+,检测 false -> true 边沿)。
+		let lastUnread = new Map();
+		/// uiSession 状态订阅的注销函数(惰性建立,见 ensureStatusSubscription)。
+		let statusUnsub = undefined;
 		/// confirm 去重:同一会话同一文案仅提示一次。
 		let lastNotifiedKeys = new Map();
 
@@ -194,74 +199,161 @@ window.__ModuleLoader__.load({
 			return parts[parts.length - 1] || undefined;
 		}
 
-		function pendingText(v) {
-			if (typeof v === 'string') return v.slice(0, 500);
-			try {
-				const s = JSON.stringify(v);
-				return s ? s.slice(0, 500) : String(v).slice(0, 500);
-			} catch {
-				return String(v).slice(0, 500);
+		/// 把待确认交互渲染成可读文案。
+		///
+		/// `SessionPendingInteraction` 是各 domain 自有形状的联合(approval 带
+		/// toolName、question 带 question 文本……),插件不硬编码具体 domain,只按
+		/// 常见字段兜底;直接 stringify 整个对象会让人看不懂通知正文。
+		function confirmText(interaction) {
+			if (typeof interaction === 'string') return interaction.slice(0, 500);
+			if (!interaction || typeof interaction !== 'object') return String(interaction).slice(0, 500);
+			// question 域的提问原文在 questions[0].question(PendingQuestion 契约),
+			// 该域的交互对象本身不含 reason/prompt 这类字段。
+			const firstQuestion = Array.isArray(interaction.questions) && interaction.questions[0];
+			const readable = interaction.question || interaction.prompt || interaction.message || interaction.reason
+				|| (firstQuestion && (firstQuestion.question || firstQuestion.title));
+			if (typeof readable === 'string' && readable) return readable.slice(0, 500);
+			const kind = typeof interaction.kind === 'string' ? interaction.kind : 'interaction';
+			const tool = typeof interaction.toolName === 'string' ? interaction.toolName : undefined;
+			return tool ? `需要确认：${kind} · ${tool}` : `需要确认：${kind}`;
+		}
+
+		/// confirm 去重键:优先用 domain 提供的稳定 key,缺失时退回文案本身。
+		function confirmKey(interaction) {
+			if (interaction && typeof interaction === 'object' && typeof interaction.key === 'string') {
+				return interaction.key;
+			}
+			return confirmText(interaction);
+		}
+
+		/// `uiSession.sessionStatus`(公开 readonly 的 HostObservable)。
+		///
+		/// 它是「running / pendingInteraction / completionUnread」三种会话事实的
+		/// 唯一来源:0.1.6-alpha.2 起 SessionSummary 上既没有 completed 也没有
+		/// pendingInteraction。更早的版本没有该字段(0.1.5-alpha.2 与
+		/// 0.1.6-alpha.1 均无)→ 返回 undefined,调用方走下面的旧版回退。
+		function sessionStatusSource() {
+			const uiSession = bridgeCtx && bridgeCtx.get("uiSession");
+			return uiSession && uiSession.sessionStatus;
+		}
+
+		/// 当前会话 UI 状态快照:`Map<SessionId, {running, pendingInteraction,
+		/// completionUnread}>`;来源不可用时返回 undefined。
+		function sessionStatusSnapshot() {
+			const src = sessionStatusSource();
+			const map = src && typeof src.getSnapshot === "function" ? src.getSnapshot() : undefined;
+			return map && typeof map.get === "function" ? map : undefined;
+		}
+
+		/// 旧版回退(两个 0.1.6 之前的版本):UiSession 没有 sessionStatus,但有公开的
+		/// `pendingInteractions`(ReadonlyMap<SessionId, SessionPendingInteraction>)。
+		/// 只在 sessionStatus 不可用时查询,新版零开销。
+		function legacyPendingInteractionMap() {
+			const uiSession = bridgeCtx && bridgeCtx.get("uiSession");
+			const src = uiSession && uiSession.pendingInteractions;
+			const map = src && typeof src.getSnapshot === "function" ? src.getSnapshot() : undefined;
+			return map && typeof map.get === "function" ? map : undefined;
+		}
+
+		/// 惰性建立 uiSession 状态订阅。
+		///
+		/// 「需确认」的发布只走 uiSession 的 status notifier(approval/request →
+		/// registerPendingInteraction → publishStatus),**不会**把 sessions list
+		/// 弄脏——只订阅 list 会整个漏掉它。服务尚未就绪时不建立,留到下次调用重试,
+		/// 从而不依赖 apply 期的装载顺序。
+		function ensureStatusSubscription() {
+			if (statusUnsub) return;
+			const uiSession = bridgeCtx && bridgeCtx.get("uiSession");
+			const src = uiSession && (uiSession.sessionStatus || uiSession.pendingInteractions);
+			if (src && typeof src.subscribe === "function") {
+				statusUnsub = src.subscribe(checkNotify);
 			}
 		}
 
 		/// 检测会话终态并上报。
-		/// confirm:同一会话同一文案仅发一次(lastNotifiedKeys)。
+		/// confirm:同一会话的同一待确认请求只发一次(按 domain 的 key 去重)。
 		/// complete:按 turn 触发——running true→false 边沿、completed false→true
 		/// 边沿、或首次观察到已完成(兜底补发,每会话一次)。旧逻辑按
 		/// sessionId+status 去重,同一会话第二次完成任务会被永久吞掉,已废弃。
 		///
-		/// 注(遗留缺口,非本批引入):上述三条 complete 判定里当前只有 running 边沿
-		/// 真正有效——`entry.completed` 在 0.1.6-alpha.2 已从 SessionSummary 移除
-		/// (只有 ≤0.1.6-alpha.1 才有),`entry.pendingInteraction` 三个版本的
-		/// SessionSummary 上都没有(它在 ui-session 的 per-session status 里)。故
-		/// confirm 与"补发"分支实际从不触发,修正需改用 dsh 的 completionUnread/
-		/// pending 状态,属独立改造。
+		/// 状态来源:`running` 优先取 uiSession.sessionStatus,回退快照字段;
+		/// `pendingInteraction` 只有新版 uiSession.sessionStatus 上有(旧版两个
+		/// 版本走公开的 uiSession.pendingInteractions),三个版本的 SessionSummary
+		/// 都没有它;`completed` 只有旧版快照才有;`completionUnread` 是 dsh 对
+		/// 「非主视图会话停止运行、尚待确认」的官方标记,仅在观测不到 running
+		/// 边沿时兜底(例如页面刚加载时就已完成)。
 		function checkNotify() {
 			if (!sessionsRef) return;
 			const snap = sessionsRef.list.getSnapshot();
 			if (snap.phase !== "ready") return;
+			// 「需确认」只改 uiSession 状态、不脏 sessions list,故每次调用都补试
+			// 建立订阅(服务未就绪时上轮可能没建成)。
+			ensureStatusSubscription();
 			const byId = snap.byId || {};
-			for (const sid of Object.keys(byId)) {
-				const entry = byId[sid];
-				if (!entry) continue;
+			const statusMap = sessionStatusSnapshot();
+			// 旧版(两个 0.1.6 之前的版本)没有 sessionStatus,用公开的
+			// pendingInteractions 补「需确认」;running/completed 仍取快照字段。
+			const legacyPending = statusMap ? undefined : legacyPendingInteractionMap();
+			// uiSession 的覆盖面更广(含已不在列表里的运行中会话),取并集。
+			const ids = new Set(Object.keys(byId));
+			if (statusMap) for (const id of statusMap.keys()) ids.add(id);
+			for (const sid of ids) {
+				const entry = byId[sid] || {};
+				const st = (statusMap && statusMap.get(sid)) || {};
+				const running = st.running !== undefined ? st.running : entry.running;
+				let pendingInteraction = st.pendingInteraction;
+				if (pendingInteraction === undefined && legacyPending) pendingInteraction = legacyPending.get(sid);
+				if (pendingInteraction === undefined) pendingInteraction = entry.pendingInteraction;
+				const completionUnread = st.completionUnread === true;
+				const completed = !!entry.completed;
 				if (entry.blank) {
-					prevRunning.set(sid, entry.running);
-					lastCompleted.set(sid, !!entry.completed);
+					prevRunning.set(sid, running);
+					lastCompleted.set(sid, completed);
+					lastUnread.set(sid, completionUnread);
 					continue;
 				}
 				const prevRun = prevRunning.get(sid);
 				const prevDone = lastCompleted.get(sid);
-				prevRunning.set(sid, entry.running);
-				lastCompleted.set(sid, !!entry.completed);
+				const prevUnread = lastUnread.get(sid);
+				prevRunning.set(sid, running);
+				lastCompleted.set(sid, completed);
+				lastUnread.set(sid, completionUnread);
 
-				if (entry.pendingInteraction) {
-					const bodyText = pendingText(entry.pendingInteraction);
-					const key = sid + ":confirm:" + bodyText;
+				if (pendingInteraction) {
+					const key = sid + ":confirm:" + confirmKey(pendingInteraction);
 					if (lastNotifiedKeys.get(sid) === key) continue;
 					lastNotifiedKeys.set(sid, key);
 					const title = entry.title || cwdBasename(entry.cwd) || "DSH task";
-					reportNotify(title, bodyText, "confirm", sid);
+					reportNotify(title, confirmText(pendingInteraction), "confirm", sid);
 					continue;
 				}
 
-				const runningEdge = prevRun === true && entry.running === false;
-				const completedEdge = !!entry.completed && prevDone === false;
-				const catchUp = !!entry.completed && prevDone === undefined;
-				if (runningEdge || completedEdge || catchUp) {
+				const runningEdge = prevRun === true && running === false;
+				const completedEdge = completed && prevDone === false;
+				const catchUp = completed && prevDone === undefined;
+				// 从未观察到该会话 running 状态时(如页面刚加载就已完成)没有
+				// running 边沿可用,用 dsh 的「后台完成未读」标记兜底;已观察到的
+				// 会话一律走 runningEdge,否则同一次停止会被两条判定各报一次。
+				const unreadEdge = prevRun === undefined && completionUnread && prevUnread !== true;
+				if (runningEdge || completedEdge || catchUp || unreadEdge) {
 					const title = entry.title || cwdBasename(entry.cwd) || "DSH task";
 					const bodyText = entry.title ? "" : (entry.cwd || "");
 					reportNotify(title, bodyText, "complete", sid);
 				}
 			}
+			// 仍在 uiSession 状态里的会话不能清:清了下一轮 prev* 又是 undefined,
+			// 同一次待确认/未读会被反复重报(statusMap-only 的会话就是这种情形)。
+			const stillTracked = (sid) => !!byId[sid] || !!(statusMap && statusMap.has(sid));
 			for (const sid of [...prevRunning.keys()]) {
-				if (!byId[sid]) {
+				if (!stillTracked(sid)) {
 					prevRunning.delete(sid);
 					lastCompleted.delete(sid);
+					lastUnread.delete(sid);
 					lastNotifiedKeys.delete(sid);
 				}
 			}
 			for (const sid of [...lastNotifiedKeys.keys()]) {
-				if (!byId[sid]) lastNotifiedKeys.delete(sid);
+				if (!stillTracked(sid)) lastNotifiedKeys.delete(sid);
 			}
 		}
 
@@ -527,6 +619,7 @@ window.__ModuleLoader__.load({
 			}
 			sessionsRef = sessions;
 			workspacesRef = workspaces;
+			bridgeCtx = ctx;
 			// 「附加为上下文」末端:暴露结构化 @ 引用芯片插入,供 Rust 侧 evaluate_script 调用。
 			installFileReferenceInjection(ctx, sessions);
 			// 会话切换末端:Rust 侧通知点击经 evaluate_script 调用。
@@ -555,6 +648,9 @@ window.__ModuleLoader__.load({
 			const unsubWorkspaces = workspaces.list.subscribe(reportCurrentPath);
 			const unsubFileExplorer = workspaces.list.subscribe(scheduleSyncFileExplorerButtons);
 			const unsubNotify = sessions.list.subscribe(checkNotify);
+			// 「需确认」不脏 sessions list,另订阅 uiSession 的状态源;服务此刻若
+			// 未就绪,由 checkNotify 内的 ensureStatusSubscription 补建。
+			ensureStatusSubscription();
 			reportCurrentPath();
 			checkNotify();
 			scheduleSyncFileExplorerButtons();
@@ -565,6 +661,10 @@ window.__ModuleLoader__.load({
 				return () => {
 					unsubSessions();
 					unsubWorkspaces();
+					if (statusUnsub) {
+						statusUnsub();
+						statusUnsub = undefined;
+					}
 					unsubFileExplorer();
 					unsubNotify();
 					if (pendingSyncRaf) cancelAnimationFrame(pendingSyncRaf);
