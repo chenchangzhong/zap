@@ -449,7 +449,7 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process;
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Mutex};
 use std::{cmp::Ordering, sync::Arc};
 use warp_core::ui::color::blend::Blend;
 use warp_core::ui::theme::{color::internal_colors, phenomenon::PhenomenonStyle, Fill};
@@ -606,35 +606,6 @@ const MOBILE_OVERLAY_SCRIM_ALPHA: u8 = 128;
 /// 悬浮工具面板的宽度下限。停靠态由 `MIN_SIDEBAR_WIDTH`(250) 兜底,但这个宽度盖在
 /// 内容之上时显得偏窄,浮层单独抬高一些;用户仍可向右拖拽加宽。
 const FLOATING_LEFT_PANEL_MIN_WIDTH: f32 = 320.;
-
-/// 悬浮工具面板正处于打开状态的窗口。
-///
-/// 面板是模态浮层,"Esc 收起面板"必须优先于任何获得焦点的编辑器自身的 `escape` 绑定
-/// (终端输入框、agent 输入框、面板内搜索框……)。而键绑定匹配是**焦点优先**的,外层绑定
-/// 压不过焦点层的绑定,所以只能反过来让这些编辑器主动让位:`EditorView::keymap_context`
-/// 会读这里,给 `escape` 绑定补上一个否定的上下文标识。
-fn floating_tool_panel_windows() -> &'static Mutex<HashSet<WindowId>> {
-    static WINDOWS: OnceLock<Mutex<HashSet<WindowId>>> = OnceLock::new();
-    WINDOWS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn set_floating_tool_panel_open(window_id: WindowId, open: bool) {
-    if let Ok(mut windows) = floating_tool_panel_windows().lock() {
-        if open {
-            windows.insert(window_id);
-        } else {
-            windows.remove(&window_id);
-        }
-    }
-}
-
-/// 该窗口的悬浮工具面板当前是否显示。
-pub(crate) fn is_floating_tool_panel_open(window_id: WindowId) -> bool {
-    floating_tool_panel_windows()
-        .lock()
-        .map(|windows| windows.contains(&window_id))
-        .unwrap_or(false)
-}
 
 pub const NEW_TAB_BUTTON_POSITION_ID: &str = "new_tab_button";
 pub const NEW_SESSION_MENU_BUTTON_POSITION_ID: &str = "new_session_menu_button";
@@ -21757,14 +21728,6 @@ impl View for Workspace {
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
-
-        // 让本窗口里所有编辑器的 `escape` 绑定为悬浮面板让位(原因见
-        // `floating_tool_panel_windows` 的说明)。
-        set_floating_tool_panel_open(
-            self.window_id,
-            Self::tool_panel_floats(app)
-                && self.active_tab_pane_group().as_ref(app).left_panel_open,
-        );
 
         let tab_bar_mode = self.tab_bar_mode(app);
 

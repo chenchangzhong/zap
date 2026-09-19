@@ -8822,12 +8822,10 @@ impl View for EditorView {
     fn keymap_context(&self, ctx: &AppContext) -> warpui::keymap::Context {
         let mut context = Self::default_keymap_context();
 
-        // 宿主要求让位时,escape 绑定不匹配(引用点见本文件 `init` 里的 escape 绑定):
-        // 要么是创建时显式指定的 `escape_yields_to_host`,要么是该窗口正显示悬浮工具面板
-        // —— 面板是模态浮层,Esc 应当优先用于收起它。
-        if self.escape_yields_to_host
-            || crate::workspace::view::is_floating_tool_panel_open(self.window_id)
-        {
+        // 宿主显式要求让位时,escape 绑定不匹配(引用点见本文件 `init` 里的 escape 绑定)。
+        // 例如悬浮工具面板里的搜索框:面板要靠 Esc 收起,而键绑定匹配是焦点优先的,
+        // 编辑器不退让就会先消费掉这个按键。
+        if self.escape_yields_to_host {
             context.set.insert("EditorView_EscapeYieldsToHost");
         }
 
