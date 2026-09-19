@@ -64,6 +64,7 @@ use super::{
     DriveObjectType, DriveSortOrder, ObjectTypeAndId,
 };
 use crate::drive::panel::DrivePanelAction;
+use crate::window_settings::WindowSettings;
 use futures::Future;
 use itertools::Itertools;
 use pathfinder_color::ColorU;
@@ -830,6 +831,8 @@ impl DriveIndex {
             let options = SingleLineEditorOptions {
                 propagate_and_no_op_vertical_navigation_keys:
                     crate::editor::PropagateAndNoOpNavigationKeys::Always,
+                // 悬浮工具面板下把 Esc 让给宿主,由面板的键盘捕获层收起面板。
+                escape_yields_to_host: *WindowSettings::as_ref(ctx).tool_panel_floating,
                 ..Default::default()
             };
             let mut editor = EditorView::single_line(options, ctx);

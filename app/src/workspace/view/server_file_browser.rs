@@ -50,6 +50,7 @@ use crate::menu::{
 use crate::remote_server::manager::RemoteServerManager;
 use crate::terminal::model::session::{ExecuteCommandOptions, Session};
 use crate::ui_components::icons::Icon;
+use crate::window_settings::WindowSettings;
 
 const ITEM_FONT_SIZE: f32 = 14.0;
 const TOOLBAR_BUTTON_SIZE: f32 = 26.0;
@@ -287,6 +288,8 @@ impl ServerFileBrowserView {
                     propagate_and_no_op_vertical_navigation_keys:
                         PropagateAndNoOpNavigationKeys::Always,
                     propagate_horizontal_navigation_keys: PropagateHorizontalNavigationKeys::Always,
+                    // 悬浮工具面板下把 Esc 让给宿主,由面板的键盘捕获层收起面板。
+                    escape_yields_to_host: *WindowSettings::as_ref(ctx).tool_panel_floating,
                     ..Default::default()
                 },
                 ctx,
@@ -311,6 +314,8 @@ impl ServerFileBrowserView {
                     propagate_and_no_op_vertical_navigation_keys:
                         PropagateAndNoOpNavigationKeys::Always,
                     propagate_horizontal_navigation_keys: PropagateHorizontalNavigationKeys::Always,
+                    // 悬浮工具面板下把 Esc 让给宿主,由面板的键盘捕获层收起面板。
+                    escape_yields_to_host: *WindowSettings::as_ref(ctx).tool_panel_floating,
                     ..Default::default()
                 },
                 ctx,

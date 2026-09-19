@@ -197,7 +197,7 @@ pub fn init(ctx: &mut AppContext) {
         FixedBinding::new(
             "escape",
             EditorAction::Escape,
-            id!("EditorView") & !id!("IMEOpen"),
+            id!("EditorView") & !id!("IMEOpen") & !id!("EditorView_EscapeYieldsToHost"),
         ),
         FixedBinding::new(
             "backspace",
@@ -1478,6 +1478,9 @@ pub struct EditorOptions {
     pub propagate_and_no_op_vertical_navigation_keys: PropagateAndNoOpNavigationKeys,
     pub propagate_horizontal_navigation_keys: PropagateHorizontalNavigationKeys,
     pub propagate_and_no_op_escape_key: PropagateAndNoOpEscapeKey,
+    /// 为 `true` 时 `escape` 不匹配编辑器的键绑定,继续向外传播 —— 供"Esc 用于收起自身"的
+    /// 宿主使用(例如悬浮工具面板里的搜索框,见 `LeftPanelView`)。
+    pub escape_yields_to_host: bool,
     pub autogrow: bool,
     pub single_line: bool,
     pub use_settings_line_height_ratio: bool,
@@ -1527,6 +1530,7 @@ impl Default for EditorOptions {
             propagate_and_no_op_vertical_navigation_keys: PropagateAndNoOpNavigationKeys::Never,
             propagate_horizontal_navigation_keys: PropagateHorizontalNavigationKeys::Never,
             propagate_and_no_op_escape_key: PropagateAndNoOpEscapeKey::HandleFirst,
+            escape_yields_to_host: false,
             autogrow: false,
             single_line: false,
             use_settings_line_height_ratio: false,
@@ -1562,6 +1566,7 @@ impl From<SingleLineEditorOptions> for EditorOptions {
                 .propagate_and_no_op_vertical_navigation_keys,
             propagate_horizontal_navigation_keys: options.propagate_horizontal_navigation_keys,
             propagate_and_no_op_escape_key: options.propagate_and_no_op_escape_key,
+            escape_yields_to_host: options.escape_yields_to_host,
             autogrow: false,
             single_line: true,
             use_settings_line_height_ratio: options.use_settings_line_height_ratio,
@@ -1599,6 +1604,8 @@ pub struct SingleLineEditorOptions {
     pub propagate_and_no_op_vertical_navigation_keys: PropagateAndNoOpNavigationKeys,
     pub propagate_horizontal_navigation_keys: PropagateHorizontalNavigationKeys,
     pub propagate_and_no_op_escape_key: PropagateAndNoOpEscapeKey,
+    /// 同 `EditorOptions::escape_yields_to_host`。
+    pub escape_yields_to_host: bool,
     pub use_settings_line_height_ratio: bool,
     pub autocomplete_symbols: bool,
     pub soft_wrap: bool,
@@ -1625,6 +1632,7 @@ impl Default for SingleLineEditorOptions {
             propagate_and_no_op_vertical_navigation_keys: PropagateAndNoOpNavigationKeys::Never,
             propagate_horizontal_navigation_keys: PropagateHorizontalNavigationKeys::Never,
             propagate_and_no_op_escape_key: PropagateAndNoOpEscapeKey::HandleFirst,
+            escape_yields_to_host: false,
             use_settings_line_height_ratio: false,
             autocomplete_symbols: false,
             soft_wrap: false,
@@ -1822,6 +1830,7 @@ pub struct EditorView {
     propagate_horizontal_navigation_keys: PropagateHorizontalNavigationKeys,
     /// Sets whether to propagate the escape key action to the parent view.
     propagate_escape_key: PropagateAndNoOpEscapeKey,
+    escape_yields_to_host: bool,
     autogrow: bool,
     /// If true, defers to the user's settings for whether to autocomplete
     /// typed symbols.
@@ -3221,6 +3230,7 @@ impl EditorView {
                 .propagate_and_no_op_vertical_navigation_keys,
             propagate_horizontal_navigation_keys: options.propagate_horizontal_navigation_keys,
             propagate_escape_key: options.propagate_and_no_op_escape_key,
+            escape_yields_to_host: options.escape_yields_to_host,
             autogrow: options.autogrow,
             window_id: ctx.window_id(),
             autocomplete_symbols_allowed: options.autocomplete_symbols,
@@ -8811,6 +8821,15 @@ impl View for EditorView {
 
     fn keymap_context(&self, ctx: &AppContext) -> warpui::keymap::Context {
         let mut context = Self::default_keymap_context();
+
+        // 宿主要求让位时,escape 绑定不匹配(引用点见本文件 `init` 里的 escape 绑定):
+        // 要么是创建时显式指定的 `escape_yields_to_host`,要么是该窗口正显示悬浮工具面板
+        // —— 面板是模态浮层,Esc 应当优先用于收起它。
+        if self.escape_yields_to_host
+            || crate::workspace::view::is_floating_tool_panel_open(self.window_id)
+        {
+            context.set.insert("EditorView_EscapeYieldsToHost");
+        }
 
         if self.single_cursor_at_buffer_end(false /* respect_line_cap */, ctx) {
             context.set.insert("EditorView_SingleCursorBufferEnd");

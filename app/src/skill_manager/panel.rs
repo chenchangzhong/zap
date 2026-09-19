@@ -26,6 +26,7 @@ use crate::editor::{
     PropagateHorizontalNavigationKeys, TextOptions,
 };
 use crate::view_components::dropdown::{Dropdown, DropdownItem};
+use crate::window_settings::WindowSettings;
 
 const PANEL_PADDING: f32 = 8.0;
 const ROW_PADDING_VERTICAL: f32 = 5.0;
@@ -73,6 +74,8 @@ impl SkillManagerPanel {
                 single_line: true,
                 clear_selections_on_blur: true,
                 convert_newline_to_space: true,
+                // 悬浮工具面板下把 Esc 让给宿主,由面板的键盘捕获层收起面板。
+                escape_yields_to_host: *WindowSettings::as_ref(ctx).tool_panel_floating,
                 ..Default::default()
             };
             let mut editor = EditorView::new(options, ctx);

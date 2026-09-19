@@ -53,7 +53,8 @@ use crate::user_config::WarpConfig;
 use crate::util::bindings;
 use crate::window_settings::{
     BackgroundBlurRadius, BackgroundBlurTexture, BackgroundOpacity, LeftPanelVisibilityAcrossTabs,
-    OpenWindowsAtCustomSize, WindowSettings, WindowSettingsChangedEvent, ZoomLevel,
+    OpenWindowsAtCustomSize, ToolPanelFloating, WindowSettings, WindowSettingsChangedEvent,
+    ZoomLevel,
 };
 use crate::workspace::header_toolbar_editor::HeaderToolbarInlineEditor;
 use crate::workspace::tab_settings::{
@@ -486,6 +487,7 @@ pub enum AppearancePageAction {
     ToggleLigatureRendering,
     ToggleBlurTexture,
     ToggleLeftPanelVisibility,
+    ToggleToolPanelFloating,
     SetEnforceMinimumContrast(EnforceMinimumContrast),
     OpenUrl(String),
     ToggleFocusPaneOnHover,
@@ -623,6 +625,7 @@ impl TypedActionView for AppearanceSettingsPageView {
             ToggleDimInactivePanes => self.toggle_dim_inactive_panes(ctx),
             ToggleBlurTexture => self.toggle_blur_texture(ctx),
             ToggleLeftPanelVisibility => self.toggle_left_panel_visibility(ctx),
+            ToggleToolPanelFloating => self.toggle_tool_panel_floating(ctx),
             SetInputMode {
                 new_mode,
                 from_binding,
@@ -1477,6 +1480,13 @@ impl AppearanceSettingsPageView {
             .is_supported_on_current_platform()
         {
             window_settings_widgets.push(Box::new(ToolsPanelStateScopeWidget::default()));
+        }
+
+        if window_settings
+            .tool_panel_floating
+            .is_supported_on_current_platform()
+        {
+            window_settings_widgets.push(Box::new(ToolPanelFloatingWidget::default()));
         }
 
         if !window_settings_widgets.is_empty() {
@@ -2697,6 +2707,15 @@ impl AppearanceSettingsPageView {
         ctx.notify();
     }
 
+    pub fn toggle_tool_panel_floating(&mut self, ctx: &mut ViewContext<Self>) {
+        WindowSettings::handle(ctx).update(ctx, |window_settings, ctx| {
+            report_if_error!(window_settings
+                .tool_panel_floating
+                .toggle_and_save_value(ctx));
+        });
+        ctx.notify();
+    }
+
     pub fn set_input_mode(
         &mut self,
         new_mode: InputMode,
@@ -3896,6 +3915,52 @@ impl SettingsWidget for ToolsPanelStateScopeWidget {
                 .build()
                 .on_click(|evt_ctx, _app, _v2f| {
                     evt_ctx.dispatch_typed_action(AppearancePageAction::ToggleLeftPanelVisibility);
+                })
+                .finish(),
+            None,
+        )
+    }
+}
+
+#[derive(Default)]
+struct ToolPanelFloatingWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for ToolPanelFloatingWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "tools panel floating overlay float above content left panel dock file tree project explorer global search"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let window_settings = WindowSettings::as_ref(app);
+        let is_enabled = *window_settings.tool_panel_floating;
+
+        render_body_item::<AppearancePageAction>(
+            crate::t!("settings-appearance-tools-panel-floating-label"),
+            None,
+            LocalOnlyIconState::for_setting(
+                ToolPanelFloating::storage_key(),
+                ToolPanelFloating::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(is_enabled)
+                .build()
+                .on_click(|evt_ctx, _app, _v2f| {
+                    evt_ctx.dispatch_typed_action(AppearancePageAction::ToggleToolPanelFloating);
                 })
                 .finish(),
             None,

@@ -44,6 +44,7 @@ use crate::editor::{
 use crate::settings::SshSettings;
 use crate::ssh_manager::candidates::{CandidateRow, CandidatesViewModel};
 use crate::ssh_manager::{SshTreeChangedEvent, SshTreeChangedNotifier};
+use crate::window_settings::WindowSettings;
 
 // ---- 视觉常量(参考 Drive) ----
 const TOOLBAR_BUTTON_SIZE: f32 = 26.0;
@@ -733,6 +734,8 @@ impl SshManagerPanel {
                     }),
                     ..Default::default()
                 },
+                // 悬浮工具面板下把 Esc 让给宿主,由面板的键盘捕获层收起面板。
+                escape_yields_to_host: *WindowSettings::as_ref(ctx).tool_panel_floating,
                 ..Default::default()
             };
             let mut editor = EditorView::single_line(options, ctx);

@@ -56,6 +56,7 @@ use crate::util::openable_file_type::{is_file_content_binary, EditorLayout, File
 use crate::util::openable_file_type::{
     resolve_file_target_to_open_in_warp, resolve_file_target_with_editor_choice,
 };
+use crate::window_settings::WindowSettings;
 use crate::{
     appearance::Appearance,
     menu::{Menu, MenuItem, MenuItemFields},
@@ -665,6 +666,8 @@ impl FileTreeView {
                         font_family_override: Some(appearance.ui_font_family()),
                         ..Default::default()
                     },
+                    // 悬浮工具面板下把 Esc 让给宿主,由面板的键盘捕获层收起面板。
+                    escape_yields_to_host: *WindowSettings::as_ref(ctx).tool_panel_floating,
                     ..Default::default()
                 },
                 ctx,

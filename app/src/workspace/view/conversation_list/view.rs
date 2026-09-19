@@ -15,6 +15,7 @@ use crate::view_components::action_button::{
     ActionButton, ButtonSize, DangerPrimaryTheme, NakedTheme, SecondaryTheme,
 };
 use crate::view_components::DismissibleToast;
+use crate::window_settings::WindowSettings;
 use crate::workspace::global_actions::ForkedConversationDestination;
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
 use crate::workspace::tab_settings::TabSettings;
@@ -233,6 +234,8 @@ impl ConversationListView {
                     propagate_and_no_op_vertical_navigation_keys:
                         PropagateAndNoOpNavigationKeys::Always,
                     propagate_horizontal_navigation_keys: PropagateHorizontalNavigationKeys::Always,
+                    // 悬浮工具面板下把 Esc 让给宿主,由面板的键盘捕获层收起面板。
+                    escape_yields_to_host: *WindowSettings::as_ref(ctx).tool_panel_floating,
                     ..Default::default()
                 },
                 ctx,

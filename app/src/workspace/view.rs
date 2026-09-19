@@ -449,7 +449,7 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::{cmp::Ordering, sync::Arc};
 use warp_core::ui::color::blend::Blend;
 use warp_core::ui::theme::{color::internal_colors, phenomenon::PhenomenonStyle, Fill};
@@ -468,8 +468,8 @@ use warpui::{
     },
     elements::{
         Align, Border, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container, CornerRadius,
-        CrossAxisAlignment, Dismiss, Element, Empty, Expanded, Fill as ElementFill, Flex,
-        Highlight, Hoverable, Icon as WarpUiIcon, MainAxisAlignment, MainAxisSize,
+        CrossAxisAlignment, Dismiss, DropShadow, Element, Empty, Expanded, Fill as ElementFill,
+        Flex, Highlight, Hoverable, Icon as WarpUiIcon, MainAxisAlignment, MainAxisSize,
         OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds,
         PositionedElementAnchor, PositionedElementOffsetBounds, Radius, SavePosition, Shrinkable,
         Stack, Text,
@@ -602,6 +602,39 @@ const NOTEBOOK_SMART_SPLIT_RATIO: f32 = 0.42;
 const MOBILE_OVERLAY_PANEL_WIDTH_RATIO: f32 = 0.9;
 #[cfg(target_family = "wasm")]
 const MOBILE_OVERLAY_SCRIM_ALPHA: u8 = 128;
+
+/// 悬浮工具面板的宽度下限。停靠态由 `MIN_SIDEBAR_WIDTH`(250) 兜底,但这个宽度盖在
+/// 内容之上时显得偏窄,浮层单独抬高一些;用户仍可向右拖拽加宽。
+const FLOATING_LEFT_PANEL_MIN_WIDTH: f32 = 320.;
+
+/// 悬浮工具面板正处于打开状态的窗口。
+///
+/// 面板是模态浮层,"Esc 收起面板"必须优先于任何获得焦点的编辑器自身的 `escape` 绑定
+/// (终端输入框、agent 输入框、面板内搜索框……)。而键绑定匹配是**焦点优先**的,外层绑定
+/// 压不过焦点层的绑定,所以只能反过来让这些编辑器主动让位:`EditorView::keymap_context`
+/// 会读这里,给 `escape` 绑定补上一个否定的上下文标识。
+fn floating_tool_panel_windows() -> &'static Mutex<HashSet<WindowId>> {
+    static WINDOWS: OnceLock<Mutex<HashSet<WindowId>>> = OnceLock::new();
+    WINDOWS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn set_floating_tool_panel_open(window_id: WindowId, open: bool) {
+    if let Ok(mut windows) = floating_tool_panel_windows().lock() {
+        if open {
+            windows.insert(window_id);
+        } else {
+            windows.remove(&window_id);
+        }
+    }
+}
+
+/// 该窗口的悬浮工具面板当前是否显示。
+pub(crate) fn is_floating_tool_panel_open(window_id: WindowId) -> bool {
+    floating_tool_panel_windows()
+        .lock()
+        .map(|windows| windows.contains(&window_id))
+        .unwrap_or(false)
+}
 
 pub const NEW_TAB_BUTTON_POSITION_ID: &str = "new_tab_button";
 pub const NEW_SESSION_MENU_BUTTON_POSITION_ID: &str = "new_session_menu_button";
@@ -5574,6 +5607,11 @@ impl Workspace {
             }
             LeftPanelEvent::NewConversationInNewTab => {
                 self.add_terminal_tab_with_new_agent_view(ctx);
+                // 新建会话会把焦点交给新会话,而悬浮面板是模态浮层 —— 留着一个挡住界面、
+                // 只能靠 Esc 关掉的浮层没有意义,直接收起。
+                if Self::tool_panel_floats(ctx) && self.is_left_panel_open(ctx) {
+                    self.close_left_panel(ctx);
+                }
             }
             LeftPanelEvent::ShowDeleteConfirmationDialog {
                 conversation_id,
@@ -14922,6 +14960,9 @@ impl Workspace {
                         .read(ctx, |pane_group, _| pane_group.left_panel_open);
                 }
             }
+            WindowSettingsChangedEvent::ToolPanelFloating { .. } => {
+                ctx.notify();
+            }
             WindowSettingsChangedEvent::ZoomLevel { .. } => {
                 self.update_titlebar_height(ctx);
             }
@@ -18597,6 +18638,21 @@ impl Workspace {
         }
     }
 
+    /// 工具面板是否以浮层形式渲染(覆盖在内容之上),而不是停靠在内容旁边。
+    /// 仅桌面端支持;移动端走既有的全屏 overlay 路径。
+    fn tool_panel_floats(app: &AppContext) -> bool {
+        cfg!(not(target_family = "wasm")) && *WindowSettings::as_ref(app).tool_panel_floating
+    }
+
+    /// 悬浮工具面板沿用用户在停靠态下拖拽出来的宽度,但不低于浮层自己的下限。
+    fn floating_left_panel_width(&self, app: &AppContext) -> f32 {
+        let stored = ResizableData::as_ref(app)
+            .get_handle(self.window_id, ModalType::LeftPanelWidth)
+            .and_then(|handle| handle.lock().ok().map(|state| state.size()))
+            .unwrap_or(DEFAULT_LEFT_PANEL_WIDTH);
+        stored.max(FLOATING_LEFT_PANEL_MIN_WIDTH)
+    }
+
     /// Renders a configurable panel for the given toolbar item, if it is open.
     /// Returns `None` if the panel should not be rendered (item not available,
     /// panel not open, or item is not a panel type).
@@ -18625,6 +18681,10 @@ impl Workspace {
             }
             HeaderToolbarItemKind::ToolsPanel => {
                 if !pane_group.left_panel_open || warpui::platform::is_mobile_device() {
+                    return None;
+                }
+                // 悬浮模式下工具面板由 `render` 里的 overlay 渲染,不占这里的布局宽度。
+                if Self::tool_panel_floats(app) {
                     return None;
                 }
                 Some(ChildView::new(&self.left_panel_view).finish())
@@ -21698,6 +21758,14 @@ impl View for Workspace {
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
 
+        // 让本窗口里所有编辑器的 `escape` 绑定为悬浮面板让位(原因见
+        // `floating_tool_panel_windows` 的说明)。
+        set_floating_tool_panel_open(
+            self.window_id,
+            Self::tool_panel_floats(app)
+                && self.active_tab_pane_group().as_ref(app).left_panel_open,
+        );
+
         let tab_bar_mode = self.tab_bar_mode(app);
 
         // For WASM simplified tab bar views (Zap Drive objects, shared sessions, conversation transcripts),
@@ -21789,6 +21857,66 @@ impl View for Workspace {
                 .with_uniform_padding(WORKSPACE_PADDING)
                 .finish(),
         );
+
+        // 悬浮工具面板:浮在内容之上,点击面板外区域收起。停靠态由 `render_config_panel`
+        // 在布局行内渲染,这里不做任何事。
+        #[cfg(not(target_family = "wasm"))]
+        if Self::tool_panel_floats(app) && self.active_tab_pane_group().as_ref(app).left_panel_open
+        {
+            let panel_body = Container::new(
+                ConstrainedBox::new(ChildView::new(&self.left_panel_view).finish())
+                    .with_width(self.floating_left_panel_width(app))
+                    .finish(),
+            )
+            .with_background(appearance.theme().surface_1())
+            .with_border(Border::all(1.0).with_border_color(appearance.theme().outline().into()))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.0)))
+            .with_drop_shadow(DropShadow::default())
+            .finish();
+            // 键盘:非 keybinding 的 KeyDown 会在整棵元素树上广播,`Stack` 在 debug 构建下更是
+            // 让后加的浮层优先派发,所以浮层不需要焦点也能拿到 Esc。前提是 Esc 没有被某个
+            // keybinding 提前消费 —— 面板打开时焦点收在 `LeftPanelView` 自身而不是面板内的
+            // `EditorView`,正是为了不给后者机会(见 `focus_active_view_on_entry`)。
+            let panel_body = EventHandler::new(panel_body)
+                .with_always_handle()
+                .on_keydown(|ctx, _app, keystroke| {
+                    if keystroke.normalized().as_str() == "escape" {
+                        ctx.dispatch_typed_action(WorkspaceAction::ToggleLeftPanel);
+                        DispatchEventResult::StopPropagation
+                    } else {
+                        DispatchEventResult::PropagateToParent
+                    }
+                })
+                .finish();
+            // 工具面板可被配置到工具栏右侧,浮层锚点跟随它的停靠侧。
+            let tools_docked_left = TabSettings::as_ref(app)
+                .header_toolbar_chip_selection
+                .left_items()
+                .contains(&HeaderToolbarItemKind::ToolsPanel);
+            let (parent_anchor, child_anchor) = if tools_docked_left {
+                (PositionedElementAnchor::BottomLeft, ChildAnchor::TopLeft)
+            } else {
+                (PositionedElementAnchor::BottomRight, ChildAnchor::TopRight)
+            };
+            stack.add_positioned_overlay_child(
+                // `Clipped` 会为面板内容新开一个 layer:面板自身的命中记录因此落在比
+                // `Dismiss` 的全窗 rect 更高的层上(`is_covered` 只查更高层,见
+                // `scene.rs`),否则点击面板内的空白处会被误判成"点在外面"而收起面板。
+                Dismiss::new(Clipped::new(panel_body).finish())
+                    .prevent_interaction_with_other_elements()
+                    .on_dismiss(|ctx, _app| {
+                        ctx.dispatch_typed_action(WorkspaceAction::ToggleLeftPanel);
+                    })
+                    .finish(),
+                OffsetPositioning::offset_from_save_position_element(
+                    TAB_BAR_POSITION_ID,
+                    vec2f(0., 0.),
+                    PositionedElementOffsetBounds::WindowBySize,
+                    parent_anchor,
+                    child_anchor,
+                ),
+            );
+        }
 
         if !use_simplified_wasm_tab_bar
             && FeatureFlag::VerticalTabs.is_enabled()

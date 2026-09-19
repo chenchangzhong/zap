@@ -1371,6 +1371,7 @@ settings-appearance-window-blur-radius = 窗口模糊半径：{ $value }
 settings-appearance-window-blur-texture-label = 启用窗口模糊（Acrylic 纹理）
 settings-appearance-window-blur-texture-not-supported = 当前硬件可能不支持透明窗口渲染。
 settings-appearance-tools-panel-consistent-label = 工具面板在所有标签页保持一致显示
+settings-appearance-tools-panel-floating-label = 工具面板悬浮在内容之上
 
 # Input
 settings-appearance-input-type-label = 输入类型

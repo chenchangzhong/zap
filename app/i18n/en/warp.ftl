@@ -1398,6 +1398,7 @@ settings-appearance-window-blur-radius = Window Blur Radius: { $value }
 settings-appearance-window-blur-texture-label = Use Window Blur (Acrylic texture)
 settings-appearance-window-blur-texture-not-supported = The selected hardware may not support rendering transparent windows.
 settings-appearance-tools-panel-consistent-label = Tools panel visibility is consistent across tabs
+settings-appearance-tools-panel-floating-label = Float the tools panel above the content
 
 # Input
 settings-appearance-input-type-label = Input type

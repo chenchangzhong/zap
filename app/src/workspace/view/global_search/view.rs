@@ -25,6 +25,7 @@ use crate::ui_components::icons::Icon as UiIcon;
 use crate::ui_components::item_highlight::{ImageOrIcon, ItemHighlightState};
 use crate::ui_components::render_file_search_row::{render_file_search_row, FileSearchRowOptions};
 use crate::view_components::action_button::{ActionButton, ButtonSize, NakedTheme};
+use crate::window_settings::WindowSettings;
 use crate::workspace::view::global_search::model::GlobalSearch;
 use crate::workspace::view::global_search::SearchConfig;
 use crate::TelemetryEvent;
@@ -647,6 +648,8 @@ impl GlobalSearchView {
                 autogrow: true,
                 // Prefer explicit newlines (from paste or shift-enter) over soft wrapping.
                 soft_wrap: false,
+                // 悬浮工具面板下把 Esc 让给宿主,由面板的键盘捕获层收起面板。
+                escape_yields_to_host: *WindowSettings::as_ref(ctx).tool_panel_floating,
                 ..Default::default()
             };
 

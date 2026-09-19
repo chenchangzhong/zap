@@ -39,6 +39,7 @@ use crate::util::file::external_editor::EditorSettings;
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::resolve_file_target_with_editor_choice;
 use crate::util::openable_file_type::FileTarget;
+use crate::window_settings::WindowSettings;
 use crate::workspace::view::conversation_list::view::{
     ConversationListView, Event as ConversationListViewEvent,
 };
@@ -814,6 +815,16 @@ impl LeftPanelView {
     }
 
     pub fn focus_active_view_on_entry(&mut self, ctx: &mut ViewContext<Self>) {
+        // 悬浮浮层下不把焦点交给面板内部控件:面板里的搜索框/重命名框是 `EditorView`,
+        // 而 `EditorView` 自带 `escape` 绑定(`app/src/editor/view/mod.rs`),会先于任何
+        // 外层绑定消费掉 Esc,面板就无法用 Esc 收起。焦点收在面板自身即可 ——
+        // `LeftPanelView` 没有 escape 绑定,Esc 会落到元素树,由 workspace 里浮层的
+        // 键盘捕获层接住并关闭面板。
+        if *WindowSettings::as_ref(ctx).tool_panel_floating {
+            ctx.focus_self();
+            return;
+        }
+
         match self.active_view.get() {
             ToolPanelView::ProjectExplorer => {
                 if let Some(file_tree_view) = self.active_file_tree_view(ctx) {
@@ -1431,13 +1442,19 @@ impl View for LeftPanelView {
             super::PanelPosition::Left => DragBarSide::Right,
             super::PanelPosition::Right => DragBarSide::Left,
         };
+        // `Resizable` 会用自己 state 里的宽度反过来卡住外层给它的约束,所以悬浮态要加宽
+        // 不能只抬外层 `ConstrainedBox`,这里的下限必须同步抬高。
+        let min_width = if super::Workspace::tool_panel_floats(app) {
+            super::FLOATING_LEFT_PANEL_MIN_WIDTH
+        } else {
+            MIN_SIDEBAR_WIDTH
+        };
         Resizable::new(self.resizable_state_handle.clone(), panel_content)
             .with_dragbar_side(drag_side)
             .on_resize(move |ctx, _| {
                 ctx.notify();
             })
             .with_bounds_callback(Box::new(move |window_size| {
-                let min_width = MIN_SIDEBAR_WIDTH;
                 let max_width = window_size.x() * MAX_SIDEBAR_WIDTH_RATIO;
                 (min_width, max_width.max(min_width))
             }))
