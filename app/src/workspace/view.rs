@@ -5040,7 +5040,9 @@ impl Workspace {
 
     /// 在 dsh 内切到指定会话。`pane_view_id` 是 dsh pane 的 creation_order_id,
     /// 用于定位 dsh webview;经 evaluate_script 调插件(zap-bridge-client)暴露的
-    /// `window.__zapActivateSession(sid)`,最终落到 dsh sessions 服务的 `open(sid)`。
+    /// `window.__zapActivateSession(sid)`,由插件落到 dsh 的切会话入口
+    /// (统一走公开的 uiWorkspace.openSession,三个版本都提供;≤0.1.6-alpha.1
+    /// 内部委托给 sessions.open)。
     /// 会话切换独立于 pane 聚焦:webview 未就绪/插件未就绪时仅记日志,不影响切页。
     #[cfg(not(target_family = "wasm"))]
     fn activate_dsh_session(
@@ -19318,6 +19320,14 @@ impl Workspace {
             crate::dsh::DshRuntimeStatus::Starting | crate::dsh::DshRuntimeStatus::Ready
         ) && self.focus_existing_dsh_pane(ctx)
         {
+            // 订阅缺失时(例如曾被 clear_dsh_git_status 清掉)补一次,让「badge
+            // 空掉后再点一次 dsh 入口」能自愈。已有订阅不动:同步重建会覆盖正在
+            // 跟随 dsh 上报的有效订阅,且每次都要多跑一次 git status 计算。
+            if matches!(status, crate::dsh::DshRuntimeStatus::Ready)
+                && self.dsh_git_status.is_none()
+            {
+                self.update_dsh_git_status_subscription(ctx);
+            }
             return;
         }
         // 2. 启动/重启 runtime(Starting 返回等就绪;Ready 无需动作——就绪

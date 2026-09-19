@@ -12,7 +12,9 @@
 // - 为侧边栏每个项目行注入"打开文件浏览器"按钮(hover 显示,右侧第一位)
 // - 暴露 `window.__zapInsertFileReference`:「附加为上下文」末端,把文件路径以 dsh `@`
 //   引用芯片(ReferenceChipNode)形态插入当前会话输入框(Rust 侧 evaluate_script 调用)
-// - 暴露 `window.__zapActivateSession`:通知点击后切到指定会话(调 sessions.open)
+// - 暴露 `window.__zapActivateSession`:通知点击后切到指定会话
+//   (统一调公开的 uiWorkspace.openSession;该服务三个版本都提供,≤0.1.6-alpha.1
+//   内部委托给 sessions.open)
 //
 // 通信方式:webview IPC(webkit.messageHandlers.ipc.postMessage)。
 // 不再使用 WebSocket 桥(端口每次启动随机分配导致连接不稳定)。
@@ -20,11 +22,18 @@
 // 项目路径判定:当前会话(SessionSummary)的 `cwd` 字段是权威来源(实测存在,
 // 如 "/Users/zhong/project/dsh-plugins");`workspaceId` 不在 summary 上,故
 // 用 cwd 直接作项目目录,并回退到 workspace 列表按 sessionIds 反查。
+// 「当前会话」的来源随 dsh 版本变化:dsh 0.1.6-alpha.2 起 sessions 快照不再带
+// `current`(见 dsh-api-session-controller 的 SessionListValue/SessionSummary
+// 契约,快照只有 `{ ids, byId, phase, subagentsByParent, jobsBySession }`),
+// "当前主会话"改由 `SessionSummary.retainedBy.mainView` 标记。故先读 `current`
+// (≤0.1.6-alpha.1),未命中再按 `retainedBy.mainView > 0` 找主会话。
 //
-// 终态判定:基于 `dsh-client-runtime` 提供的 `sessions` 服务快照(dsh-client-runtime
-// `SessionManager` 经 `ctx.reflect.provide("sessions")` 注册)。快照形状:
-// `{ ids, byId: { [sessionId]: SessionEntry }, current, phase }`,其中
-// SessionEntry 含 `running`, `completed`, `pendingInteraction`, `title`, `cwd` 等。
+// 终态判定:基于 `sessions` 服务快照(0.1.5-alpha.2 与 0.1.6-alpha.2 实测均由
+// dsh-api-session-controller 经 `ctx.reflect.provide("sessions")` 注册)。
+// 快照形状:`{ ids, byId: { [sessionId]: SessionEntry }, phase, ... }`(≤0.1.6-alpha.1
+// 另带 `current`/`currentAddress`)。SessionEntry 实测含 `running`, `title`, `cwd`,
+// `blank`, `retainedBy` 等;`completed` 仅 ≤0.1.6-alpha.1 存在,`pendingInteraction`
+// 三个版本的 SessionSummary 上都没有(详见 checkNotify 的注记)。
 // 终态映射:`pendingInteraction` -> confirm(需确认), `completed` 或
 // `running:true -> false` 边沿 -> complete。无专用 `notifications` 服务时以
 // `sessions` 状态变迁代理,符合 cordis `inject + ctx.effect` 模型。
@@ -104,13 +113,34 @@ window.__ModuleLoader__.load({
 			}
 		};
 
+		/// 当前主会话 id。
+		///
+		/// 来源随 dsh 版本变化:
+		/// - ≤0.1.6-alpha.1:sessions 快照自带 `current`(实测 0.1.5-alpha.2 的
+		///   list 快照仍带 `current`/`currentAddress`);
+		/// - 0.1.6-alpha.2 起 `current` 被移除(快照只剩 `{ ids, byId, phase,
+		///   subagentsByParent, jobsBySession }`),"当前主会话"改由
+		///   `SessionSummary.retainedBy.mainView` 标记——replaceMain 以
+		///   `retain(target, { source: "mainView" })` 写入,读取用
+		///   `(s.retainedBy.mainView ?? 0) > 0`,这是 dsh 自身十余处
+		///   (ui-layout / ui-cordis / ui-session / ui-agent-preset 等)的公开惯用法。
+		///
+		/// 注:`uiWorkspace.selection` 虽同源,但在 dsh 公开契约里是 private
+		/// 字段(navigation.d.ts `private readonly selection`),dsh 自身零消费,
+		/// 故不用它,以免耦合非公开面。
+		function currentSessionId(sessionSnap) {
+			if (sessionSnap.current) return sessionSnap.current;
+			const byId = sessionSnap.byId || {};
+			return Object.values(byId).find((s) => (s?.retainedBy?.mainView ?? 0) > 0)?.id;
+		}
+
 		/// 计算当前活跃会话所属项目的绝对路径。
 		///
 		/// 优先用会话 `cwd`(SessionSummary 实测字段,即项目目录);缺失时回退
 		/// 到 workspace 列表按 `sessionIds` 反查(workspace.path 为项目根)。
 		function currentWorkspacePath(sessions, workspaces) {
 			const sessionSnap = sessions.list.getSnapshot();
-			const currentId = sessionSnap.current;
+			const currentId = currentSessionId(sessionSnap);
 			if (!currentId) return undefined;
 			const session = sessionSnap.byId[currentId];
 			if (!session) return undefined;
@@ -179,6 +209,13 @@ window.__ModuleLoader__.load({
 		/// complete:按 turn 触发——running true→false 边沿、completed false→true
 		/// 边沿、或首次观察到已完成(兜底补发,每会话一次)。旧逻辑按
 		/// sessionId+status 去重,同一会话第二次完成任务会被永久吞掉,已废弃。
+		///
+		/// 注(遗留缺口,非本批引入):上述三条 complete 判定里当前只有 running 边沿
+		/// 真正有效——`entry.completed` 在 0.1.6-alpha.2 已从 SessionSummary 移除
+		/// (只有 ≤0.1.6-alpha.1 才有),`entry.pendingInteraction` 三个版本的
+		/// SessionSummary 上都没有(它在 ui-session 的 per-session status 里)。故
+		/// confirm 与"补发"分支实际从不触发,修正需改用 dsh 的 completionUnread/
+		/// pending 状态,属独立改造。
 		function checkNotify() {
 			if (!sessionsRef) return;
 			const snap = sessionsRef.list.getSnapshot();
@@ -348,8 +385,11 @@ window.__ModuleLoader__.load({
 			window.__zapInsertFileReference = function (fullPath, isDir) {
 				try {
 					const snap = sessions.list.getSnapshot();
-					if (snap.phase !== "ready" || !snap.current) return false;
-					const sessionId = snap.current;
+					if (snap.phase !== "ready") return false;
+					// 当前会话与 reportCurrentPath 同源:0.1.6-alpha.2 起快照不再带
+					// `current`,统一走 currentSessionId(见其注释)。
+					const sessionId = currentSessionId(snap);
+					if (!sessionId) return false;
 					const conversation = rootCtx.get("conversation");
 					const input = conversation && conversation.input;
 					if (!input) return false;
@@ -489,11 +529,24 @@ window.__ModuleLoader__.load({
 			workspacesRef = workspaces;
 			// 「附加为上下文」末端:暴露结构化 @ 引用芯片插入,供 Rust 侧 evaluate_script 调用。
 			installFileReferenceInjection(ctx, sessions);
-			// 会话切换末端:Rust 侧通知点击经 evaluate_script 调用,落到 sessions.open(sid)
-			// (dsh-api-session-controller 的 ClientSessions.open,侧边栏点击切换同源)。
+			// 会话切换末端:Rust 侧通知点击经 evaluate_script 调用。
+			// dsh 0.1.6-alpha.2 起 sessions 服务不再提供 open()(其公开方法表里没有,
+			// dsh 全库也零调用),"切主会话"改由公开的 uiWorkspace.openSession(与侧栏
+			// 点击同源)。此处惰性解析 uiWorkspace:本函数在 apply 之后才被点击触发,
+			// 不存在装载顺序依赖;≤0.1.6-alpha.1 回退 sessions.open。
 			window.__zapActivateSession = function (sessionId) {
-				if (!sessionId || !sessionsRef || typeof sessionsRef.open !== "function") return;
-				sessionsRef.open(sessionId);
+				if (!sessionId) return;
+				const uiWorkspace = ctx.get("uiWorkspace");
+				if (typeof uiWorkspace?.openSession === "function") {
+					uiWorkspace.openSession(sessionId);
+					return;
+				}
+				if (sessionsRef && typeof sessionsRef.open === "function") {
+					sessionsRef.open(sessionId);
+					return;
+				}
+				// 两个入口都不可用时留痕,避免下次再以"点击无反应"的形态静默复发。
+				console.warn("[zap-bridge-client] activate_session: no session-switch entry available");
 			};
 			// 文件链接拦截:sidebarRight.openResource → Zap 内打开。
 			installOpenFileInterceptor(ctx);
