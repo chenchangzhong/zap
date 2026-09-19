@@ -15,9 +15,11 @@ use header::PaneHeader;
 
 use warpui::{
     elements::{
-        Border, Container, DropTarget, DropTargetData, Flex, MainAxisSize, ParentElement,
-        SavePosition, Shrinkable,
+        Border, ChildAnchor, Container, DropTarget, DropTargetData, Flex, MainAxisSize,
+        OffsetPositioning, ParentElement, PositionedElementAnchor, PositionedElementOffsetBounds,
+        SavePosition, Shrinkable, Stack,
     },
+    geometry::vector::vec2f,
     presenter::ChildView,
     AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle,
@@ -51,10 +53,11 @@ pub enum PaneViewEvent {
     PaneDraggedOutsideTabBarOrPaneGroup,
     PaneDragEnded,
     PaneHeaderClicked,
+    /// pane 头部的关闭按钮被点击。`PaneGroup` 里的 pane 由 `PaneContent::close` 处理,
+    /// 不依赖这个事件;它服务于**没有** `PaneGroup` 接管的宿主,例如 `Workspace` 的
+    /// 悬浮编辑器浮层。
+    CloseRequested,
 }
-
-#[derive(Debug, Clone)]
-pub enum PaneAction {}
 
 impl<P: BackingView> Entity for PaneView<P> {
     type Event = PaneViewEvent;
@@ -68,6 +71,9 @@ pub struct PaneView<P: BackingView> {
     header: ViewHandle<PaneHeader<P>>,
     is_being_dragged: bool,
     focus_handle: Option<PaneFocusHandle>,
+    /// 该 pane 由宿主直接持有、**没有** `PaneGroup` 接管(目前仅 `Workspace` 的悬浮编辑器
+    /// 浮层)。此时关闭由宿主处理,`PaneView` 只发 [`PaneViewEvent::CloseRequested`]。
+    detached_from_pane_group: bool,
 }
 
 impl<P: BackingView> PaneView<P> {
@@ -113,6 +119,7 @@ impl<P: BackingView> PaneView<P> {
             header,
             is_being_dragged: false,
             focus_handle: None,
+            detached_from_pane_group: false,
         }
     }
 
@@ -172,6 +179,13 @@ impl<P: BackingView> PaneView<P> {
 
     pub fn is_being_dragged(&self) -> bool {
         self.is_being_dragged
+    }
+
+    /// 声明该 pane 不由 `PaneGroup` 接管(见 [`Self::detached_from_pane_group`])。
+    /// 宿主在直接持有 pane 时调用一次即可。
+    pub fn set_detached_from_pane_group(&mut self, ctx: &mut ViewContext<Self>) {
+        self.detached_from_pane_group = true;
+        ctx.notify();
     }
 
     /// Handles events from the pane stack model.
@@ -242,6 +256,9 @@ impl<P: BackingView> PaneView<P> {
                 self.child(ctx).update(ctx, |child, ctx| {
                     child.on_pane_header_overflow_menu_toggled(*is_open, ctx);
                 });
+                // 菜单展开/收起会改变 header 的内部状态;宿主提升渲染菜单的路径需要
+                // `PaneView::render` 重跑才能看到新状态(否则它一直用旧值)。
+                ctx.notify();
             }
             header::Event::SelectedOverflowMenuAction(action) => {
                 self.child(ctx).update(ctx, |child, ctx| {
@@ -252,12 +269,18 @@ impl<P: BackingView> PaneView<P> {
                 child.handle_custom_action(action, ctx);
             }),
             header::Event::Close => {
-                // Close all views in the stack so they can clean up.
-                let views: Vec<_> = self.pane_stack.as_ref(ctx).views().cloned().collect();
-                for view in views {
-                    view.update(ctx, |child, ctx| {
-                        child.close(ctx);
-                    });
+                ctx.emit(PaneViewEvent::CloseRequested);
+                // 由 `PaneGroup` 接管时,pane 自己走 `PaneContent::close` 清理并关闭。
+                // 宿主直接持有时(悬浮编辑器浮层)关闭由宿主负责 —— 它自己会做未保存确认,
+                // 这里再调一次 `child.close()` 会弹出第二个确认框。
+                if !self.detached_from_pane_group {
+                    // Close all views in the stack so they can clean up.
+                    let views: Vec<_> = self.pane_stack.as_ref(ctx).views().cloned().collect();
+                    for view in views {
+                        view.update(ctx, |child, ctx| {
+                            child.close(ctx);
+                        });
+                    }
                 }
             }
             header::Event::MovePaneWithinPaneGroup {
@@ -322,6 +345,43 @@ impl<P: BackingView> PaneView<P> {
     pub fn pane_id(&self) -> PaneId {
         self.pane_id
     }
+
+    /// 宿主直接持有该 pane(悬浮编辑器浮层)时,把 header 的溢出菜单提升到 `element`
+    /// **之后**渲染。
+    ///
+    /// 原因:菜单默认挂在 header 内部,而 header 在 `PaneView` 的 column 里先于内容绘制;
+    /// 在 overlay 层上下文里层索引只增不减(`Scene::push_overlay_layer` 用数组长度作索引),
+    /// 菜单的层号必然低于编辑器随后开出的层,于是菜单被文件内容盖住。放到这里之后,它在
+    /// header 与编辑器都画完才创建层,索引必然更高,从而浮在最上。
+    ///
+    /// 常规标签页/分屏(`detached_from_pane_group == false`)不走这条路径 —— 那时内容在
+    /// `normal_layers`、菜单在 `overlay_layers`,渲染器先画完全部 normal 再画 overlay,
+    /// 菜单天然在最上。
+    fn with_elevated_overflow_menu(
+        &self,
+        element: Box<dyn Element>,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        if !self.detached_from_pane_group {
+            return element;
+        }
+        let header = self.header.as_ref(app);
+        if !header.is_overflow_menu_open() {
+            return element;
+        }
+        let mut outer = Stack::new().with_child(element);
+        outer.add_positioned_overlay_child(
+            ChildView::new(header.overflow_menu()).finish(),
+            OffsetPositioning::offset_from_save_position_element(
+                header.overflow_button_position_id(),
+                vec2f(0., 0.),
+                PositionedElementOffsetBounds::WindowByPosition,
+                PositionedElementAnchor::BottomRight,
+                ChildAnchor::TopRight,
+            ),
+        );
+        outer.finish()
+    }
 }
 
 #[derive(PartialEq, Copy, Clone, Debug)]
@@ -344,7 +404,9 @@ impl<P: BackingView> View for PaneView<P> {
             let column = Flex::column()
                 .with_main_axis_size(MainAxisSize::Min)
                 .with_child(ChildView::new(&self.header).finish());
-            return column.finish();
+            // 拖拽 pane 头部时也走这里。宿主提升渲染菜单时 header 自己已不画菜单,若不在
+            // 这里补上,拖拽期间菜单会凭空消失(见下方同名的提升逻辑)。
+            return self.with_elevated_overflow_menu(column.finish(), app);
         }
 
         // Normal case: pane is visible (i.e. not being dragged), use Max sizing to fill available space
@@ -393,11 +455,13 @@ impl<P: BackingView> View for PaneView<P> {
             container = container.with_foreground_overlay(appearance.theme().surface_2())
         }
 
-        SavePosition::new(
+        let pane_element = SavePosition::new(
             DropTarget::new(container.finish(), PaneDropTargetData { id: self.pane_id }).finish(),
             &self.pane_id.position_id(),
         )
-        .finish()
+        .finish();
+
+        self.with_elevated_overflow_menu(pane_element, app)
     }
 
     fn keymap_context(&self, _ctx: &AppContext) -> warpui::keymap::Context {
@@ -406,10 +470,16 @@ impl<P: BackingView> View for PaneView<P> {
 }
 
 impl<P: BackingView> TypedActionView for PaneView<P> {
-    type Action = PaneAction;
+    /// 直接采用 header 的动作类型:宿主提升渲染溢出菜单时(`detached_from_pane_group`),
+    /// 菜单挂在本视图的元素树上,响应者链不再经过 `PaneHeader`,菜单项派发的
+    /// [`PaneHeaderAction`] 会因"无人处理"而失效。这里接住它并转发给 header。
+    type Action = PaneHeaderAction<P::PaneHeaderOverflowMenuAction, P::CustomAction>;
 
-    fn handle_action(&mut self, action: &Self::Action, _ctx: &mut ViewContext<Self>) {
-        match *action {}
+    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
+        let header = self.header.clone();
+        header.update(ctx, |header, ctx| {
+            TypedActionView::handle_action(header, action, ctx);
+        });
     }
 }
 

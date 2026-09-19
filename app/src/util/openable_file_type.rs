@@ -24,6 +24,8 @@ pub use warp_util::file_type::{is_binary_file, is_file_content_binary, is_markdo
 pub enum EditorLayout {
     SplitPane,
     NewTab,
+    /// 在 Workspace 的居中浮层里打开文件,不占用标签页也不参与分屏布局。
+    Floating,
 }
 
 /// The type of file that can be opened in Zap. The in-product treatment for "opening" a file

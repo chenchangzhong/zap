@@ -323,6 +323,9 @@ code-replace-all = Replace all
 code-goto-line-placeholder = Line number:Column
 code-open-file-unavailable-remote-tooltip = Opening files is unavailable for remote sessions
 code-view-markdown-preview = View Markdown preview
+code-view-close-saved = Close saved files
+code-view-maximize-pane = Maximize pane
+code-view-minimize-pane = Minimize pane
 markdown-display-mode-rendered = Rendered
 markdown-display-mode-raw = Raw
 code-review-commit-and-create-pr = Commit and create PR
@@ -2371,6 +2374,7 @@ settings-external-editor-tabbed-desc = When this setting is on, any files opened
 settings-external-editor-prefer-markdown = Open Markdown files in Zap's Markdown Viewer by default
 settings-external-editor-layout-split-pane = Split Pane
 settings-external-editor-layout-new-tab = New Tab
+settings-external-editor-layout-floating = Floating Panel
 settings-external-editor-default-app = Default App
 
 # =============================================================================

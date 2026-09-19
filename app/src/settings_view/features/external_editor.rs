@@ -123,6 +123,7 @@ impl ExternalEditorView {
     ) {
         let split_pane_text = crate::t!("settings-external-editor-layout-split-pane");
         let new_tab_text = crate::t!("settings-external-editor-layout-new-tab");
+        let floating_text = crate::t!("settings-external-editor-layout-floating");
         let default_app = DropdownItem::new(
             split_pane_text.clone(),
             ExternalEditorAction::SetLayout(EditorLayout::SplitPane),
@@ -133,11 +134,16 @@ impl ExternalEditorView {
             new_tab_text.clone(),
             ExternalEditorAction::SetLayout(EditorLayout::NewTab),
         ));
+        items.push(DropdownItem::new(
+            floating_text.clone(),
+            ExternalEditorAction::SetLayout(EditorLayout::Floating),
+        ));
 
         dropdown.set_items(items, ctx);
         match layout_to_open_files {
             EditorLayout::SplitPane => dropdown.set_selected_by_name(split_pane_text, ctx),
             EditorLayout::NewTab => dropdown.set_selected_by_name(new_tab_text, ctx),
+            EditorLayout::Floating => dropdown.set_selected_by_name(floating_text, ctx),
         };
     }
 

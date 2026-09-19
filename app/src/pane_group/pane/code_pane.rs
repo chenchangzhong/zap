@@ -54,6 +54,13 @@ impl CodePane {
         self.view.as_ref(ctx).child(ctx)
     }
 
+    /// 外层 `PaneView` 的 handle。宿主(如 `Workspace` 的悬浮编辑器浮层)需要订阅
+    /// pane 头部的关闭事件时使用 —— 浮层没有 `PaneGroup` 接管 `PaneContent::close`,
+    /// 必须由宿主自己接住。
+    pub fn pane_view(&self) -> &ViewHandle<PaneView<CodeView>> {
+        &self.view
+    }
+
     pub fn editor_status(&self, app: &AppContext) -> CodeEditorStatus {
         CodeEditorStatus::editor_status(&self.file_view(app), app)
     }

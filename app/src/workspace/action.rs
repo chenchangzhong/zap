@@ -263,6 +263,13 @@ pub enum WorkspaceAction {
     /// In Code Mode V2 this toggles the left panel which contains both the project explorer and
     /// Zap Drive. This happens as explicit action from the user.
     ToggleLeftPanel,
+    /// 收起 `EditorLayout::Floating` 的悬浮编辑器(有未保存修改时先弹确认)。
+    DismissFloatingEditor,
+    /// 收起流程走完后的实际销毁。由 `DismissFloatingEditor` 在确认流程结束时延迟派发 ——
+    /// 销毁必须 update 浮层的 `CodeView`,不能在它自己的 update 闭包内重入。
+    FinishDismissFloatingEditor,
+    /// 用户在未保存确认框上取消了收起:丢弃本次排队等待装入浮层的 pane,浮层保持原样。
+    CancelDismissFloatingEditor,
     /// Toggles directly to the Zap Drive tab of the left panel in Code Mode V2
     ToggleWarpDrive,
     /// Unconditionally opens Zap Drive. This is used in the case of user lifecycle
@@ -791,6 +798,9 @@ impl WorkspaceAction {
             | DragTab { .. }
             | StartTabDrag
             | ToggleLeftPanel
+            | DismissFloatingEditor
+            | FinishDismissFloatingEditor
+            | CancelDismissFloatingEditor
             | ToggleWarpDrive
             | ZapDrive
             | ClosePanel

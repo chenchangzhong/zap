@@ -97,6 +97,12 @@ use crate::{
 type SaveCallback =
     Box<dyn FnOnce(SaveOutcome, &mut CodeView, &mut ViewContext<CodeView>) + Send + Sync + 'static>;
 
+/// 全部 tab 关闭完成后的回调,见 [`CodeView::close_all_tabs_with_callback`]。
+/// 参数为 `true` 表示所有未保存修改都已处理完(可以继续收尾);`false` 表示用户在确认框上
+/// 取消了,流程中止。
+pub type CloseAllCallback =
+    Box<dyn FnOnce(bool, &mut ViewContext<CodeView>) + Send + Sync + 'static>;
+
 const CLOSE_BUTTON_WIDTH: f32 = 24.;
 const LANGUAGE_ICON_WIDTH: f32 = 16.;
 const TAB_INTERNAL_MARGIN: f32 = 4.;
@@ -276,6 +282,8 @@ pub struct CodeView {
     /// "关 tab"对应的 callback 必须延迟到这条事件到达,否则保存失败时 tab 已被
     /// 关闭,用户看不到错误。
     pending_remote_save_callbacks: HashMap<EntityId, SaveCallback>,
+    /// [`Self::close_all_tabs_with_callback`] 的收尾回调,等所有未保存 tab 都处理完再触发。
+    pending_close_all_callback: Option<CloseAllCallback>,
 }
 
 impl CodeView {
@@ -293,6 +301,7 @@ impl CodeView {
             drag_position: None,
             markdown_mode_segmented_control: None,
             pending_remote_save_callbacks: HashMap::new(),
+            pending_close_all_callback: None,
         }
     }
 
@@ -984,6 +993,26 @@ impl CodeView {
         Some(tab.editor_view.as_ref(ctx).scroll_fraction(ctx))
     }
 
+    /// 在当前(可能已是复用中的)`CodeView` 里开一个新的空白文件 tab。
+    ///
+    /// 供宿主(`Workspace` 的悬浮编辑器浮层)在浮层已开着别的文件时处理"新建文件" ——
+    /// 直接调 `open_or_focus_existing(None, ..)` 不行:`build_tab_data` 靠 `self.source`
+    /// 判断是否为新建文件,而复用的 `CodeView` 的 source 是之前那个文件(`Link`),
+    /// 于是 `set_new_file` / `set_default_directory` 都不会生效。
+    pub fn open_new_untitled_tab(
+        &mut self,
+        default_directory: Option<std::path::PathBuf>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let original_source = self.source.clone();
+        self.source = CodeSource::New { default_directory };
+        let new_tab = self.build_tab_data(None, false, ctx);
+        self.source = original_source;
+
+        self.tab_group.push(new_tab);
+        self.set_active_tab_index(self.tab_group.len() - 1, ctx);
+    }
+
     fn open_new_tab_for_location(
         &mut self,
         location: Option<BufferLocation>,
@@ -1049,6 +1078,35 @@ impl CodeView {
             pane_config.set_title_secondary(secondary, ctx);
             ctx.emit(PaneConfigurationEvent::TitleUpdated);
         });
+    }
+
+    /// 请 `CodeView` 走它自己那套"逐个 tab 确认未保存修改"的关闭流程,全部处理完后回调。
+    ///
+    /// 供宿主(`Workspace` 的悬浮编辑器浮层)收起浮层前使用:浮层里可能累积了多个 tab,
+    /// 宿主自己只查一次 `contains_unsaved_changes` 再保存活动 tab 是不够的 —— 其余 tab 的
+    /// 未保存内容会随 `cleanup_all_tabs` 静默丢失。该流程复用 `CodeView` 既有的逐个确认。
+    ///
+    /// **回调可能在本次 `update` 的闭包内同步触发**(没有未保存内容时)。宿主若要在回调里
+    /// 更新同一个 `CodeView`,必须先离开这个闭包,否则框架会以 "Circular view update"
+    /// panic(见 `warpui_core` 的 `update_view`)。
+    pub fn close_all_tabs_with_callback(
+        &mut self,
+        callback: CloseAllCallback,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let unsaved_indices = self.unsaved_indices(ctx);
+
+        // 没有未保存内容时无需确认,直接清理。
+        if unsaved_indices.is_empty() {
+            self.cleanup_all_tabs(ctx);
+            self.set_active_tab_index(0, ctx);
+            callback(true, ctx);
+            return;
+        }
+
+        // 有未保存内容时交给既有的逐个确认流程,全部处理完再回调。
+        self.pending_close_all_callback = Some(callback);
+        self.process_next_tab_for_clear(unsaved_indices, 0, ctx);
     }
 
     fn save_local(
@@ -1534,7 +1592,14 @@ impl CodeView {
             Some(PendingSaveIntent::Discard) => {
                 self.process_next_tab_for_clear(unsaved_indices, current_index + 1, ctx);
             }
-            _ => (),
+            // 用户取消:流程中止,通知宿主(悬浮编辑器浮层)放弃本次收尾 —— 否则宿主的
+            // 待办状态会一直挂着,之后被意外消费。
+            Some(PendingSaveIntent::Cancel) => {
+                if let Some(callback) = self.pending_close_all_callback.take() {
+                    callback(false, ctx);
+                }
+            }
+            None => {}
         }
     }
 
@@ -1548,6 +1613,10 @@ impl CodeView {
         if current_index >= unsaved_indices.len() {
             self.cleanup_all_tabs(ctx);
             self.set_active_tab_index(0, ctx);
+            // 宿主(悬浮编辑器浮层)在等这个回调收尾。
+            if let Some(callback) = self.pending_close_all_callback.take() {
+                callback(true, ctx);
+            }
             return;
         }
 
@@ -2274,14 +2343,23 @@ impl CodeView {
             "Ctrl-R"
         };
 
-        let mut items = vec![
-            MenuItemFields::new_with_label("Close saved", &format!("{modifier_keys} U"))
-                .with_on_select_action(CodeViewAction::CloseSaved)
-                .into_item(),
-            MenuItemFields::toggle_pane_action(is_maximized)
-                .with_on_select_action(CodeViewAction::ToggleMaximized)
-                .into_item(),
-        ];
+        let mut items = vec![MenuItemFields::new_with_label(
+            crate::t!("code-view-close-saved"),
+            format!("{modifier_keys} U"),
+        )
+        .with_on_select_action(CodeViewAction::CloseSaved)
+        .into_item()];
+
+        // 悬浮编辑器浮层里没有兄弟 pane,"最大化 pane"无从生效(它由 `PaneGroup` 隐藏其它
+        // pane 实现),因此不提供该项。浮层 pane 从不被 `PaneGroup` attach,`focus_handle`
+        // 恒为 `None`,以此区分。
+        if self.focus_handle.is_some() {
+            items.push(
+                MenuItemFields::toggle_pane_action(is_maximized)
+                    .with_on_select_action(CodeViewAction::ToggleMaximized)
+                    .into_item(),
+            );
+        }
 
         #[cfg(feature = "local_fs")]
         if let Some(path) = self.local_path(ctx) {
@@ -2449,7 +2527,15 @@ impl TypedActionView for CodeView {
             }
 
             CodeViewAction::CloseSaved => {
-                self.close_saved_tabs(ctx);
+                // 悬浮编辑器浮层里只有一个 pane,且从不被 `PaneGroup` attach
+                // (`focus_handle` 因此恒为 `None`)。此时"关闭已保存的文件"会保留有改动的
+                // tab、让浮层变成半空壳,而用户点它期望的是关掉浮层 —— 直接请求关闭,由
+                // 宿主 `Workspace` 走统一的收起流程(含未保存确认)。
+                if self.focus_handle.is_none() {
+                    ctx.emit(CodeViewEvent::Pane(PaneEvent::Close));
+                } else {
+                    self.close_saved_tabs(ctx);
+                }
             }
 
             CodeViewAction::ToggleMaximized => {

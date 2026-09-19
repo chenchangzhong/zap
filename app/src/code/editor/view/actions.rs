@@ -41,6 +41,10 @@ use warpui::{
 /// Limit the keybindings that conflict with the Agent Mode embedded editor.
 const NON_EDITABLE_KEYMAP_CONTEXT: &str = "NonEditableKeymapContext";
 
+/// 由 `CodeEditorView::keymap_context` 在窗口里有模态浮层(悬浮编辑器)占据 Esc 时置入,
+/// 用于让 `escape` 绑定不匹配、把按键让给浮层的捕获层。见 `EscapeOwner`。
+pub const ESCAPE_YIELDS_TO_HOST: &str = "CodeEditorView_EscapeYieldsToHost";
+
 lazy_static! {
     static ref AUTOCOMPLETE_SYMBOLS: HashMap<char, char> =
         HashMap::from([('(', ')'), ('[', ']'), ('{', '}'), ('\'', '\''), ('"', '"'),]);
@@ -289,7 +293,11 @@ pub fn init(app: &mut AppContext) {
             crate::t!("keybinding-desc-editor-redo"),
             text_entry.clone(),
         ),
-        FixedBinding::new("escape", CodeEditorViewAction::Escape, text_entry.clone()),
+        FixedBinding::new(
+            "escape",
+            CodeEditorViewAction::Escape,
+            text_entry.clone() & !id!(ESCAPE_YIELDS_TO_HOST),
+        ),
     ]);
 
     // Bind Ctrl-R to Redo when in Vim normal mode.

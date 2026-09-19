@@ -76,6 +76,11 @@ impl FilePane {
     pub fn file_view(&self, ctx: &AppContext) -> ViewHandle<FileNotebookView> {
         self.view.as_ref(ctx).child(ctx)
     }
+
+    /// 外层 `PaneView` 的 handle,用途同 [`CodePane::pane_view`]。
+    pub fn pane_view(&self) -> &ViewHandle<PaneView<FileNotebookView>> {
+        &self.view
+    }
 }
 
 impl PaneContent for FilePane {

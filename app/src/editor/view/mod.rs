@@ -8825,7 +8825,12 @@ impl View for EditorView {
         // 宿主显式要求让位时,escape 绑定不匹配(引用点见本文件 `init` 里的 escape 绑定)。
         // 例如悬浮工具面板里的搜索框:面板要靠 Esc 收起,而键绑定匹配是焦点优先的,
         // 编辑器不退让就会先消费掉这个按键。
-        if self.escape_yields_to_host {
+        // 悬浮编辑器浮层是靠 Esc 收起的模态浮层,同样需要让位,见
+        // `workspace::view::EscapeOwner`(悬浮工具面板不走这里,它用逐点让位)。
+        if self.escape_yields_to_host
+            || crate::workspace::view::escape_owner(self.window_id)
+                != crate::workspace::view::EscapeOwner::None
+        {
             context.set.insert("EditorView_EscapeYieldsToHost");
         }
 

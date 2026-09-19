@@ -314,6 +314,9 @@ code-replace-all = 全部替换
 code-goto-line-placeholder = 行号:列号
 code-open-file-unavailable-remote-tooltip = 远程会话无法打开文件
 code-view-markdown-preview = 查看 Markdown 预览
+code-view-close-saved = 关闭已保存的文件
+code-view-maximize-pane = 最大化面板
+code-view-minimize-pane = 还原面板
 markdown-display-mode-rendered = 预览
 markdown-display-mode-raw = 源码
 code-review-commit-and-create-pr = 提交并创建 PR
@@ -2291,6 +2294,7 @@ settings-external-editor-tabbed-desc = 开启后，同一标签页中打开的�
 settings-external-editor-prefer-markdown = 默认用 Zap Markdown 查看器打开 Markdown 文件
 settings-external-editor-layout-split-pane = 分屏面板
 settings-external-editor-layout-new-tab = 新建标签页
+settings-external-editor-layout-floating = 悬浮面板
 settings-external-editor-default-app = 系统默认
 
 # =============================================================================

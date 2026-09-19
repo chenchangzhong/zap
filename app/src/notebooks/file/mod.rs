@@ -1002,14 +1002,20 @@ impl BackingView for FileNotebookView {
         ctx: &AppContext,
     ) -> Vec<MenuItem<FileNotebookAction>> {
         // 与 `CodeView`(Raw markdown 模式)保持一致:Rendered 模式的溢出菜单同样提供
-        // "Maximize pane" / "Minimize pane" 入口。
+        // "Maximize pane" / "Minimize pane" 入口 —— 但悬浮编辑器浮层里没有兄弟 pane,
+        // 该动作无从生效(它由 `PaneGroup` 隐藏其它 pane 实现),因此不提供。浮层 pane
+        // 从不被 `PaneGroup` attach,`focus_handle` 恒为 `None`,以此区分。
         let is_maximized = self
             .focus_handle
             .as_ref()
             .is_some_and(|h| h.is_maximized(ctx));
-        let mut actions = vec![MenuItemFields::toggle_pane_action(is_maximized)
-            .with_on_select_action(FileNotebookAction::ToggleMaximized)
-            .into_item()];
+        let mut actions = if self.focus_handle.is_some() {
+            vec![MenuItemFields::toggle_pane_action(is_maximized)
+                .with_on_select_action(FileNotebookAction::ToggleMaximized)
+                .into_item()]
+        } else {
+            Vec::new()
+        };
 
         if let Some(SourceFile::Local {
             local_path: _local_path,

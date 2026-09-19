@@ -1150,6 +1150,8 @@ impl PaneGroup {
                     ctx.emit(Event::TerminalViewStateChanged);
                     ctx.notify();
                 }
+                // pane 已通过 `PaneContent::close` 自行处理关闭,这里无需额外动作。
+                PaneViewEvent::CloseRequested => {}
             }
         } else {
             log::warn!("Session {pane_id:?} not found");

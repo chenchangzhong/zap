@@ -2393,6 +2393,15 @@ impl View for CodeEditorView {
     fn keymap_context(&self, app: &AppContext) -> warpui::keymap::Context {
         let mut context = Self::default_keymap_context();
 
+        // 窗口里存在占据 Esc 的模态浮层(悬浮编辑器)时,让 `escape` 绑定不匹配
+        // (`app/src/code/editor/view/actions.rs` 里那条 escape 绑定),把 Esc 让给浮层的
+        // 捕获层收起浮层。键绑定匹配是焦点优先的,编辑器不退让就会先消费掉这个按键。
+        if crate::workspace::view::escape_owner(self.window_id)
+            != crate::workspace::view::EscapeOwner::None
+        {
+            context.set.insert(actions::ESCAPE_YIELDS_TO_HOST);
+        }
+
         if self.interaction_state(app) != InteractionState::Editable {
             context.set.insert(NON_EDITABLE_KEYMAP_CONTEXT);
         }

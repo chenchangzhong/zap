@@ -137,6 +137,7 @@ use crate::auth::{AuthView, AuthViewEvent, AuthViewVariant};
 #[cfg(feature = "local_fs")]
 use crate::code::editor_management::CodeManager;
 use crate::code::editor_management::CodeSource;
+use crate::code::view::CodeViewEvent;
 use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::drive::export::ExportManager;
 use crate::drive::settings::WarpDriveSettings;
@@ -220,8 +221,8 @@ use crate::notebooks::manager::{NotebookManager, NotebookSource};
 use crate::pane_group::FilePane;
 use crate::pane_group::ImagePane;
 use crate::pane_group::{
-    self, AnyPaneContent, CodeDiffPane, CodePane, Direction, NewTerminalOptions, PanesLayout,
-    TabBarHoverIndex,
+    self, AnyPaneContent, CodeDiffPane, CodePane, Direction, NewTerminalOptions, PaneEvent,
+    PanesLayout, TabBarHoverIndex,
 };
 use crate::remote_server::manager::RemoteServerManager;
 #[cfg(feature = "local_fs")]
@@ -360,7 +361,6 @@ use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback};
 
 use warp_core::user_preferences::GetUserPreferences as _;
 use warpui::clipboard::ClipboardContent;
-#[cfg(target_family = "wasm")]
 use warpui::elements::Percentage;
 use warpui::elements::{
     CacheOption, DispatchEventResult, DraggableState, DropTarget, EventHandler, Image,
@@ -449,7 +449,7 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::{cmp::Ordering, sync::Arc};
 use warp_core::ui::color::blend::Blend;
 use warp_core::ui::theme::{color::internal_colors, phenomenon::PhenomenonStyle, Fill};
@@ -606,6 +606,54 @@ const MOBILE_OVERLAY_SCRIM_ALPHA: u8 = 128;
 /// 悬浮工具面板的宽度下限。停靠态由 `MIN_SIDEBAR_WIDTH`(250) 兜底,但这个宽度盖在
 /// 内容之上时显得偏窄,浮层单独抬高一些;用户仍可向右拖拽加宽。
 const FLOATING_LEFT_PANEL_MIN_WIDTH: f32 = 320.;
+
+/// 悬浮编辑器浮层的最大尺寸(窗口宽/高的比例)。居中显示,内容自适应但不撑满整屏。
+const FLOATING_EDITOR_WIDTH_RATIO: f32 = 0.9;
+const FLOATING_EDITOR_HEIGHT_RATIO: f32 = 0.9;
+
+/// 悬浮编辑器浮层背景的不透明度(百分数)。写死:浮层要始终半透,窗口的原生磨砂才能
+/// 透上来(仓库没有元素级背景模糊能力)。
+const FLOATING_EDITOR_BACKGROUND_OPACITY: u8 = 99;
+
+/// 当前 Esc 归哪个模态浮层"所有"。
+///
+/// 悬浮编辑器浮层靠 Esc 收起,而键绑定匹配是**焦点优先**的:任何获得焦点的 `EditorView`
+/// (终端输入框、agent 输入框、悬浮编辑器自身……)都会先吃掉 Esc,外层元素树上的捕获层
+/// 根本收不到。所以只能反过来让编辑器主动让位 —— `EditorView::keymap_context` 会读这里,
+/// 给自己的 `escape` 绑定补一个否定标识。
+///
+/// 只登记悬浮编辑器:悬浮工具面板用的是逐点 `escape_yields_to_host`(见面板里各
+/// `EditorView` 的构造点),不需要在这里做全局让位 —— 那会让工具面板打开期间终端与 agent
+/// 输入框的 Esc 行为整体改变。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EscapeOwner {
+    None,
+    FloatingEditor,
+}
+
+fn escape_owner_slots() -> &'static Mutex<HashMap<WindowId, EscapeOwner>> {
+    static OWNERS: OnceLock<Mutex<HashMap<WindowId, EscapeOwner>>> = OnceLock::new();
+    OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_escape_owner(window_id: WindowId, owner: EscapeOwner) {
+    if let Ok(mut owners) = escape_owner_slots().lock() {
+        if owner == EscapeOwner::None {
+            owners.remove(&window_id);
+        } else {
+            owners.insert(window_id, owner);
+        }
+    }
+}
+
+/// 该窗口当前是否有需要优先消费 Esc 的模态浮层。见 [`EscapeOwner`]。
+pub(crate) fn escape_owner(window_id: WindowId) -> EscapeOwner {
+    escape_owner_slots()
+        .lock()
+        .ok()
+        .and_then(|owners| owners.get(&window_id).copied())
+        .unwrap_or(EscapeOwner::None)
+}
 
 pub const NEW_TAB_BUTTON_POSITION_ID: &str = "new_tab_button";
 pub const NEW_SESSION_MENU_BUTTON_POSITION_ID: &str = "new_session_menu_button";
@@ -866,6 +914,15 @@ pub struct TransferredTab {
     pub draggable_state: DraggableState,
 }
 
+/// `EditorLayout::Floating` 的浮层里承载的编辑器。
+///
+/// 只支持代码编辑器与 Markdown 预览器 —— 图片与外部编辑器另有既有路径。pane 不进入
+/// 任何 `PaneGroup`,因此这里只保留 Workspace 渲染需要的具体类型。
+enum FloatingEditorPane {
+    Code(CodePane),
+    Markdown(FilePane),
+}
+
 pub struct Workspace {
     window_id: WindowId,
     pub(crate) tabs: Vec<TabData>,
@@ -991,6 +1048,12 @@ pub struct Workspace {
     vertical_tabs_panel: VerticalTabsPanelState,
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
+    /// `EditorLayout::Floating` 打开的编辑器:pane 不进入任何 PaneGroup,由 `render` 以
+    /// 居中浮层渲染。`Some` 即表示浮层可见;收起时连同编辑器实例一起销毁。
+    floating_editor_pane: Option<FloatingEditorPane>,
+    /// 收起当前浮层后要接着装进来的新 pane(浮层里已有编辑器、但类型不同时)。
+    /// 见 `show_floating_editor`。
+    pending_floating_editor: Option<FloatingEditorPane>,
     right_panel_view: ViewHandle<RightPanelView>,
     working_directories_model: ModelHandle<pane_group::WorkingDirectoriesModel>,
     lightbox_view: Option<ViewHandle<LightboxView>>,
@@ -3117,6 +3180,8 @@ impl Workspace {
             vertical_tabs_panel: Default::default(),
             left_panel_view,
             left_panel_views,
+            floating_editor_pane: None,
+            pending_floating_editor: None,
             right_panel_view,
             working_directories_model,
 
@@ -7255,6 +7320,20 @@ impl Workspace {
         layout: EditorLayout,
         ctx: &mut ViewContext<Self>,
     ) {
+        // 同 `open_code`:悬浮布局不能走下面的"复用本 pane group 里已有 FilePane"分支,
+        // 否则设置被静默忽略(文件跑进已有面板)。
+        if matches!(layout, EditorLayout::Floating) {
+            let pane = FilePane::new(
+                Some(path),
+                session,
+                #[cfg(feature = "local_fs")]
+                None,
+                ctx,
+            );
+            self.show_floating_editor(FloatingEditorPane::Markdown(pane), ctx);
+            return;
+        }
+
         let existing_file_pane = {
             let pane_group = self.active_tab_pane_group();
             pane_group
@@ -7302,6 +7381,9 @@ impl Workspace {
                         ctx,
                     );
                 });
+            }
+            EditorLayout::Floating => {
+                self.show_floating_editor(FloatingEditorPane::Markdown(pane), ctx);
             }
         }
     }
@@ -7547,6 +7629,39 @@ impl Workspace {
             ctx
         );
 
+        // 悬浮布局不参与下面的"并入已有 CodeView / 复用本 pane group 里已有 pane"逻辑 ——
+        // 那些分支找的都是 `PaneGroup` 里的编辑器,而浮层编辑器不在其中。若放行,设置会被
+        // 静默忽略(文件跑进已有分屏)。浮层自己的合并在 `show_floating_editor` 里做。
+        if matches!(layout, EditorLayout::Floating) {
+            // 浮层里已开着代码编辑器时,直接把这份文件并入它 —— 不先建一个 `CodePane`
+            // (那会立刻加载文件)再丢弃。
+            if let Some(FloatingEditorPane::Code(existing)) = self.floating_editor_pane.as_ref() {
+                let existing = existing.file_view(ctx);
+                match source.location() {
+                    Some(location) => {
+                        existing.update(ctx, |code_view, ctx| {
+                            code_view.open_or_focus_existing(Some(location), line_col, ctx);
+                        });
+                    }
+                    None => {
+                        let default_directory = source.default_directory().cloned();
+                        existing.update(ctx, |code_view, ctx| {
+                            code_view.open_new_untitled_tab(default_directory, ctx);
+                        });
+                    }
+                }
+                ctx.notify();
+                return;
+            }
+            let pane = if preview {
+                CodePane::new_preview(source, ctx)
+            } else {
+                CodePane::new(source, line_col, ctx)
+            };
+            self.show_floating_editor(FloatingEditorPane::Code(pane), ctx);
+            return;
+        }
+
         let grouping_on = FeatureFlag::TabbedEditorView.is_enabled()
             && *EditorSettings::as_ref(ctx)
                 .prefer_tabbed_editor_view
@@ -7663,6 +7778,9 @@ impl Workspace {
                         ctx,
                     );
                 });
+            }
+            EditorLayout::Floating => {
+                self.show_floating_editor(FloatingEditorPane::Code(pane), ctx);
             }
         }
 
@@ -8111,6 +8229,187 @@ impl Workspace {
         });
 
         ctx.notify();
+    }
+
+    /// 销毁浮层 pane,并做 `PaneGroup` 本会替它做的清理。
+    ///
+    /// 浮层 pane 从不经过 `PaneGroup::attach`/`detach`,所以:
+    /// - 不走 `CodeView::cleanup_all_tabs`,会让 `GlobalBufferModel` 残留未保存的内存内容,
+    ///   下次打开同一文件会看到"看着已保存"的假象(见 `CodePane::detach` 的注释);
+    /// - 也不走 `PaneContent::detach` 的取消订阅。
+    fn destroy_floating_editor(&mut self, ctx: &mut ViewContext<Self>) {
+        match self.floating_editor_pane.take() {
+            Some(FloatingEditorPane::Code(pane)) => {
+                ctx.unsubscribe_to_view(pane.pane_view());
+                let view = pane.file_view(ctx);
+                ctx.unsubscribe_to_view(&view);
+                view.update(ctx, |code_view, ctx| code_view.cleanup_all_tabs(ctx));
+            }
+            Some(FloatingEditorPane::Markdown(pane)) => {
+                ctx.unsubscribe_to_view(pane.pane_view());
+                let view = pane.file_view(ctx);
+                ctx.unsubscribe_to_view(&view);
+            }
+            None => {}
+        }
+
+        // 收起时若有排队的新 pane(类型不同被顶掉的那个),接着装上。
+        if let Some(pending) = self.pending_floating_editor.take() {
+            self.show_floating_editor(pending, ctx);
+            return;
+        }
+
+        ctx.notify();
+    }
+
+    /// 显示(或复用)`EditorLayout::Floating` 的居中浮层。
+    ///
+    /// 浮层同时只承载一个 pane:已有浮层时把新文件并入现有编辑器,而不是再叠一层 ——
+    /// 浮层是模态的,叠第二层会让"点外部收起"的语义变得无法解释。
+    fn show_floating_editor(&mut self, pane: FloatingEditorPane, ctx: &mut ViewContext<Self>) {
+        // 清掉上一次未完成收起流程留下的排队项:用户在未保存确认框上点「取消」时,
+        // `dismiss_floating_editor` 不会被回调,那个排队的新 pane 会一直留着,之后任意一次
+        // 收起都会把它"自己冒出来"地装进浮层 —— 而用户早已放弃那次打开。
+        self.pending_floating_editor = None;
+        match (&self.floating_editor_pane, pane) {
+            (Some(FloatingEditorPane::Code(existing)), FloatingEditorPane::Code(new_pane)) => {
+                let location = new_pane.file_view(ctx).as_ref(ctx).source().location();
+                match location {
+                    Some(location) => {
+                        existing.file_view(ctx).update(ctx, |code_view, ctx| {
+                            code_view.open_or_focus_existing(Some(location), None, ctx);
+                        });
+                    }
+                    // 新文件(`CodeSource::New` 等)没有 location,无法并入现有编辑器。
+                    // 不能丢弃新 pane —— 用户按"新建文件"会毫无反应。改为在浮层里开一枚
+                    // 空白 tab,并把 `CodeSource::New` 的语义(新建标记、默认目录)带过去:
+                    // 复用的 `CodeView` 自身 source 是别的文件,靠它判断不出"新建"。
+                    None => {
+                        let source = new_pane.file_view(ctx).as_ref(ctx).source().clone();
+                        let default_directory = source.default_directory().cloned();
+                        existing.file_view(ctx).update(ctx, |code_view, ctx| {
+                            code_view.open_new_untitled_tab(default_directory, ctx);
+                        });
+                    }
+                }
+                ctx.notify();
+                return;
+            }
+            // 浮层里已有编辑器、但类型不同(例如先开代码再开 Markdown)。不能直接覆盖:
+            // 那会绕过未保存确认,静默丢掉用户正在编辑的内容。先走正常收起流程(含未保存
+            // 确认),收起完成后再把新 pane 装进浮层。
+            (Some(_), new_pane) => {
+                self.pending_floating_editor = Some(new_pane);
+                self.dismiss_floating_editor(ctx);
+                return;
+            }
+            (None, pane) => {
+                self.floating_editor_pane = Some(pane);
+            }
+        }
+
+        // 浮层没有 `PaneGroup` 接管 `PaneContent::close`:告知 pane 关闭由宿主负责,并把
+        // pane 头部与 overflow 菜单里的关闭意图接回同一个收起流程。浮层的收起已经包含
+        // 未保存确认,所以这里不需要再走一遍编辑器自己的确认。
+        match self.floating_editor_pane.as_ref() {
+            Some(FloatingEditorPane::Code(pane)) => {
+                let pane_view = pane.pane_view().clone();
+                pane_view.update(ctx, |pane_view, ctx| {
+                    pane_view.set_detached_from_pane_group(ctx);
+                    let header = pane_view.header().clone();
+                    header.update(ctx, |header, ctx| {
+                        // 菜单改由 `PaneView` 提升到整棵 pane 之后渲染,否则在 overlay 层
+                        // 上下文里会被后绘制的编辑器内容盖住。
+                        header.set_overflow_menu_rendered_by_host(true, ctx);
+                        // 浮层里的 pane 不在任何 `PaneGroup` 中,拖拽移动/拆分/拖到标签栏
+                        // 都无从生效,直接关掉头部拖拽包装。
+                        header.set_draggable_disabled(true, ctx);
+                    });
+                });
+                ctx.subscribe_to_view(&pane_view, |me, _, event, ctx| {
+                    if matches!(event, crate::pane_group::pane::PaneViewEvent::CloseRequested) {
+                        me.dismiss_floating_editor(ctx);
+                    }
+                });
+                // 浮层里只有一个 pane,菜单里的"关闭已保存的文件"被 `CodeView` 转成了
+                // `PaneEvent::Close`(见其 `CloseSaved` 分支)。走和"点外侧"一样的收起流程,
+                // 而不是直接销毁 —— 用户此时可能还有未保存改动。
+                let code_view = pane.file_view(ctx);
+                ctx.subscribe_to_view(&code_view, |me, _, event, ctx| {
+                    if matches!(event, CodeViewEvent::Pane(PaneEvent::Close)) {
+                        me.dismiss_floating_editor(ctx);
+                    }
+                });
+            }
+            Some(FloatingEditorPane::Markdown(pane)) => {
+                let pane_view = pane.pane_view().clone();
+                pane_view.update(ctx, |pane_view, ctx| {
+                    pane_view.set_detached_from_pane_group(ctx);
+                    let header = pane_view.header().clone();
+                    header.update(ctx, |header, ctx| {
+                        header.set_overflow_menu_rendered_by_host(true, ctx);
+                        header.set_draggable_disabled(true, ctx);
+                    });
+                });
+                ctx.subscribe_to_view(&pane_view, |me, _, event, ctx| {
+                    if matches!(event, crate::pane_group::pane::PaneViewEvent::CloseRequested) {
+                        me.dismiss_floating_editor(ctx);
+                    }
+                });
+            }
+            None => {
+                ctx.notify();
+                return;
+            }
+        }
+
+        if let Some(FloatingEditorPane::Code(pane)) = self.floating_editor_pane.as_ref() {
+            let view = pane.file_view(ctx);
+            view.update(ctx, |view, ctx| view.focus(ctx));
+        }
+        ctx.notify();
+    }
+
+    /// 收起悬浮编辑器。有未保存修改时先弹确认,确认后才销毁;Markdown 预览器为只读,
+    /// 直接销毁。
+    ///
+    /// 代码编辑器走 `CodeView::close_all_tabs_with_callback` 而不是自己弹框:浮层里可能
+    /// 累积了多个 tab(多次打开文件会合并进同一个 `CodeView`),宿主只查一次未保存状态再
+    /// 保存活动 tab 会让其余 tab 的内容静默丢失。该流程复用 `CodeView` 既有的逐个确认。
+    fn dismiss_floating_editor(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(pane) = self.floating_editor_pane.as_ref() else {
+            return;
+        };
+
+        let FloatingEditorPane::Code(pane) = pane else {
+            self.destroy_floating_editor(ctx);
+            return;
+        };
+
+        // 销毁只能由 `close_all_tabs_with_callback` 在确认流程真正走完后触发 —— 提前销毁
+        // 会让"确认框还没点,浮层就关了"。而这个回调可能在 `CodeView` 的 update 闭包内
+        // 同步触发,那时 `CodeView` 已被框架从 `window.views` 取出,再 update 它会以
+        // "Circular view update" panic(`warpui_core` 的 `update_view`),销毁本身又必须
+        // update 它。因此回调里只**延迟派发**一个 action,由它在安全时机完成销毁。
+        //
+        // `finished == false` 表示用户在未保存确认框上点了「取消」:保持浮层原样,
+        // 并丢弃本次为"打开另一个 pane"排的队(见 `pending_floating_editor`)。
+        pane.file_view(ctx).update(ctx, |code_view, ctx| {
+            code_view.close_all_tabs_with_callback(
+                Box::new(|finished, ctx| {
+                    if finished {
+                        ctx.dispatch_typed_action_deferred(
+                            WorkspaceAction::FinishDismissFloatingEditor,
+                        );
+                    } else {
+                        ctx.dispatch_typed_action_deferred(
+                            WorkspaceAction::CancelDismissFloatingEditor,
+                        );
+                    }
+                }),
+                ctx,
+            );
+        });
     }
 
     fn toggle_vertical_tabs_panel(&mut self, ctx: &mut ViewContext<Self>) {
@@ -11202,6 +11501,9 @@ impl Workspace {
                             ctx,
                         );
                     });
+                }
+                EditorLayout::Floating => {
+                    self.show_floating_editor(FloatingEditorPane::Code(pane), ctx);
                 }
             }
         }
@@ -20214,6 +20516,12 @@ impl TypedActionView for Workspace {
                     self.open_left_panel_view(&LeftPanelAction::ZapDrive, ctx);
                 }
             }
+            DismissFloatingEditor => self.dismiss_floating_editor(ctx),
+            FinishDismissFloatingEditor => self.destroy_floating_editor(ctx),
+            // 用户取消了收起:丢弃本次排队的新 pane,浮层保持原样。
+            CancelDismissFloatingEditor => {
+                self.pending_floating_editor = None;
+            }
             ToggleLeftPanel => {
                 let active_pane_group = self.active_tab_pane_group().clone();
                 let was_open = active_pane_group.read(ctx, |pg, _| pg.left_panel_open);
@@ -21739,6 +22047,17 @@ impl View for Workspace {
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
 
+        // 登记 Esc 归属:悬浮编辑器打开时,让本窗口里所有编辑器的 `escape` 绑定让位,
+        // 由浮层的捕获层收起它(见 `EscapeOwner`)。悬浮工具面板不在此列,它用逐点让位。
+        set_escape_owner(
+            self.window_id,
+            if self.floating_editor_pane.is_some() {
+                EscapeOwner::FloatingEditor
+            } else {
+                EscapeOwner::None
+            },
+        );
+
         let tab_bar_mode = self.tab_bar_mode(app);
 
         // For WASM simplified tab bar views (Zap Drive objects, shared sessions, conversation transcripts),
@@ -21850,9 +22169,17 @@ impl View for Workspace {
             // 让后加的浮层优先派发,所以浮层不需要焦点也能拿到 Esc。前提是 Esc 没有被某个
             // keybinding 提前消费 —— 面板打开时焦点收在 `LeftPanelView` 自身而不是面板内的
             // `EditorView`,正是为了不给后者机会(见 `focus_active_view_on_entry`)。
+            //
+            // 悬浮编辑器浮层也在这个 stack 上,且 release 构建下 `Stack` 走 `Broadcast`
+            // (正序、不停止),两个捕获层都会收到同一次 Esc。这里显式让位,避免一次按键
+            // 同时收起两个浮层。
+            let floating_editor_open = self.floating_editor_pane.is_some();
             let panel_body = EventHandler::new(panel_body)
                 .with_always_handle()
-                .on_keydown(|ctx, _app, keystroke| {
+                .on_keydown(move |ctx, _app, keystroke| {
+                    if floating_editor_open {
+                        return DispatchEventResult::PropagateToParent;
+                    }
                     if keystroke.normalized().as_str() == "escape" {
                         ctx.dispatch_typed_action(WorkspaceAction::ToggleLeftPanel);
                         DispatchEventResult::StopPropagation
@@ -21887,6 +22214,84 @@ impl View for Workspace {
                     PositionedElementOffsetBounds::WindowBySize,
                     parent_anchor,
                     child_anchor,
+                ),
+            );
+        }
+
+        // 悬浮编辑器(`EditorLayout::Floating`):居中的模态浮层,点外部或 Esc 收起。
+        if let Some(floating_pane) = self.floating_editor_pane.as_ref() {
+            // 渲染整个 `PaneView` 而不是裸的 `CodeView`/`FileNotebookView`:tab 栏与 pane
+            // 头部(含关闭按钮)由 `PaneView` 的 header 提供,`CodeView::render` 只画活动 tab。
+            let editor_view = match floating_pane {
+                FloatingEditorPane::Code(pane) => ChildView::new(pane.pane_view()).finish(),
+                FloatingEditorPane::Markdown(pane) => ChildView::new(pane.pane_view()).finish(),
+            };
+            let theme = appearance.theme();
+            // 与整窗底色一致:同一组色(`surface_2` 叠 `fg_overlay_1`),并施加固定的
+            // 透明度让窗口的原生磨砂透上来。透明度写死不跟随窗口设置 —— 浮层需要始终
+            // 半透才能显出磨砂质感(仓库没有元素级背景模糊,磨砂只在原生窗口底层)。
+            //
+            // 层级安排(阴影可见性由它决定):
+            // - 外层 `Align` 铺满整个内容区(100%),只负责居中;
+            // - `Percentage` 让卡片占 90% —— 剩下四周各 5% 是**留给阴影的展示空间**。
+            //   阴影只在外扩 `spread_radius` 的范围内可见,若卡片贴满可用区域,阴影会
+            //   整片落在窗口之外,表现为"没有阴影"。
+            // - `Clipped` 在最内层:只裁编辑器内容,不影响父级卡片的背景与阴影。
+            let panel_body = Align::new(
+                Percentage::both(
+                    FLOATING_EDITOR_WIDTH_RATIO,
+                    FLOATING_EDITOR_HEIGHT_RATIO,
+                    Container::new(Clipped::new(editor_view).finish())
+                        .with_background(
+                            theme
+                                .surface_2()
+                                .blend(&internal_colors::fg_overlay_1(theme))
+                                .with_opacity(FLOATING_EDITOR_BACKGROUND_OPACITY),
+                        )
+                        .with_border(Border::all(1.0).with_border_color(theme.outline().into()))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.0)))
+                        // 四面均匀的阴影:不设偏移,否则上/下与左/右的浓淡不对称。
+                        .with_drop_shadow(DropShadow {
+                            color: ColorU::new(0, 0, 0, 170),
+                            offset: vec2f(0., 0.),
+                            blur_radius: 28.,
+                            spread_radius: 48.,
+                        })
+                        .finish(),
+                )
+                .finish(),
+            )
+            .finish();
+            // 与悬浮工具面板同款:浮层捕获 Esc(编辑器自身的 escape 绑定已在
+            // `EditorView::keymap_context` 里让位),`Clipped` 新开一层避免点浮层内部
+            // 空白被 `Dismiss` 判成"点在外面"。
+            let panel_body = EventHandler::new(panel_body)
+                .with_always_handle()
+                .on_keydown(|ctx, _app, keystroke| {
+                    if keystroke.normalized().as_str() == "escape" {
+                        ctx.dispatch_typed_action(WorkspaceAction::DismissFloatingEditor);
+                        DispatchEventResult::StopPropagation
+                    } else {
+                        DispatchEventResult::PropagateToParent
+                    }
+                })
+                .finish();
+            stack.add_positioned_overlay_child(
+                // 外层 `Clipped` 为浮层新开一层:面板的命中记录因此落在比 `Dismiss` 全窗
+                // rect 更高的层上(`is_covered` 只查更高层),否则点面板内空白会被误判成
+                // "点在外面"而收起浮层。它的裁剪范围是整个内容区(外层 `Align` 铺满),
+                // 不会裁到卡片的阴影。
+                Dismiss::new(Clipped::new(panel_body).finish())
+                    .prevent_interaction_with_other_elements()
+                    .on_dismiss(|ctx, _app| {
+                        ctx.dispatch_typed_action(WorkspaceAction::DismissFloatingEditor);
+                    })
+                    .finish(),
+                OffsetPositioning::offset_from_parent(
+                    vec2f(0., 0.),
+                    ParentOffsetBounds::ParentBySize,
+                    ParentAnchor::Center,
+                    ChildAnchor::Center,
                 ),
             );
         }
@@ -22900,6 +23305,9 @@ impl View for Workspace {
         WorkspaceRegistry::handle(ctx).update(ctx, |registry, _| {
             registry.unregister(window_id);
         });
+
+        // 清掉本窗口的 Esc 归属登记,避免 map 随窗口开关无界增长。
+        set_escape_owner(window_id, EscapeOwner::None);
 
         // If this workspace's close was registered as part of a tab-drag
         // handoff, clear the entry now that the workspace is gone from the

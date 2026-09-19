@@ -130,6 +130,15 @@ pub struct PaneHeader<P: BackingView> {
         ViewHandle<Menu<PaneHeaderAction<P::PaneHeaderOverflowMenuAction, P::CustomAction>>>,
     toolbelt_buttons: Vec<ToolbeltButton>,
     open_overlay: OpenOverlay,
+    /// 溢出菜单改由宿主(`PaneView`)提升到整棵 pane 之后渲染,header 自己不再画。
+    /// 用于悬浮编辑器浮层:在 overlay 层上下文里,header 先绘制会让菜单层号低于后面的
+    /// 编辑器内容,从而被盖住。
+    overflow_menu_rendered_by_host: bool,
+    /// 该 pane 由宿主直接持有(悬浮编辑器浮层),不做头部拖拽包装。
+    ///
+    /// 拖拽用于在 `PaneGroup` 内移动 / 拆分 / 拖到标签栏;浮层里的 pane 不在任何
+    /// `PaneGroup` 中,拖不出也拆不了,只会让头部变成可拖状态(并且把菜单挤没)。
+    draggable_disabled: bool,
     is_visible_in_pane_group: bool, // If this pane header is being dragged along the tab bar, then it is not visible in the pane group
     toolbelt_feature_popup: ViewHandle<FeaturePopup>,
 }
@@ -164,6 +173,8 @@ impl<P: BackingView> PaneHeader<P> {
             mouse_state_handles: Default::default(),
             overflow_menu,
             open_overlay: Default::default(),
+            overflow_menu_rendered_by_host: false,
+            draggable_disabled: false,
             toolbelt_buttons: Default::default(),
             is_visible_in_pane_group: true,
             toolbelt_feature_popup,
@@ -259,6 +270,38 @@ impl<P: BackingView> PaneHeader<P> {
     #[cfg(feature = "integration_tests")]
     pub fn is_overlay_open(&self) -> bool {
         !matches!(self.open_overlay, OpenOverlay::None)
+    }
+
+    /// 溢出菜单是否展开。
+    pub fn is_overflow_menu_open(&self) -> bool {
+        matches!(self.open_overlay, OpenOverlay::OverflowMenu)
+    }
+
+    /// 溢出菜单的视图句柄,供宿主把它渲染到更晚的位置。
+    ///
+    /// 菜单默认挂在 pane header 内部,而 header 在 `PaneView` 的 column 里先于内容绘制;
+    /// 在 overlay 层上下文里层索引只增不减,菜单因此会低于后绘制的内容。宿主(悬浮编辑器
+    /// 浮层)需要把它取出来、放到整棵 pane 之后渲染。
+    pub fn overflow_menu(
+        &self,
+    ) -> &ViewHandle<Menu<PaneHeaderAction<P::PaneHeaderOverflowMenuAction, P::CustomAction>>> {
+        &self.overflow_menu
+    }
+
+    /// 声明该 pane 由宿主直接持有:关闭头部拖拽包装(见 [`Self::draggable_disabled`])。
+    pub fn set_draggable_disabled(&mut self, disabled: bool, ctx: &mut ViewContext<Self>) {
+        self.draggable_disabled = disabled;
+        ctx.notify();
+    }
+
+    /// 声明溢出菜单由宿主提升渲染(见 [`Self::overflow_menu_rendered_by_host`])。
+    pub fn set_overflow_menu_rendered_by_host(
+        &mut self,
+        rendered_by_host: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.overflow_menu_rendered_by_host = rendered_by_host;
+        ctx.notify();
     }
 
     pub fn set_overflow_menu_items(
@@ -367,7 +410,7 @@ enum OpenOverlay {
 }
 
 impl<P: BackingView> PaneHeader<P> {
-    fn overflow_button_position_id(&self) -> String {
+    pub(super) fn overflow_button_position_id(&self) -> String {
         format!(
             "pane_header_overflow_button:{}",
             self.pane_configuration.id()
@@ -503,6 +546,10 @@ impl<P: BackingView> PaneHeader<P> {
         should_display_overflow_menu_button: bool,
         _app: &AppContext,
     ) {
+        // 菜单被宿主提升渲染时,这里不能再画一遍(否则会出现两个菜单)。
+        if self.overflow_menu_rendered_by_host {
+            return;
+        }
         match self.open_overlay {
             OpenOverlay::OverflowMenu => {
                 if should_display_overflow_menu_button {
@@ -778,7 +825,7 @@ impl<P: BackingView> View for PaneHeader<P> {
         })
         .finish();
 
-        if should_wrap_with_draggable {
+        if should_wrap_with_draggable && !self.draggable_disabled {
             render_pane_header_draggable::<P>(
                 self.pane_configuration.clone(),
                 clickable_stack,
