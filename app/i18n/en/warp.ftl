@@ -1402,6 +1402,7 @@ settings-appearance-window-blur-texture-label = Use Window Blur (Acrylic texture
 settings-appearance-window-blur-texture-not-supported = The selected hardware may not support rendering transparent windows.
 settings-appearance-tools-panel-consistent-label = Tools panel visibility is consistent across tabs
 settings-appearance-tools-panel-floating-label = Float the tools panel above the content
+settings-appearance-vertical-tabs-auto-hide-label = Float the vertical tabs panel above the content (reveal on hover, hide when you move away)
 
 # Input
 settings-appearance-input-type-label = Input type

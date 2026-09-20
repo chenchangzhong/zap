@@ -96,6 +96,23 @@ impl OffsetPositioning {
         )
     }
 
+    /// Marks both axes as conditional, so that the child is skipped (rather than triggering an
+    /// error) when the anchor element's position is not available yet -- for example on the first
+    /// frame an element anchored to a not-yet-laid-out [`SavePosition`] is rendered.
+    ///
+    /// [`OffsetPositioning::size_constraint`] checks each axis separately, so both axes must be
+    /// marked; see [`PositioningAxis::with_conditional_anchor`].
+    ///
+    /// Only valid for save-position / child-relative anchors. Calling it on a
+    /// `PositioningAnchor::RelativeToParent` locator (e.g. one built by
+    /// [`OffsetPositioning::offset_from_parent`]) trips the `debug_assert` inside
+    /// `PositioningAxis::with_conditional_anchor`.
+    pub fn with_conditional_anchor(mut self) -> Self {
+        self.x_axis = self.x_axis.with_conditional_anchor();
+        self.y_axis = self.y_axis.with_conditional_anchor();
+        self
+    }
+
     /// Returns the size constraint to be used for the stack child, according to the
     /// anchors and bounding behaviors specified in the [`PositionAxis`]'s.
     pub fn size_constraint(

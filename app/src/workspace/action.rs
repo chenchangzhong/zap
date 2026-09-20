@@ -282,6 +282,11 @@ pub enum WorkspaceAction {
     OpenCodeReviewPanel(PaneViewLocator),
     /// Toggles the vertical tabs panel. This happens as an explicit action from the user.
     ToggleVerticalTabsPanel,
+    /// 自动隐藏的垂直标签栏:鼠标进入悬停探测区,钉住面板。
+    VerticalTabsAutoHideReveal,
+    /// 自动隐藏的垂直标签栏:鼠标离开悬停探测区(或点击了面板之外)后解除钉住,
+    /// 让面板收起。
+    VerticalTabsAutoHideCollapse,
     ToggleVerticalTabsSettingsPopup,
     SetVerticalTabsDisplayGranularity(VerticalTabsDisplayGranularity),
     SetVerticalTabsTabItemMode(VerticalTabsTabItemMode),
@@ -898,6 +903,8 @@ impl WorkspaceAction {
             | TabConfigSidecarRemoveConfig { .. }
             | OpenSettingsFile
             | FixSettingsWithOz { .. } => false,
+            // 纯 UI 显隐(自动隐藏面板的钉住/解除),不改变需要持久化的状态。
+            VerticalTabsAutoHideReveal | VerticalTabsAutoHideCollapse => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
             #[cfg(target_family = "wasm")]

@@ -61,7 +61,7 @@ use crate::workspace::tab_settings::{
     DirectoryTabColor, PreserveActiveTabColor, ShowCodeReviewButton, ShowIndicatorsButton,
     ShowTitleBarSearchBar, ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition,
     TabSettings, TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames,
-    UseVerticalTabs, WorkspaceDecorationVisibility,
+    UseVerticalTabs, VerticalTabsPanelAutoHide, WorkspaceDecorationVisibility,
 };
 use crate::workspace::WorkspaceAction;
 use crate::{editor::EditorView, themes::theme_chooser::ThemeChooserMode};
@@ -488,6 +488,7 @@ pub enum AppearancePageAction {
     ToggleBlurTexture,
     ToggleLeftPanelVisibility,
     ToggleToolPanelFloating,
+    ToggleVerticalTabsPanelAutoHide,
     SetEnforceMinimumContrast(EnforceMinimumContrast),
     OpenUrl(String),
     ToggleFocusPaneOnHover,
@@ -626,6 +627,7 @@ impl TypedActionView for AppearanceSettingsPageView {
             ToggleBlurTexture => self.toggle_blur_texture(ctx),
             ToggleLeftPanelVisibility => self.toggle_left_panel_visibility(ctx),
             ToggleToolPanelFloating => self.toggle_tool_panel_floating(ctx),
+            ToggleVerticalTabsPanelAutoHide => self.toggle_vertical_tabs_panel_auto_hide(ctx),
             SetInputMode {
                 new_mode,
                 from_binding,
@@ -1592,6 +1594,8 @@ impl AppearanceSettingsPageView {
 
         if FeatureFlag::VerticalTabs.is_enabled() {
             tab_settings_widgets.push(Box::new(VerticalTabsWidget::default()));
+            // 悬浮开关紧跟在"启用垂直标签栏"之后:两者是同一件事的两面(开哪条栏、它以什么方式显示)。
+            tab_settings_widgets.push(Box::new(VerticalTabsPanelAutoHideWidget::default()));
             tab_settings_widgets.push(Box::new(
                 ShowVerticalTabPanelInRestoredWindowsWidget::default(),
             ));
@@ -2711,6 +2715,15 @@ impl AppearanceSettingsPageView {
         WindowSettings::handle(ctx).update(ctx, |window_settings, ctx| {
             report_if_error!(window_settings
                 .tool_panel_floating
+                .toggle_and_save_value(ctx));
+        });
+        ctx.notify();
+    }
+
+    pub fn toggle_vertical_tabs_panel_auto_hide(&mut self, ctx: &mut ViewContext<Self>) {
+        TabSettings::handle(ctx).update(ctx, |tab_settings, ctx| {
+            report_if_error!(tab_settings
+                .vertical_tabs_panel_auto_hide
                 .toggle_and_save_value(ctx));
         });
         ctx.notify();
@@ -3961,6 +3974,53 @@ impl SettingsWidget for ToolPanelFloatingWidget {
                 .build()
                 .on_click(|evt_ctx, _app, _v2f| {
                     evt_ctx.dispatch_typed_action(AppearancePageAction::ToggleToolPanelFloating);
+                })
+                .finish(),
+            None,
+        )
+    }
+}
+
+#[derive(Default)]
+struct VerticalTabsPanelAutoHideWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for VerticalTabsPanelAutoHideWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "vertical tabs panel float floating above content auto hide hover edge reveal sidebar dock"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let tab_settings = TabSettings::as_ref(app);
+        let is_enabled = *tab_settings.vertical_tabs_panel_auto_hide;
+
+        render_body_item::<AppearancePageAction>(
+            crate::t!("settings-appearance-vertical-tabs-auto-hide-label"),
+            None,
+            LocalOnlyIconState::for_setting(
+                VerticalTabsPanelAutoHide::storage_key(),
+                VerticalTabsPanelAutoHide::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(is_enabled)
+                .build()
+                .on_click(|evt_ctx, _app, _v2f| {
+                    evt_ctx
+                        .dispatch_typed_action(AppearancePageAction::ToggleVerticalTabsPanelAutoHide);
                 })
                 .finish(),
             None,

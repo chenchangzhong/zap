@@ -484,6 +484,19 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "appearance.vertical_tabs.enabled",
         description: "Whether to display tabs vertically instead of horizontally.",
     },
+    // 归档位置与其它 `appearance.vertical_tabs.*` 保持一致:它描述的是这条侧栏自己的显示
+    // 方式,而不是窗口级设置(toml 路径与云同步语义与原定义完全相同,迁移对用户透明)。
+    vertical_tabs_panel_auto_hide: VerticalTabsPanelAutoHide {
+        type: bool,
+        // 默认停靠:浮层的贴边热区是完全透明的(`Empty` 不画任何东西),默认开启会让已有
+        // 垂直标签栏的用户升级后"看不到侧栏、也找不到任何入口"。想要悬停浮出的自己开。
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "appearance.vertical_tabs.auto_hide",
+        description: "Whether the vertical tabs panel auto-hides at the window edge and reveals on hover instead of docking beside the content.",
+    },
     show_vertical_tab_panel_in_restored_windows: ShowVerticalTabPanelInRestoredWindows {
         type: bool,
         default: false,
