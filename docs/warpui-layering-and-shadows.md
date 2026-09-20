@@ -264,6 +264,57 @@ FixedBinding::new("escape", Action::Escape, ctx_id & !id!("...EscapeYieldsToHost
 
 ---
 
+## 12. 悬浮面板里的弹出层:三条实测结论(2026-09,悬浮工具面板)
+
+这一节是 §3 推论 3 / §5 在"整块面板都在 overlay 层里"时的具体化,三条都踩过:
+
+1. **要"新开一层但不裁剪",用 `Stack::new()` + `add_overlay_child(child)`**。
+   `Clipped` 的裁剪范围与它自己的矩形绑定,拿它当"新层"会顺手把子树裁到该矩形 —— 悬浮工具面板
+   的文件树右键菜单、会话列表溢出菜单就是这样被裁到面板内、出不了面板的。
+   `Stack::paint` 对 overlay 子元素走 `start_overlay_layer(ClipBounds::None)`,正好是"要层号、
+   不要裁剪"(而层号仍高于 `Dismiss` 的整窗 underlay,所以"点面板内空白不误关"照旧成立)。
+
+2. **`add_positioned_overlay_child` 在 overlay 上下文里也必须不裁剪**。
+   `Stack::paint` 只认 `child.element.is_overlay()`,而 positioned overlay child 的子树是
+   `Positioned(Overlay(..))`:`Positioned` 不转发时会被当普通子元素(`start_layer(ActiveLayer)`,
+   **继承祖先裁剪**),此时 `Overlay::paint` 又因 `already_in_overlay` 跳过开层 → 滚动容器里的
+   弹出菜单被裁到列表视口内(普通上下文里靠上游那层 `start_overlay_layer(None)` 掩盖了)。
+   修法:`Positioned::is_overlay()` 转发给子元素(层号/层数都不变,只把 `clip_bounds` 从"继承"
+   变成 `None`)。回归测试:`elements::stack::tests::positioned_overlay_child_is_unclipped_in_overlay_context`。
+
+3. **面板头部必须"在内容之后绘制"**。
+   overlay 上下文里层号只按绘制顺序比高低,头部先画 → 它按钮的 tooltip
+   (`ButtonTooltipPosition` 默认 `Below`,压在内容区上)会被后画的内容区盖住。
+   **当前采用的修法:把头部按钮的 tooltip 改成朝上**
+   (`with_tooltip_position(ButtonTooltipPosition::Above)`,与 tab bar 那排按钮的 tooltip 一致),
+   不动层结构。
+   **曾试过、已回退的修法**:把头部做成根 `Stack` 的 positioned overlay child(内容前补等高占位,
+   与 §5 同一手法)。它确实修好了遮挡,但 `Stack::paint` 会给**每个 child 各开一层**,改变了面板
+   内部各元素的层关系;同时它自身引入过两个缺陷(绝对定位子元素拿到窗口尺寸约束 → `MainAxisSize::Max`
+   的头部行被撑到窗口宽、关闭按钮跑到窗口另一侧;头部移出列后列宽不再被钉住 → 面板宽度与
+   `Resizable` 的 state 脱钩)。若要走这条路,先补上 `with_constrain_absolute_children()` 和
+   "铺满的等高占位",并**用探针确认**层变化没有影响 hover/光标/命中。
+   注意:同期"拖拽光标闪烁"**并不是它造成的**(见下一条),别把它当替罪羊。
+   - 必须 `with_constrain_absolute_children()`:`Stack::new()` 默认**不**约束绝对定位子元素
+     (`stack/mod.rs` 的 `SHOULD_ENABLE_NEW_STACK_CONSTRAINT_BEHAVIOR`),子元素拿到的是**窗口**
+     尺寸约束;头部行内若是 `Flex::row(MainAxisSize::Max)`,会被撑到窗口宽,`SpaceBetween` 的
+     关闭按钮就被推到窗口另一侧。
+   - 占位不能是宽度为 0 的 `Empty`:头部移出列之后,列的交叉轴宽度只由内容自然宽决定,面板宽度
+     会与 `Resizable` 的 state 脱钩(内容窄时"拖不动"重现)。占位自身要铺满。
+
+4. **"resize 光标一闪就没"不要先怀疑层/hover**(2026-09 排查结论,含一次误判)。
+   现象:鼠标沿悬浮面板右边缘移动时,resize 光标出现一次就回默认。我按"层遮挡 / z 仲裁"连改三轮
+   (拖拽带单独分层、每次 MouseMoved 重声明光标、加宽命中带),**都没修好**;最后用户自己发现
+   **系统里所有 app 的拖拽光标都这样** —— 是环境级现象,不是本面板的 bug,所有改动已回退。
+   **排查教训**:
+   - 这类"输入设备/光标"现象**先确认是否只在本应用出现**(换个 app 试同一动作),再决定要不要查代码;
+   - 探针要打**事实**(命中区范围、`is_hovering`/`is_covered`、仲裁的 z 与胜负),不要打推演结论
+     —— 本次 `is_hovering=true` 235 次、`is_covered=true` **0 次**,直接推翻了我"被层遮挡"的假设;
+   - `Presenter::set_cursor` 是**"z 高者胜"**、`reset_cursor` 只在"本次派发没人设过"时生效;
+     `Resizable` 只在**进入/离开拖拽带**时设一次光标(这是既有设计,别当成 bug 去改)。
+
+---
+
 ## 排查清单
 
 遇到"层级/可见性"问题时按顺序做:

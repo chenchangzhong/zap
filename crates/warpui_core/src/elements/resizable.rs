@@ -10,7 +10,7 @@ use pathfinder_geometry::{
 };
 
 use crate::{
-    event::DispatchedEvent, platform::Cursor, AfterLayoutContext, AppContext, Element,
+    event::DispatchedEvent, platform::Cursor, AfterLayoutContext, AppContext, ClipBounds, Element,
     EventContext, PaintContext, SizeConstraint,
 };
 
@@ -403,12 +403,19 @@ impl Element for Resizable {
             ),
         };
 
+        // 拖拽带**单独放一层**:它的光标要压过面板内容。`Presenter::set_cursor` 是"z 高者胜"
+        // (presenter.rs),而面板内容(编辑器 I-beam、列表行 PointingHand)在更深的层里 ——
+        // 实测拖拽带 z 是 `Overlay(2)` 而内容是 `Overlay(5)`,不单独分层的话拖拽中光标会被
+        // 内容顶成手指/竖线。
+        ctx.scene.start_layer(ClipBounds::ActiveLayer);
         ctx.scene
             .draw_rect_with_hit_recording(RectF::new(dragbar_origin, dragbar_size))
             .with_background(self.dragbar.color);
+        let dragbar_z_index = ctx.scene.z_index();
+        ctx.scene.stop_layer();
 
         self.dragbar.bounds = Some(RectF::new(dragbar_origin, dragbar_size));
-        self.dragbar.origin = Some(Point::from_vec2f(dragbar_origin, ctx.scene.z_index()));
+        self.dragbar.origin = Some(Point::from_vec2f(dragbar_origin, dragbar_z_index));
         self.dragbar.size = Some(dragbar_size);
         self.dragbar.z_index = Some(ctx.scene.max_active_z_index());
 
@@ -462,6 +469,16 @@ impl Element for Resizable {
                     if resized.is_some() {
                         dispatch_callback(self.resize_handler.as_mut(), ctx, app)
                     }
+                    // 拖拽过程中必须**每次**重新声明 resize 光标:`MouseMoved` 分支只在
+                    // 进入/离开拖拽带时设一次,而拖拽期间指针会扫过内容区,内容请求的
+                    // PointingHand/I-beam 会把光标顶掉(实测:拖拽中光标变成手指/竖线)。
+                    if let Some(z_index) = self.dragbar.z_index {
+                        let cursor = match self.direction {
+                            ResizeDirection::Horizontal => Cursor::ResizeLeftRight,
+                            ResizeDirection::Vertical => Cursor::ResizeUpDown,
+                        };
+                        ctx.set_cursor(cursor, z_index);
+                    }
                     return true;
                 }
             }
@@ -475,13 +492,16 @@ impl Element for Resizable {
                 let was_already_hovering =
                     mem::replace(&mut self.hovering_dragbar, hovering_dragbar);
 
-                if hovering_dragbar && !was_already_hovering {
+                if hovering_dragbar {
+                    // 悬停期间**每次**重新声明:光标是全局单槽,浮层里其它元素的 hover-out
+                    // (一次 `reset_cursor`)会把它清掉,而这里只在"进入/离开"时设一次的话,
+                    // 光标就"出现一次后被清掉",再也不会自己回来。
                     let cursor = match self.direction {
                         ResizeDirection::Horizontal => Cursor::ResizeLeftRight,
                         ResizeDirection::Vertical => Cursor::ResizeUpDown,
                     };
                     ctx.set_cursor(cursor, z_index);
-                } else if !hovering_dragbar && was_already_hovering {
+                } else if was_already_hovering {
                     ctx.reset_cursor();
                 }
 

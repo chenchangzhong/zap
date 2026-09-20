@@ -798,3 +798,89 @@ fn position_child_and_assert_location(
         );
     });
 }
+
+/// 渲染:根 `Stack` 的 overlay child 里放一个 `Clipped::sized(.., 100x100)`,裁剪层内再放一个
+/// 内层 `Stack`(普通矩形 + 一个 `add_positioned_overlay_child` 的矩形)。
+///
+/// 用来守住:`Positioned::is_overlay` 必须转发给子元素 —— 否则在 **overlay 上下文**里
+/// (`Overlay::paint` 因 `already_in_overlay` 不再开新层)`add_positioned_overlay_child` 的子树会
+/// 退化成"继承祖先裁剪",面板/滚动列表里的弹出菜单会被裁到视口内(实测过的 bug)。
+struct PositionedOverlayInsideClippedOverlayView;
+
+impl Entity for PositionedOverlayInsideClippedOverlayView {
+    type Event = String;
+}
+
+impl crate::core::View for PositionedOverlayInsideClippedOverlayView {
+    fn render<'a>(&self, _: &AppContext) -> Box<dyn Element> {
+        let mut inner = Stack::new();
+        inner.add_child(
+            ConstrainedBox::new(Rect::new().finish())
+                .with_width(20.)
+                .with_height(20.)
+                .finish(),
+        );
+        // 放到 (120, 0):完全落在 `Clipped` 的 100x100 之外。
+        inner.add_positioned_overlay_child(
+            ConstrainedBox::new(Rect::new().finish())
+                .with_width(20.)
+                .with_height(20.)
+                .finish(),
+            OffsetPositioning::offset_from_parent(
+                vec2f(120., 0.),
+                ParentOffsetBounds::WindowByPosition,
+                ParentAnchor::TopLeft,
+                ChildAnchor::TopLeft,
+            ),
+        );
+
+        let mut root = Stack::new();
+        root.add_overlay_child(Clipped::sized(inner.finish(), vec2f(100., 100.)).finish());
+        root.finish()
+    }
+
+    fn ui_name() -> &'static str {
+        "PositionedOverlayInsideClippedOverlayView"
+    }
+}
+
+impl TypedActionView for PositionedOverlayInsideClippedOverlayView {
+    type Action = ();
+}
+
+#[test]
+fn positioned_overlay_child_is_unclipped_in_overlay_context() {
+    App::test((), |mut app| async move {
+        let app = &mut app;
+        let (window_id, _view) = app.add_window(WindowStyle::NotStealFocus, |_| {
+            PositionedOverlayInsideClippedOverlayView
+        });
+
+        app.update(|ctx| ctx.simulate_render_frame(window_id));
+
+        let presenter_ref = app
+            .presenter(window_id)
+            .expect("Test window should have a presenter since first frame is rendered.");
+        let presenter = presenter_ref.borrow();
+        let scene = presenter
+            .scene()
+            .expect("Presenter should have rendered a scene after the view was updated.");
+
+        // positioned overlay child 的矩形必须落在**不裁剪**的 overlay 层里(该层里只有它)。
+        let escaping_layer = scene
+            .overlay_layers()
+            .find(|layer| layer.clip_bounds.is_none() && !layer.rects.is_empty())
+            .expect(
+                "positioned overlay child 必须拿到 `ClipBounds::None` 的 overlay 层;\
+                 退化成继承祖先裁剪说明 `Positioned::is_overlay` 转发失效",
+            );
+        assert!(
+            escaping_layer
+                .rects
+                .iter()
+                .any(|rect| rect.bounds.min_x() >= 120.),
+            "不裁剪层里应当有那个被放到裁剪区之外 (x=120) 的矩形,实际: {:?}",
+            escaping_layer.rects.iter().map(|r| r.bounds).collect::<Vec<_>>()
+        );
+    });
+}

@@ -207,6 +207,7 @@ use crate::cloud_object::{
 };
 use crate::context_chips::ChipRuntimeCapabilities;
 use crate::drive::import::modal::{ImportModal, ImportModalEvent};
+use crate::drive::panel::MIN_SIDEBAR_WIDTH;
 use crate::drive::workflows::arguments::ArgumentsState;
 use crate::drive::workflows::modal::{WorkflowModal, WorkflowModalEvent};
 use crate::drive::{
@@ -608,10 +609,6 @@ const MOBILE_OVERLAY_PANEL_WIDTH_RATIO: f32 = 0.9;
 #[cfg(target_family = "wasm")]
 const MOBILE_OVERLAY_SCRIM_ALPHA: u8 = 128;
 
-/// 悬浮工具面板的宽度下限。停靠态由 `MIN_SIDEBAR_WIDTH`(250) 兜底,但这个宽度盖在
-/// 内容之上时显得偏窄,浮层单独抬高一些;用户仍可向右拖拽加宽。
-const FLOATING_LEFT_PANEL_MIN_WIDTH: f32 = 320.;
-
 /// 自动隐藏的垂直标签栏:贴边判定的"理想到达宽度"。
 ///
 /// **实际生效的贴边宽度是它与 `VERTICAL_TABS_PROBE_MARGIN` 之和(14px)**:探测层用的是
@@ -627,51 +624,99 @@ const VERTICAL_TABS_EDGE_REACH: f32 = VERTICAL_TABS_HOT_ZONE_WIDTH + VERTICAL_TA
 /// 悬停探测层的位置 id。自动隐藏的侧栏收起时面板不在渲染树里(没有面板矩形),但拖拽
 /// 落点判定仍然需要侧边这一条,所以单独登记(见 `tab_bar_rects_for_window`)。
 const VERTICAL_TABS_PROBE_POSITION_ID: &str = "workspace_view:vtabs_auto_hide_probe";
-/// 面板与窗口四边的留白。既让浮层不贴边,也给阴影留出可见空间 —— 阴影只在外扩 quad 内
+/// 悬浮面板与窗口四边的留白。既让浮层不贴边,也给阴影留出可见空间 —— 阴影只在外扩 quad 内
 /// 可见且受 layer 裁剪,卡片铺满可用区域时那一圈会被裁掉、完全看不到阴影
-/// (见 docs/warpui-layering-and-shadows.md §7.2/§7.3)。
-const VERTICAL_TABS_PANEL_INSET: f32 = 5.;
-/// 自动隐藏侧栏滑出/收起的时长(秒)与帧间隔。进度按时间插值,与帧率无关。
+/// (见 docs/warpui-layering-and-shadows.md §7.2/§7.3)。垂直标签栏悬浮侧栏与悬浮工具面板共用。
+const FLOATING_PANEL_INSET: f32 = 5.;
+/// 悬浮面板滑出/收起的时长(秒)与帧间隔。进度按时间插值,与帧率无关。
 /// 时长比"看起来够快"要再长一点:debug 构建下整窗重绘每帧成本高,时长短会让可用帧数
 /// 太少,动画就会显得一顿一顿。
-const VERTICAL_TABS_SLIDE_SECS: f32 = 0.26;
-const VERTICAL_TABS_SLIDE_FRAME_MS: u64 = 16;
+const PANEL_SLIDE_SECS: f32 = 0.26;
+const PANEL_SLIDE_FRAME_MS: u64 = 16;
 
-/// 自动隐藏侧栏的滑出动画:记录起点与起止进度,每帧按经过时间取插值,因此与帧率无关。
+/// 悬浮面板的滑出动画:记录起点与起止进度,每帧按经过时间取插值,因此与帧率无关。
 #[derive(Clone, Copy)]
-struct VerticalTabsSlide {
+struct PanelSlide {
     started_at: Instant,
     from: f32,
     to: f32,
 }
 
-/// 面板子树是否应该留在渲染树里。抽成纯函数便于单测:它同时决定面板子树的存留**和**探测层
-/// 宽度(收起态只有贴边一条 / 展开态整幅),算错会同时坏掉"能展开"和"点得到"。
+/// 悬浮面板子树是否应该留在渲染树里。抽成纯函数便于单测。
 ///
 /// 判据里**不能**出现 `slide.is_some()`:那个字段只在 `render` 里被清,而动画结束后没有东西
 /// 再触发 `render`,用它当条件会让收起后的面板子树永久常驻(实测踩过,见文件内相关注释)。
-fn vertical_tabs_panel_revealed(progress: f32, pinned: bool) -> bool {
-    progress > 0. || pinned
+fn panel_revealed(progress: f32, open: bool) -> bool {
+    progress > 0. || open
+}
+
+/// 兜底落定:没有动画在飞时,把进度对齐到面板的开关状态。
+///
+/// 面板开关(`pane_group.left_panel_open`)有几条不经 `open_left_panel`/`close_left_panel` 的
+/// 路径(切标签页、会话恢复、新标签继承),那些路径不起动画。此时**必须**直接落定,否则
+/// "已打开的面板"会停在窗口外的收起位置(整块看不见),而"已关闭的面板"会让 `Dismiss` 的
+/// 整窗 hit-rect 一直留在元素树里把窗口挡死。抽成纯函数便于单测。
+fn settle_panel_progress(progress: f32, open: bool, animating: bool) -> f32 {
+    let target = if open { 1. } else { 0. };
+    if !animating && (progress - target).abs() > f32::EPSILON {
+        target
+    } else {
+        progress
+    }
 }
 
 /// 按归一化时间 `t` 在 `from` → `to` 之间插值,smoothstep 缓动(两端速度为零,比 ease-out
 /// cubic 的"猛冲急停"自然)。`t` 夹在 `[0, 1]`,动画超时后也不会越界。
-fn vertical_tabs_slide_progress(from: f32, to: f32, t: f32) -> f32 {
+fn panel_slide_progress(from: f32, to: f32, t: f32) -> f32 {
     let t = t.clamp(0., 1.);
     let eased = t * t * (3. - 2. * t);
     from + (to - from) * eased
 }
 
-/// 自动隐藏侧栏的滑出:把"按经过时间取进度"和水平位移都放在元素内部完成。
+/// 悬浮面板的统一外壳:底色(surface_2 叠 fg_overlay_1,压到 99% 不透明)、描边、圆角、阴影。
+/// 垂直标签栏悬浮侧栏与悬浮工具面板共用,保证两处样式不漂移。留白(给阴影留出可见空间)
+/// 由调用方按 `FLOATING_PANEL_INSET` 在外面补。
+fn floating_panel_surface(appearance: &Appearance, contents: Box<dyn Element>) -> Box<dyn Element> {
+    Container::new(contents)
+        // 底色与窗口同一档(surface_2 叠 fg_overlay_1),再压到 99% 不透明:面板与窗口
+        // 看起来是一体的,层级靠阴影而不是靠色差区分。
+        .with_background(
+            appearance
+                .theme()
+                .surface_2()
+                .blend(&internal_colors::fg_overlay_1(appearance.theme()))
+                .with_opacity(99),
+        )
+        .with_border(Border::all(1.0).with_border_color(appearance.theme().outline().into()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.0)))
+        // 阴影是高斯衰减、可见范围约 ±3σ(shaders.metal 的 `roundedBoxShadow`
+        // 用 `clamp(±3.0 * sigma)` 截断采样),而 σ 就是 `blur_radius`。所以必须
+        // 满足 `3σ ≤ 留白`,否则高斯最浓的一段会被 quad 边界直接切掉,表现为
+        // "边缘很生硬、直接没了、没有从灰到透明的过渡"。
+        // 取 σ=2 → 3σ≈6px,到 quad 边界(5px)时已衰减到约 4%,过渡自然。
+        .with_drop_shadow(DropShadow {
+            color: ColorU::new(0, 0, 0, 64),
+            offset: vec2f(0., 2.),
+            blur_radius: 2.,
+            // 留白必须 ≥ 3σ(σ = `blur_radius`),否则高斯最浓的一段会被阴影 quad 的边界切掉。
+            // 这里取"留白 == spread":垂直标签栏悬浮侧栏把带阴影的容器包在 `Clipped` 里,
+            // 阴影 quad 正好填满裁剪边界,两者必须相等;悬浮工具面板没有那层裁剪(见 render 里
+            // 浮层的注释),取相等仍是最自然的做法,改任一项都只是让阴影更完整/更淡。
+            spread_radius: FLOATING_PANEL_INSET,
+        })
+        .finish()
+}
+
+/// 悬浮面板的滑出:把"按经过时间取进度"和水平位移都放在元素内部完成。
 ///
 /// **为什么不放在 `render` 里**:`ctx.repaint_after` 只触发重绘(`paint`),不会重新调用
 /// `render` —— 元素树被复用。进度若在 `render` 里算,动画就永远停在第 1 帧,直到下一个真实
 /// 事件把它直接推到终态(实测:`paint` 跑了 141 次而 `render` 只有 1 次)。spinner 与 dsh
 /// pane 的省略号动画把状态放在元素内部,正是为了绕开这一点。
-struct VerticalTabsSlideRepaint {
+struct PanelSlideRepaint {
     child: Box<dyn Element>,
     /// 动画参数。元素跨帧被复用时靠它算进度;`None` 表示不在动画中。
-    slide: Option<VerticalTabsSlide>,
+    slide: Option<PanelSlide>,
     /// 收起时整块让出的水平距离。
     full_width: f32,
     side: PanelPosition,
@@ -679,10 +724,10 @@ struct VerticalTabsSlideRepaint {
     progress_cell: Rc<Cell<f32>>,
 }
 
-impl VerticalTabsSlideRepaint {
+impl PanelSlideRepaint {
     fn new(
         child: Box<dyn Element>,
-        slide: Option<VerticalTabsSlide>,
+        slide: Option<PanelSlide>,
         full_width: f32,
         side: PanelPosition,
         progress_cell: Rc<Cell<f32>>,
@@ -696,29 +741,27 @@ impl VerticalTabsSlideRepaint {
         }
     }
 
-    /// 与 `Workspace::current_vertical_tabs_progress` 用同一条曲线,保证元素侧算出的进度与
-    /// `render` 侧的落定值一致。
+    /// 与 `Workspace::current_*_progress` 用同一条曲线,保证元素侧算出的进度与 `render`
+    /// 侧的落定值一致。
     fn progress(&self) -> f32 {
         // `slide == None` 时**不要**硬编码 1.0:那等于假设"没有动画就是完全展开"。将来若有人
-        // 直接置 `pinned = true` 而不起动画,元素会每帧把共享进度写成 1.0,等于把"面板永久
-        // 常驻"从另一扇门放回来。一律以共享进度为准。
+        // 直接置开状态而不起动画,元素会每帧把共享进度写成 1.0,等于把"面板永久常驻"从另一扇门
+        // 放回来。一律以共享进度为准。
         let Some(slide) = self.slide else {
             return self.progress_cell.get();
         };
-        let t =
-            (slide.started_at.elapsed().as_secs_f32() / VERTICAL_TABS_SLIDE_SECS).clamp(0., 1.);
+        let t = (slide.started_at.elapsed().as_secs_f32() / PANEL_SLIDE_SECS).clamp(0., 1.);
         // smoothstep(3t²-2t³):两端速度都为 0。
-        vertical_tabs_slide_progress(slide.from, slide.to, t)
+        panel_slide_progress(slide.from, slide.to, t)
     }
 
     fn animating(&self) -> bool {
-        self.slide.is_some_and(|slide| {
-            slide.started_at.elapsed().as_secs_f32() < VERTICAL_TABS_SLIDE_SECS
-        })
+        self.slide
+            .is_some_and(|slide| slide.started_at.elapsed().as_secs_f32() < PANEL_SLIDE_SECS)
     }
 }
 
-impl Element for VerticalTabsSlideRepaint {
+impl Element for PanelSlideRepaint {
     fn layout(
         &mut self,
         constraint: SizeConstraint,
@@ -744,7 +787,7 @@ impl Element for VerticalTabsSlideRepaint {
         self.child.paint(origin + vec2f(offset, 0.), ctx, app);
         if self.animating() {
             // 动画心跳:每帧请求下一次重绘(见 `app/src/ui_components/spinner.rs`)。
-            ctx.repaint_after(Duration::from_millis(VERTICAL_TABS_SLIDE_FRAME_MS));
+            ctx.repaint_after(Duration::from_millis(PANEL_SLIDE_FRAME_MS));
         }
     }
 
@@ -1255,6 +1298,10 @@ pub struct Workspace {
     file_upload_sessions: FileUploadSessions,
     ai_fact_view: ViewHandle<AIFactView>,
     left_panel_open: bool,
+    /// 悬浮工具面板:滑出进度(0=完全收起,1=完全展开)与进行中的动画。与垂直标签栏同一套机制,
+    /// 进度同样必须由渲染元素在 `paint` 时写回(见 `PanelSlideRepaint`)。
+    left_panel_progress: Rc<Cell<f32>>,
+    left_panel_slide: Cell<Option<PanelSlide>>,
     vertical_tabs_panel_open: bool,
     /// 自动隐藏模式下,用户通过按钮/快捷键显式打开面板时置位 —— 此时面板直接浮出,而不是
     /// 只留一条贴边热区(否则点一下毫无反馈)。启动恢复不算显式打开,仍只显示热区。
@@ -1262,11 +1309,11 @@ pub struct Workspace {
     /// 自动隐藏的垂直标签栏:滑出进度(0=完全收起,1=完全展开)与进行中的动画。
     ///
     /// 进度用 `Rc<Cell<_>>` 与渲染元素共享,是因为它必须被**元素在 `paint` 时实时写回**:
-    /// 动画期间 `render` 基本不会重跑(见 `VerticalTabsSlideRepaint` 的说明),只靠在 `render`
+    /// 动画期间 `render` 基本不会重跑(见 `PanelSlideRepaint` 的说明),只靠在 `render`
     /// 里更新的话,收起会从一个滞后的起点开始 —— 实测起点停在展开动画的第一帧 0.0035,
     /// 于是"收起瞬间到位、没有过渡"。
     vertical_tabs_panel_progress: Rc<Cell<f32>>,
-    vertical_tabs_panel_slide: Cell<Option<VerticalTabsSlide>>,
+    vertical_tabs_panel_slide: Cell<Option<PanelSlide>>,
     vertical_tabs_panel: VerticalTabsPanelState,
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
@@ -3411,6 +3458,8 @@ impl Workspace {
             file_upload_sessions: Default::default(),
             ai_fact_view,
             left_panel_open: false,
+            left_panel_progress: Rc::new(Cell::new(0.)),
+            left_panel_slide: Cell::new(None),
             vertical_tabs_panel_open: false,
             vertical_tabs_panel_pinned: false,
             vertical_tabs_panel_progress: Rc::new(Cell::new(0.)),
@@ -4893,6 +4942,13 @@ impl Workspace {
         pane_group.update(ctx, |pane_group, ctx| {
             pane_group.set_left_panel_open(desired_open, ctx);
         });
+
+        // 这条路径直接改 `pane_group` 的开合状态(切标签页时把当前状态同步给新 pane group),
+        // 不经 `open_left_panel`/`close_left_panel` —— 悬浮态要在这里补上动画起算,否则进度
+        // 只能靠 `left_panel_progress_for` 直接落定(没有过渡)。
+        if Self::tool_panel_floats(ctx) {
+            self.slide_left_panel_to(if desired_open { 1. } else { 0. }, ctx);
+        }
     }
 
     /// Notifies the agent views model and notifications model that a terminal view gained focus.
@@ -8437,6 +8493,23 @@ impl Workspace {
             pane_group.set_left_panel_open(true, ctx);
         });
 
+        // 悬浮态的面板是浮层,开合走滑出动画(停靠态在布局行内,没有过渡可言)。
+        if Self::tool_panel_floats(ctx) {
+            self.slide_left_panel_to(1., ctx);
+            // 浮层的 `Dismiss` 用 prevent 模式铺了一层整窗 hit-rect:面板打开期间鼠标事件不再
+            // 到达标题栏按钮,按钮的 hover/clicked 状态会"冻"在点击那一刻 —— 工具提示与 hover
+            // 底色会一直留着(横排/竖排两个入口按钮都可能被点)。清掉交互状态,让提示随面板
+            // 打开立即消失,与垂直标签栏按钮(非模态浮层,事件照常)表现一致。
+            for handle in [
+                &self.mouse_states.tools_panel_icon,
+                &self.mouse_states.left_panel_icon,
+            ] {
+                if let Ok(mut state) = handle.lock() {
+                    state.reset_interaction_state();
+                }
+            }
+        }
+
         ctx.notify();
     }
 
@@ -8487,6 +8560,11 @@ impl Workspace {
         active_pane_group.update(ctx, |pane_group, ctx| {
             pane_group.set_left_panel_open(false, ctx);
         });
+
+        // 收起同样走滑出动画:面板子树会在 `progress` 落到 0 之前继续渲染(见 `render`)。
+        if Self::tool_panel_floats(ctx) {
+            self.slide_left_panel_to(0., ctx);
+        }
 
         ctx.notify();
     }
@@ -8674,13 +8752,13 @@ impl Workspace {
 
     /// 把自动隐藏侧栏滑向 `target`(0=收起,1=展开)。重复调用从当前进度重新起算,所以鼠标
     /// 快速进出不会跳变。逐帧推进交给 `current_vertical_tabs_progress` 与探测层上的
-    /// `VerticalTabsSlideRepaint`,这里不做任何调度。
+    /// `PanelSlideRepaint`,这里不做任何调度。
     fn slide_vertical_tabs_panel_to(&mut self, target: f32, ctx: &mut ViewContext<Self>) {
         if (self.vertical_tabs_panel_progress.get() - target).abs() < f32::EPSILON {
             self.vertical_tabs_panel_slide.set(None);
             return;
         }
-        self.vertical_tabs_panel_slide.set(Some(VerticalTabsSlide {
+        self.vertical_tabs_panel_slide.set(Some(PanelSlide {
             started_at: Instant::now(),
             from: self.vertical_tabs_panel_progress.get(),
             to: target,
@@ -8690,7 +8768,7 @@ impl Workspace {
         // 本 view。少了这一下,收起结束后 `revealed` 不会落 false —— 探测层会长时间停在展开
         // 宽度(单帧内把指针甩到贴边就会被拒绝展开),隐藏的面板子树也继续每帧 layout + paint。
         ctx.spawn(
-            Timer::after(Duration::from_secs_f32(VERTICAL_TABS_SLIDE_SECS + 0.05)),
+            Timer::after(Duration::from_secs_f32(PANEL_SLIDE_SECS + 0.05)),
             |me, _, ctx| {
                 // 顺带落定一次(清掉 slide),再请求重绘。
                 me.current_vertical_tabs_progress();
@@ -8700,21 +8778,87 @@ impl Workspace {
     }
 
     /// 当前滑出进度。动画进行中按经过时间插值,到点即落定并清掉动画。这里只读+推进,不需要
-    /// 任何定时器 —— 每帧的重绘由探测层上的 `VerticalTabsSlideRepaint` 在 `paint` 后请求。
+    /// 任何定时器 —— 每帧的重绘由探测层上的 `PanelSlideRepaint` 在 `paint` 后请求。
     fn current_vertical_tabs_progress(&self) -> f32 {
         let Some(slide) = self.vertical_tabs_panel_slide.get() else {
             return self.vertical_tabs_panel_progress.get();
         };
-        let t =
-            (slide.started_at.elapsed().as_secs_f32() / VERTICAL_TABS_SLIDE_SECS).clamp(0., 1.);
+        let t = (slide.started_at.elapsed().as_secs_f32() / PANEL_SLIDE_SECS).clamp(0., 1.);
         if t >= 1. {
             self.vertical_tabs_panel_progress.set(slide.to);
             self.vertical_tabs_panel_slide.set(None);
             return slide.to;
         }
-        let progress = vertical_tabs_slide_progress(slide.from, slide.to, t);
+        let progress = panel_slide_progress(slide.from, slide.to, t);
         self.vertical_tabs_panel_progress.set(progress);
         progress
+    }
+
+    /// 把悬浮工具面板滑向 `target`(0=收起,1=展开)。与 `slide_vertical_tabs_panel_to` 同构:
+    /// 重复调用从当前进度重新起算,逐帧推进交给 `current_left_panel_progress` 与浮层上的
+    /// `PanelSlideRepaint`。
+    fn slide_left_panel_to(&mut self, target: f32, ctx: &mut ViewContext<Self>) {
+        if (self.left_panel_progress.get() - target).abs() < f32::EPSILON {
+            self.left_panel_slide.set(None);
+            return;
+        }
+        self.left_panel_slide.set(Some(PanelSlide {
+            started_at: Instant::now(),
+            from: self.left_panel_progress.get(),
+            to: target,
+        }));
+        ctx.notify();
+        // 与侧栏同理:元素的心跳只调度 `paint`,不会 invalidate 本 view。少了这一下,收起动画
+        // 结束后 `panel_revealed` 不会落 false —— 面板子树(含 `Dismiss` 的整窗 hit-rect)会一直
+        // 留在元素树里,把窗口的交互挡死。
+        ctx.spawn(
+            Timer::after(Duration::from_secs_f32(PANEL_SLIDE_SECS + 0.05)),
+            |me, _, ctx| {
+                me.current_left_panel_progress();
+                ctx.notify();
+            },
+        );
+    }
+
+    /// 悬浮工具面板当前的滑出进度。与 `current_vertical_tabs_progress` 同构。
+    fn current_left_panel_progress(&self) -> f32 {
+        let Some(slide) = self.left_panel_slide.get() else {
+            return self.left_panel_progress.get();
+        };
+        let t = (slide.started_at.elapsed().as_secs_f32() / PANEL_SLIDE_SECS).clamp(0., 1.);
+        if t >= 1. {
+            self.left_panel_progress.set(slide.to);
+            self.left_panel_slide.set(None);
+            return slide.to;
+        }
+        let progress = panel_slide_progress(slide.from, slide.to, t);
+        self.left_panel_progress.set(progress);
+        progress
+    }
+
+    /// `render` 侧读悬浮工具面板的滑出进度,并按面板的开关状态兜底落定
+    /// (见 [`settle_panel_progress`])。
+    fn left_panel_progress_for(&self, open: bool) -> f32 {
+        let progress = self.current_left_panel_progress();
+        let settled = settle_panel_progress(progress, open, self.left_panel_slide.get().is_some());
+        self.left_panel_progress.set(settled);
+        settled
+    }
+
+    /// 悬浮工具面板收起动画的**位移距离**(内容宽 + 两侧描边 + 两侧留白),只用于把面板整块
+    /// 移出窗口:少算会在窗口边缘残一条,多算无害。**不参与布局** —— 面板宽度由它自己的
+    /// `Resizable` state 决定(见 `render` 里悬浮浮层的注释);名字刻意不叫 `..._width`,避免
+    /// 后人再把它当布局宽度用回父级约束(那正是本次修的 bug 形态)。
+    fn floating_left_panel_slide_distance(&self, app: &AppContext) -> f32 {
+        let stored = ResizableData::as_ref(app)
+            .get_handle(self.window_id, ModalType::LeftPanelWidth)
+            .and_then(|handle| handle.lock().ok().map(|state| state.size()))
+            .unwrap_or(DEFAULT_LEFT_PANEL_WIDTH);
+        // 必须按**下限**兜一次:state 是在 layout 里才被 `Resizable` 的 bounds callback 钳到
+        // `MIN_SIDEBAR_WIDTH` 的,而这里是 render 期读的旧值。首次打开(初值 240 或 toggle 时
+        // 重算出的 15% 窗宽)会小到 216,位移就会少盖几十像素,收起动画的起点残一条。
+        // 2. 是 `floating_panel_surface` 里 `Border::all(1.0)` 的两侧之和。
+        stored.max(MIN_SIDEBAR_WIDTH) + 2. + 2. * FLOATING_PANEL_INSET
     }
 
     fn toggle_vertical_tabs_panel(&mut self, ctx: &mut ViewContext<Self>) {
@@ -19247,15 +19391,6 @@ impl Workspace {
             && *TabSettings::as_ref(app).vertical_tabs_panel_auto_hide
     }
 
-    /// 悬浮工具面板沿用用户在停靠态下拖拽出来的宽度,但不低于浮层自己的下限。
-    fn floating_left_panel_width(&self, app: &AppContext) -> f32 {
-        let stored = ResizableData::as_ref(app)
-            .get_handle(self.window_id, ModalType::LeftPanelWidth)
-            .and_then(|handle| handle.lock().ok().map(|state| state.size()))
-            .unwrap_or(DEFAULT_LEFT_PANEL_WIDTH);
-        stored.max(FLOATING_LEFT_PANEL_MIN_WIDTH)
-    }
-
     /// Renders a configurable panel for the given toolbar item, if it is open.
     /// Returns `None` if the panel should not be rendered (item not available,
     /// panel not open, or item is not a panel type).
@@ -22571,59 +22706,27 @@ impl View for Workspace {
             // `VERTICAL_TABS_PANEL_POSITION_ID` 那个窗口外矩形)永久常驻,进而污染
             // `tab_bar_rects_for_window` 的拖拽落点判定。`progress` 来自与元素共享的
             // `Rc<Cell<_>>`、每帧 `paint` 都会写回,它才是实时的那个。
-            let revealed =
-                vertical_tabs_panel_revealed(progress, self.vertical_tabs_panel_pinned);
+            let revealed = panel_revealed(progress, self.vertical_tabs_panel_pinned);
 
             if revealed {
-                let panel_body = Container::new(
-                    Container::new(
-                        SavePosition::new(
-                            self.render_vertical_tabs_panel(side, app),
-                            VERTICAL_TABS_PANEL_POSITION_ID,
-                        )
-                        .finish(),
+                let panel_body = Container::new(floating_panel_surface(
+                    appearance,
+                    SavePosition::new(
+                        self.render_vertical_tabs_panel(side, app),
+                        VERTICAL_TABS_PANEL_POSITION_ID,
                     )
-                    // 宽度不由这里决定:停靠态交给面板自己的 `Resizable`,悬浮态则由
-                    // `render_vertical_tabs_panel` 早退成固定宽度(浮层不提供拖拽改宽)。
-                    // 这里只负责把那层结果原样包上留白与阴影,动画只改位置。
-                    // 底色与窗口同一档(surface_2 叠 fg_overlay_1),再压到 99% 不透明:面板与窗口
-                    // 看起来是一体的,层级靠阴影而不是靠色差区分。
-                    .with_background(
-                        appearance
-                            .theme()
-                            .surface_2()
-                            .blend(&internal_colors::fg_overlay_1(appearance.theme()))
-                            .with_opacity(99),
-                    )
-                    .with_border(
-                        Border::all(1.0).with_border_color(appearance.theme().outline().into()),
-                    )
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.0)))
-                    // 阴影是高斯衰减、可见范围约 ±3σ(shaders.metal 的 `roundedBoxShadow`
-                    // 用 `clamp(±3.0 * sigma)` 截断采样),而 σ 就是 `blur_radius`。所以必须
-                    // 满足 `3σ ≤ 留白`,否则高斯最浓的一段会被 quad 边界直接切掉,表现为
-                    // "边缘很生硬、直接没了、没有从灰到透明的过渡"。
-                    // 取 σ=2 → 3σ≈6px,到 quad 边界(5px)时已衰减到约 4%,过渡自然。
-                    .with_drop_shadow(DropShadow {
-                        color: ColorU::new(0, 0, 0, 64),
-                        offset: vec2f(0., 2.),
-                        blur_radius: 2.,
-                        // 硬约束:必须与 `VERTICAL_TABS_PANEL_INSET` 相等。带阴影的容器包在
-                        // `Clipped` 里面,阴影 quad 正好填满裁剪边界,改任一项阴影都会被裁掉。
-                        spread_radius: VERTICAL_TABS_PANEL_INSET,
-                    })
                     .finish(),
-                )
+                ))
                 // 四边留白:浮层不贴窗口边缘,同时给阴影留出可见空间(§7.3 "容器铺满、内容内缩")。
-                .with_uniform_padding(VERTICAL_TABS_PANEL_INSET)
+                .with_uniform_padding(FLOATING_PANEL_INSET)
                 .finish();
                 // 非 prevent 模式:只在"点击面板之外"时收起,不会阻塞其它元素的交互。
                 // `Clipped` 为面板内容新开一层,使其命中记录高于 `Dismiss` 的全窗 rect,
                 // 否则点面板内的空白也会被误判成"点在外面"。
                 stack.add_positioned_overlay_child(
-                    // 位移交给 `VerticalTabsSlideRepaint` 在 paint 时施加(它不依赖 `render`
+                    // 位移交给 `PanelSlideRepaint` 在 paint 时施加(它不依赖 `render`
                     // 重跑);这里只把面板摆到"完全展开"的位置。
-                    Box::new(VerticalTabsSlideRepaint::new(
+                    Box::new(PanelSlideRepaint::new(
                         Dismiss::new(Clipped::new(panel_body).finish())
                             .on_dismiss(|ctx, _app| {
                                 ctx.dispatch_typed_action(
@@ -22633,7 +22736,7 @@ impl View for Workspace {
                             .finish(),
                         self.vertical_tabs_panel_slide.get(),
                         // 位移要盖过面板的**总**宽度(内容宽 + 两侧留白),否则收起后会残一条。
-                        full_width + 2. * VERTICAL_TABS_PANEL_INSET,
+                        full_width + 2. * FLOATING_PANEL_INSET,
                         side,
                         self.vertical_tabs_panel_progress.clone(),
                     )),
@@ -22713,69 +22816,121 @@ impl View for Workspace {
         // 悬浮工具面板:浮在内容之上,点击面板外区域收起。停靠态由 `render_config_panel`
         // 在布局行内渲染,这里不做任何事。
         #[cfg(not(target_family = "wasm"))]
-        if Self::tool_panel_floats(app) && self.active_tab_pane_group().as_ref(app).left_panel_open
-        {
-            let panel_body = Container::new(
-                ConstrainedBox::new(ChildView::new(&self.left_panel_view).finish())
-                    .with_width(self.floating_left_panel_width(app))
-                    .finish(),
-            )
-            .with_background(appearance.theme().surface_1())
-            .with_border(Border::all(1.0).with_border_color(appearance.theme().outline().into()))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.0)))
-            .with_drop_shadow(DropShadow::default())
-            .finish();
-            // 键盘:非 keybinding 的 KeyDown 会在整棵元素树上广播,`Stack` 在 debug 构建下更是
-            // 让后加的浮层优先派发,所以浮层不需要焦点也能拿到 Esc。前提是 Esc 没有被某个
-            // keybinding 提前消费 —— 面板打开时焦点收在 `LeftPanelView` 自身而不是面板内的
-            // `EditorView`,正是为了不给后者机会(见 `focus_active_view_on_entry`)。
-            //
-            // 悬浮编辑器浮层也在这个 stack 上,且 release 构建下 `Stack` 走 `Broadcast`
-            // (正序、不停止),两个捕获层都会收到同一次 Esc。这里显式让位,避免一次按键
-            // 同时收起两个浮层。
-            let floating_editor_open = self.floating_editor_pane.is_some();
-            let panel_body = EventHandler::new(panel_body)
-                .with_always_handle()
-                .on_keydown(move |ctx, _app, keystroke| {
-                    if floating_editor_open {
-                        return DispatchEventResult::PropagateToParent;
-                    }
-                    if keystroke.normalized().as_str() == "escape" {
-                        ctx.dispatch_typed_action(WorkspaceAction::ToggleLeftPanel);
-                        DispatchEventResult::StopPropagation
-                    } else {
-                        DispatchEventResult::PropagateToParent
-                    }
-                })
+        if Self::tool_panel_floats(app) {
+            let tools_panel_open = self.active_tab_pane_group().as_ref(app).left_panel_open;
+            let progress = self.left_panel_progress_for(tools_panel_open);
+            // 收起动画期间面板子树必须继续渲染,否则没有过渡;判据用元素每帧写回的 `progress`,
+            // **不能**用 `slide.is_some()`(它只在 `render` 里被清,会让面板子树永久常驻)。
+            if panel_revealed(progress, tools_panel_open) {
+                // 宽度交给面板自己的 `Resizable`(与停靠态同源)。这里**不能**再用
+                // `ConstrainedBox::with_width` 把宽度写进父级元素:父级(Workspace)元素只在
+                // Workspace 被 notify 时重建,而拖拽只 notify `LeftPanelView`,写死的宽度会一直
+                // 停在旧值,表现为"拖了宽度不变"。宽度下限由 `LeftPanelView` 里 `Resizable`
+                // 的 bounds callback 提供,两个模式共用。
+                //
+                // 外壳(底色/描边/圆角/阴影)与垂直标签栏悬浮侧栏共用 `floating_panel_surface`;
+                // 四边留白既让浮层不贴窗口边缘,也给阴影留出可见空间(§7.3 "容器铺满、内容内缩")。
+                let panel_body = Container::new(floating_panel_surface(
+                    appearance,
+                    ChildView::new(&self.left_panel_view).finish(),
+                ))
+                .with_uniform_padding(FLOATING_PANEL_INSET)
                 .finish();
-            // 工具面板可被配置到工具栏右侧,浮层锚点跟随它的停靠侧。
-            let tools_docked_left = TabSettings::as_ref(app)
-                .header_toolbar_chip_selection
-                .left_items()
-                .contains(&HeaderToolbarItemKind::ToolsPanel);
-            let (parent_anchor, child_anchor) = if tools_docked_left {
-                (PositionedElementAnchor::BottomLeft, ChildAnchor::TopLeft)
-            } else {
-                (PositionedElementAnchor::BottomRight, ChildAnchor::TopRight)
-            };
-            stack.add_positioned_overlay_child(
-                // `Clipped` 会为面板内容新开一个 layer:面板自身的命中记录因此落在比
-                // `Dismiss` 的全窗 rect 更高的层上(`is_covered` 只查更高层,见
-                // `scene.rs`),否则点击面板内的空白处会被误判成"点在外面"而收起面板。
-                Dismiss::new(Clipped::new(panel_body).finish())
-                    .prevent_interaction_with_other_elements()
-                    .on_dismiss(|ctx, _app| {
-                        ctx.dispatch_typed_action(WorkspaceAction::ToggleLeftPanel);
+                // 键盘:非 keybinding 的 KeyDown 会在整棵元素树上广播,`Stack` 在 debug 构建下更是
+                // 让后加的浮层优先派发,所以浮层不需要焦点也能拿到 Esc。前提是 Esc 没有被某个
+                // keybinding 提前消费 —— 面板打开时焦点收在 `LeftPanelView` 自身而不是面板内的
+                // `EditorView`,正是为了不给后者机会(见 `focus_active_view_on_entry`)。
+                //
+                // 悬浮编辑器浮层也在这个 stack 上,且 release 构建下 `Stack` 走 `Broadcast`
+                // (正序、不停止),两个捕获层都会收到同一次 Esc。这里显式让位,避免一次按键
+                // 同时收起两个浮层。
+                let floating_editor_open = self.floating_editor_pane.is_some();
+                let panel_body = EventHandler::new(panel_body)
+                    .with_always_handle()
+                    .on_keydown(move |ctx, _app, keystroke| {
+                        if floating_editor_open {
+                            return DispatchEventResult::PropagateToParent;
+                        }
+                        // 收起动画期间面板已经是"关闭"状态,此时按 Esc 不该再把它打开回去
+                        // (与同一窗口期不挂 `Dismiss` 的处理一致)。
+                        if !tools_panel_open {
+                            return DispatchEventResult::PropagateToParent;
+                        }
+                        if keystroke.normalized().as_str() == "escape" {
+                            ctx.dispatch_typed_action(WorkspaceAction::ToggleLeftPanel);
+                            DispatchEventResult::StopPropagation
+                        } else {
+                            DispatchEventResult::PropagateToParent
+                        }
                     })
-                    .finish(),
-                OffsetPositioning::offset_from_save_position_element(
-                    TAB_BAR_POSITION_ID,
-                    vec2f(0., 0.),
-                    PositionedElementOffsetBounds::WindowBySize,
-                    parent_anchor,
-                    child_anchor,
-                ),
-            );
+                    .finish();
+                // 工具面板可被配置到工具栏右侧,浮层锚点跟随它的停靠侧。
+                let tools_docked_left = TabSettings::as_ref(app)
+                    .header_toolbar_chip_selection
+                    .left_items()
+                    .contains(&HeaderToolbarItemKind::ToolsPanel);
+                let (parent_anchor, child_anchor) = if tools_docked_left {
+                    (ParentAnchor::TopLeft, ChildAnchor::TopLeft)
+                } else {
+                    (ParentAnchor::TopRight, ChildAnchor::TopRight)
+                };
+                // 需要"新开一层",让面板的命中记录落在比 `Dismiss` 整窗 underlay 更高的层上
+                // (`is_covered` 只查更高层,见 `scene.rs`),否则点面板内的空白处会被判成
+                // "点在外面"而收起面板。用 `Stack::add_overlay_child` 新开一个**不裁剪**
+                // (`ClipBounds::None`)的 overlay 层,而不是 `Clipped`:面板内容与停靠态一样
+                // 不需要被裁到自身矩形(裁了反而会让内容在圆角处更"贴",且早期版本正是因为
+                // 这层裁剪把面板内的弹出菜单一起裁掉了)。菜单能逃出裁剪另有保障:
+                // `Positioned::is_overlay` 会转发给子元素,使 `add_positioned_overlay_child`
+                // 的子树也拿到不裁剪的 overlay 层(见 crates/warpui_core/.../stack/positioned.rs)。
+                let mut panel_layer = Stack::new();
+                panel_layer.add_overlay_child(panel_body);
+                let panel = panel_layer.finish();
+                let panel: Box<dyn Element> = if tools_panel_open {
+                    Dismiss::new(panel)
+                        .prevent_interaction_with_other_elements()
+                        .on_dismiss(|ctx, _app| {
+                            ctx.dispatch_typed_action(WorkspaceAction::ToggleLeftPanel);
+                        })
+                        .finish()
+                } else {
+                    // 收起动画期间不挂 `Dismiss`:面板此刻已经是"关闭"状态,再让一次点击走到
+                    // `on_dismiss` 会把它重新打开,而 prevent 模式的整窗 hit-rect 也会在这段
+                    // 窗口期把整个界面挡死。此时面板只是一块会滑走的残影 —— 位移只作用在
+                    // `paint` 上、命中记录跟着位移走,于是"面板让出来的那块区域"点击会落到下层
+                    // (终端),与垂直标签栏浮层收起时同一行为。已知代价:残影自身在 260ms 内
+                    // 仍可被点到(要真拦需要在内容之上再叠一层 blocker,不值得为这点窗口加机制)。
+                    panel
+                };
+                stack.add_positioned_overlay_child(
+                    // 位移交给 `PanelSlideRepaint` 在 `paint` 时施加(它不依赖 `render` 重跑);
+                    // 这里只把面板摆到"完全展开"的位置。`full_width` 必须盖过面板总宽,否则
+                    // 收起后会在窗口边缘残一条。
+                    Box::new(PanelSlideRepaint::new(
+                        panel,
+                        self.left_panel_slide.get(),
+                        self.floating_left_panel_slide_distance(app),
+                        if tools_docked_left {
+                            PanelPosition::Left
+                        } else {
+                            PanelPosition::Right
+                        },
+                        self.left_panel_progress.clone(),
+                    )),
+                    OffsetPositioning::offset_from_parent(
+                        // 锚在**铺满窗口的父级**上,而不是 tab bar 的 `SavePosition`:tab bar 在
+                        // `ShowTabBar::Hidden`(全屏禅模式)下不渲染,锚在它上面会因位置缺失在
+                        // debug 构建里断言失败、release 下整段跳过(面板消失)。父级锚点还顺带
+                        // 免掉"首帧位置缓存未就绪"那个坑(与垂直标签栏悬浮侧栏同一处理)。
+                        // 顶部对齐到 tab bar 的**总**高度处:比原来锚 tab bar 底边时高 1px
+                        // (tab bar 还嵌在 `WORKSPACE_PADDING` 里),横向也贴边近 1px —— 1px 的
+                        // 差异可忽略,换来的是四种 tab bar 形态下都成立。
+                        vec2f(0., TOTAL_TAB_BAR_HEIGHT),
+                        ParentOffsetBounds::ParentBySize,
+                        parent_anchor,
+                        child_anchor,
+                    ),
+                );
+            }
         }
 
         // 悬浮编辑器(`EditorLayout::Floating`):居中的模态浮层,点外部或 Esc 收起。

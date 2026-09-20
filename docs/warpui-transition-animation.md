@@ -75,7 +75,8 @@ PaintContext::repaint_after(d)            // presenter.rs:632,取更早的到期
 
 - spinner:`SpinnerStateHandle`(`Arc<Mutex<Instant>>` 记起始时刻)在 `layout` 里选帧;
 - dsh pane 的 `EllipsisText`:同样在 `layout` 里按 `Instant` 算省略号档位;
-- 自制滑出动画:`VerticalTabsSlideRepaint` 持有 `{ started_at, from, to }`,在 `paint`
+- 自制滑出动画:`PanelSlideRepaint`(原 `VerticalTabsSlideRepaint`,现由垂直标签栏悬浮侧栏
+  与悬浮工具面板共用)持有 `{ started_at, from, to }`,在 `paint`
   里算进度并给 child 的 `origin` 加偏移。
 
 ## 4. 推论 2:不要用 `ctx.spawn(Timer::after(..))` 驱动逐帧
@@ -130,10 +131,14 @@ render@slide elapsed_ms=8  from=0.0035   to=0   ← 收起开始,起点却是 0.
 | 宽度驱动 | `ConstrainedBox::with_width(w * progress)` | 内容随宽度反复重排,像被"挤压"出来 |
 | 位移驱动 | 元素在 `paint` 时给 `origin` 加 `-w * (1 - progress)` | 内容只布局一次,整块平移 |
 
-位移更自然,但有一个**已知代价**:包装元素 `origin()` / `size()` 返回的仍是**未加偏移**
-的值,所以动画进行中,`Dismiss`、`Hoverable` 这类依赖位置的命中判定会和视觉位置
-错开(最多一个元素宽)。窗口期等于动画时长,通常可接受;若不可接受,需要让包装元素
-把偏移量也纳入 `origin()`。
+位移更自然。实现上有两点要记牢:
+
+1. **偏移必须施加在 `paint` 的 origin 上**(`child.paint(origin + offset, ..)`)。这样子元素的
+   `origin()` 与它记录的命中矩形都会**跟着位移走**,点击位置与视觉位置一致 —— 已核对
+   (`Hoverable`/`Dismiss` 的矩形都取自 paint 时的 origin)。若改成"paint 完再改 origin"或
+   只在 `render` 里另算偏移,就会变成命中与视觉错开。
+2. **位移不改布局**:包装元素的 `size()` 不变,外层 `Stack` 每帧仍按未位移的锚点算位置。
+   所以 `layout` / `after_layout` 阶段读到的几何是"未位移"的;动画期间不要用它反推视觉位置。
 
 ## 8. 展开 / 收起的判据要对称
 

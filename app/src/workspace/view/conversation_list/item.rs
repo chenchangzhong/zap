@@ -356,8 +356,17 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
                 ParentAnchor::TopRight,
                 ChildAnchor::TopRight,
             );
+            let overflow_button = EventHandler::new(overflow_button.finish())
+                .with_always_handle()
+                // 「…」按钮区域整体吞掉鼠标按下:菜单打开后按钮会被菜单那层的命中记录盖住
+                // (Hoverable 不再 hover → 不再处理点击),点击就落到行上触发 `OpenItem`,
+                // 表现为"第二次点击关闭菜单时把会话打开了"(实测探针:`child_handled=false`
+                // → `row on_click(OpenItem)`)。这里在按钮外层再拦一层,保证该区域的点击
+                // 永远不落到行;按钮自身与菜单的行为不受影响。
+                .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
+                .finish();
             // Use add_positioned_child (not overlay) so button stays within item bounds
-            stack.add_positioned_child(overflow_button.finish(), overflow_offset);
+            stack.add_positioned_child(overflow_button, overflow_offset);
         }
 
         // Hide the tooltip when the overflow menu is being shown so that they don't overlap.

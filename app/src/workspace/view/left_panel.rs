@@ -5,11 +5,13 @@ use std::sync::Arc;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::{send_telemetry_from_ctx, ui::Icon, HostId, SessionId};
 use warp_util::path::LineAndColumnArg;
+use warpui::geometry::vector::vec2f;
 use warpui::{
     elements::{
-        resizable_state_handle, ChildView, ConstrainedBox, Container, CrossAxisAlignment,
-        DragBarSide, Element, Empty, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle,
-        ParentElement, Resizable, ResizableStateHandle, Shrinkable,
+        resizable_state_handle, ChildAnchor, ChildView, ConstrainedBox, Container,
+        CrossAxisAlignment, DragBarSide, Element, Empty, Flex, MainAxisAlignment, MainAxisSize,
+        MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds,
+        Resizable, ResizableStateHandle, Shrinkable, Stack,
     },
     platform::Cursor,
     ui_components::components::{Coords, UiComponent, UiComponentStyles},
@@ -1426,11 +1428,56 @@ impl View for LeftPanelView {
             .with_padding_right(HEADER_EDGE_PADDING)
             .finish();
 
-            column
-                .with_child(header_row)
-                .with_child(Shrinkable::new(1.0, content_area).finish())
-                .with_main_axis_size(MainAxisSize::Max)
-                .finish()
+            // 悬浮态:头部改成"在内容之后绘制"的 overlay child。面板整体处在 overlay 层里,
+            // 而 overlay 层内部只按**绘制顺序**比高低(见 docs/warpui-layering-and-shadows.md §3):
+            // 头部先画的话,它按钮的 tooltip(默认朝下 `ButtonTooltipPosition::Below`,会压在
+            // 内容区上方)就会被后画的内容区盖住。内容前补一个等高占位,把绘制顺序反过来 ——
+            // 头部及其所有弹出层(含 tooltip)始终在内容之上,且 tooltip 方向保持全局约定(下方)。
+            //
+            // 两条硬约束(都踩过,审查也提过;第二条后来由实测证实是"光标闪烁"的根源):
+            // 1. 必须 `with_constrain_absolute_children()`:`Stack::new()` 默认**不**约束绝对
+            //    定位子元素(它拿到的是窗口尺寸约束),而头部行内是 `Flex::row(MainAxisSize::Max)`
+            //    → 会被撑到窗口宽,`SpaceBetween` 把关闭按钮推到窗口右缘。
+            // 2. 占位要**铺满**(内部 `MainAxisSize::Max`),不能是宽度 0 的 `Empty`:头部移出列后,
+            //    列的交叉轴宽度只由内容自然宽决定 → 面板**渲染宽度随内容抖动**,而拖拽带贴内容
+            //    右缘 → 命中带跟着抖 → 鼠标位置不变也会 hover 进/出,resize 光标反复闪烁
+            //    (实测日志:bounds 右边缘 302→300→290→289→274 连缩,鼠标固定在 283.6)。
+            if super::Workspace::tool_panel_floats(app) {
+                let mut stack = Stack::new().with_constrain_absolute_children();
+                stack.add_child(
+                    column
+                        .with_child(
+                            ConstrainedBox::new(
+                                Flex::row().with_main_axis_size(MainAxisSize::Max).finish(),
+                            )
+                            .with_height(PANE_HEADER_HEIGHT)
+                            .finish(),
+                        )
+                        .with_child(Shrinkable::new(1.0, content_area).finish())
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .finish(),
+                );
+                stack.add_positioned_overlay_child(
+                    header_row,
+                    // 必须用 `ParentBySize`(而不是 `ParentByPosition`):后者的位置兜底里有一条
+                    // "算出的位置 < 0 → 居中到窗口",而面板做滑出动画时它的 x 是负的 → 头部会被
+                    // 居中到整个 app 的中间(实测:开关面板时工具带按钮跑到窗口水平中央)。
+                    // `ParentBySize` 只把位置钳在父级矩形内,且会算出正确的最大宽度。
+                    OffsetPositioning::offset_from_parent(
+                        vec2f(0., 0.),
+                        ParentOffsetBounds::ParentBySize,
+                        ParentAnchor::TopLeft,
+                        ChildAnchor::TopLeft,
+                    ),
+                );
+                stack.finish()
+            } else {
+                column
+                    .with_child(header_row)
+                    .with_child(Shrinkable::new(1.0, content_area).finish())
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .finish()
+            }
         })
         .finish();
 
@@ -1442,13 +1489,8 @@ impl View for LeftPanelView {
             super::PanelPosition::Left => DragBarSide::Right,
             super::PanelPosition::Right => DragBarSide::Left,
         };
-        // `Resizable` 会用自己 state 里的宽度反过来卡住外层给它的约束,所以悬浮态要加宽
-        // 不能只抬外层 `ConstrainedBox`,这里的下限必须同步抬高。
-        let min_width = if super::Workspace::tool_panel_floats(app) {
-            super::FLOATING_LEFT_PANEL_MIN_WIDTH
-        } else {
-            MIN_SIDEBAR_WIDTH
-        };
+        // 宽度下限两个模式共用 `MIN_SIDEBAR_WIDTH`。分叉的代价实测过:悬浮态曾单独用 320,
+        // 一旦停靠态拖出的宽度(250~320)进过悬浮态,就会被抬高写回共享 state,再也回不去。
         Resizable::new(self.resizable_state_handle.clone(), panel_content)
             .with_dragbar_side(drag_side)
             .on_resize(move |ctx, _| {
@@ -1456,7 +1498,7 @@ impl View for LeftPanelView {
             })
             .with_bounds_callback(Box::new(move |window_size| {
                 let max_width = window_size.x() * MAX_SIDEBAR_WIDTH_RATIO;
-                (min_width, max_width.max(min_width))
+                (MIN_SIDEBAR_WIDTH, max_width.max(MIN_SIDEBAR_WIDTH))
             }))
             .finish()
     }

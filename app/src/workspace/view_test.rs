@@ -2179,31 +2179,45 @@ fn test_open_file_notebook_focuses_existing_markdown_pane() {
 }
 
 #[test]
-fn vertical_tabs_panel_revealed_only_while_animating_or_pinned() {
+fn panel_revealed_only_while_animating_or_open() {
     // 收起终态必须落 false:否则面板子树与"展开态"探测层会永久留在渲染树里,鼠标再移到
     // 边缘时会先撞上那条宽探测层、hover 却在复核里被丢弃,表现为"只能展开一次"。
-    assert!(!vertical_tabs_panel_revealed(0., false));
-    // 动画进行中(进度 > 0)与显式钉住时都必须留在树里,否则收起动画第一帧就会把面板抽掉。
-    assert!(vertical_tabs_panel_revealed(0.5, false));
-    assert!(vertical_tabs_panel_revealed(1., false));
-    assert!(vertical_tabs_panel_revealed(0., true));
+    assert!(!panel_revealed(0., false));
+    // 动画进行中(进度 > 0)与显式打开时都必须留在树里,否则收起动画第一帧就会把面板抽掉。
+    assert!(panel_revealed(0.5, false));
+    assert!(panel_revealed(1., false));
+    assert!(panel_revealed(0., true));
     // 进度是"从元素写回的实时值",越界值也不应改变结论。
-    assert!(!vertical_tabs_panel_revealed(-0.5, false));
+    assert!(!panel_revealed(-0.5, false));
 }
 
 #[test]
-fn vertical_tabs_slide_progress_clamps_and_eases() {
+fn panel_slide_progress_clamps_and_eases() {
     // 两端精确落在目标值,避免动画结束后残留半像素位移。
-    assert_eq!(vertical_tabs_slide_progress(0., 1., 0.), 0.);
-    assert_eq!(vertical_tabs_slide_progress(0., 1., 1.), 1.);
+    assert_eq!(panel_slide_progress(0., 1., 0.), 0.);
+    assert_eq!(panel_slide_progress(0., 1., 1.), 1.);
     // smoothstep 的中点恰为 0.5(两端速度为 0,不会"猛冲急停")。
-    assert!((vertical_tabs_slide_progress(0., 1., 0.5) - 0.5).abs() < 1e-6);
+    assert!((panel_slide_progress(0., 1., 0.5) - 0.5).abs() < 1e-6);
     // 超时的时间要被夹住,否则动画结束后继续推进会越界。
-    assert_eq!(vertical_tabs_slide_progress(0., 1., 2.), 1.);
-    assert_eq!(vertical_tabs_slide_progress(1., 0., -1.), 1.);
+    assert_eq!(panel_slide_progress(0., 1., 2.), 1.);
+    assert_eq!(panel_slide_progress(1., 0., -1.), 1.);
     // 反方向(收起)同样成立。
-    assert_eq!(vertical_tabs_slide_progress(1., 0., 0.5), 0.5);
-    assert_eq!(vertical_tabs_slide_progress(1., 0., 1.), 0.);
+    assert_eq!(panel_slide_progress(1., 0., 0.5), 0.5);
+    assert_eq!(panel_slide_progress(1., 0., 1.), 0.);
+}
+
+#[test]
+fn settle_panel_progress_aligns_when_not_animating() {
+    // 没有动画在飞时进度必须直接对齐开关状态:否则"已打开"的面板会停在窗口外(整块看不见),
+    // "已关闭"的面板会让 `Dismiss` 的整窗 hit-rect 常驻,把窗口交互挡死。
+    assert_eq!(settle_panel_progress(0., true, false), 1.);
+    assert_eq!(settle_panel_progress(1., false, false), 0.);
+    // 动画进行中不许落定,否则展开/收起会被掐断在第一帧。
+    assert_eq!(settle_panel_progress(0.5, false, true), 0.5);
+    assert_eq!(settle_panel_progress(0.5, true, true), 0.5);
+    // 已经对齐时原样返回。
+    assert_eq!(settle_panel_progress(1., true, false), 1.);
+    assert_eq!(settle_panel_progress(0., false, false), 0.);
 }
 
 /// 最大化(全屏)的 Code Review 面板必须让窗口里的编辑器给 `escape` 让位,否则面板内嵌的

@@ -66,6 +66,16 @@ impl Element for Positioned {
         Some(&self.parent_data)
     }
 
+    /// 转发给子元素:`add_positioned_overlay_child` 的子树是 `Positioned(Overlay(..))`,
+    /// 不转发的话 `Stack::paint` 认不出它是 overlay 子元素,会退化成"新层继承当前层的裁剪"。
+    /// 后果:在 overlay 上下文里(悬浮面板/浮层编辑器,此时 `Overlay::paint` 的
+    /// `already_in_overlay` 为真、不会再开新层)子元素里的弹出菜单会被祖先的滚动容器裁掉,
+    /// 表现为"菜单出不了面板";而在普通上下文里上游那层 `start_overlay_layer(None)` 恰好
+    /// 掩盖了这个问题。转发后两条路径都落到同一个不裁剪的 overlay 层,且不会多套一层。
+    fn is_overlay(&self) -> bool {
+        self.child.is_overlay()
+    }
+
     fn origin(&self) -> Option<Point> {
         self.child.origin()
     }
