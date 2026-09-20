@@ -1256,6 +1256,14 @@ impl CodeView {
         Self::has_unsaved_changes(tab, ctx)
     }
 
+    /// 任意一个 tab 有未保存改动。悬浮编辑器浮层收起前用它分流(见
+    /// `Workspace::dismiss_floating_editor`):没有未保存内容时不需要逐个确认,可以先播收起动画、
+    /// 把 tab 的清理留到销毁时 —— 否则 [`Self::close_all_tabs_with_callback`] 会立刻清空 tab,
+    /// 收起动画那 0.2s 里卡片就只剩 `Empty`,用户看到的是空白卡片下沉。
+    pub fn has_unsaved_tabs(&self, ctx: &AppContext) -> bool {
+        !self.unsaved_indices(ctx).is_empty()
+    }
+
     fn has_unsaved_changes(tab: &TabData, ctx: &AppContext) -> bool {
         let local_editor = tab.editor_view.as_ref(ctx);
         local_editor.has_unsaved_changes(ctx)

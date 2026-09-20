@@ -60,6 +60,7 @@ use crate::app_state::{
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::browser::BrowserWebViewManager;
+use crate::code_review::code_review_view::CodeReviewView;
 use crate::code_review::diff_state::DiffStateModel;
 #[cfg(feature = "local_fs")]
 use crate::code_review::CodeReviewTelemetryEvent;
@@ -371,6 +372,7 @@ use warpui::elements::{
 };
 use warpui::ui_components::button::Button;
 use warpui::windowing::{StateEvent, WindowManager};
+use warpui::r#async::SpawnedFutureHandle;
 use warpui::r#async::Timer;
 use warpui::{elements::MouseStateHandle, fonts::Properties};
 
@@ -809,6 +811,109 @@ impl Element for PanelSlideRepaint {
     }
 }
 
+/// 悬浮编辑器浮层的过渡:整块按进度垂直位移(自下而上浮现,收起时沉回),同时逐帧画一层
+/// 压暗遮罩。
+///
+/// 进度算法与 `PanelSlideRepaint` 同源 —— 元素内部按经过时间算,并在每帧 `paint` 时写回共享的
+/// `Rc<Cell<_>>`。理由见 `docs/warpui-transition-animation.md`:动画期间 `render` 基本不重跑,
+/// 进度算在 `render` 里就会永远停在第 1 帧。与 `PanelSlideRepaint` 有两处不同:
+/// - 位移施加在**卡片**的 paint origin 上,而不是最外层 `Clipped` —— `Clipped` 的裁剪框由
+///   paint 的 origin 算出,让它跟着偏移会把卡片下沿的阴影裁掉;
+/// - 遮罩走 `draw_rect_without_hit_recording`:记录命中会盖住 `Dismiss` 的整窗 rect,使
+///   "点浮层外部收起"失效。
+struct FloatingEditorTransition {
+    child: Box<dyn Element>,
+    slide: Option<PanelSlide>,
+    progress_cell: Rc<Cell<f32>>,
+}
+
+impl FloatingEditorTransition {
+    fn new(
+        child: Box<dyn Element>,
+        slide: Option<PanelSlide>,
+        progress_cell: Rc<Cell<f32>>,
+    ) -> Self {
+        Self {
+            child,
+            slide,
+            progress_cell,
+        }
+    }
+
+    /// 与 `PanelSlideRepaint` 用同一条曲线,保证元素侧与 `Workspace` 侧算出的进度一致。
+    fn progress(&self) -> f32 {
+        let Some(slide) = self.slide else {
+            return self.progress_cell.get();
+        };
+        let t = (slide.started_at.elapsed().as_secs_f32() / FLOATING_EDITOR_SLIDE_SECS).clamp(0., 1.);
+        panel_slide_progress(slide.from, slide.to, t)
+    }
+
+    fn animating(&self) -> bool {
+        self.slide.is_some_and(|slide| {
+            slide.started_at.elapsed().as_secs_f32() < FLOATING_EDITOR_SLIDE_SECS
+        })
+    }
+}
+
+impl Element for FloatingEditorTransition {
+    fn layout(
+        &mut self,
+        constraint: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &AppContext,
+    ) -> Vector2F {
+        self.child.layout(constraint, ctx, app)
+    }
+
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
+        self.child.after_layout(ctx, app);
+    }
+
+    fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+        let progress = self.progress();
+        // 实时写回共享进度:下一帧的插值、以及动画结束后的终态落定都靠它接上。
+        self.progress_cell.set(progress);
+
+        // 遮罩铺满窗口(与 `Dismiss` 的整窗 rect 同一坐标系),不透明度跟着进度走。
+        let alpha = (f32::from(FLOATING_EDITOR_SCRIM_OPACITY) * progress) as u8;
+        if alpha > 0 {
+            ctx.scene
+                .draw_rect_without_hit_recording(RectF::new(Vector2F::zero(), ctx.window_size))
+                .with_background(ElementFill::Solid(ColorU::new(0, 0, 0, alpha)));
+        }
+
+        // 位移只给卡片:展开时从下方浮现,收起时沉回去。
+        let offset = vec2f(
+            0.,
+            ctx.window_size.y() * FLOATING_EDITOR_SLIDE_RATIO * (1. - progress),
+        );
+        self.child.paint(origin + offset, ctx, app);
+
+        if self.animating() {
+            // 动画心跳:每帧请求下一次重绘(见 `app/src/ui_components/spinner.rs`)。
+            ctx.repaint_after(Duration::from_millis(PANEL_SLIDE_FRAME_MS));
+        }
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.child.size()
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.child.origin()
+    }
+
+    fn dispatch_event(
+        &mut self,
+        event: &DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &AppContext,
+    ) -> bool {
+        self.child.dispatch_event(event, ctx, app)
+    }
+}
+
 /// 悬浮编辑器浮层的最大尺寸(窗口宽/高的比例)。居中显示,内容自适应但不撑满整屏。
 const FLOATING_EDITOR_WIDTH_RATIO: f32 = 0.9;
 const FLOATING_EDITOR_HEIGHT_RATIO: f32 = 0.9;
@@ -816,6 +921,21 @@ const FLOATING_EDITOR_HEIGHT_RATIO: f32 = 0.9;
 /// 悬浮编辑器浮层背景的不透明度(百分数)。写死:浮层要始终半透,窗口的原生磨砂才能
 /// 透上来(仓库没有元素级背景模糊能力)。
 const FLOATING_EDITOR_BACKGROUND_OPACITY: u8 = 99;
+
+/// 悬浮编辑器浮层的过渡时长(秒)。位移跨度是整整一个窗口高度,比侧栏滑出的几十~几百像素
+/// 大得多,所以时长必须短 —— 0.3s 上下就会显得拖沓。这里比悬浮面板的
+/// `PANEL_SLIDE_SECS`(0.26)还短。
+///
+/// 不必迁就渲染成本 —— 过渡期间渲染的是空壳,不渲染编辑器(见 `render` 的浮层段)。
+const FLOATING_EDITOR_SLIDE_SECS: f32 = 0.20;
+
+/// 悬浮编辑器浮层的过渡位移,按**窗口高度**的比例取。取 1.0 时卡片起始/终止位置在底边之外
+/// (居中卡片上边已留 5%,再加一个窗口高度就越过底边),所以是"整块从底部升上来"、收起时
+/// "整块沉下去"。不能写成固定像素:28px 在 90% 窗口高的卡片上只占约 3%,看起来只是原位抖一下。
+const FLOATING_EDITOR_SLIDE_RATIO: f32 = 1.0;
+
+/// 悬浮编辑器浮层的压暗遮罩不透明度(百分数),跟着展开进度淡入后就常驻。
+const FLOATING_EDITOR_SCRIM_OPACITY: u8 = 40;
 
 /// 当前 Esc 归哪个模态浮层"所有"。
 ///
@@ -1174,6 +1294,18 @@ enum FloatingEditorPane {
     Markdown(FilePane),
 }
 
+/// 待打开的悬浮编辑器:过渡动画期间先显示加载占位,动画结束后才真正创建 `CodePane`。
+///
+/// 每次打开浮层都是新建一个编辑器,而 `CodePane::new` 会**同步加载文件**,其后的高亮解析还会
+/// 在主线程上跑一阵 —— 实测大文件时这一段会把过渡动画的帧间隔从 16ms 拖到 180ms 以上(动画
+/// 本身才 0.2s),看起来就是"一半的时候卡一下"。所以把创建整体推到动画结束之后(见
+/// `open_floating_editor_lazily`)。
+struct PendingFloatingEditor {
+    source: CodeSource,
+    line_col: Option<LineAndColumnArg>,
+    preview: bool,
+}
+
 pub struct Workspace {
     window_id: WindowId,
     pub(crate) tabs: Vec<TabData>,
@@ -1323,6 +1455,21 @@ pub struct Workspace {
     /// 收起当前浮层后要接着装进来的新 pane(浮层里已有编辑器、但类型不同时)。
     /// 见 `show_floating_editor`。
     pending_floating_editor: Option<FloatingEditorPane>,
+    /// 待创建的浮层编辑器。与 `floating_editor_pane` 二者有一个为 `Some` 就表示浮层可见:
+    /// 过渡动画期间只有它,内容是加载占位(见 `PendingFloatingEditor`)。
+    floating_editor_pending_open: Option<PendingFloatingEditor>,
+    /// 物化编辑器的定时器句柄(见 `open_floating_editor_lazily`)。收起或重新打开前要先
+    /// `abort` —— 否则陈旧的任务会把已经作废、甚至下一次的请求提前创建出来,正好落在动画中段。
+    floating_editor_materialize_task: Option<SpawnedFutureHandle>,
+    /// 悬浮编辑器浮层的展开/收起进度(0=收起,1=展开)与进行中的动画。与悬浮面板同一套机制:
+    /// 进度必须由渲染元素在 `paint` 时写回(见 `FloatingEditorTransition`)。
+    ///
+    /// 展开动画期间编辑器还没被创建(见 `open_floating_editor_lazily`),浮层渲染的是加载占位。
+    floating_editor_progress: Rc<Cell<f32>>,
+    floating_editor_slide: Cell<Option<PanelSlide>>,
+    /// 收起动画进行中。浮层在这段时间里继续渲染(否则收起没有过渡),期间不接受新的并入,
+    /// 也不重复响应收起。
+    floating_editor_closing: bool,
     right_panel_view: ViewHandle<RightPanelView>,
     working_directories_model: ModelHandle<pane_group::WorkingDirectoriesModel>,
     lightbox_view: Option<ViewHandle<LightboxView>>,
@@ -3469,6 +3616,11 @@ impl Workspace {
             left_panel_views,
             floating_editor_pane: None,
             pending_floating_editor: None,
+            floating_editor_pending_open: None,
+            floating_editor_materialize_task: None,
+            floating_editor_progress: Rc::new(Cell::new(0.)),
+            floating_editor_slide: Cell::new(None),
+            floating_editor_closing: false,
             right_panel_view,
             working_directories_model,
 
@@ -7947,34 +8099,12 @@ impl Workspace {
 
         // 悬浮布局不参与下面的"并入已有 CodeView / 复用本 pane group 里已有 pane"逻辑 ——
         // 那些分支找的都是 `PaneGroup` 里的编辑器,而浮层编辑器不在其中。若放行,设置会被
-        // 静默忽略(文件跑进已有分屏)。浮层自己的合并在 `show_floating_editor` 里做。
+        // 静默忽略(文件跑进已有分屏)。浮层自己的合并在 `open_floating_editor_lazily` 里做。
         if matches!(layout, EditorLayout::Floating) {
-            // 浮层里已开着代码编辑器时,直接把这份文件并入它 —— 不先建一个 `CodePane`
-            // (那会立刻加载文件)再丢弃。
-            if let Some(FloatingEditorPane::Code(existing)) = self.floating_editor_pane.as_ref() {
-                let existing = existing.file_view(ctx);
-                match source.location() {
-                    Some(location) => {
-                        existing.update(ctx, |code_view, ctx| {
-                            code_view.open_or_focus_existing(Some(location), line_col, ctx);
-                        });
-                    }
-                    None => {
-                        let default_directory = source.default_directory().cloned();
-                        existing.update(ctx, |code_view, ctx| {
-                            code_view.open_new_untitled_tab(default_directory, ctx);
-                        });
-                    }
-                }
-                ctx.notify();
-                return;
-            }
-            let pane = if preview {
-                CodePane::new_preview(source, ctx)
-            } else {
-                CodePane::new(source, line_col, ctx)
-            };
-            self.show_floating_editor(FloatingEditorPane::Code(pane), ctx);
+            // 全部交给 `open_floating_editor_lazily`:它一次处理"已有编辑器就并入""正在收起
+            // 就排队""没有浮层就先播动画、动画结束再加载"三种情形。这里不再单独写一份并入
+            // 逻辑 —— 同一个判据写两遍,正是上一轮 closing 期间被并入"正在销毁的编辑器"的成因。
+            self.open_floating_editor_lazily(source, line_col, preview, ctx);
             return;
         }
 
@@ -8069,6 +8199,8 @@ impl Workspace {
             }
         }
 
+        // 悬浮布局在函数开头就分流到 `open_floating_editor_lazily` 并 `return` 了,这里不会
+        // 再命中 Floating —— 所以下面 `match` 里那个分支是空的。
         let pane = if preview {
             CodePane::new_preview(source, ctx)
         } else {
@@ -8095,9 +8227,9 @@ impl Workspace {
                     );
                 });
             }
-            EditorLayout::Floating => {
-                self.show_floating_editor(FloatingEditorPane::Code(pane), ctx);
-            }
+            // `Floating` 在函数开头就分流到 `open_floating_editor_lazily` 并 `return` 了,这里
+            // 不会再命中;保留分支只是让 `match` 保持穷尽(仓库禁止 `_` 通配)。
+            EditorLayout::Floating => {}
         }
 
         // Open any additional paths as tabs in the code view we just created.
@@ -8591,6 +8723,23 @@ impl Workspace {
             None => {}
         }
 
+        // 过渡状态到这里才清。`closing` 必须在装排队项之前清掉,否则 `show_floating_editor` 会
+        // 把它当成"收起中"又塞回队列。
+        self.floating_editor_closing = false;
+        self.floating_editor_slide.set(None);
+        self.floating_editor_progress.set(0.);
+
+        // 收起期间排队的"打开请求"要等上面把旧 pane 清理完才物化 —— 提前创建会让新旧 pane
+        // 共用同一个 buffer,而它刚被 `cleanup_all_tabs` 关掉(见 `open_floating_editor_lazily`
+        // 的 closing 分支)。此处 `closing` 已清,`materialize` 会正常执行。
+        if self.floating_editor_pending_open.is_some() {
+            if let Some(task) = self.floating_editor_materialize_task.take() {
+                task.abort();
+            }
+            self.materialize_pending_floating_editor(ctx);
+            return;
+        }
+
         // 收起时若有排队的新 pane(类型不同被顶掉的那个),接着装上。
         if let Some(pending) = self.pending_floating_editor.take() {
             self.show_floating_editor(pending, ctx);
@@ -8600,15 +8749,156 @@ impl Workspace {
         ctx.notify();
     }
 
+    /// 浮层当前是否可见(需要渲染)。两种状态都算:编辑器已就绪,或过渡动画期间编辑器还在
+    /// 等创建。
+    ///
+    /// **别在别处再写一份 `floating_editor_pane.is_some()`**:Esc 归属与悬浮工具面板让位都靠
+    /// 这个判据,漏掉"等待创建"那一态会让浮层在那 0.2s 里收不掉、或在 release 下被一次 Esc
+    /// 同时收起两样东西(见各自调用点的注释)。
+    fn floating_editor_visible(&self) -> bool {
+        self.floating_editor_pane.is_some()
+            || self.floating_editor_pending_open.is_some()
+            // 收起动画期间浮层仍要渲染:这时上面两个字段可能都已经清空(等待创建期按 Esc),
+            // 少了这一项,收起动画就会变成"啪地消失"。对照悬浮工具面板的判据
+            // `panel_revealed(progress, open) = progress > 0. || open`。
+            || self.floating_editor_closing
+    }
+
+    /// 打开 `EditorLayout::Floating` 的编辑器,但**先不创建它**:摆出空浮层、播过渡动画,
+    /// 动画结束后才 `CodePane::new` 加载文件(见 `materialize_pending_floating_editor`)。
+    ///
+    /// 为什么不能像其它布局那样先建 pane:每次打开浮层都是新建一个编辑器,而 `CodePane::new`
+    /// 会**同步加载文件**,其后的解析高亮还会在主线程上跑一阵。这段工作和 0.2s 的过渡动画抢
+    /// 主线程,实测大文件会把帧间隔从 16ms 拖到 180ms 以上 —— 看起来就是"动画一半时卡一下"。
+    /// 动画期间浮层渲染加载占位(见 `render` 的浮层段),用户不会对着一张空白卡片干等。
+    fn open_floating_editor_lazily(
+        &mut self,
+        source: CodeSource,
+        line_col: Option<LineAndColumnArg>,
+        preview: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // 收起动画进行中:浮层里的编辑器正在被销毁。既不能并入它(新文件会跟着一起消失),也
+        // **不能立刻建 pane** —— 旧 pane 的 buffer 还在 `GlobalBufferModel` 里,而
+        // `destroy_floating_editor` 稍后会对旧 pane 调 `cleanup_all_tabs` 把那个 buffer 关掉;
+        // 新 pane 会和它共用同一个 buffer(见 `open_local` / `open_remote_buffer` 的复用),等于
+        // 从脚下被抽掉。所以这里只排队"请求",等清理完之后再创建(见 `destroy_floating_editor`)。
+        if self.floating_editor_closing {
+            self.floating_editor_pending_open = Some(PendingFloatingEditor {
+                source,
+                line_col,
+                preview,
+            });
+            return;
+        }
+
+        // 浮层里已经有代码编辑器:直接并入,不新建 —— 建了也会被丢弃,而"建"就是立刻加载文件。
+        if let Some(FloatingEditorPane::Code(existing)) = self.floating_editor_pane.as_ref() {
+            let existing = existing.file_view(ctx);
+            match source.location() {
+                Some(location) => {
+                    existing.update(ctx, |code_view, ctx| {
+                        code_view.open_or_focus_existing(Some(location), line_col, ctx);
+                    });
+                }
+                None => {
+                    let default_directory = source.default_directory().cloned();
+                    existing.update(ctx, |code_view, ctx| {
+                        code_view.open_new_untitled_tab(default_directory, ctx);
+                    });
+                }
+            }
+            ctx.notify();
+            return;
+        }
+
+        // 其余情况(浮层里是 Markdown、已有排队项)都极少见,直接建出 pane 交给
+        // `show_floating_editor` 的既有排队语义,不为此再扩一套状态。
+        if self.floating_editor_visible() || self.pending_floating_editor.is_some() {
+            let pane = if preview {
+                CodePane::new_preview(source, ctx)
+            } else {
+                CodePane::new(source, line_col, ctx)
+            };
+            self.show_floating_editor(FloatingEditorPane::Code(pane), ctx);
+            return;
+        }
+
+        // 主路径:先摆空浮层 + 播过渡动画,编辑器等动画结束再加载。
+        // 上一次的物化任务先作废 —— 否则它到点会把这次(或上一次)的请求提前创建出来,正好
+        // 落在动画中段,又变成要消除的那种卡顿。
+        if let Some(task) = self.floating_editor_materialize_task.take() {
+            task.abort();
+        }
+        self.floating_editor_pending_open = Some(PendingFloatingEditor {
+            source,
+            line_col,
+            preview,
+        });
+        self.floating_editor_progress.set(0.);
+        self.floating_editor_slide.set(Some(PanelSlide {
+            started_at: Instant::now(),
+            from: 0.,
+            to: 1.,
+        }));
+        ctx.notify();
+        self.floating_editor_materialize_task = Some(ctx.spawn(
+            Timer::after(Duration::from_secs_f32(FLOATING_EDITOR_SLIDE_SECS + 0.05)),
+            |me, _, ctx| me.materialize_pending_floating_editor(ctx),
+        ));
+    }
+
+    /// 作废"等动画结束后物化编辑器"的排队项,并取消它的定时器。
+    ///
+    /// 清 `floating_editor_pending_open` 的地方都该走这里 —— 只清字段不 abort,陈旧定时器照样
+    /// 会跑;`materialize` 的守卫让它创建不出东西,但那是兜底,不是这里的意图。
+    fn cancel_pending_floating_editor_materialization(&mut self) {
+        self.floating_editor_pending_open = None;
+        if let Some(task) = self.floating_editor_materialize_task.take() {
+            task.abort();
+        }
+    }
+
+    /// 过渡动画结束后真正创建编辑器并装进浮层(见 `open_floating_editor_lazily`)。
+    fn materialize_pending_floating_editor(&mut self, ctx: &mut ViewContext<Self>) {
+        self.floating_editor_materialize_task = None;
+        let Some(pending) = self.floating_editor_pending_open.take() else {
+            return;
+        };
+        // 期间浮层可能已经被别的路径接管(直接装入 / 正在收起)。这时要放弃本次物化,否则会把
+        // 刚装好的编辑器顶掉 —— 而被顶掉的那个不会走 `destroy_floating_editor`,它的订阅与
+        // `GlobalBufferModel` 里的 buffer 都会残留。
+        if self.floating_editor_closing || self.floating_editor_pane.is_some() {
+            return;
+        }
+        let pane = if pending.preview {
+            CodePane::new_preview(pending.source, ctx)
+        } else {
+            CodePane::new(pending.source, pending.line_col, ctx)
+        };
+        self.floating_editor_pane = Some(FloatingEditorPane::Code(pane));
+        // `install_floating_editor_pane` 末尾会 `ctx.notify()`,内容由此出现。
+        self.install_floating_editor_pane(ctx);
+    }
+
     /// 显示(或复用)`EditorLayout::Floating` 的居中浮层。
     ///
     /// 浮层同时只承载一个 pane:已有浮层时把新文件并入现有编辑器,而不是再叠一层 ——
     /// 浮层是模态的,叠第二层会让"点外部收起"的语义变得无法解释。
     fn show_floating_editor(&mut self, pane: FloatingEditorPane, ctx: &mut ViewContext<Self>) {
+        // 收起动画进行中:当前编辑器正在关闭,绝不能把新文件并进去 —— 那会让用户刚打开的
+        // 文件跟着浮层一起消失。排队到销毁流程结束时装入(见 `destroy_floating_editor`)。
+        if self.floating_editor_closing {
+            self.pending_floating_editor = Some(pane);
+            return;
+        }
         // 清掉上一次未完成收起流程留下的排队项:用户在未保存确认框上点「取消」时,
         // `dismiss_floating_editor` 不会被回调,那个排队的新 pane 会一直留着,之后任意一次
         // 收起都会把它"自己冒出来"地装进浮层 —— 而用户早已放弃那次打开。
         self.pending_floating_editor = None;
+        // 同理,这次装入之后"等动画结束再创建"的排队项也作废 —— 连它的定时器一起取消,
+        // 否则那个定时器到点会把更早请求的文件创建出来,顶掉刚装好的这个。
+        self.cancel_pending_floating_editor_materialization();
         match (&self.floating_editor_pane, pane) {
             (Some(FloatingEditorPane::Code(existing)), FloatingEditorPane::Code(new_pane)) => {
                 let location = new_pane.file_view(ctx).as_ref(ctx).source().location();
@@ -8643,9 +8933,34 @@ impl Workspace {
             }
             (None, pane) => {
                 self.floating_editor_pane = Some(pane);
+                // 新浮层从收起态浮现。并入已有编辑器的分支不重启动画,否则每打开一个文件
+                // 浮层都会重新滑一次。
+                self.floating_editor_progress.set(0.);
+                self.floating_editor_slide.set(Some(PanelSlide {
+                    started_at: Instant::now(),
+                    from: 0.,
+                    to: 1.,
+                }));
+                // 过渡期间渲染的是空壳(见 `render` 的浮层段),落位后需要一次 **view 级**重绘
+                // 才能把编辑器装上去 —— 元素那边的心跳只调度 `paint`,不会 invalidate 本 view。
+                // 不需要清 `slide`:判据是"经过时间 < 时长",到点自然落定;期间用户若已收起,
+                // 这次重绘也只是多做一次空壳绘制。
+                ctx.spawn(
+                    Timer::after(Duration::from_secs_f32(FLOATING_EDITOR_SLIDE_SECS + 0.05)),
+                    |_, _, ctx| ctx.notify(),
+                );
             }
         }
 
+        self.install_floating_editor_pane(ctx);
+    }
+
+    /// 把 `self.floating_editor_pane` 里已经就绪的编辑器装进浮层:告知 pane 关闭由宿主负责,
+    /// 把 pane 头部与 overflow 菜单里的关闭意图接回收起流程,并把焦点交给编辑器。
+    ///
+    /// 由 `show_floating_editor`(pane 已创建)与 `materialize_pending_floating_editor`(懒创建
+    /// 完成)共用 —— 两条路径装进来的东西不同,但这些接线完全一样。
+    fn install_floating_editor_pane(&mut self, ctx: &mut ViewContext<Self>) {
         // 浮层没有 `PaneGroup` 接管 `PaneContent::close`:告知 pane 关闭由宿主负责,并把
         // pane 头部与 overflow 菜单里的关闭意图接回同一个收起流程。浮层的收起已经包含
         // 未保存确认,所以这里不需要再走一遍编辑器自己的确认。
@@ -8715,15 +9030,46 @@ impl Workspace {
     /// 累积了多个 tab(多次打开文件会合并进同一个 `CodeView`),宿主只查一次未保存状态再
     /// 保存活动 tab 会让其余 tab 的内容静默丢失。该流程复用 `CodeView` 既有的逐个确认。
     fn dismiss_floating_editor(&mut self, ctx: &mut ViewContext<Self>) {
+        // 收起动画已经在跑:连点浮层外部、或 Esc 与点击各来一次,都会重复走到这里。
+        if self.floating_editor_closing {
+            return;
+        }
+        // 编辑器还在等创建(展开动画期间):没有任何需要确认的内容,直接收起。**顺序很关键** ——
+        // `start_floating_editor_dismiss` 的早退判据要看得到 `pending_open`,先 `take` 掉它就会让
+        // 收起动画整个空转(浮层"啪"地消失而不是沉下去);等它起完动画再丢排队项,免得那个物化
+        // 定时器到点又把它创建出来。
+        if self.floating_editor_pane.is_none() {
+            if self.floating_editor_pending_open.is_some() {
+                self.start_floating_editor_dismiss(ctx);
+                self.cancel_pending_floating_editor_materialization();
+            }
+            return;
+        }
         let Some(pane) = self.floating_editor_pane.as_ref() else {
             return;
         };
 
         let FloatingEditorPane::Code(pane) = pane else {
-            self.destroy_floating_editor(ctx);
+            // Markdown 预览器只读,没有未保存确认流程。
+            self.start_floating_editor_dismiss(ctx);
             return;
         };
+        // 先把句柄克隆出来:下面要调 `&mut self` 的方法,一直挂着对 `self.floating_editor_pane`
+        // 的借用会冲突。
+        let code_view = pane.file_view(ctx).clone();
 
+        // 没有未保存内容时不必走逐个确认:直接起收起动画,tab 的清理留给动画结束后的
+        // `destroy_floating_editor`(它本来就会 `cleanup_all_tabs`)。**不能**在这里调
+        // `close_all_tabs_with_callback` —— 它会立刻清空 tab,而那 0.2s 的收起动画期间
+        // `CodeView::render` 就只剩 `Empty` 了,用户看到的是空白卡片下沉,不是内容下沉。
+        if !code_view.as_ref(ctx).has_unsaved_tabs(ctx) {
+            self.start_floating_editor_dismiss(ctx);
+            return;
+        }
+
+        // 有未保存内容:必须在浮层还看得见的时候逐个确认,所以走下面的流程。该流程本身就会
+        // 关掉 tab,这条路径上动画开始时内容已经消失 —— 这是确认流程的必然结果。
+        //
         // 销毁只能由 `close_all_tabs_with_callback` 在确认流程真正走完后触发 —— 提前销毁
         // 会让"确认框还没点,浮层就关了"。而这个回调可能在 `CodeView` 的 update 闭包内
         // 同步触发,那时 `CodeView` 已被框架从 `window.views` 取出,再 update 它会以
@@ -8732,7 +9078,7 @@ impl Workspace {
         //
         // `finished == false` 表示用户在未保存确认框上点了「取消」:保持浮层原样,
         // 并丢弃本次为"打开另一个 pane"排的队(见 `pending_floating_editor`)。
-        pane.file_view(ctx).update(ctx, |code_view, ctx| {
+        code_view.update(ctx, |code_view, ctx| {
             code_view.close_all_tabs_with_callback(
                 Box::new(|finished, ctx| {
                     if finished {
@@ -8748,6 +9094,29 @@ impl Workspace {
                 ctx,
             );
         });
+    }
+
+    /// 开始收起悬浮编辑器:整块沉下去、遮罩淡出,动画走完才真正销毁。
+    ///
+    /// 销毁必须延后 —— `floating_editor_pane` 是"`Some` 即渲染"的判据,提前 `take()` 会让浮层
+    /// 在动画的第一帧就消失。延时略长于动画,确保元素已把终态写回共享进度。
+    fn start_floating_editor_dismiss(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.floating_editor_closing
+            || (self.floating_editor_pane.is_none() && self.floating_editor_pending_open.is_none())
+        {
+            return;
+        }
+        self.floating_editor_closing = true;
+        self.floating_editor_slide.set(Some(PanelSlide {
+            started_at: Instant::now(),
+            from: self.floating_editor_progress.get(),
+            to: 0.,
+        }));
+        ctx.notify();
+        ctx.spawn(
+            Timer::after(Duration::from_secs_f32(FLOATING_EDITOR_SLIDE_SECS + 0.05)),
+            |me, _, ctx| me.destroy_floating_editor(ctx),
+        );
     }
 
     /// 把自动隐藏侧栏滑向 `target`(0=收起,1=展开)。重复调用从当前进度重新起算,所以鼠标
@@ -11944,6 +12313,12 @@ impl Workspace {
                 }
             }
 
+            // 悬浮布局交给懒创建(见 `open_floating_editor_lazily`)。
+            if matches!(&layout, EditorLayout::Floating) {
+                self.open_floating_editor_lazily(source, None, false, ctx);
+                return;
+            }
+
             let pane = CodePane::new(source, None, ctx);
 
             match layout {
@@ -11965,9 +12340,9 @@ impl Workspace {
                         );
                     });
                 }
-                EditorLayout::Floating => {
-                    self.show_floating_editor(FloatingEditorPane::Code(pane), ctx);
-                }
+                // `Floating` 在函数开头就分流到 `open_floating_editor_lazily` 并 `return` 了,
+                // 这里不会再命中;保留分支只是让 `match` 保持穷尽。
+                EditorLayout::Floating => {}
             }
         }
 
@@ -20984,7 +21359,7 @@ impl TypedActionView for Workspace {
                 }
             }
             DismissFloatingEditor => self.dismiss_floating_editor(ctx),
-            FinishDismissFloatingEditor => self.destroy_floating_editor(ctx),
+            FinishDismissFloatingEditor => self.start_floating_editor_dismiss(ctx),
             // 用户取消了收起:丢弃本次排队的新 pane,浮层保持原样。
             CancelDismissFloatingEditor => {
                 self.pending_floating_editor = None;
@@ -22551,7 +22926,7 @@ impl View for Workspace {
         // 由浮层的捕获层收起它(见 `EscapeOwner`)。悬浮工具面板不在此列,它用逐点让位。
         set_escape_owner(
             self.window_id,
-            if self.floating_editor_pane.is_some() {
+            if self.floating_editor_visible() {
                 EscapeOwner::FloatingEditor
             } else {
                 EscapeOwner::None
@@ -22873,7 +23248,7 @@ impl View for Workspace {
                 // 悬浮编辑器浮层也在这个 stack 上,且 release 构建下 `Stack` 走 `Broadcast`
                 // (正序、不停止),两个捕获层都会收到同一次 Esc。这里显式让位,避免一次按键
                 // 同时收起两个浮层。
-                let floating_editor_open = self.floating_editor_pane.is_some();
+                let floating_editor_open = self.floating_editor_visible();
                 let panel_body = EventHandler::new(panel_body)
                     .with_always_handle()
                     .on_keydown(move |ctx, _app, keystroke| {
@@ -22963,12 +23338,23 @@ impl View for Workspace {
         }
 
         // 悬浮编辑器(`EditorLayout::Floating`):居中的模态浮层,点外部或 Esc 收起。
-        if let Some(floating_pane) = self.floating_editor_pane.as_ref() {
-            // 渲染整个 `PaneView` 而不是裸的 `CodeView`/`FileNotebookView`:tab 栏与 pane
-            // 头部(含关闭按钮)由 `PaneView` 的 header 提供,`CodeView::render` 只画活动 tab。
-            let editor_view = match floating_pane {
-                FloatingEditorPane::Code(pane) => ChildView::new(pane.pane_view()).finish(),
-                FloatingEditorPane::Markdown(pane) => ChildView::new(pane.pane_view()).finish(),
+        // "可见"有两种状态:编辑器已就绪(`floating_editor_pane`),或过渡动画期间编辑器还在等
+        // 创建(`floating_editor_pending_open`)。
+        if self.floating_editor_visible() {
+            // - 编辑器就绪 → 渲染整个 `PaneView`(tab 栏与 pane 头部由它提供,`CodeView::render`
+            //   只画活动 tab)。收起动画期间也照常渲染:没有未保存内容时 tab 的清理被推到销毁
+            //   (见 `dismiss_floating_editor`),所以那 0.2s 里用户看到的是内容随卡片沉下去。
+            // - 编辑器还在等创建(展开动画期间)→ 渲染与 code review 面板一致的加载占位,别让
+            //   用户对着一张空白卡片干等。占位只是几个渐变 `Rect`,每帧成本可以忽略。
+            // 卡片尺寸不受影响:`Percentage` 按窗口比例给尺寸,与内容无关。
+            let editor_view: Box<dyn Element> = match self.floating_editor_pane.as_ref() {
+                Some(pane) => match pane {
+                    FloatingEditorPane::Code(pane) => ChildView::new(pane.pane_view()).finish(),
+                    FloatingEditorPane::Markdown(pane) => {
+                        ChildView::new(pane.pane_view()).finish()
+                    }
+                },
+                None => CodeReviewView::render_loading_state(appearance),
             };
             let theme = appearance.theme();
             // 与整窗底色一致:同一组色(`surface_2` 叠 `fg_overlay_1`),并施加固定的
@@ -23020,17 +23406,36 @@ impl View for Workspace {
                     }
                 })
                 .finish();
-            stack.add_positioned_overlay_child(
-                // 外层 `Clipped` 为浮层新开一层:面板的命中记录因此落在比 `Dismiss` 全窗
-                // rect 更高的层上(`is_covered` 只查更高层),否则点面板内空白会被误判成
-                // "点在外面"而收起浮层。它的裁剪范围是整个内容区(外层 `Align` 铺满),
-                // 不会裁到卡片的阴影。
-                Dismiss::new(Clipped::new(panel_body).finish())
+            // 外层 `Clipped` 为浮层新开一层:面板的命中记录因此落在比 `Dismiss` 全窗
+            // rect 更高的层上(`is_covered` 只查更高层),否则点面板内空白会被误判成
+            // "点在外面"而收起浮层。它的裁剪范围是整个内容区(外层 `Align` 铺满),
+            // 不会裁到卡片的阴影。
+            //
+            // 过渡元素放在这层 `Clipped` **里面**:位移只作用于卡片,裁剪框不跟着偏移,
+            // 卡片下沿的阴影才不会被裁掉。
+            let floating_editor: Box<dyn Element> =
+                Clipped::new(Box::new(FloatingEditorTransition::new(
+                    panel_body,
+                    self.floating_editor_slide.get(),
+                    self.floating_editor_progress.clone(),
+                )))
+                .finish();
+            // 收起动画期间不挂 `Dismiss`:它带 `prevent_interaction_with_other_elements`,那圈整窗
+            // hit-rect 会在这 0.2s 里把鼠标事件全部吞掉(位移只作用于卡片,不影响它)。这段时间的
+            // 收起请求本来也已经被 `dismiss_floating_editor` 的 closing 守卫忽略,摘掉不丢功能。
+            // 悬浮工具面板的收起是同一处理。
+            let floating_editor: Box<dyn Element> = if self.floating_editor_closing {
+                floating_editor
+            } else {
+                Dismiss::new(floating_editor)
                     .prevent_interaction_with_other_elements()
                     .on_dismiss(|ctx, _app| {
                         ctx.dispatch_typed_action(WorkspaceAction::DismissFloatingEditor);
                     })
-                    .finish(),
+                    .finish()
+            };
+            stack.add_positioned_overlay_child(
+                floating_editor,
                 OffsetPositioning::offset_from_parent(
                     vec2f(0., 0.),
                     ParentOffsetBounds::ParentBySize,
