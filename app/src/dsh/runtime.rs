@@ -14,9 +14,9 @@
 //! 平台:macOS 先行(webview 基建仅 macOS 有实现),其他平台编译为空壳。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use command::r#async::Command;
@@ -32,9 +32,17 @@ use crate::{
 /// 复制而来,与用户终端自用的 web profile、DSH Desktop 的 desktop profile
 /// 互不干扰,插件/配置各自独立)。
 const DSH_PROFILE: &str = "zap";
-/// Zap 专属 dsh web 日志文件名(带 zap 前缀,与用户终端 dsh、DSH Desktop
+/// Zap 专属 dsh web 日志文件名前缀(带 zap 前缀,与用户终端 dsh、DSH Desktop
 /// 的日志区分开;位于 DSH_HOME 根目录)。
-const DSH_WEB_LOG_FILE: &str = "zap-dsh-web.log";
+///
+/// 每次启动写一份 `zap-dsh-web-<unix 秒>[-<序号>].log`,只保留最近
+/// [`DSH_WEB_LOG_KEEP`] 份:单文件覆盖写会把上一次启动的现场(尤其崩溃那次)
+/// 直接截掉,事后无法回看。
+const DSH_WEB_LOG_PREFIX: &str = "zap-dsh-web-";
+/// 保留的历史 web 日志份数(含当前一份)。
+const DSH_WEB_LOG_KEEP: usize = 5;
+/// 记录本次启动 `(zap_pid, pgid, started_at)` 的文件名,供下次启动回收残留实例。
+const DSH_PID_FILE: &str = "dsh.pid";
 /// dsh npm 包名(升级命令与 registry 查询共用)。
 pub(crate) const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh";
 /// 参与更新检查的发布渠道(dist-tag);`next` 为 rc 预览、`alpha` 为内测,
@@ -53,6 +61,80 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 /// 崩溃计数重置阈值:距上次成功启动超过该时长后崩溃,视为健康运行期间
 /// 的偶发崩溃,重置连续崩溃计数(避免数月内偶发崩溃累计触发 GiveUp)。
 const CRASH_COUNT_RESET_AFTER: Duration = Duration::from_secs(300);
+
+/// 当前 dsh 进程组 id(= spawn 时 dsh 的 pid;dsh 以 `setpgid(0,0)` 自成一组的
+/// 组长)。信号 handler 在异步信号上下文里读它,故只能原子读写、不能取锁;
+/// `0` 表示当前没有受管的 dsh。
+static DSH_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// 记录当前受管的 dsh 进程组(信号 handler 转发用)。
+fn remember_process_group(pgid: u32) {
+    DSH_PROCESS_GROUP.store(pgid as i32, Ordering::SeqCst);
+}
+
+/// 清除当前受管的 dsh 进程组记录。
+///
+/// 只在记录的正是 `pgid` 时清除:新旧启动重叠时,回收旧组不能把新组的记录抹掉。
+fn forget_process_group(pgid: u32) {
+    let _ = DSH_PROCESS_GROUP.compare_exchange(
+        pgid as i32,
+        0,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+}
+
+/// 当前 unix 时间戳(秒);系统时钟早于 epoch 时返回 0。
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// 文件名是否为本模块写出的 web 日志。
+fn is_web_log_name(name: &str) -> bool {
+    name.starts_with(DSH_WEB_LOG_PREFIX) && name.ends_with(".log")
+}
+
+/// 安装「把终止信号转发给 dsh 进程组」的 handler(进程内只装一次)。
+///
+/// Zap 被 `pkill`(SIGTERM)、被 SIGKILL 或崩溃时既不跑 `Drop` 也不跑
+/// `on_will_terminate`,信号是唯一的同步清理机会;没有它,dsh 会被 reparent
+/// 到 launchd 后继续常驻(开发重启循环下每次重启留一个)。
+///
+/// handler 内只做异步信号安全的操作:原子读 + `killpg` + 恢复默认动作并重抛,
+/// 不取锁、不分配。末尾的重抛是必须的——装了 handler 后默认动作被替换,不重抛
+/// `pkill` 就杀不掉 Zap(开发重启循环会失效)。
+#[cfg(unix)]
+fn install_signal_forwarding() {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    use std::sync::Once;
+
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        for signal in [SIGTERM, SIGINT, SIGHUP] {
+            let handler = move || {
+                let pgid = DSH_PROCESS_GROUP.load(Ordering::SeqCst);
+                if pgid > 0 {
+                    // 用 kill(-pgid) 而不是 killpg:POSIX 的异步信号安全函数表里
+                    // 明确列了 kill,而 killpg 只是它的薄封装(两者等价)。
+                    // SAFETY:kill 是异步信号安全的,参数只来自原子读。
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGTERM);
+                    }
+                }
+                let _ = signal_hook::low_level::emulate_default_handler(signal);
+            };
+            // SAFETY:handler 内只调用异步信号安全的函数(killpg / raise /
+            // sigaction),且只读原子量,不触碰任何加锁状态。
+            let registered = unsafe { signal_hook::low_level::register(signal, handler) };
+            if let Err(err) = registered {
+                log::warn!("[dsh] failed to forward signal {signal} to dsh: {err}");
+            }
+        }
+    });
+}
 
 /// 当前 Zap 项目目录(注入 dsh 作 `DSH_CWD`,使会话工作目录跟随 Zap 项目)。
 /// 由 `open_dsh_pane` 在启动 dsh 时更新;`start_inner`(异步关联函数)读取。
@@ -334,35 +416,216 @@ impl Drop for DshRuntime {
 }
 
 impl DshRuntime {
-    /// 终止子进程:优先 SIGTERM 优雅退出,超时后 SIGKILL。
+    /// 终止 dsh 子进程**组**:优先 SIGTERM 优雅退出,超时后 SIGKILL。
+    ///
+    /// dsh 以 `setpgid(0,0)` 自成一组的组长(spawn 时 pgid == pid),故这里按
+    /// 整组发信号:dsh 自己派生的子进程(agent shell、MCP server 等)一并回收,
+    /// 不会在 dsh 退出后变成孤儿。
     ///
     /// 同步执行(主线程可安全调用);`kill` 是同步的,退出状态交给
     /// async-process 的 reap 线程回收。
     fn terminate_child(child: &mut async_process::Child) {
-        // 1. SIGTERM 优雅退出(Unix)。
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(child.id() as i32, libc::SIGTERM);
-        }
+        let pgid = child.id();
+        // 1. SIGTERM 优雅退出(整组)。
+        Self::signal_process_group(pgid, true);
         // 2. 等待优雅退出,超时后 SIGKILL。
         let deadline = std::time::Instant::now() + STOP_GRACE;
-        loop {
-            if child.try_status().ok().flatten().is_some() {
-                return;
-            }
+        while child.try_status().ok().flatten().is_none() {
             if std::time::Instant::now() >= deadline {
+                Self::signal_process_group(pgid, false);
+                // 兜底单进程 SIGKILL:非 unix 平台没有进程组。
+                let _ = child.kill();
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let _ = child.kill();
-        // 短轮询回收,避免 zombie。
+        // 3. 短轮询回收,避免 zombie。
         for _ in 0..100 {
             if child.try_status().ok().flatten().is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        forget_process_group(pgid);
+    }
+
+    /// 向 dsh 进程组发终止信号:`graceful` 为 true 时 SIGTERM,否则 SIGKILL。
+    ///
+    /// 非 unix 平台没有进程组(见 `command::r#async::Command::new_with_process_group`
+    /// 的 TODO),此时为空操作,由 `child.kill()` 兜底。
+    fn signal_process_group(pgid: u32, graceful: bool) {
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(
+                pgid as i32,
+                if graceful {
+                    libc::SIGTERM
+                } else {
+                    libc::SIGKILL
+                },
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (pgid, graceful);
+        }
+    }
+
+    /// 把本次启动的 `(zap_pid, pgid, started_at)` 写入 `dsh.pid`。
+    ///
+    /// 覆盖写单份:下次启动靠它判断「上一次 Zap 是否已死、它的 dsh 组是否还在」。
+    /// 记录里必须带 zap_pid——只存 dsh pid 时,无法区分「上次 Zap 遗留的实例」
+    /// 与「另一个还活着的 Zap 实例(打包版 + dev 版并存)的 dsh」。
+    fn write_pid_record(dir: &Path, pgid: u32) {
+        let text = format!(
+            "zap_pid={}\npgid={pgid}\nstarted_at={}\n",
+            std::process::id(),
+            unix_now()
+        );
+        let path = dir.join(DSH_PID_FILE);
+        if let Err(err) = std::fs::write(&path, text) {
+            log::warn!("[dsh] failed to write {}: {err}", path.display());
+        }
+    }
+
+    /// 启动前回收上一次 Zap 会话遗留的 dsh 进程组。
+    ///
+    /// Zap 被 `pkill`(SIGTERM)、被 SIGKILL 或崩溃退出时,`Drop` 与
+    /// `on_will_terminate` 都不执行,上次启动的 dsh 无人回收、会一直常驻
+    /// (开发重启循环下每次重启留一个)。这里按 [`DSH_PID_FILE`] 记录判定并整组
+    /// 回收,判定条件见 [`Self::orphan_group_from_record`]。
+    ///
+    /// 记录丢失(旧格式、文件被删)时不做进程扫描兜底:扫描只能靠
+    /// `--profile zap` 匹配 argv,会连用户手工启动的同 profile 实例一起杀掉,
+    /// 代价高于收益。
+    async fn reclaim_orphan_group(dir: &Path) {
+        let Ok(text) = std::fs::read_to_string(dir.join(DSH_PID_FILE)) else {
+            return;
+        };
+        let Some(pgid) = Self::orphan_group_from_record(&text) else {
+            return;
+        };
+        if !Self::process_group_alive(pgid) {
+            // 上次 Zap 已正常停止(组不存在):无需动作,也保持日志干净。
+            return;
+        }
+        log::warn!(
+            "[dsh] reclaiming orphan dsh process group {pgid}: previous Zap run exited without cleanup"
+        );
+        Self::signal_process_group(pgid as u32, true);
+        let deadline = std::time::Instant::now() + STOP_GRACE;
+        while Self::process_group_alive(pgid) {
+            if std::time::Instant::now() >= deadline {
+                Self::signal_process_group(pgid as u32, false);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 从上次启动的记录里解出「该回收的 dsh 进程组」。
+    ///
+    /// 三个条件同时成立才回收:记录可解析、记录的 Zap 进程**已不存在**、
+    /// 且不是本进程自己的记录。第二个条件保证多实例并存时不会误杀另一个活着的
+    /// Zap 的 dsh;旧格式(裸 pid、无 pgid)解析不出,一律不回收——宁可不回收,
+    /// 也不赌 pid 复用后误杀无关进程组。
+    fn orphan_group_from_record(text: &str) -> Option<i32> {
+        let zap_pid = Self::pid_record_field(text, "zap_pid")?;
+        let pgid = Self::pid_record_field(text, "pgid")?;
+        if pgid <= 0 || zap_pid == std::process::id() as i32 {
+            return None;
+        }
+        if Self::process_alive(zap_pid) {
+            return None;
+        }
+        Some(pgid)
+    }
+
+    /// 取记录文本里某个 `key=value` 整数域。
+    fn pid_record_field(text: &str, key: &str) -> Option<i32> {
+        text.lines()
+            .filter_map(|line| line.trim().split_once('='))
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value.trim().parse().ok())
+    }
+
+    /// 进程是否仍存在(`kill(pid, 0)` 探活,`EPERM` 视为存在)。
+    fn process_alive(pid: i32) -> bool {
+        #[cfg(unix)]
+        {
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                return true;
+            }
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            false
+        }
+    }
+
+    /// 进程组是否仍存在(`killpg(pgid, 0)` 探活;非 unix 恒 false)。
+    fn process_group_alive(pgid: i32) -> bool {
+        #[cfg(unix)]
+        {
+            unsafe { libc::killpg(pgid, 0) == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pgid;
+            false
+        }
+    }
+
+    /// 只保留最近 [`DSH_WEB_LOG_KEEP`] 份 web 日志(按修改时间),删除更旧的。
+    ///
+    /// `current` 是本次刚创建的那份,**永不删除**:同秒内重启产生的带序号文件
+    /// (`<秒>-2.log`)按路径比较排在 `<秒>.log` 之前,只按时间+路径排序时会把
+    /// 最新那份当成最旧的删掉——而崩溃重启恰恰常发生在同一秒内。
+    fn prune_web_logs(dir: &Path, current: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut logs: Vec<(SystemTime, PathBuf)> = entries
+            .flatten()
+            .filter(|entry| is_web_log_name(&entry.file_name().to_string_lossy()))
+            .filter(|entry| entry.path() != current)
+            .filter_map(|entry| {
+                let modified = entry.metadata().and_then(|meta| meta.modified()).ok()?;
+                Some((modified, entry.path()))
+            })
+            .collect();
+        // current 自己占一份配额,其余最多再留 KEEP - 1 份。
+        let allowed = DSH_WEB_LOG_KEEP.saturating_sub(1);
+        if logs.len() <= allowed {
+            return;
+        }
+        // 主序修改时间,同刻(同一秒内多次启动)退化为按路径(即文件名)比较,
+        // 保证结果确定、不随 read_dir 顺序漂移。
+        logs.sort_by(|(a_time, a_path), (b_time, b_path)| {
+            a_time.cmp(b_time).then_with(|| a_path.cmp(b_path))
+        });
+        let stale = logs.len() - allowed;
+        for (_, path) in logs.into_iter().take(stale) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// 最近一份 web 日志路径(崩溃原因提取用;目录里没有任何日志时返回 None)。
+    fn latest_web_log_path(dir: &Path) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter(|entry| is_web_log_name(&entry.file_name().to_string_lossy()))
+            .filter_map(|entry| {
+                let modified = entry.metadata().and_then(|meta| meta.modified()).ok()?;
+                Some((modified, entry.path()))
+            })
+            .max_by(|(a_time, a_path), (b_time, b_path)| {
+                a_time.cmp(b_time).then_with(|| a_path.cmp(b_path))
+            })
+            .map(|(_, path)| path)
     }
 
     pub fn new() -> Self {
@@ -596,14 +859,27 @@ impl DshRuntime {
         //    插件注入;`--profile web` 是 `dsh web` 的等价形式,Zap 用自己的
         //    profile 隔离插件与配置)。
         let dsh_home = Self::dsh_data_dir()?;
+        // 2.1 先回收上一次 Zap 会话遗留的 dsh 组:Zap 非正常退出时没有任何清理
+        //     路径会执行,不回收就会一代代堆积(见 reclaim_orphan_group)。
+        Self::reclaim_orphan_group(&dsh_home).await;
         // 注入 zap-bridge-client 浏览器端插件(经 webview IPC 发项目切换通知)。
         if let Err(err) = Self::install_client_plugin(&dsh_home) {
             log::warn!("[dsh] install_client_plugin failed: {err}");
         }
-        let mut cmd = Command::new(&dsh_bin);
+        // 进程组隔离:让 dsh 成为自成一组的组长(pgid == pid),停止与启动回收
+        // 都按整组处理,dsh 派生的子进程不会变成孤儿。
+        let mut cmd = Command::new_with_process_group(&dsh_bin);
         // command crate 默认 stdout/stderr = null;dsh web 对 null/socket 无效
         // stdout 会启动即退出(exit 1)。重定向到文件(正常可写目标),顺带留日志。
-        let dsh_web_log = std::fs::File::create(dsh_home.join(DSH_WEB_LOG_FILE))?;
+        // 每次启动一份独立文件:同秒内再次启动(崩溃重启)加序号,不截断上一份。
+        let mut log_path = dsh_home.join(format!("{DSH_WEB_LOG_PREFIX}{}.log", unix_now()));
+        let mut seq = 2;
+        while log_path.exists() {
+            log_path = dsh_home.join(format!("{DSH_WEB_LOG_PREFIX}{}-{seq}.log", unix_now()));
+            seq += 1;
+        }
+        let dsh_web_log = std::fs::File::create(&log_path)?;
+        Self::prune_web_logs(&dsh_home, &log_path);
         cmd.stdout(std::process::Stdio::from(dsh_web_log.try_clone()?));
         cmd.stderr(std::process::Stdio::from(dsh_web_log));
         cmd.arg("--profile")
@@ -623,24 +899,33 @@ impl DshRuntime {
             log::info!("[dsh] workspace cwd set to {}", dir.display());
         }
         Self::apply_shebang_path_env(&mut cmd);
+        // 装一次信号转发:Zap 被 pkill/崩溃杀掉时没有其它清理机会(见
+        // install_signal_forwarding)。只在真要拉起 dsh 时装,不影响不开 dsh 的会话。
+        #[cfg(unix)]
+        install_signal_forwarding();
         let mut child = cmd.spawn().context("Failed to spawn dsh web")?;
+        // 刚 spawn 就登记进程组并落盘:启动期崩溃或 Zap 自己被杀时也有据可查
+        // (DSH_PROCESS_GROUP 供信号 handler 转发)。
+        remember_process_group(child.id());
+        Self::write_pid_record(&dsh_home, child.id());
 
         // 4. 就绪探测:dsh 启动成功后会把最终 URL(含随机端口与访问 token)
-        //    打到 stdout(已重定向到 zap-dsh-web.log),解析出该 URL 并 HTTP 探测。
+        //    打到 stdout(已重定向到本次启动的日志文件),解析出该 URL 并 HTTP 探测。
         //    探测同时盯着子进程,启动期退出立即失败。
-        //    失败时显式清理子进程,避免 async-process 的 Child drop 不杀进程
+        //    失败时显式清理进程组,避免 async-process 的 Child drop 不杀进程
         //    导致泄漏。
-        let log_path = dsh_home.join(DSH_WEB_LOG_FILE);
         let url = match Self::wait_until_ready(&mut child, &log_path).await {
             Ok(url) => url,
             Err(err) => {
+                // 启动期失败:整组强杀(dsh 可能已派生过子进程,只杀组长会留孤儿)。
+                // 不等优雅退出——这里在异步任务里,不能阻塞执行器;万一仍有残留,
+                // 已落盘的 pid 记录会让下次启动回收它。
+                Self::signal_process_group(child.id(), false);
                 let _ = child.kill();
+                forget_process_group(child.id());
                 return Err(err);
             }
         };
-
-        // 5. 记录 PID 到文件,便于调试/外部检查。
-        let _ = std::fs::write(dsh_home.join("dsh.pid"), child.id().to_string());
 
         Ok((child, url))
     }
@@ -685,7 +970,7 @@ impl DshRuntime {
     ///
     /// Finder/Dock 启动的 GUI 进程 PATH 不含 nvm/homebrew 的 node:dsh 定位
     /// 虽可经登录 shell 回退(`find_global_dsh`),但即便定位成功,shebang 的
-    /// `env node` 解析失败仍会让 dsh 启动即死(zap-dsh-web.log 首行
+    /// `env node` 解析失败仍会让 dsh 启动即死(启动日志首行
     /// `env: node: No such file or directory`),`wait_until_ready` 空转到
     /// 120s 超时,面板永远停在"启动中"。当前进程 PATH 已含 node 时(终端
     /// 启动)不覆盖,保留完整原环境。
@@ -766,7 +1051,7 @@ impl DshRuntime {
     /// 轮询等待 dsh web 就绪并返回其 URL。
     ///
     /// dsh 启动成功后把最终 URL(随机端口 + 访问 token)打到 stdout(已重
-    /// 定向到 zap-dsh-web.log):`dsh web: http://127.0.0.1:<port>/?token=<token>`。
+    /// 定向到本次启动的日志文件):`dsh web: http://127.0.0.1:<port>/?token=<token>`。
     /// 0.1.2-rc.1 起 web 端有 token 鉴权,裸地址 GET 返回 401,故必须解析
     /// 该 URL 用作探测与 webview 加载地址;URL 中的 token 随启动随机生成。
     ///
@@ -833,7 +1118,7 @@ impl DshRuntime {
         }
     }
 
-    /// 从 zap-dsh-web.log 提取第一条错误行(供启动期退出时展示真实原因)。
+    /// 从 dsh 启动日志提取第一条错误行(供启动期退出时展示真实原因)。
     ///
     /// dsh 是 Node 程序:崩溃时把 `Error: ...` / `SyntaxError: ...` 连同嵌套
     /// cause 一起打到 stdout/stderr(已重定向到日志)。取**第一条**含
@@ -853,9 +1138,16 @@ impl DshRuntime {
     ///
     /// 崩溃日志里通常留有针对性的报错行;拿不到时给出「无错误行 + 日志路径」,
     /// 而不是 `repeated crashes` 这类对用户与 Agent 都无信息的占位串。
+    /// 日志按启动分份,这里取最近一份(就是刚崩溃那次)。
     pub fn crash_failure_reason() -> String {
-        let Ok(log_path) = Self::dsh_data_dir().map(|dir| dir.join(DSH_WEB_LOG_FILE)) else {
+        let Ok(dir) = Self::dsh_data_dir() else {
             return "dsh web crashed repeatedly".to_string();
+        };
+        let Some(log_path) = Self::latest_web_log_path(&dir) else {
+            return format!(
+                "dsh web crashed repeatedly; no {DSH_WEB_LOG_PREFIX}*.log in {}",
+                dir.display()
+            );
         };
         let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
         Self::crash_failure_reason_from(&log_path, &log_text)
@@ -872,7 +1164,7 @@ impl DshRuntime {
         }
     }
 
-    /// 从 zap-dsh-web.log 读取就绪 URL(尚无输出时返回 None)。
+    /// 从本次启动的日志读取就绪 URL(尚无输出时返回 None)。
     fn read_ready_url(log_path: &Path) -> Option<String> {
         Self::parse_ready_url(&std::fs::read_to_string(log_path).ok()?)
     }
@@ -1591,6 +1883,198 @@ mod tests {
             DshRuntime::crash_failure_reason_from(log_path, "[plugin] ok\n"),
             "dsh web crashed repeatedly; no error line in /tmp/zap-dsh-web.log"
         );
+    }
+
+    /// `dsh.pid` 记录的解析与「该不该回收」判定:只有记录可解析、上次 Zap 已死、
+    /// 且不是本进程自己的记录时,才给出要回收的 pgid。
+    #[cfg(unix)]
+    #[test]
+    fn orphan_group_decision_from_pid_record() {
+        // 上次 Zap 早已不存在(取值超出 pid 上限)→ 回收它留下的组。
+        let dead = i32::MAX - 1;
+        assert_eq!(
+            DshRuntime::orphan_group_from_record(&format!(
+                "zap_pid={dead}\npgid=4321\nstarted_at=1\n"
+            )),
+            Some(4321)
+        );
+
+        // 本进程自己的记录(崩溃重启路径):不回收。
+        let own = format!("zap_pid={}\npgid=4321\nstarted_at=1\n", std::process::id());
+        assert_eq!(DshRuntime::orphan_group_from_record(&own), None);
+
+        // 另一个仍活着的进程(pid 1 恒存在且不属于本用户 → EPERM 视为活着):
+        // 多实例并存时不能误杀另一个 Zap 的 dsh。
+        assert_eq!(
+            DshRuntime::orphan_group_from_record("zap_pid=1\npgid=4321\nstarted_at=1\n"),
+            None
+        );
+        assert!(DshRuntime::process_alive(1));
+
+        // 旧格式(裸 pid)与残缺/非法记录:解析不出就不回收,不赌 pid 复用。
+        assert_eq!(DshRuntime::orphan_group_from_record("69209"), None);
+        assert_eq!(DshRuntime::orphan_group_from_record("zap_pid=1\n"), None);
+        assert_eq!(
+            DshRuntime::orphan_group_from_record("zap_pid=1\npgid=0\n"),
+            None
+        );
+        assert_eq!(
+            DshRuntime::orphan_group_from_record("zap_pid=1\npgid=not-a-pid\n"),
+            None
+        );
+    }
+
+    /// 日志分份:只保留最近 DSH_WEB_LOG_KEEP 份,本次启动那份永不删除
+    /// (同秒重启的带序号文件按路径排在最前,会被误当最旧),目录里的无关文件
+    /// (如 dsh.pid)也不能删。
+    #[test]
+    fn prune_web_logs_keeps_newest() {
+        let dir = std::env::temp_dir().join(format!("zap-dsh-logs-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let total = DSH_WEB_LOG_KEEP + 3;
+        for index in 0..total {
+            std::fs::write(dir.join(format!("{DSH_WEB_LOG_PREFIX}{index}.log")), b"x").unwrap();
+        }
+        // 本次启动那份:与最新一份同秒(带序号),路径比较排在 `<秒>.log` 之前。
+        let current = dir.join(format!("{DSH_WEB_LOG_PREFIX}{}-2.log", total - 1));
+        std::fs::write(&current, b"x").unwrap();
+        std::fs::write(dir.join(DSH_PID_FILE), b"zap_pid=1\n").unwrap();
+
+        DshRuntime::prune_web_logs(&dir, &current);
+
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| is_web_log_name(name))
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), DSH_WEB_LOG_KEEP);
+        assert!(current.exists(), "本次启动的日志不能被删");
+        assert!(dir.join(DSH_PID_FILE).exists(), "无关文件不能被删");
+        // 保留 current + 最新的 KEEP-1 份旧日志,更旧的那几份被删。
+        let removed = total - DSH_WEB_LOG_KEEP + 1;
+        for index in 0..removed {
+            assert!(
+                !dir.join(format!("{DSH_WEB_LOG_PREFIX}{index}.log")).exists(),
+                "最旧的 {index} 应被删除"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 停止按**整组**回收:dsh 派生的子进程(同组)在组长退出后也必须一起死,
+    /// 否则每停一次 dsh 就留一批孤儿。
+    #[cfg(unix)]
+    #[test]
+    fn terminate_child_kills_whole_process_group() {
+        let dir = std::env::temp_dir().join(format!("zap-dsh-group-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("grandchild.pid");
+
+        // 组长(模拟 dsh)在自成一组的组里再派生一个长睡进程,并把它的 pid 落盘。
+        let mut cmd = Command::new_with_process_group("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 300 & echo $! > {}; wait", pid_file.display()));
+        let mut child = cmd.spawn().expect("spawn fake dsh group");
+        let pgid = child.id();
+
+        let mut grandchild = None;
+        for _ in 0..200 {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                grandchild = Some(pid);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild = grandchild.expect("grandchild pid should be written");
+
+        DshRuntime::terminate_child(&mut child);
+
+        assert!(
+            !DshRuntime::process_alive(pgid as i32),
+            "group leader {pgid} should be gone"
+        );
+        // 孙进程被 reparent 后由 launchd 回收,给一点时间避免读到僵尸态。
+        for _ in 0..100 {
+            if !DshRuntime::process_alive(grandchild) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !DshRuntime::process_alive(grandchild),
+            "grandchild {grandchild} survived group termination"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 启动回收:记录里的上次 Zap 已死时整组回收遗留进程;记录属于本进程
+    /// (崩溃重启路径)时不动它。这里刻意让组长先退出、只剩它派生的进程活着,
+    /// 复现真实残留形态(上次 Zap 被杀后留下的 dsh)。
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_orphan_group_kills_leftover_group() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!("zap-dsh-reclaim-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).unwrap();
+
+            // 组长自成一组的组里派生一个长睡进程后立即退出。
+            let mut cmd = Command::new_with_process_group("sh");
+            cmd.arg("-c").arg("sleep 300 & exit 0");
+            let mut child = cmd.spawn().expect("spawn leftover group");
+            let pgid = child.id();
+            for _ in 0..200 {
+                if child.try_status().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                child.try_status().ok().flatten().is_some(),
+                "leader should have exited"
+            );
+            assert!(
+                DshRuntime::process_group_alive(pgid as i32),
+                "derived process should keep the group alive"
+            );
+
+            // 记录属于本进程(崩溃重启路径):不回收。
+            std::fs::write(
+                dir.join(DSH_PID_FILE),
+                format!("zap_pid={}\npgid={pgid}\nstarted_at=1\n", std::process::id()),
+            )
+            .unwrap();
+            DshRuntime::reclaim_orphan_group(&dir).await;
+            assert!(
+                DshRuntime::process_group_alive(pgid as i32),
+                "own record must not be reclaimed"
+            );
+
+            // 记录属于已死的上次 Zap:整组回收。
+            std::fs::write(
+                dir.join(DSH_PID_FILE),
+                format!("zap_pid={}\npgid={pgid}\nstarted_at=1\n", i32::MAX - 1),
+            )
+            .unwrap();
+            DshRuntime::reclaim_orphan_group(&dir).await;
+            assert!(
+                !DshRuntime::process_group_alive(pgid as i32),
+                "leftover group must be reclaimed"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
     }
 
     /// begin_start 复位 stopping 与崩溃计数,并置位 Starting。
