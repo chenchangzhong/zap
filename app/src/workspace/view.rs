@@ -776,23 +776,58 @@ const FLOATING_EDITOR_BACKGROUND_OPACITY: u8 = 99;
 
 /// 当前 Esc 归哪个模态浮层"所有"。
 ///
-/// 悬浮编辑器浮层靠 Esc 收起,而键绑定匹配是**焦点优先**的:任何获得焦点的 `EditorView`
-/// (终端输入框、agent 输入框、悬浮编辑器自身……)都会先吃掉 Esc,外层元素树上的捕获层
-/// 根本收不到。所以只能反过来让编辑器主动让位 —— `EditorView::keymap_context` 会读这里,
-/// 给自己的 `escape` 绑定补一个否定标识。
+/// 这些宿主都靠 Esc 收起,而键绑定匹配是**焦点优先**的:任何获得焦点的 `EditorView`
+/// (终端输入框、agent 输入框、宿主自己嵌的编辑器……)都会先吃掉 Esc,宿主的绑定或外层
+/// 元素树上的捕获层根本收不到。所以只能反过来让编辑器主动让位 —— `EditorView` 与
+/// `CodeEditorView` 的 `keymap_context` 会读这里,给自己的 `escape` 绑定补一个否定标识。
 ///
-/// 只登记悬浮编辑器:悬浮工具面板用的是逐点 `escape_yields_to_host`(见面板里各
-/// `EditorView` 的构造点),不需要在这里做全局让位 —— 那会让工具面板打开期间终端与 agent
-/// 输入框的 Esc 行为整体改变。
+/// 悬浮工具面板不在此列:它用逐点 `escape_yields_to_host`(见面板里各 `EditorView` 的
+/// 构造点),不需要全局让位 —— 那会让面板打开期间终端与 agent 输入框的 Esc 行为整体改变。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EscapeOwner {
     None,
+    /// 悬浮编辑器浮层:由 `Workspace::render` 每帧登记,Esc 收起浮层。
     FloatingEditor,
+    /// 最大化(全屏)的 Code Review 面板:Esc 由 `RightPanelView` 的绑定直接关闭面板,
+    /// 同样由 `Workspace::render` 每帧登记。见 [`set_window_escape_owner_host`]。
+    MaximizedCodeReview,
 }
 
+/// 浮层宿主的登记表(见 [`EscapeOwner::FloatingEditor`])。
 fn escape_owner_slots() -> &'static Mutex<HashMap<WindowId, EscapeOwner>> {
     static OWNERS: OnceLock<Mutex<HashMap<WindowId, EscapeOwner>>> = OnceLock::new();
     OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 每窗口至多一个的 Esc 宿主(目前是最大化/全屏的 Code Review 面板)。
+///
+/// 这张表由 `Workspace::render` **每帧**按 pane group 的真实状态覆盖,而不是靠登记/注销配对:
+/// 面板关闭、切换标签页、还原都会改变状态,配对式注销容易漏掉一处,残留的后果是窗口里的
+/// 编辑器永久让出 Esc —— 此时宿主已不在响应者链上,这个按键会变得无人处理。
+fn window_escape_owner_hosts() -> &'static Mutex<HashMap<WindowId, EscapeOwner>> {
+    static HOSTS: OnceLock<Mutex<HashMap<WindowId, EscapeOwner>>> = OnceLock::new();
+    HOSTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 覆盖式设置窗口级 Esc 宿主;`EscapeOwner::None` 表示该窗口没有这类宿主。
+pub(crate) fn set_window_escape_owner_host(
+    owner: EscapeOwner,
+    window_id: WindowId,
+    active: bool,
+) {
+    if let Ok(mut hosts) = window_escape_owner_hosts().lock() {
+        if active {
+            hosts.insert(window_id, owner);
+        } else {
+            hosts.remove(&window_id);
+        }
+    }
+}
+
+fn clear_window_escape_owner_hosts(window_id: WindowId) {
+    if let Ok(mut hosts) = window_escape_owner_hosts().lock() {
+        hosts.remove(&window_id);
+    }
 }
 
 fn set_escape_owner(window_id: WindowId, owner: EscapeOwner) {
@@ -805,13 +840,27 @@ fn set_escape_owner(window_id: WindowId, owner: EscapeOwner) {
     }
 }
 
-/// 该窗口当前是否有需要优先消费 Esc 的模态浮层。见 [`EscapeOwner`]。
+/// 该窗口当前是否有需要优先消费 Esc 的模态浮层或宿主视图。见 [`EscapeOwner`]。
 pub(crate) fn escape_owner(window_id: WindowId) -> EscapeOwner {
-    escape_owner_slots()
+    if let Some(owner) = escape_owner_slots()
         .lock()
         .ok()
         .and_then(|owners| owners.get(&window_id).copied())
-        .unwrap_or(EscapeOwner::None)
+    {
+        return owner;
+    }
+
+    // 最大化的 Code Review 面板不是浮层,它的 Esc 由 `RightPanelView` 的绑定接住,
+    // 但面板内嵌的编辑器(双列 diff、评论输入框)同样要先让位。
+    if let Some(owner) = window_escape_owner_hosts()
+        .lock()
+        .ok()
+        .and_then(|hosts| hosts.get(&window_id).copied())
+    {
+        return owner;
+    }
+
+    EscapeOwner::None
 }
 
 pub const NEW_TAB_BUTTON_POSITION_ID: &str = "new_tab_button";
@@ -6098,6 +6147,11 @@ impl Workspace {
             RightPanelEvent::ToggleMaximize => {
                 self.toggle_right_panel_maximized(ctx);
             }
+            RightPanelEvent::ClosePanel => {
+                // Esc 收起最大化(全屏)的 Code Review 面板:直接关闭整个面板。
+                let pane_group = self.active_tab_pane_group().clone();
+                self.close_right_panel(&pane_group, ctx);
+            }
             RightPanelEvent::OpenFileWithTarget {
                 path,
                 target,
@@ -8947,6 +9001,16 @@ impl Workspace {
                     ctx
                 );
                 self.setup_code_review_panel(panel_update_params.review_pane_context, ctx);
+
+                // 面板打开后把焦点交给 Code Review 视图:手动最大化(`toggle_right_panel_maximized`)
+                // 已经这么做,打开路径漏了这一步 —— 焦点会留在终端,而面板不在响应者链上,
+                // 最大化状态下的 `escape` 绑定根本收不到按键(表现为"打开面板后要先点一下面板,
+                // Esc 才生效")。
+                if new_is_maximized {
+                    self.right_panel_view.update(ctx, |view, ctx| {
+                        view.focus_active_code_review_view(ctx);
+                    });
+                }
             }
         } else {
             self.focus_active_tab(ctx);
@@ -22357,6 +22421,20 @@ impl View for Workspace {
             },
         );
 
+        // 最大化(全屏)的 Code Review 面板同理:面板里嵌的编辑器(双列 diff、评论输入框)
+        // 要让出 Esc,交给 `RightPanelView` 的绑定关闭面板。每帧按 pane group 的真实状态
+        // 覆盖,面板关闭 / 还原 / 切标签页都不会留下过期的让位登记。
+        let code_review_maximized = {
+            let pane_group = self.active_tab_pane_group();
+            let pane_group = pane_group.as_ref(app);
+            pane_group.right_panel_open && pane_group.is_right_panel_maximized
+        };
+        set_window_escape_owner_host(
+            EscapeOwner::MaximizedCodeReview,
+            self.window_id,
+            code_review_maximized,
+        );
+
         let tab_bar_mode = self.tab_bar_mode(app);
 
         // For WASM simplified tab bar views (Zap Drive objects, shared sessions, conversation transcripts),
@@ -23793,6 +23871,7 @@ impl View for Workspace {
 
         // 清掉本窗口的 Esc 归属登记,避免 map 随窗口开关无界增长。
         set_escape_owner(window_id, EscapeOwner::None);
+        clear_window_escape_owner_hosts(window_id);
 
         // If this workspace's close was registered as part of a tab-drag
         // handoff, clear the entry now that the workspace is gone from the

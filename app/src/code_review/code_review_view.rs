@@ -4729,11 +4729,25 @@ impl CodeReviewView {
         is_in_split_pane: bool,
         app: &warpui::AppContext,
     ) -> Box<dyn Element> {
+        // side-by-side 时列表必须是 flexible child:`Flex` 对**非 flexible** 子元素给的是
+        // **无限**主轴约束(见 warpui_core `flex/mod.rs` 的布局算法),而 viewported_list 的
+        // 尺寸直接取 `constraint.max`,于是它的 `viewport_height` 变成 ∞ —— 底下那层
+        // `ConstrainedBox::with_max_height(viewport_height)` 随之形同虚设,双列编辑器拿不到
+        // 有限约束:用 FillMaxHeight 会 panic,用 InfiniteHeight 会渲染所有行(1000+ 行卡顿)。
+        // 包成 Shrinkable 后它拿到的才是"父约束减去固定子项"的有限剩余空间。
+        // inline 模式必须保持自然高度(外层列表滚动),所以只在 side-by-side 下包。
+        let diffs = self.render_content(state, appearance, app);
+        let diffs = if self.diff_layout.is_side_by_side() {
+            Shrinkable::new(1., diffs).finish()
+        } else {
+            diffs
+        };
+
         let top_section = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Start)
             .with_main_axis_alignment(MainAxisAlignment::Start)
             .with_child(self.render_header(state, appearance, is_in_split_pane, app))
-            .with_child(self.render_content(state, appearance, app));
+            .with_child(diffs);
 
         let top_section_with_margin = ConstrainedBox::new(
             Container::new(Shrinkable::new(1., top_section.finish()).finish())
@@ -6948,6 +6962,9 @@ impl CodeReviewView {
             CodeEditorView::new(
                 None,
                 None,
+                // 双列是"固定高度视口 + 内部滚动":`render_file_diff` 已把 item 夹到列表的
+                // 视口高度,编辑器必须收下这个有限约束才能虚拟滚动(改成 InfiniteHeight 会
+                // 渲染所有行,1000+ 行文件明显卡顿)。
                 CodeEditorRenderOptions::new(VerticalExpansionBehavior::FillMaxHeight)
                     .lazy_layout()
                     .line_height_override(CODE_REVIEW_EDITOR_LINE_HEIGHT_RATIO)
@@ -7017,6 +7034,7 @@ impl CodeReviewView {
             CodeEditorView::new(
                 None,
                 None,
+                // 同左列:固定高度视口 + 内部滚动,收下 item 的有限高度以启用虚拟滚动。
                 CodeEditorRenderOptions::new(VerticalExpansionBehavior::FillMaxHeight)
                     .lazy_layout()
                     .line_height_override(CODE_REVIEW_EDITOR_LINE_HEIGHT_RATIO)

@@ -2205,3 +2205,22 @@ fn vertical_tabs_slide_progress_clamps_and_eases() {
     assert_eq!(vertical_tabs_slide_progress(1., 0., 0.5), 0.5);
     assert_eq!(vertical_tabs_slide_progress(1., 0., 1.), 0.);
 }
+
+/// 最大化(全屏)的 Code Review 面板必须让窗口里的编辑器给 `escape` 让位,否则面板内嵌的
+/// 编辑器(双列 diff、评论输入框)会先吃掉按键,面板永远收不到 Esc。
+#[test]
+fn escape_owner_reports_maximized_code_review() {
+    let window_id = WindowId::new();
+
+    assert_eq!(escape_owner(window_id), EscapeOwner::None);
+
+    set_window_escape_owner_host(EscapeOwner::MaximizedCodeReview, window_id, true);
+    assert_eq!(escape_owner(window_id), EscapeOwner::MaximizedCodeReview);
+
+    // 其它窗口不受影响。
+    assert_eq!(escape_owner(WindowId::new()), EscapeOwner::None);
+
+    // 面板还原 / 关闭时注销,避免编辑器永久让出 Esc(那时宿主已不在响应者链上)。
+    set_window_escape_owner_host(EscapeOwner::MaximizedCodeReview, window_id, false);
+    assert_eq!(escape_owner(window_id), EscapeOwner::None);
+}

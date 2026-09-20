@@ -43,6 +43,8 @@ use warp_core::ui::Icon;
 use warp_util::path::LineAndColumnArg;
 use warpui::elements::{ChildAnchor, Empty, PositionedElementAnchor};
 use warpui::keymap::EditableBinding;
+#[cfg(feature = "local_fs")]
+use warpui::keymap::FixedBinding;
 use warpui::EntityId;
 use warpui::{
     elements::{
@@ -298,6 +300,9 @@ impl CodeReviewState {
     }
 }
 
+/// 右面板处于最大化(全屏)状态。见 `RightPanelView::keymap_context`。
+const RIGHT_PANEL_MAXIMIZED_CONTEXT: &str = "RightPanelMaximized";
+
 #[derive(Clone, Debug)]
 #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
 pub enum RightPanelAction {
@@ -308,12 +313,16 @@ pub enum RightPanelAction {
     },
     OpenRepository,
     ToggleMaximize,
+    /// Esc 收起最大化(全屏)的 Code Review 面板。见 `RightPanelView::init` 里的 escape 绑定。
+    ClosePanel,
 }
 
 #[derive(Clone, Debug)]
 #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
 pub enum RightPanelEvent {
     ToggleMaximize,
+    /// 关闭整个右面板,由 `Workspace` 处理。
+    ClosePanel,
     #[cfg(feature = "local_fs")]
     OpenFileWithTarget {
         path: PathBuf,
@@ -353,6 +362,21 @@ impl RightPanelView {
         .with_enabled(|| cfg!(feature = "local_fs"))
         .with_context_predicate(id!("RightPanelView"))
         .with_custom_action(CustomAction::ToggleMaximizePane)]);
+
+        // 最大化(全屏)的 Code Review 面板靠 Esc 直接关闭。
+        //
+        // 绑定放在 `RightPanelView` 上而不是 `CodeReviewView`:面板里可能挂着评论输入框、
+        // 查找栏等自己的 Esc 语义,它们比宿主更靠近焦点,天然优先。绑定匹配是焦点优先的,
+        // 面板内嵌的编辑器会让位(见 `workspace::view::EscapeOwner::MaximizedCodeReview`),
+        // 否则这个按键会先被它们吃掉。
+        // 非 local_fs 构建下右面板这套 code review 不存在(`handle_action` 是空实现),
+        // 不注册这条绑定,免得 Esc 被一个空转的动作吃掉。
+        #[cfg(feature = "local_fs")]
+        app.register_fixed_bindings([FixedBinding::new(
+            "escape",
+            RightPanelAction::ClosePanel,
+            id!("RightPanelView") & id!(RIGHT_PANEL_MAXIMIZED_CONTEXT),
+        )]);
     }
 
     pub fn new(
@@ -1794,6 +1818,10 @@ impl TypedActionView for RightPanelView {
                 ctx.emit(RightPanelEvent::ToggleMaximize);
                 ctx.notify();
             }
+            RightPanelAction::ClosePanel => {
+                ctx.emit(RightPanelEvent::ClosePanel);
+                ctx.notify();
+            }
             RightPanelAction::OpenRepository => {
                 if let Some(active_pane_group) = &self.active_pane_group {
                     let terminal_view = active_pane_group.read(ctx, |pane_group, ctx| {
@@ -1828,6 +1856,22 @@ impl TypedActionView for RightPanelView {
 impl View for RightPanelView {
     fn ui_name() -> &'static str {
         "RightPanelView"
+    }
+
+    fn keymap_context(&self, app: &AppContext) -> warpui::keymap::Context {
+        let mut context = Self::default_keymap_context();
+
+        // 只有"最大化且面板开着"时才让 `escape` 绑定匹配:面板缩在侧栏里时 Esc 不该关掉它,
+        // 面板已关闭时也不该匹配。判定口径与 `Workspace::render` 里的让位登记保持一致。
+        let maximized_and_open = self.active_pane_group.as_ref().is_some_and(|pane_group| {
+            let pane_group = pane_group.as_ref(app);
+            pane_group.right_panel_open && pane_group.is_right_panel_maximized
+        });
+        if maximized_and_open {
+            context.set.insert(RIGHT_PANEL_MAXIMIZED_CONTEXT);
+        }
+
+        context
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
