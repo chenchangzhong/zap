@@ -82,10 +82,8 @@ use warpui::ui_components::text_input::TextInput;
 use warpui::{AppContext, EntityId, SingletonEntity, ViewHandle, WindowId};
 
 const PANEL_WIDTH: f32 = 248.;
+/// 停靠态与悬浮态**共用**的宽度下限:分叉的代价实测过(见 `floating_panel_width`)。
 const MIN_PANEL_WIDTH: f32 = 200.;
-/// 自动隐藏浮层的宽度下限。停靠态由 `MIN_PANEL_WIDTH`(200) 兜底,但同一宽度盖在
-/// 内容之上时显得偏窄;用户仍可拖拽加宽。
-const FLOATING_MIN_PANEL_WIDTH: f32 = 260.;
 const MAX_PANEL_WIDTH_RATIO: f32 = 0.5;
 const DETAIL_SIDECAR_SECTION_PADDING: f32 = 12.;
 const DETAIL_SIDECAR_SECTION_GAP: f32 = 4.;
@@ -660,14 +658,17 @@ impl VerticalTabsPanelState {
             .unwrap_or(false)
     }
 
-    /// 自动隐藏浮层沿用的宽度:停靠态下拖拽出来的宽度,但不低于浮层自己的下限。
+    /// 悬浮浮层沿用的宽度:与停靠态共用同一个 `resizable_state`(悬浮态自己也能拖拽改宽),
+    /// 下限同样是 `MIN_PANEL_WIDTH`,不再单独抬高。
     pub(super) fn floating_panel_width(&self) -> f32 {
         let stored = self
             .resizable_state
             .lock()
             .map(|state| state.size())
             .unwrap_or(PANEL_WIDTH);
-        stored.max(FLOATING_MIN_PANEL_WIDTH)
+        // 与停靠态共用同一个下限。分叉的代价在工具面板上实测过:悬浮态若用更高的下限,停靠态
+        // 拖出的较小宽度一进悬浮态就会被抬高写回共享 state,再也回不去。
+        stored.max(MIN_PANEL_WIDTH)
     }
 
     pub(super) fn clear_detail_sidecar(&self) {
@@ -1512,17 +1513,12 @@ fn render_vertical_tabs_panel(
     // 面板不再自绘底色:整窗统一色由窗口背景层提供(见 Workspace::render 中
     // set_window_background_color),否则侧栏会比主区亮一档。
     //
-    // `Resizable` 会用自己 state 里的宽度反过来卡住外层给它的约束,所以漂浮态要加宽不能
-    // 只抬外层 `ConstrainedBox`,这里的下限必须同步抬高。
-    // 悬浮态不提供拖拽改宽:面板是浮层,拖拽带在悬浮包装下收不到拖拽事件(已实测,把静止态
-    // 结构压成与工具面板同构后仍然拖不动),拖了没有反应。宽度固定为浮层宽度;要改宽就关掉
-    // 悬浮开关、在停靠态拖 —— 两种模式共用同一个 `resizable_state`,改完再开悬浮即生效。
-    if super::Workspace::vertical_tabs_panel_auto_hides(app) {
-        return ConstrainedBox::new(panel_with_popup)
-            .with_width(state.floating_panel_width())
-            .finish();
-    }
-
+    // 停靠态与悬浮态共用同一个 `Resizable`、同一个下限(见 `floating_panel_width` 的说明)。
+    // 宽度只由它自己的 state 决定,外层不写死宽度:这个 `Resizable` 是**内联建在
+    // `Workspace::render` 里**的(停靠态走 `render_config_panel`、悬浮态走浮层那一段),所以
+    // `on_resize` 的 `ctx.notify()` 通知的就是 `Workspace`,外层若把宽度写死,渲染宽度会和
+    // state 打架。工具面板那条"父级不写死宽度"的结论在这里同样成立,但原因不同 —— 那边的
+    // `Resizable` 属于持久 View,父级不重建,写死会停在旧值。
     Resizable::new(state.resizable_state.clone(), panel_with_popup)
         .with_dragbar_side(drag_side)
         .on_resize(|ctx, _| {

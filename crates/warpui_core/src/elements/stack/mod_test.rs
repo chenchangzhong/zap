@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
 };
@@ -10,7 +10,10 @@ use pathfinder_geometry::rect::RectF;
 use super::*;
 
 use crate::{
-    elements::{Clipped, DispatchEventResult},
+    elements::{
+        resizable_state_handle, Clipped, DispatchEventResult, DragBarSide, Hoverable,
+        MouseStateHandle, Resizable,
+    },
     platform::WindowStyle,
     TypedActionView,
 };
@@ -883,4 +886,143 @@ fn positioned_overlay_child_is_unclipped_in_overlay_context() {
             escaping_layer.rects.iter().map(|r| r.bounds).collect::<Vec<_>>()
         );
     });
+}
+
+/// 回归:`Stack` 里后加的 hover 探测层不能吞掉兄弟节点(拖拽带)的 `drag`。
+///
+/// 复刻真实场景(`docs/vertical-tabs-floating-resize-issue.md`):`Resizable` 的拖拽带被后加的
+/// 贴边 hover 探测层盖住。`Stack` 的 `Waterfall` 模式**逆序**派发、首个返回 `true` 的子元素即
+/// 终止;而 `Hoverable` 默认 `suppress_drag = true`,并在 `LeftMouseDown` 命中它时写下
+/// `click_count`,于是它把后续每一条 `LeftMouseDragged` 都 `return true` 吃掉 —— 拖拽带再也
+/// 收不到 drag,表现为"按下有反应、拖拽完全无反应"。解法是给这类 hover 目标加
+/// `with_propagate_drag()`(与 pane 分隔条同构)。
+///
+/// 这里显式钉住 `Waterfall`:`Stack::new()` 只在 debug 构建下默认用它,用例不该依赖构建模式。
+/// 用真实的 `Resizable` 而不是 `EventHandler` 当拖拽带:`EventHandler` 会做 `at_z_index`
+/// 覆盖判定,被上层盖住时它本来就不会响应 —— 那不是本例要证的机制。
+struct ProbeOverDragView {
+    probe_propagates_drag: bool,
+    /// `Resizable::on_resize` 的调用次数:按下那次 1 次,之后每完成一步拖拽再 +1。
+    resize_callbacks: Rc<Cell<u32>>,
+}
+
+impl Entity for ProbeOverDragView {
+    type Event = String;
+}
+
+impl TypedActionView for ProbeOverDragView {
+    type Action = ();
+}
+
+impl crate::core::View for ProbeOverDragView {
+    fn render<'a>(&self, _: &AppContext) -> Box<dyn Element> {
+        let mut stack = Stack::new().with_event_dispatch_mode(EventDispatchMode::Waterfall);
+
+        let resize_callbacks = self.resize_callbacks.clone();
+        // 先加:拖拽带(等价于悬浮侧栏面板右边缘那一条)。`Waterfall` 逆序派发,所以它排在
+        // 探测层**之后**才被派发。
+        stack.add_child(
+            Resizable::new(
+                resizable_state_handle(100.),
+                ConstrainedBox::new(Rect::new().finish())
+                    .with_height(100.)
+                    .with_width(100.)
+                    .finish(),
+            )
+            .with_dragbar_side(DragBarSide::Right)
+            .on_resize(move |_ctx, _app| {
+                resize_callbacks.set(resize_callbacks.get() + 1);
+            })
+            .finish(),
+        );
+
+        // 后加:透明的 hover 探测层,盖住拖拽带(真实代码里它是 overlay 子元素,派发顺序一致)。
+        let mut probe = Hoverable::new(MouseStateHandle::default(), |_| {
+            ConstrainedBox::new(Rect::new().finish())
+                .with_height(100.)
+                .with_width(100.)
+                .finish()
+        });
+        if self.probe_propagates_drag {
+            probe = probe.with_propagate_drag();
+        }
+        stack.add_child(probe.finish());
+
+        stack.finish()
+    }
+
+    fn ui_name() -> &'static str {
+        "probe_over_drag_view"
+    }
+}
+
+/// `expected_resize_callbacks`:按下 1 次 + 每被拖到的新位置 1 次。放行 drag 时两条 drag 都应
+/// 落到 `Resizable`(3 次);被探测层吃掉时只有按下那 1 次。
+fn assert_drag_through_hover_probe(probe_propagates_drag: bool, expected_resize_callbacks: u32) {
+    App::test((), |mut app| async move {
+        let app = &mut app;
+        let (window_id, view) = app.add_window(WindowStyle::NotStealFocus, move |_| {
+            ProbeOverDragView {
+                probe_propagates_drag,
+                resize_callbacks: Rc::new(Cell::new(0)),
+            }
+        });
+
+        let mut presenter = Presenter::new(window_id);
+        let mut updated = crate::EntityIdSet::default();
+        updated.insert(app.root_view_id(window_id).unwrap());
+        let invalidation = WindowInvalidation {
+            updated,
+            ..Default::default()
+        };
+
+        app.update(move |ctx| {
+            presenter.invalidate(invalidation, ctx);
+            presenter.build_scene(vec2f(200., 200.), 1., None, ctx);
+            let presenter = Rc::new(RefCell::new(presenter));
+
+            // 按在拖拽带上(x ∈ [95, 100])。探测层盖着同一块区域,所以它会记下 `click_count`。
+            ctx.simulate_window_event(
+                Event::LeftMouseDown {
+                    position: vec2f(97., 50.),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    is_first_mouse: false,
+                },
+                window_id,
+                presenter.clone(),
+            );
+            // 两条 drag:不放行时被探测层 `return true` 截断,放行时才会落到拖拽带上。
+            for x in [80., 60.] {
+                ctx.simulate_window_event(
+                    Event::LeftMouseDragged {
+                        position: vec2f(x, 50.),
+                        modifiers: Default::default(),
+                    },
+                    window_id,
+                    presenter.clone(),
+                );
+            }
+        });
+
+        view.read(app, |view, _| {
+            assert_eq!(
+                expected_resize_callbacks,
+                view.resize_callbacks.get(),
+                "probe_propagates_drag={probe_propagates_drag} 时,拖拽带收到的 drag 步数不对"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_hover_probe_added_last_swallows_sibling_drag_without_propagate() {
+    // 陷阱本身:默认 `suppress_drag` 的探测层会把兄弟节点的 drag 全部吃掉(1 步都到不了)。
+    assert_drag_through_hover_probe(false, 1);
+}
+
+#[test]
+fn test_hover_probe_with_propagate_drag_lets_sibling_receive_drag() {
+    // 解法:`with_propagate_drag()` 之后,drag 正常落到被压住的拖拽带上(按下 1 次 + 两步拖拽)。
+    assert_drag_through_hover_probe(true, 3);
 }

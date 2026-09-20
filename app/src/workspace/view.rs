@@ -21096,8 +21096,10 @@ impl TypedActionView for Workspace {
                 //    弹窗都渲染在面板外侧 —— 鼠标移到它们上面时探测层会 hover out,
                 //    `Dismiss` 也会把点它们当成"点了外面";
                 // 2. 拖拽 tab 时指针常会短暂离开探测区(收起还会连带影响拖拽落点判定)。
-                // (没有"拖拽面板右边缘改宽"这一条:悬浮态已经不提供改宽,见
-                // `render_vertical_tabs_panel` 的早退,`is_resizing` 那条守卫是死分支已删。)
+                // (没有"拖拽面板右边缘改宽"这一条:悬浮态现在也提供改宽,但拖拽期间指针只发
+                // `LeftMouseDragged`、不会有 `MouseMoved`,探测层根本不会 hover out;唯一会误判的
+                // 是重绘后补发的合成 `MouseMoved`(它拿的是按下前的过期坐标),已在探测层用
+                // `with_skip_synthetic_hover_out` 处理,见 `render` 里探测层那段注释。)
                 if self.vertical_tabs_panel.has_active_detail_target()
                     || self.current_workspace_state.is_tab_being_dragged
                     || self.show_tab_right_click_menu.is_some()
@@ -22721,19 +22723,26 @@ impl View for Workspace {
                 .with_uniform_padding(FLOATING_PANEL_INSET)
                 .finish();
                 // 非 prevent 模式:只在"点击面板之外"时收起,不会阻塞其它元素的交互。
-                // `Clipped` 为面板内容新开一层,使其命中记录高于 `Dismiss` 的全窗 rect,
+                // 面板内容靠下面那层不裁剪的 overlay 层把命中记录抬到 `Dismiss` 的整窗 rect 之上,
                 // 否则点面板内的空白也会被误判成"点在外面"。
                 stack.add_positioned_overlay_child(
                     // 位移交给 `PanelSlideRepaint` 在 paint 时施加(它不依赖 `render`
                     // 重跑);这里只把面板摆到"完全展开"的位置。
                     Box::new(PanelSlideRepaint::new(
-                        Dismiss::new(Clipped::new(panel_body).finish())
-                            .on_dismiss(|ctx, _app| {
-                                ctx.dispatch_typed_action(
-                                    WorkspaceAction::VerticalTabsAutoHideCollapse,
-                                );
-                            })
-                            .finish(),
+                        Dismiss::new({
+                            // 与悬浮工具面板一致:用 `Stack::add_overlay_child` 新开一层
+                            // **不裁剪**(`ClipBounds::None`)的 overlay 层,而不是 `Clipped` ——
+                            // 同样能让面板的命中记录高于 `Dismiss` 的整窗 rect(否则点面板内的
+                            // 空白会被误判成"点在外面"),但不会把面板内的弹出菜单(新会话菜单、
+                            // 显示设置弹窗、详情侧栏)按面板矩形裁掉。
+                            let mut panel_layer = Stack::new();
+                            panel_layer.add_overlay_child(panel_body);
+                            panel_layer.finish()
+                        })
+                        .on_dismiss(|ctx, _app| {
+                            ctx.dispatch_typed_action(WorkspaceAction::VerticalTabsAutoHideCollapse);
+                        })
+                        .finish(),
                         self.vertical_tabs_panel_slide.get(),
                         // 位移要盖过面板的**总**宽度(内容宽 + 两侧留白),否则收起后会残一条。
                         full_width + 2. * FLOATING_PANEL_INSET,
@@ -22795,7 +22804,27 @@ impl View for Workspace {
                             ctx.dispatch_typed_action(WorkspaceAction::VerticalTabsAutoHideCollapse);
                         }
                     }
-                });
+                })
+                // 探测层必须放行拖拽:`Hoverable` 默认 `suppress_drag`(hoverable.rs),展开态它的宽度
+                // 盖住了面板右边缘的拖拽带,按下时又会记下 `click_count`,于是后续每一条
+                // `LeftMouseDragged` 都在探测层被 `return true` 吃掉 —— 外层 `Stack` 在 debug 下是
+                // Waterfall 且逆序派发(探测层加在面板之后),面板子树(含 `Resizable`)再也收不到
+                // drag,表现为"按下有反应、拖拽完全无反应"。与 pane 分隔条的 hover 目标同一处理。
+                .with_propagate_drag()
+                // 合成 MouseMoved 不能让探测层 hover out:框架每次重绘后补发的那条事件用的是
+                // **最后一次真实 MouseMoved** 的坐标(`set_last_mouse_move_event` 只认 MouseMoved),
+                // 而拖拽边缘期间指针只发 `LeftMouseDragged` —— 坐标是过期的。把面板拖窄时探测层
+                // 跟着变窄,过期坐标就落到探测层外,合成 hover out 直接把面板收起,表现为"拖宽可以、
+                // 往回拖就收起"。合成事件不代表用户真的移开了指针,跳过(与 tab 行 hover 同一处理)。
+                //
+                // 已知残余(框架取舍,见 `Hoverable::handle_mouse_moved_without_delay`):跳过的是
+                // **回调**,`is_hovered` 仍被写成 false —— 收缩越过"`w + 16` < 按下前坐标"之后,
+                // 状态就停在 false。此时若松手后第一条真实 `MouseMoved` 直接跳到探测层之外(单次
+                // 事件跨 >11px 的"甩出去"),那次真实 hover out 会被 `was_hovered == is_hovered`
+                // 早退吞掉,面板要"移回探测层内再移出"或点面板外(`Dismiss`)才收起。触发条件窄且
+                // 有兜底,故不动框架公共路径(改状态会让 tab 行/会话列表出现"滚出指针下的行仍保留
+                // hover 高亮")。
+                .with_skip_synthetic_hover_out();
             let probe = probe.finish();
             // 探测层必须一直覆盖到窗口最边缘:锚点(水平 tab bar)在窗口内有约 1px 留白,
             // 不额外外扩的话鼠标推到最左一列就会掉出探测区,表现为"移过去展开、再往左又收起"。

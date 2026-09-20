@@ -12,7 +12,7 @@ use crate::{
 };
 use pathfinder_geometry::vector::vec2f;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
 };
@@ -30,6 +30,16 @@ fn mouse_moved_event(position: Vector2F) -> Event {
         cmd: false,
         shift: false,
         is_synthetic: false,
+    }
+}
+
+/// 框架在每次重绘后补发的那种 `MouseMoved`(见 `App::build_scene`)。
+fn synthetic_mouse_moved_event(position: Vector2F) -> Event {
+    Event::MouseMoved {
+        position,
+        cmd: false,
+        shift: false,
+        is_synthetic: true,
     }
 }
 
@@ -707,6 +717,124 @@ fn test_unpainted_hoverable_receives_click_events_without_panic() {
                 modifiers: Default::default(),
             };
             hoverable.dispatch_event(&DispatchedEvent::from(mouse_up), &mut event_ctx, ctx);
+        });
+    });
+}
+
+/// 回归:配了 `with_skip_synthetic_hover_out()` 的 hover 目标,不会被框架补发的**合成**
+/// `MouseMoved` 判成 hover out。
+///
+/// 背景(见 `docs/vertical-tabs-floating-resize-issue.md`):框架补发的合成事件用的是"最后一次
+/// **真实** `MouseMoved`"的坐标,拖拽期间那是过期坐标;几何随交互变化的 hover 目标(悬浮侧栏的
+/// 贴边探测层)会被它误判成"指针离开"而收起面板。
+///
+/// 本用例同时把该 API 的**已知取舍**钉住:跳过的是回调,`is_hovered` 仍被写成 `false`,所以
+/// 紧接着的**真实** hover out 会因 `was_hovered == is_hovered` 被早退,要"回到元素内再移出"
+/// 才恢复。将来若在框架侧改掉这个取舍,这条断言会失败,提醒一并更新上面那份文档的 §6。
+#[derive(Default)]
+struct SkipSyntheticHoverOutView {
+    hover_state: MouseStateHandle,
+    hover_ins: Rc<Cell<u32>>,
+    hover_outs: Rc<Cell<u32>>,
+}
+
+impl Entity for SkipSyntheticHoverOutView {
+    type Event = ();
+}
+
+impl TypedActionView for SkipSyntheticHoverOutView {
+    type Action = ();
+}
+
+impl crate::core::View for SkipSyntheticHoverOutView {
+    fn render(&self, _: &AppContext) -> Box<dyn Element> {
+        let hover_ins = self.hover_ins.clone();
+        let hover_outs = self.hover_outs.clone();
+        Hoverable::new(self.hover_state.clone(), |_| {
+            ConstrainedBox::new(Rect::new().finish())
+                .with_height(25.)
+                .with_width(25.)
+                .finish()
+        })
+        .on_hover(move |hovered, _ctx, _app, _position| {
+            if hovered {
+                hover_ins.set(hover_ins.get() + 1);
+            } else {
+                hover_outs.set(hover_outs.get() + 1);
+            }
+        })
+        .with_skip_synthetic_hover_out()
+        .finish()
+    }
+
+    fn ui_name() -> &'static str {
+        "skip_synthetic_hover_out_view"
+    }
+}
+
+#[test]
+fn test_skip_synthetic_hover_out_ignores_synthetic_mouse_moved() {
+    App::test((), |mut app| async move {
+        let app = &mut app;
+        let (window_id, view) = app.add_window(WindowStyle::NotStealFocus, |_| {
+            SkipSyntheticHoverOutView::default()
+        });
+
+        let mut presenter = Presenter::new(window_id);
+        let mut updated = crate::EntityIdSet::default();
+        updated.insert(app.root_view_id(window_id).unwrap());
+        let invalidation = WindowInvalidation {
+            updated,
+            ..Default::default()
+        };
+
+        app.update(move |ctx| {
+            presenter.invalidate(invalidation, ctx);
+            presenter.build_scene(vec2f(100., 100.), 1., None, ctx);
+            let presenter = Rc::new(RefCell::new(presenter));
+
+            // 1) 真实进入:触发 hover in。
+            ctx.simulate_window_event(
+                mouse_moved_event(vec2f(10., 10.)),
+                window_id,
+                presenter.clone(),
+            );
+            // 2) 合成事件落到元素外:跳过,不触发 hover out(本用例要钉住的行为)。
+            ctx.simulate_window_event(
+                synthetic_mouse_moved_event(vec2f(90., 90.)),
+                window_id,
+                presenter.clone(),
+            );
+            // 3) 真实移到元素外:上一步已把 `is_hovered` 置 false,这里被早退(已知取舍)。
+            ctx.simulate_window_event(
+                mouse_moved_event(vec2f(90., 90.)),
+                window_id,
+                presenter.clone(),
+            );
+            // 4) 回到元素内重新 arm,再移出才恢复 hover out。
+            ctx.simulate_window_event(
+                mouse_moved_event(vec2f(10., 10.)),
+                window_id,
+                presenter.clone(),
+            );
+            ctx.simulate_window_event(
+                mouse_moved_event(vec2f(90., 90.)),
+                window_id,
+                presenter.clone(),
+            );
+        });
+
+        view.read(app, |view, _| {
+            assert_eq!(
+                2,
+                view.hover_ins.get(),
+                "真实 hover in 应发生两次:初次进入 + 被合成 out 打掉后的重新 arm"
+            );
+            assert_eq!(
+                1,
+                view.hover_outs.get(),
+                "只有最后一次真实移出才应触发 hover out(合成 out 与它之后的那次真实移出都被跳过)"
+            );
         });
     });
 }
