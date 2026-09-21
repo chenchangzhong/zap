@@ -1,0 +1,5 @@
+launch browser process
+[0921/113356.922186:WARNING:cef/libcef/common/resource_util.cc:83] Please customize CefSettings.root_cache_path for your application. Use of the default value may lead to unintended process singleton behavior.
+[41281:1538759:0921/113359.126832:ERROR:cef/libcef/browser/browser_info_manager.cc:858] Timeout of new browser info response for frame 6-9D5A7A38BCAC646066B951F9AAFEF662 (has_rfh=1)
+[41281:1538759:0921/113400.522430:ERROR:cef/libcef/browser/browser_info_manager.cc:858] Timeout of new browser info response for frame 8-6804023E56E9D14CE213181BA5003646 (has_rfh=0)
+[41281:1538759:0921/113401.129371:ERROR:cef/libcef/browser/browser_info_manager.cc:858] Timeout of new browser info response for frame 6-0AE14D222E400CF8454003C90CB683FC (has_rfh=1)

@@ -1,0 +1,4 @@
+server up
+[zap-ipc-received] zap.switch_project
+1
+{"path":"/tmp"}

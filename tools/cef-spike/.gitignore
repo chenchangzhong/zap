@@ -1,0 +1,2 @@
+# 构建产物不入库(根 .gitignore 的 /target 锚定在顶层,管不到本目录)
+/target
