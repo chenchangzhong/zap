@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CEF TRANSPARENCY PROBE</title>
+<style>
+  /* 关键:页面背景完全透明,用于判定 CEF 视图是否透出下层(ProbeBackgroundView #12171F)。 */
+  html, body { margin: 0; height: 100%; background: transparent; }
+  body { font: 18px/1.4 -apple-system, system-ui, sans-serif; color: #eaf7ef; }
+  /* 洞内左上角的不透明标记:证明页面确实渲染、且渲染位置正确(中心留空供采样)。 */
+  .marker {
+    position: absolute; left: 20px; top: 20px; width: 120px; height: 120px;
+    background: #ff2d55; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; color: #fff;
+  }
+</style>
+</head>
+<body>
+  <div class="marker">RENDERED</div>
+</body>
+</html>

@@ -207,6 +207,7 @@ dependencies = [
 name = "cef-spike"
 version = "0.0.0"
 dependencies = [
+ "cc",
  "cef",
  "objc2",
  "objc2-app-kit",

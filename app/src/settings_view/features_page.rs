@@ -41,6 +41,7 @@ use crate::settings::ai::AISettings;
 use crate::settings::{
     AISettingsChangedEvent, ScrollSettingsChangedEvent, UserNativeRedirectPreference,
 };
+use crate::settings::CefWebviewSettings;
 use crate::settings::{
     AliasExpansionEnabled, AliasExpansionSettings, AppEditorSettings, AtContextMenuInTerminalMode,
     AutocompleteSymbols, AutosuggestionKeybindingHint, CodeSettings, CommandCorrections,
@@ -696,6 +697,10 @@ pub enum FeaturesPageAction {
     ToggleNeedsAttentionNotifications,
     ToggleNotificationSound,
     SetNotificationToastDuration,
+    /// 设置"隐藏的 dsh 页面冻结超时"(秒;0 = 不冻结)。
+    SetWebviewFreezeSecs(u32),
+    /// 切换"使用 Chromium 内核"(仅 macOS)。
+    ToggleUseChromiumWebview,
     ToggleShowWarningBeforeQuitting,
     ToggleQuitOnLastWindowClosed,
     ToggleSmartSelection,
@@ -1225,6 +1230,14 @@ impl FeaturesPageAction {
                     *SessionSettings::as_ref(ctx).notification_toast_duration_secs
                 ),
             },
+            Self::SetWebviewFreezeSecs(secs) => TelemetryEvent::FeaturesPageAction {
+                action: "SetWebviewFreezeSecs".to_string(),
+                value: format!("{secs}s"),
+            },
+            Self::ToggleUseChromiumWebview => TelemetryEvent::FeaturesPageAction {
+                action: "ToggleUseChromiumWebview".to_string(),
+                value: to_string(*CefWebviewSettings::as_ref(ctx).use_chromium),
+            },
             Self::ToggleAgentInAppNotifications => TelemetryEvent::FeaturesPageAction {
                 action: "ToggleAgentInAppNotifications".to_string(),
                 value: to_string(*AISettings::as_ref(ctx).show_agent_notifications),
@@ -1284,6 +1297,8 @@ pub struct FeaturesPageView {
 
     notifications_long_running_threshold_editor: ViewHandle<EditorView>,
     notification_toast_duration_editor: ViewHandle<EditorView>,
+    /// "隐藏的 dsh 页面冻结超时"下拉(仅 macOS + cef_webview 构建下渲染)。
+    webview_freeze_dropdown: ViewHandle<Dropdown<FeaturesPageAction>>,
 
     #[cfg(feature = "local_tty")]
     working_directory_view: ViewHandle<features::WorkingDirectoryView>,
@@ -1961,6 +1976,16 @@ impl TypedActionView for FeaturesPageView {
                         .toggle_and_save_value(ctx));
                 });
             }
+            ToggleUseChromiumWebview => {
+                CefWebviewSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.use_chromium.toggle_and_save_value(ctx));
+                });
+            }
+            SetWebviewFreezeSecs(secs) => {
+                CefWebviewSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.freeze_after_secs.set_value(*secs, ctx));
+                });
+            }
             SetNotificationToastDuration => {
                 let user_input = self
                     .notification_toast_duration_editor
@@ -2438,6 +2463,9 @@ impl FeaturesPageView {
             );
         });
 
+        let webview_freeze_dropdown = ctx.add_typed_action_view(Dropdown::new);
+        Self::update_webview_freeze_dropdown(webview_freeze_dropdown.clone(), ctx);
+
         ctx.subscribe_to_model(&GPUState::handle(ctx), |me, _, event, ctx| {
             if matches!(event, GPUStateEvent::LowPowerGPUAvailable) {
                 me.page = Self::build_page(ctx);
@@ -2473,6 +2501,7 @@ impl FeaturesPageView {
 
             notifications_long_running_threshold_editor,
             notification_toast_duration_editor,
+            webview_freeze_dropdown,
 
             #[cfg(feature = "local_tty")]
             working_directory_view,
@@ -2583,6 +2612,14 @@ impl FeaturesPageView {
             && !FeatureFlag::ZapNewSettingsModes.is_enabled()
         {
             general_widgets.push(Box::new(AutoOpenCodeReviewPaneWidget::default()));
+        }
+
+        // macOS 专属的两项(用户要求:开关在冻结超时**上面**):放在该 if 之外,
+        // 否则只有 AutoOpenCodeReviewPane flag 开启时才显示。
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        {
+            general_widgets.push(Box::new(UseChromiumWebviewWidget::default()));
+            general_widgets.push(Box::new(WebviewFreezeWidget::default()));
         }
 
         if DefaultTerminal::can_warp_become_default() {
@@ -2860,6 +2897,51 @@ impl FeaturesPageView {
         ];
 
         PageType::new_categorized(categories, None)
+    }
+
+    /// 隐藏冻结超时的候选项(秒):0 = 不冻结。
+    const WEBVIEW_FREEZE_PRESETS: [u32; 6] = [0, 60, 300, 900, 1800, 3600];
+
+    fn webview_freeze_label(secs: u32) -> String {
+        match secs {
+            0 => crate::t!("settings-features-webview-freeze-off"),
+            3600 => crate::t!("settings-features-webview-freeze-one-hour"),
+            other => format!(
+                "{} {}",
+                other / 60,
+                crate::t!("settings-features-webview-freeze-minutes")
+            ),
+        }
+    }
+
+    fn update_webview_freeze_dropdown(
+        dropdown: ViewHandle<Dropdown<FeaturesPageAction>>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        dropdown.update(ctx, |dropdown, ctx| {
+            let current = *CefWebviewSettings::as_ref(ctx).freeze_after_secs;
+            let presets = Self::WEBVIEW_FREEZE_PRESETS;
+            // 当前值不在预设里(用户手改 settings.toml)时,就近落到最接近的预设。
+            let selected = presets
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, value)| value.abs_diff(current))
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            dropdown.set_items(
+                presets
+                    .into_iter()
+                    .map(|secs| {
+                        DropdownItem::new(
+                            Self::webview_freeze_label(secs),
+                            FeaturesPageAction::SetWebviewFreezeSecs(secs),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown.set_selected_by_index(selected, ctx);
+        });
     }
 
     fn update_ctrl_tab_behavior_dropdown(
@@ -6449,6 +6531,101 @@ impl SettingsWidget for TabKeyBehaviorWidget {
         )
         .with_margin_bottom(10.)
         .finish()
+    }
+}
+
+/// macOS 上是否用 Chromium(CEF)内核承载 dsh pane。
+///
+/// 其他平台内置 webview 已是 Chromium 内核,故这一项(以及下面的冻结超时)只在
+/// macOS 显示。切换后对**新打开**的 dsh pane 生效:CEF 未初始化时会在建 pane 时
+/// 按需初始化(见 cef_backend::ensure_initialized),无需重启应用。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+#[derive(Default)]
+struct UseChromiumWebviewWidget {
+    switch_state: SwitchStateHandle,
+}
+
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+impl SettingsWidget for UseChromiumWebviewWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "chromium cef webview engine kernel macos dsh"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_body_item::<FeaturesPageAction>(
+            crate::t!("settings-features-use-chromium-webview"),
+            None,
+            LocalOnlyIconState::for_setting(
+                crate::settings::UseChromiumWebview::storage_key(),
+                crate::settings::UseChromiumWebview::sync_to_cloud(),
+                &mut view
+                    .button_mouse_states
+                    .local_only_icon_tooltip_states
+                    .borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*CefWebviewSettings::as_ref(app).use_chromium)
+                .build()
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(FeaturesPageAction::ToggleUseChromiumWebview);
+                })
+                .finish(),
+            Some(crate::t!("settings-features-use-chromium-webview-description")),
+        )
+    }
+}
+
+/// 隐藏的 dsh 页面冻结超时(macOS + cef_webview 构建下显示)。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+#[derive(Default)]
+struct WebviewFreezeWidget {}
+
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+impl SettingsWidget for WebviewFreezeWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "webview freeze hidden dsh chromium cef memory"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        // 下拉行的标准写法(与 Ctrl-Tab 行为等一致)。这一行比上下邻居略高的间距
+        // 来自下拉行本身(render_dropdown_item 给标签加了 bottom margin、控件自带内边距),
+        // 不是本行特有问题 —— 用户已确认所有下拉框都是这样。
+        render_dropdown_item(
+            appearance,
+            &crate::t!("settings-features-webview-freeze-label"),
+            None,
+            None,
+            LocalOnlyIconState::for_setting(
+                crate::settings::CefWebviewFreezeAfterSecs::storage_key(),
+                crate::settings::CefWebviewFreezeAfterSecs::sync_to_cloud(),
+                &mut view
+                    .button_mouse_states
+                    .local_only_icon_tooltip_states
+                    .borrow_mut(),
+                app,
+            ),
+            None,
+            &view.webview_freeze_dropdown,
+        )
     }
 }
 

@@ -32,6 +32,7 @@ use warp_core::semantic_selection::SemanticSelection;
 
 use super::{
     app_icon::AppIconSettings, app_installation_detection::UserAppInstallDetectionSettings,
+    cef_webview::CefWebviewSettings,
     cloud_preferences::PreferencesSettings, cloud_sync::CloudSyncSettings,
     initializer::SettingsInitializer,
     language::LanguageSettings, native_preference::NativePreferenceSettings,
@@ -66,6 +67,7 @@ pub fn register_all_settings(ctx: &mut AppContext) {
     SafeModeSettings::register(ctx);
     TerminalSettings::register(ctx);
     PaneSettings::register(ctx);
+    CefWebviewSettings::register(ctx);
     CommandSearchSettings::register(ctx);
     AliasExpansionSettings::register(ctx);
     CodeSettings::register(ctx);

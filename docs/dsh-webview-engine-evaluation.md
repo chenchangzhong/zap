@@ -145,7 +145,7 @@ dsh 是本地 web 服务,直接给 Chrome `--app=` 窗口。最快见效,但 `za
 |---|------|---------|
 | a 包体 | **超限** | bundle 322MB→**275MB**(locale 全量裁到中/英文系,84MB→34MB);引擎 dylib 独占 224MB 不可减。无路径接近 spec 目标 <150MB;现实下限 ≈ 260-280MB |
 | b 签名 | ✅ | `codesign --force --deep -s -` + `--verify --deep --strict` 全绿,5 个 helper 子 app 结构完整 |
-| c 裸窗共存 | ✅(部分) | CEF 窗体正常启动+渲染本地页(9 进程);**Metal 挖洞合并未测**(待阶段 1) |
+| c 挖洞共存 | ✅(阶段 1 已验) | 阶段 1 生死项探针在 zap 同构拓扑下通过:CEF 子视图 frame 与洞一致、层级正确、洞内命中 Chromium 视图而洞外命中覆盖层、key window 下完整点击链到达页面;另发现**两条集成要求**(事件判定泛化 4 处、尺寸每帧驱动+坐标翻转)。细节见 `specs/cef-webview-minimal/evidence/phase1/RESULT.md` |
 | d IPC 通道 | ✅ | zap: 协议经本地回环 HTTP(spec 的 shim 设计)字节级往返:`zap.switch_project\n1\n{"path":"/tmp"}` 完整到达 |
 | e 内存 | **超限** | 同一高频更新页面(私有足迹合计):CEF **~634MB**(browser 73.6 + renderer 365.5 + 其余 ~195)vs WKWebView **~456MB**(WebContent 306 + GPU 121 + 应用 29)→ CEF **+180MB(~+40%)**;dsh 式单页固定开销差 ~+120-180MB,页面渲染内存两者接近。注意口径:RSS 总和(跨进程重复计入 224MB libcef)会虚报 ~870MB,私有足迹才是真账面 |
 | f 高频更新稳定性 | ✅ | 60Hz DOM 追加+scrollTo 连续 150s:**无崩溃**;renderer 私有内存被 GC 回落到 47.1MB(WKWebView 同场景峰值 367MB) |

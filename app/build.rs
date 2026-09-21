@@ -44,6 +44,15 @@ fn main() -> Result<()> {
             .file("src/platform/mac/objc/services.m")
             .compile("warp_objc");
 
+        // CEF 后端的宿主原语(周期定时器 + NSApplication 协议桥)只在
+        // cef_webview feature 下编译;默认构建完全不含这部分代码。
+        if env::var("CARGO_FEATURE_CEF_WEBVIEW").is_ok() {
+            println!("cargo:rerun-if-changed=src/platform/mac/objc/cef_support.m");
+            cc::Build::new()
+                .file("src/platform/mac/objc/cef_support.m")
+                .compile("warp_objc_cef_support");
+        }
+
         // Build the dock tile plugin
         println!("cargo:rerun-if-changed=DockTilePlugin/ZapDockTilePlugin.m");
         println!("cargo:rerun-if-changed=DockTilePlugin/ZapDockTilePlugin.h");

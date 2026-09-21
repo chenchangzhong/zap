@@ -21,6 +21,14 @@ name = "make-bundle"
 path = "src/bin/make_bundle.rs"
 required-features = []
 
+# 阶段 1 第一生死项探针(CEF 子视图 × zap 挖洞分层窗口)
+[[bin]]
+name = "hole-probe"
+path = "src/bin/hole-probe.rs"
+
+[build-dependencies]
+cc = "1"
+
 # spec 决策:Developer ID 分发,不启用 CEF sandbox(sandbox feature 与 MAS 归属绑定,
 # 而本仓库 spd 侧确认不进 MAS);site-isolation 保持 CEF 默认(关)。
 [features]

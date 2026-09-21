@@ -18,7 +18,9 @@ use warpui::{
 
 use crate::{
     appearance::Appearance,
-    browser::browser_web_view::{BrowserWebViewEvent, BrowserWebViewManager, PENDING_PLATFORM_VIEWS},
+    browser::browser_web_view::{
+        BrowserWebViewEvent, BrowserWebViewManager, WebViewBackend, PENDING_PLATFORM_VIEWS,
+    },
     pane_group::{
         pane::view::{self, PaneView},
         pane::{DetachType, PaneContent, ShareableLink, ShareableLinkError},
@@ -60,6 +62,9 @@ pub struct BrowserPaneView {
     /// `127.0.0.1` 上不断累积,请求头超过 dsh 服务器约 16KB 的上限后,
     /// 所有子资源请求被 431 拒绝(页面表现为模块加载失败)。
     incognito: bool,
+    /// 用哪个后端承载(dsh pane 在 CEF 可用时走 CEF,其余仍走 wry)。
+    /// 见 specs/cef-webview-minimal/TECH.md 阶段 1。
+    backend: WebViewBackend,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +104,7 @@ impl BrowserPaneView {
         show_address_bar: bool,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
-        Self::new_inner(url, show_address_bar, false, ctx)
+        Self::new_inner(url, show_address_bar, false, WebViewBackend::Wry, ctx)
     }
 
     /// 创建 dsh Web UI pane:无地址栏,且 webview 使用非持久化数据存储。
@@ -107,7 +112,26 @@ impl BrowserPaneView {
     /// 持久化就会在 `127.0.0.1` 上跨实例累积,超过 dsh 的请求头上限后
     /// 子资源(模块 bundle)全部被 431 拒绝。
     pub fn new_dsh(url: String, ctx: &mut ViewContext<Self>) -> Self {
-        let mut view = Self::new_inner(url.clone(), false, true, ctx);
+        // 后端选择:仅当 CEF 已初始化(feature + flag + framework 就绪)时用 CEF,
+        // 否则自动回退 wry —— 保证未打包 CEF 的构建/环境行为不变。
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        // 由设置项决定是否用 Chromium 内核;若尚未初始化则此刻按需初始化(无需重启)。
+        let backend = if *crate::settings::CefWebviewSettings::as_ref(ctx).use_chromium
+            && crate::browser::cef_backend::ensure_initialized()
+        {
+            WebViewBackend::Cef
+        } else {
+            WebViewBackend::Wry
+        };
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        log::info!(
+            "[cef] dsh pane 后端选择: {} (init_status={})",
+            if backend == WebViewBackend::Cef { "Cef" } else { "Wry" },
+            crate::browser::cef_backend::init_status()
+        );
+        #[cfg(not(all(target_os = "macos", feature = "cef_webview")))]
+        let backend = WebViewBackend::Wry;
+        let mut view = Self::new_inner(url.clone(), false, true, backend, ctx);
         // 首建 URL 即带 token 的认证地址:任何后续 webview 重建(渲染崩溃、
         // Moved 换窗)都重新走 token 换 cookie,见 model.auth_url 文档。
         view.model.auth_url = Some(url);
@@ -118,6 +142,7 @@ impl BrowserPaneView {
         url: String,
         show_address_bar: bool,
         incognito: bool,
+        backend: WebViewBackend,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new("Browser"));
@@ -156,6 +181,7 @@ impl BrowserPaneView {
             needs_recreate: false,
             show_address_bar,
             incognito,
+            backend,
         };
 
         ctx.subscribe_to_view(&view.address_bar, Self::handle_address_bar_event);
@@ -193,6 +219,13 @@ impl BrowserPaneView {
     fn create_webview(&self, url: &str, ctx: &mut ViewContext<Self>) {
         if let Some(platform_window) = ctx.windows().platform_window(self.window_id) {
             if let Ok(handle) = platform_window.as_ref().window_handle() {
+                // 传给 CEF 后端填背景:CEF windowed 无法真透明(会退化成白底),
+                // 用窗口底色(surface_2 叠 fg_overlay_1)保持一致。opacity 传 100:
+                // CEF 不支持 alpha,半透明窗口下只能按不透明色近似。
+                let background_color = Some(crate::appearance::window_surface_color(
+                    Appearance::as_ref(ctx).theme(),
+                    100,
+                ));
                 BrowserWebViewManager::as_ref(ctx).create(
                     &handle,
                     self.model.platform_view_id,
@@ -200,6 +233,8 @@ impl BrowserPaneView {
                     RectF::default(),
                     self.window_id,
                     self.incognito,
+                    self.backend,
+                    background_color,
                 );
             }
         }

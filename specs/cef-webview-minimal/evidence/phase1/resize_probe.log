@@ -1,0 +1,14 @@
+[probe] window created hole=(100,100,600,400) windowNumber=5875
+[probe] WINDOW_NUMBER=5875
+[probe] browser created as child of 0x130002fe380 rect=(100,100,600,400)
+[probe] window resized by (+240,+160) -> {{160, 160}, {1200, 832}}
+[probe] synthesizing click at hole center
+[probe] container frame={{0, 0}, {1200, 800}} bounds={{0, 0}, {1200, 800}}
+[probe]   subview ProbeBackgroundView frame={{0, 0}, {1200, 800}} hidden=0 alpha=1.00
+[probe]   subview CefBrowserHostView frame={{100, 100}, {840, 560}} hidden=0 alpha=1.00
+[probe] hitTest(hole center 400,300) -> RenderWidgetHostViewCocoa
+[probe] hitTest(outside 20,20) -> ProbeOverlayView
+[probe] isKeyWindow=1 appActive=1 firstResponder=RenderWidgetHostViewCocoa
+[probe] CLICK_PROCEEDING
+[probe] click sent
+[probe] exit

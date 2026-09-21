@@ -1,0 +1,114 @@
+#!/bin/bash
+# CEF 后端的受控冒烟:构建带 cef_webview 的 zap → 打成 .app(内嵌 CEF)→ 启动 →
+# 校验 CEF 在 zap 内初始化成功 → 只清理自己启动的实例。
+#
+# 用法:
+#   script/macos/cef_smoke            # 只构建+打包,打印如何手动运行
+#   script/macos/cef_smoke --run      # 构建+打包+启动+校验+清理自启实例
+#
+# 前提:CEF 二进制就位(CEF_PATH 或 ~/.local/share/cef);详见
+# specs/cef-webview-minimal/TECH.md。脚本**不会**触碰 /Applications/Zap.app 等
+# 其它实例,只结束自己启动的进程。
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CEF_DIR="${CEF_PATH:-$HOME/.local/share/cef}"
+# 放仓库内 target 下:避免 /tmp 的 sandbox 扩展告警(sandbox_extension_issue_file_to_process)。
+WORK="${CEF_SMOKE_DIR:-$ROOT/target/cef-smoke}"
+APP="$WORK/ZapCEF.app"
+BIN="zap-oss"
+RUN=false
+[[ "${1:-}" == "--run" ]] && RUN=true
+
+[[ -d "$CEF_DIR/Chromium Embedded Framework.framework" ]] || {
+  echo "未找到 CEF framework:$CEF_DIR" >&2
+  exit 1
+}
+
+echo "==> 构建 $BIN(--features cef_webview)"
+( cd "$ROOT" && CEF_PATH="$CEF_DIR" cargo build -p warp --features cef_webview --bin "$BIN" ) || exit 1
+
+echo "==> 组装 $APP"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS"
+cp "$ROOT/target/debug/$BIN" "$APP/Contents/MacOS/$BIN"
+cat > "$APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>zap-oss</string>
+  <key>CFBundleIdentifier</key><string>dev.zap.cef-smoke</string>
+  <key>CFBundleName</key><string>ZapCEF</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>0.1.0</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+
+( cd "$ROOT" && CEF_PATH="$CEF_DIR" cargo build \
+    --manifest-path tools/cef-helper/Cargo.toml --release ) || exit 1
+"$ROOT/script/macos/cef_embed" "$APP" \
+  --cef-path "$CEF_DIR" \
+  --helper-executable "$ROOT/tools/cef-helper/target/release/zap_cef_helper" || exit 1
+codesign --force --deep -s - "$APP" >/dev/null 2>&1
+codesign --verify --deep --strict "$APP" && echo "签名校验:OK"
+
+if [[ "$RUN" != true ]]; then
+  cat <<EOF
+
+打包完成:$APP
+手动实跑(可用 ZAP_CEF_WEBVIEW=1 强制;或直接在 设置→功能页 打开「使用 Chromium 内核」):
+  ZAP_CEF_WEBVIEW=1 "$APP/Contents/MacOS/$BIN"
+  # 然后:菜单打开 dsh pane(CEF flag 已在带 feature 构建中默认开启)
+日志(zap 正式版与 dev 版共用日志文件,按时间戳区分):
+  tail -f ~/Library/Logs/zap.log | grep '\[cef\]'
+预期:出现 "[cef] message pump active";打开 dsh pane 后出现
+"[cef] webview N browser created",页面经回环通道上报(见 evidence/phase1)。
+EOF
+  exit 0
+fi
+
+# 应用日志:每次启动会轮转 zap.log,本次实例的行就在新的 zap.log(必要时看 .old.0)。
+ZAP_LOG="$HOME/Library/Logs/zap.log"
+# 启动前记录 mtime:用于判定本轮是否真的写过日志(见下方断言)。
+BEFORE_MTIME=$(stat -f %m "$ZAP_LOG" 2>/dev/null || echo 0)
+
+echo "==> 启动(经 LaunchServices,自主实例;ZAP_CEF_WEBVIEW=1 显式启用 CEF)"
+# 用 open 而非直接 exec:实例归 LaunchServices 所有,不会随调用方 shell/工具中断被杀。
+# --env 需要 macOS 13+;不可用时回退为直接执行(回退路径才拿得到 stdout)。
+if ! open -n --env ZAP_CEF_WEBVIEW=1 "$APP" 2>"$WORK/open_err.log"; then
+  echo "open --env 不可用,回退直接启动"
+  ZAP_CEF_WEBVIEW=1 "$APP/Contents/MacOS/$BIN" > "$WORK/cef_smoke.log" 2>&1 &
+  SMOKE_PID=$!
+else
+  SMOKE_PID=0
+fi
+sleep 25
+echo "==> CEF 日志(应用日志 $ZAP_LOG)"
+grep -a "\[cef\]" "$ZAP_LOG" 2>/dev/null | tail -5
+# 断言只看**当前** zap.log(启动时日志会轮转,本次实例的行就在这个新文件里),
+# 并要求它在本轮被写过 —— 否则"上一轮成功过"会让本轮假绿(评审 N5)。
+AFTER_MTIME=$(stat -f %m "$ZAP_LOG" 2>/dev/null || echo 0)
+if [[ "$AFTER_MTIME" -gt "$BEFORE_MTIME" ]] && grep -qaE "\[cef\] (message pump active|由设置项触发,已初始化 CEF 后端)" "$ZAP_LOG" 2>/dev/null; then
+  echo "结果:CEF 在 zap 内初始化成功 ✅"
+else
+  echo "结果:未见本轮 CEF 初始化日志 ❌(mtime $BEFORE_MTIME → $AFTER_MTIME;查看 $ZAP_LOG 与 $WORK/cef_smoke.log)"
+fi
+echo "==> 清理本次启动的实例(只按本脚本产物的路径匹配,不动 /Applications/Zap.app)"
+# 优先走优雅退出:Apple Event → applicationWillTerminate → cef::shutdown()(F6 路径);
+# SIGTERM/pkill 不会经过该路径,故不能用它验证关机行为(评审 N5)。
+BUNDLE_NAME=$(plutil -extract CFBundleName raw "$APP/Contents/Info.plist" 2>/dev/null || true)
+if [[ -n "$BUNDLE_NAME" ]]; then
+  osascript -e "tell application \"$BUNDLE_NAME\" to quit" >/dev/null 2>&1 || true
+  sleep 3
+fi
+if [[ "$SMOKE_PID" != "0" ]]; then
+  kill "$SMOKE_PID" 2>/dev/null
+  wait "$SMOKE_PID" 2>/dev/null
+fi
+pkill -f "$APP/Contents/MacOS/$BIN" 2>/dev/null

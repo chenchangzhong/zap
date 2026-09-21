@@ -536,3 +536,22 @@ pub fn register(app: &mut impl AddSingletonModel) {
     app.add_singleton_model(|ctx| build_appearance(ctx));
     app.add_singleton_model(AppearanceManager::new);
 }
+
+/// 整窗底色:主题 `surface_2` 叠一层 `fg_overlay_1`(前景 5%)。
+///
+/// 与 workspace 渲染窗口背景用的是同一套计算(见 workspace/view.rs 的
+/// `set_window_background_color`),抽出来是为了让嵌入式 CEF webview 能填上同一个
+/// 颜色:CEF 的 windowed 浏览器**无法真透明**(cef_types.h:透明 alpha 会退回
+/// `CefSettings.background_color`,再透明就退化成不透明白色),不显式填色就是白底。
+pub(crate) fn window_surface_color(
+    theme: &warp_core::ui::theme::WarpTheme,
+    opacity: u8,
+) -> warpui::color::ColorU {
+    use warp_core::ui::{color::blend::Blend, theme::{color::internal_colors, Fill}};
+    let surface = theme.surface_2().blend(&internal_colors::fg_overlay_1(theme));
+    match surface.with_opacity(opacity) {
+        Fill::Solid(color) => color,
+        Fill::VerticalGradient(gradient) => gradient.get_most_opaque(),
+        Fill::HorizontalGradient(gradient) => gradient.get_most_opaque(),
+    }
+}

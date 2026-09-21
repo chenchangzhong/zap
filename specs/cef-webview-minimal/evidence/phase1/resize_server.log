@@ -1,0 +1,5 @@
+server up
+[zap-ipc-received] probe.loaded
+[zap-ipc-received] probe.mousedown
+[zap-ipc-received] probe.mouseup
+[zap-ipc-received] probe.click

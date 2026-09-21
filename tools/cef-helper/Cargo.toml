@@ -1,0 +1,17 @@
+[package]
+name = "zap_cef_helper"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-only"
+
+# 独立于 zap 根 workspace:本 crate 需要 CEF 二进制才能构建(CEF_PATH),
+# 若作为 workspace 成员会让 `cargo check/test --workspace` 在没装 CEF 的机器上失败。
+# 由 script/macos/cef_embed / bundle 在需要时按 manifest 路径单独构建。
+[workspace]
+
+[[bin]]
+name = "zap_cef_helper"
+
+[dependencies]
+cef = "152.4.0"

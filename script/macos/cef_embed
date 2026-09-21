@@ -1,0 +1,126 @@
+#!/bin/bash
+# 把 CEF(Chromium Embedded Framework)嵌入一个 .app bundle,并完成分层签名。
+#
+# 用途:CEF 后端(cef_webview feature)的打包步骤。默认构建不调用本脚本,
+# 故对现有打包流程零影响;`script/macos/bundle --cef` 会在 cargo bundle 之后调用它。
+#
+# 用法:
+#   script/macos/cef_embed <app_bundle> [选项]
+#     --cef-path <dir>          CEF 二进制目录(默认 $CEF_PATH 或 ~/.local/share/cef)
+#     --helper-executable <p>   放进 helper.app 的可执行文件(默认:主可执行文件;
+#                               相对路径按 app 内 Contents/MacOS 解析)
+#     --no-sign                 只嵌入不签名(调试用;正式打包不要)
+#
+# 为什么 helper 可以指向主可执行文件:CEF 以 `--type=<process>` 启动 helper,
+# 应用在启动最早期调用 execute_process 分流(TECH.md 阶段 1 的启动接线项),
+# 因此同一个二进制既能当 browser 进程也能当 renderer/gpu 子进程。
+#
+# 签名顺序(参照 CEF/Electron 的实践与 AGENTS.md §5.9 的校验要求):
+#   framework → 各 helper.app → 主 app(由调用方在最后统一签,或本脚本代劳)
+set -euo pipefail
+
+APP="${1:?usage: cef_embed <app_bundle> [--cef-path <dir>] [--helper-executable <path>] [--no-sign]}"
+shift || true
+
+CEF_DIR="${CEF_PATH:-$HOME/.local/share/cef}"
+HELPER_EXECUTABLE=""
+DO_SIGN=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cef-path) CEF_DIR="$2"; shift 2 ;;
+    --helper-executable) HELPER_EXECUTABLE="$2"; shift 2 ;;
+    --no-sign) DO_SIGN=0; shift ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+FRAMEWORK="Chromium Embedded Framework.framework"
+CONTENTS="$APP/Contents"
+FRAMEWORKS_DIR="$CONTENTS/Frameworks"
+MACOS_DIR="$CONTENTS/MacOS"
+PLIST="$CONTENTS/Info.plist"
+
+[[ -d "$APP" ]] || { echo "not an app bundle: $APP" >&2; exit 1; }
+[[ -d "$CEF_DIR/$FRAMEWORK" ]] || {
+  echo "CEF framework not found at $CEF_DIR/$FRAMEWORK" >&2
+  echo "先准备 CEF 二进制(见 specs/cef-webview-minimal/TECH.md:export-cef-dir 或 CEF_PATH)" >&2
+  exit 1
+}
+
+MAIN_EXE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")"
+APP_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$PLIST" 2>/dev/null || echo "$MAIN_EXE_NAME")"
+BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")"
+SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" 2>/dev/null || echo "1.0.0")"
+BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST" 2>/dev/null || echo "$SHORT_VERSION")"
+
+if [[ -z "$HELPER_EXECUTABLE" ]]; then
+  HELPER_EXECUTABLE="$MACOS_DIR/$MAIN_EXE_NAME"
+elif [[ ! -e "$HELPER_EXECUTABLE" && "$HELPER_EXECUTABLE" != /* ]]; then
+  # 相对路径先按调用方 CWD 解析(常见:tools/cef-helper/target/release/zap_cef_helper),
+  # 找不到再回退到 app 内 Contents/MacOS。
+  if [[ -e "$PWD/$HELPER_EXECUTABLE" ]]; then
+    HELPER_EXECUTABLE="$PWD/$HELPER_EXECUTABLE"
+  else
+    HELPER_EXECUTABLE="$MACOS_DIR/$HELPER_EXECUTABLE"
+  fi
+fi
+[[ -x "$HELPER_EXECUTABLE" ]] || { echo "helper executable not found: $HELPER_EXECUTABLE" >&2; exit 1; }
+echo "==> 嵌入 CEF framework ($CEF_DIR)"
+mkdir -p "$FRAMEWORKS_DIR"
+rm -rf "$FRAMEWORKS_DIR/$FRAMEWORK"
+ditto "$CEF_DIR/$FRAMEWORK" "$FRAMEWORKS_DIR/$FRAMEWORK"
+
+# CEF 在 macOS 上按 "<主可执行名> Helper[ (类型)].app" 查找子进程 bundle。
+HELPERS=("Helper" "Helper (GPU)" "Helper (Renderer)" "Helper (Plugin)" "Helper (Alerts)")
+for helper in "${HELPERS[@]}"; do
+  helper_app="$FRAMEWORKS_DIR/${MAIN_EXE_NAME} ${helper}.app"
+  echo "==> 生成 ${MAIN_EXE_NAME} ${helper}.app"
+  mkdir -p "$helper_app/Contents/MacOS"
+  # 关键:helper 内的可执行文件必须**重命名为 "<主可执行名> <Helper>"**并让
+  # CFBundleExecutable 与之一致;保留原文件名(实测)会让 GPU/Renderer 启动失败
+  # (gpu_process_host error_code=1003),CEF/Chromium 依赖该命名约定。
+  helper_exe_name="${MAIN_EXE_NAME} ${helper}"
+  cp "$HELPER_EXECUTABLE" "$helper_app/Contents/MacOS/$helper_exe_name"
+  suffix="$(echo "$helper" | tr ' ()' '-.' | tr 'A-Z' 'a-z' | sed 's/-\+/-/g; s/^-//; s/-$//')"
+  cat > "$helper_app/Contents/Info.plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>$helper_exe_name</string>
+  <key>CFBundleIdentifier</key><string>$BUNDLE_ID.$suffix</string>
+  <key>CFBundleName</key><string>$APP_NAME $helper</string>
+  <key>CFBundleDisplayName</key><string>$APP_NAME $helper</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key><string>$SHORT_VERSION</string>
+  <key>CFBundleVersion</key><string>$BUNDLE_VERSION</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>LSEnvironment</key><dict><key>MallocNanoZone</key><string>0</string></dict>
+</dict>
+</plist>
+PLIST_EOF
+done
+
+if [[ "$DO_SIGN" == "1" ]]; then
+  IDENTITY="${CEF_EMBED_SIGN_IDENTITY:--}"
+  echo "==> 分层签名(identity=$IDENTITY):framework → helpers"
+  # framework 内嵌 dylib 在 CEF 发行包里是 adhoc/linker-signed,非 deep 签名不覆盖它们,
+  # 且非 deep 的 --verify 会给出**假绿**(评审实测:libvk_swiftshader.dylib 仍是 adhoc)。
+  codesign --force --deep --sign "$IDENTITY" "$FRAMEWORKS_DIR/$FRAMEWORK"
+  for helper in "${HELPERS[@]}"; do
+    codesign --force --sign "$IDENTITY" "$FRAMEWORKS_DIR/${MAIN_EXE_NAME} ${helper}.app"
+  done
+  echo "==> 校验嵌入结构(deep)"
+  codesign --verify --deep --strict "$FRAMEWORKS_DIR/$FRAMEWORK" \
+    && echo "framework: OK"
+  for helper in "${HELPERS[@]}"; do
+    codesign --verify --deep --strict "$FRAMEWORKS_DIR/${MAIN_EXE_NAME} ${helper}.app" \
+      && echo "${MAIN_EXE_NAME} ${helper}.app: OK"
+  done
+fi
+
+echo "==> CEF 嵌入完成:$APP"

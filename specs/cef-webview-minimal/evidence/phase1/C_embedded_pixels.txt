@@ -1,0 +1,6 @@
+# routing=embedded tag=C_embedded
+# 采样点: IN_HOLE=(1120,1240) 期望=页面渐变(偏绿); OUTSIDE=(380,600) 期望=覆盖层底色(#212E42 附近,偏蓝)
+image=3840x2160
+1120,1240 = #000000
+380,600 = #000000
+./probes/run_hole_probe.sh: line 83: 22944 Terminated: 15          python3 "$HERE/loopback_receiver.py" > "$EVIDENCE_DIR/${TAG}_server.log" 2>&1

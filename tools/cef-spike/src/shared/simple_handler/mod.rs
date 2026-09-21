@@ -64,10 +64,60 @@ impl SimpleHandler {
         }
     }
 
+    /// 透明实验开关:环境变量或落文件标记(经 `open` 启动时环境变量不生效)。
+    fn transparent_probe() -> bool {
+        std::env::var_os("PROBE_TRANSPARENT").is_some()
+            || std::path::Path::new("/tmp/probe_transparent").exists()
+    }
+
+    /// 透明实验:递归清空浏览器视图子树的 layer 背景并置为非不透明。
+    fn apply_transparent_layers(browser: Option<&mut Browser>) {
+        use objc2::msg_send;
+        use objc2::runtime::{AnyObject, Bool};
+
+        if !Self::transparent_probe() {
+            return;
+        }
+        let Some(host) = browser.and_then(|browser| browser.host()) else {
+            return;
+        };
+        let root = host.window_handle() as *mut AnyObject;
+        if root.is_null() {
+            return;
+        }
+
+        unsafe fn walk(view: *mut AnyObject, depth: u32) {
+            if view.is_null() || depth > 8 {
+                return;
+            }
+            let _: () = msg_send![view, setWantsLayer: Bool::YES];
+            let layer: *mut AnyObject = msg_send![view, layer];
+            if !layer.is_null() {
+                let clear: *mut AnyObject = msg_send![objc2::class!(NSColor), clearColor];
+                // CGColor 返回类型是 CGColorRef(^{CGColor=}),声成对象指针会被 objc2 判为签名不符而 panic。
+                let cg: *mut std::ffi::c_void = msg_send![clear, CGColor];
+                let _: () = msg_send![layer, setBackgroundColor: cg];
+                let _: () = msg_send![layer, setOpaque: Bool::NO];
+            }
+            let subviews: *mut AnyObject = msg_send![view, subviews];
+            if subviews.is_null() {
+                return;
+            }
+            let count: usize = msg_send![subviews, count];
+            for index in 0..count {
+                let subview: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+                walk(subview, depth + 1);
+            }
+        }
+
+        unsafe { walk(root, 0) };
+        println!("[probe] transparent layers applied");
+    }
+
     fn on_after_created(&mut self, browser: Option<&mut Browser>) {
         debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
-        let browser = browser.cloned().expect("Browser is None");
+        let mut browser = browser.cloned().expect("Browser is None");
 
         // Sanity-check the configured runtime style.
         assert_eq!(
@@ -78,6 +128,9 @@ impl SimpleHandler {
                 RuntimeStyle::CHROME
             }
         );
+
+        // 透明实验:创建后立刻清一次视图层的背景/不透明标记。
+        Self::apply_transparent_layers(Some(&mut browser));
 
         // Add to the list of existing browsers.
         self.browser_list.push(browser);
@@ -273,6 +326,15 @@ wrap_load_handler! {
     }
 
     impl LoadHandler {
+        fn on_load_end(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _http_status_code: ::std::os::raw::c_int,
+        ) {
+            SimpleHandler::apply_transparent_layers(browser);
+        }
+
         fn on_load_error(
             &self,
             browser: Option<&mut Browser>,

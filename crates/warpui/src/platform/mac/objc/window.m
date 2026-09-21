@@ -208,6 +208,45 @@ NSNumber *previouslyActiveAppPID;
 @end
 
 // Returns the titlebar container view for the given window, or nil if not found.
+
+/// 命中/焦点目标是否属于"嵌入的平台视图"(WKWebView 或未来的 CEF 宿主)。
+///
+/// 背景:macOS 27 起 AppKit 会把 mouseUp/Dragged 改投 contentView,故必须识别
+/// "该事件交给嵌入视图还是 Warp 自己"。旧逻辑硬编码 `WKWebView` 类名;CEF 后端的
+/// 宿主视图(CefBrowserHostView / RenderWidgetHostViewCocoa)不在名单里,实测点击链
+/// 会断在 mouseUp(证据:specs/cef-webview-minimal/evidence/phase1/RESULT.md)。
+///
+/// warpui 的 `HasWindowHandle` 把 `WebViewContainerView` 作为 wry 的父视图
+/// (crates/warpui/src/platform/mac/window.rs:1110-1119),所以 WKWebView、
+/// WKContentView 与 CEF 宿主视图都是它的后代 —— 按"是否后代"判定可同时覆盖
+/// 现有与将来的嵌入后端,且对 WKWebView 行为不变(它本来就在容器内)。
+static BOOL warp_is_embedded_platform_view(NSWindow *window, NSView *view) {
+    if (view == nil || window == nil) {
+        return NO;
+    }
+    NSView *contentView = window.contentView;
+    if (contentView == nil || ![contentView isKindOfClass:[WarpHostView class]]) {
+        return NO;
+    }
+    NSView *container = [(WarpHostView *)contentView webViewContainer];
+    if (container == nil) {
+        return NO;
+    }
+    // 只认容器的**严格后代**:容器自身是全窗 frame,内容区里"既不在 overlay rect、
+    // 也不在 webview frame 内"的普通点击,命中目标就是容器本身;若把它也判为
+    // 嵌入视图,会跳过下方 `[self.contentView mouseUp:]` 的 CLD-2581 兜底,
+    // 改变默认(wry)路径的事件分发行为(评审 F3)。
+    if (view == container) {
+        return NO;
+    }
+    for (NSView *candidate = view; candidate != nil; candidate = candidate.superview) {
+        if (candidate == container) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 static NSView *get_titlebar_container_view(NSWindow *window) {
     NSButton *closeButton = [window standardWindowButton:NSWindowCloseButton];
     if (!closeButton) return nil;
@@ -502,9 +541,9 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
             if (@available(macOS 27, *)) {
                 if (_leftMouseDownStartedInNativeWindowChrome) {
                     [super sendEvent:event];
-                } else if ([_leftMouseDownTarget isKindOfClass:NSClassFromString(@"WKWebView")]) {
-                    // mouseDown 落在嵌入的 webview 上:后续事件走系统默认
-                    // 分发(发给 mouseDown 的目标),否则 webview 收不到
+                } else if (warp_is_embedded_platform_view(self, _leftMouseDownTarget)) {
+                    // mouseDown 落在嵌入的平台视图上:后续事件走系统默认
+                    // 分发(发给 mouseDown 的目标),否则视图收不到
                     // mouseUp,点击/拖动选中全部失效。
                     [super sendEvent:event];
                 } else {
@@ -522,7 +561,7 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
             if (@available(macOS 27, *)) {
                 if (_leftMouseDownStartedInNativeWindowChrome) {
                     [super sendEvent:event];
-                } else if ([_leftMouseDownTarget isKindOfClass:NSClassFromString(@"WKWebView")]) {
+                } else if (warp_is_embedded_platform_view(self, _leftMouseDownTarget)) {
                     [super sendEvent:event];
                 } else {
                     [self.contentView mouseDragged:event];
@@ -542,7 +581,7 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
             // (case 标号后直接跟声明属 C23 扩展,花括号成块以兼容 C17。)
             NSPoint rightPoint = [self.contentView convertPoint:event.locationInWindow fromView:nil];
             NSView *rightTarget = [self.contentView hitTest:rightPoint];
-            if ([rightTarget isKindOfClass:NSClassFromString(@"WKWebView")]) {
+            if (warp_is_embedded_platform_view(self, rightTarget)) {
                 [super sendEvent:event];
             } else {
                 [self.contentView rightMouseDown:event];
@@ -601,16 +640,26 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
             return [super performKeyEquivalent:event];
         }
 
-        // 标准编辑命令:当 first responder 是 WKWebView(或 WKContentView)
-        // 时直接发送,不经过 key binding 系统。
+        // 标准编辑命令:当 first responder 是嵌入平台视图(WKWebView/WKContentView,
+        // 以及 CEF 的宿主视图)时直接发送,不经过 key binding 系统。
+        // 判定按"容器后代"而非类名(见 warp_is_embedded_platform_view)。
         id firstResponder = [self firstResponder];
-        BOOL isWKView = [firstResponder isKindOfClass:NSClassFromString(@"WKWebView")]
-            || [firstResponder isKindOfClass:NSClassFromString(@"WKContentView")];
-        if (isWKView) {
+        BOOL isEmbeddedView = [firstResponder isKindOfClass:[NSView class]]
+            && warp_is_embedded_platform_view(self, (NSView *)firstResponder);
+        if (isEmbeddedView) {
             NSString *chars = [event charactersIgnoringModifiers];
             NSUInteger mods = [event modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
             if (mods == NSEventModifierFlagCommand) {
                 if ([chars isEqualToString:@"c"]) {
+                    // CEF(及其它嵌入视图):Chromium 宿主视图自己实现 copy:,
+                    // 直接转发即可;WKWebView 走下方专用剪贴板路径。
+                    if (![firstResponder isKindOfClass:NSClassFromString(@"WKWebView")]) {
+                        if ([firstResponder respondsToSelector:@selector(copy:)]) {
+                            [firstResponder copy:nil];
+                            return YES;
+                        }
+                        return [super performKeyEquivalent:event];
+                    }
                     // Cmd+C 复制:first responder 是外层 WryWebView,对它直接发
                     // `copy:` 是空操作(AppKit 不转发到真正持有文本选中的内层
                     // WKContentView),因此用 WebView 公开 API 读选中文本并写
@@ -638,14 +687,26 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
                               }];
                     return YES;
                 } else if ([chars isEqualToString:@"v"]) {
-                    [firstResponder paste:nil];
-                    return YES;
+                    // 嵌入视图未必实现这些编辑 selector(CEF 的宿主视图与
+                    // WKWebView 的子视图不同):先探测,缺失则交回系统路径,
+                    // 避免 unrecognized selector 直接崩溃。
+                    if ([firstResponder respondsToSelector:@selector(paste:)]) {
+                        [firstResponder paste:nil];
+                        return YES;
+                    }
+                    return [super performKeyEquivalent:event];
                 } else if ([chars isEqualToString:@"x"]) {
-                    [firstResponder cut:nil];
-                    return YES;
+                    if ([firstResponder respondsToSelector:@selector(cut:)]) {
+                        [firstResponder cut:nil];
+                        return YES;
+                    }
+                    return [super performKeyEquivalent:event];
                 } else if ([chars isEqualToString:@"a"]) {
-                    [firstResponder selectAll:nil];
-                    return YES;
+                    if ([firstResponder respondsToSelector:@selector(selectAll:)]) {
+                        [firstResponder selectAll:nil];
+                        return YES;
+                    }
+                    return [super performKeyEquivalent:event];
                 }
             }
 

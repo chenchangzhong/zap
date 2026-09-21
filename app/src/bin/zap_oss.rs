@@ -23,6 +23,13 @@ pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 
 // Zap OSS 构建的入口,简单包一层 warp::run()。
 fn main() -> Result<()> {
+    // CEF(cef_webview feature)子进程分流:必须早于 ChannelState::new —— 后者会按
+    // 当前 bundle identifier 解析 AppId,而 helper bundle 的后缀会让它 panic。
+    #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+    if warp::maybe_run_as_cef_subprocess() {
+        return Ok(());
+    }
+
     let mut state = ChannelState::new(
         Channel::Oss,
         ChannelConfig {

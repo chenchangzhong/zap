@@ -24241,14 +24241,8 @@ impl View for Workspace {
         // 原先自己叠的那一档。此前该层只由标签栏绘制,侧栏因此比主区亮一档;现在
         // 由窗口底色统一承担,各区域不再各画一层底色,半透明窗口下 webview 空洞
         // 区域与 Metal 绘制区域也保持一致。有背景图时只能按单色近似。
-        let window_surface = theme
-            .surface_2()
-            .blend(&internal_colors::fg_overlay_1(theme));
-        let background_color = match window_surface.with_opacity(background_opacity) {
-            Fill::Solid(color) => color,
-            Fill::VerticalGradient(gradient) => gradient.get_most_opaque(),
-            Fill::HorizontalGradient(gradient) => gradient.get_most_opaque(),
-        };
+        let background_color =
+            crate::appearance::window_surface_color(theme, background_opacity);
         app.windows()
             .set_window_background_color(self.window_id, background_color);
 

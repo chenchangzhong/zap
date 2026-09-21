@@ -1,0 +1,20 @@
+[probe] window created hole=(100,100,600,400) windowNumber=6078
+[probe] window frame={{160, 160}, {960, 672}} content={{0, 0}, {960, 640}}
+[probe] routing=plain(平台默认)
+[probe] WINDOW_NUMBER=6078
+[probe] browser created as child of 0x130002fe380 rect=(100,100,600,400)
+[probe] synthesizing click at hole center
+[probe] CLICK_PROCEEDING (key=0 active=0 attempt=12;分支日志为主证据)
+[probe] container frame={{0, 0}, {960, 640}} bounds={{0, 0}, {960, 640}}
+[probe]   subview ProbeBackgroundView frame={{0, 0}, {960, 640}} hidden=0 alpha=1.00
+[probe]   subview CefBrowserHostView frame={{100, 100}, {600, 400}} hidden=0 alpha=1.00
+[probe] hitTest(hole center 400,300) -> RenderWidgetHostViewCocoa
+[probe] hitTest(outside 20,20) -> ProbeOverlayView
+[probe] shotmap screen=1920x1080 scale=2 holeCenterScreen=(560,460)
+[probe] lastLeftMouseDownTarget=(nil)
+[probe] isKeyWindow=0 appActive=0 firstResponder=RenderWidgetHostViewCocoa
+[probe] sendMouse type=5 isKeyWindow=0 appActive=0
+[probe] sendMouse type=1 isKeyWindow=0 appActive=0
+[probe] sendMouse type=2 isKeyWindow=0 appActive=0
+[probe] click sent
+[probe] exit

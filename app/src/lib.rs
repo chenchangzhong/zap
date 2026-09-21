@@ -554,6 +554,29 @@ pub fn run() -> Result<()> {
     // Parse command-line arguments.
     let args = warp_cli::Args::from_env();
 
+    // CEF(Chromium)后端:编译期 feature 决定代码是否存在;运行时**用户可见开关**是
+    // 设置项 `general.webview.use_chromium`(默认开,见 settings/cef_webview.rs),
+    // 启动期这里只处理"环境开关/flag 显式要求"的情形 —— 用户在运行中打开开关时,
+    // 由 `cef_backend::ensure_initialized()` 按需初始化(评审 N7)。此处 NSApp 已由 platform::init
+    // 创建:先初始化 CEF(失败则完全不碰 NSApplication),再补协议桥,最后起消息泵。
+    //
+    // **必须在崩溃恢复子进程里跳过**:zap 会为自身再拉起一个带
+    // `--crash-recovery-mechanism` 的 watchdog 子进程,它同样会走到这里;两个进程都
+    // 初始化 CEF 会共用缓存目录并触发 Chromium 的 ProcessSingleton 冲突(实测:探针
+    // 日志里 CefInitialize 出现两次,主进程随后被杀)。
+    // 还要排除 CLI 子命令进程:`zap-oss terminal-server …` 同样会走到这里,而它只需要
+    // 跑终端服务,不需要(也不应该)初始化 CEF。仅主 app 启动(无子命令)才初始化。
+    #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+    if browser::cef_backend::is_requested()
+        && !browser::cef_backend::is_crash_recovery_process()
+        && args.command().is_none()
+    {
+        if browser::cef_backend::initialize_runtime() {
+            browser::cef_backend::install_app_protocol_support();
+            browser::cef_backend::start_pump();
+        }
+    }
+
     if let Some(command) = args.command() {
         #[cfg(windows)]
         if command.prints_to_stdout() {
@@ -1518,6 +1541,12 @@ fn initialize_app(
                         _ => {}
                     }
                 });
+                // CEF 后端的冻结阈值来自设置(每帧推入一次原子量,代价可忽略)。
+                #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+                browser::cef_backend::set_freeze_after_secs(
+                    *crate::settings::CefWebviewSettings::as_ref(ctx).freeze_after_secs,
+                );
+
                 // 消费 IPC 推入的待处理事件(SwitchProject, Notify 等)。
                 dsh::DshRuntime::handle(ctx).update(ctx, |_runtime, ctx| {
                     dsh::bridge::drain_events(ctx);
@@ -1825,6 +1854,17 @@ fn initialize_app(
             app_installation_detection::make_router(),
             profiling::make_router(),
         ];
+        // feature-off 构建没有 push,故用 cfg 决定是否再绑定为 mut(避免 unused_mut)。
+        #[cfg(feature = "cef_webview")]
+        let mut routers = routers;
+        // dsh 的 CEF 后端把 `zap.*` IPC 从 webview 桥迁到回环 HTTP 端点
+        // (specs/cef-webview-minimal/TECH.md 阶段 1.3)。未启用 CEF 时不注册,
+        // 避免为默认(WKWebView)路径引入多余监听面。
+        // 只按 feature 做编译期门控:CEF 可能在用户打开设置开关后才**按需初始化**
+        // (见 cef_backend::ensure_initialized),启动时未必已启用;若这里跟随运行时
+        // 开关,懒初始化后回环端点会缺失,页面的 zap.* IPC 会静默失效。
+        #[cfg(feature = "cef_webview")]
+        routers.push(dsh::loopback_ipc::make_router());
         http_server::HttpServer::new(routers, ctx)
     });
 
@@ -1887,6 +1927,11 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
             ctx.dispatch_global_action("root_view:update_quake_mode_state", &update_quake_mode_arg);
         })),
         on_will_terminate: Some(Box::new(move |ctx| {
+            // CEF 要求进程退出前 CefShutdown(否则 Chromium 线程/atexit 清理可能崩溃或
+            // 挂起;评审 F6)。幂等,未初始化时是 no-op。
+            #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+            browser::cef_backend::shutdown();
+
             NotebookManager::handle(ctx).update(ctx, |manager, ctx| {
                 // Notebooks are only saved periodically, so ensure that any pending changes have
                 // been sent to the writer thread before terminating.
@@ -2383,6 +2428,20 @@ pub fn init_feature_flags() {
     features::mark_initialized();
 }
 
+/// CEF 子进程分流(仅 `cef_webview` feature):CEF 会以 `--type=<process>` 重新拉起
+/// 本可执行文件。子进程只应 `execute_process` 后退出。
+///
+/// **必须在任何 `ChannelState::set` / 日志 / 平台初始化之前调用**:helper 的
+/// bundle id 是主 app 的带后缀形式(段数更多),而 `ChannelState::set` 会从当前
+/// bundle identifier 解析 AppId 并要求恰好三段 —— 晚于它调用会在 helper 里 panic
+/// (实测:5 个 helper 进程全部 panic 在 channel/state.rs:277)。
+///
+/// 返回 `true` 表示当前进程是 CEF 子进程且已处理完毕,调用方应立即返回。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+pub fn maybe_run_as_cef_subprocess() -> bool {
+    !browser::cef_backend::handle_subprocess_or_continue()
+}
+
 /// Returns all feature flags which should be enabled in the current channel.
 pub fn enabled_features() -> HashSet<FeatureFlag> {
     // Enable features overridden for the given channel.
@@ -2413,6 +2472,14 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
     // (wry webview 基建目前仅 macOS 实现)。开发期默认开启便于联调。
     #[cfg(target_os = "macos")]
     flags.insert(FeatureFlag::DshPane);
+    // dsh 的 CEF(Chromium)后端:需要 feature(代码存在)+ 显式环境开关(运行时启用)。
+    // feature 会链接 CEF 并要求 bundle 内含 framework/helpers(script/macos/cef_embed);
+    // 加环境开关是因为该路径尚未完成受控实跑验证,不能仅凭"构建带了 feature"就默认
+    // 启用(见 specs/cef-webview-minimal/TECH.md 阶段 1 与评审建议)。
+    #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+    if std::env::var_os("ZAP_CEF_WEBVIEW").is_some() {
+        flags.insert(FeatureFlag::CefWebview);
+    }
 
     // Issue #72: HTTP 代理设置页面。不走 channel 判断,所有 channel 含 zap-oss
     // 默认启用,作为企业 VPN / 公司代理场景的基本能力。

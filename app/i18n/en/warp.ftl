@@ -3822,3 +3822,11 @@ cloud-sync-gist-error-request = Network request failed: { $detail }
 cloud-sync-gist-error-not-found = Gist not found
 cloud-sync-gist-error-no-token = Token is not configured
 cloud-sync-gist-error-api = API error: { $status } { $body }
+
+settings-features-webview-freeze-label = Freeze hidden embedded web pages after:
+settings-features-webview-freeze-off = Never
+settings-features-webview-freeze-minutes = minutes
+settings-features-webview-freeze-one-hour = 1 hour
+
+settings-features-use-chromium-webview = Use the Chromium engine for embedded web pages
+settings-features-use-chromium-webview-description = Applies to newly opened dsh panes.

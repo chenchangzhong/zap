@@ -235,6 +235,9 @@ CODESIGN=true
 SELFSIGN=false
 OPEN_AFTER_BUNDLE=false
 READ_PASSWORDS_FROM_ENV=false
+# 嵌入 CEF(Chromium)后端并启用 cef_webview feature。需要 CEF 二进制
+# (CEF_PATH 或 ~/.local/share/cef)。见 specs/cef-webview-minimal/TECH.md。
+CEF=false
 
 PARAMS=""
 while (( "$#" )); do
@@ -332,6 +335,14 @@ while (( "$#" )); do
         echo "Error: Argument for $1 is missing" >&2
         exit 1
       fi
+      ;;
+    # 嵌入 CEF(Chromium)后端:启用 cef_webview feature 并把 framework +
+    # 5 个 helper.app 装进 bundle(用 tools/cef-helper 的小二进制当 helper)。
+    --cef)
+      echo "CEF (Chromium) backend enabled."
+      CEF=true
+      FEATURES="$FEATURES,cef_webview"
+      shift
       ;;
     # Read codesigning passwords from environment variables instead of GCP secret manager
     --read-passwords-from-env)
@@ -504,6 +515,21 @@ fi
 mkdir -p "$OUT_DIR"
 rm -R "$OUT_DIR/$WARP_APP_NAME.app" || echo "No old app to remove"
 rm -R "$OUT_DIR/$FINAL_DMG_NAME" || echo "No old dmg to remove"
+
+# CEF 前置检查:在构建之前失败,避免白等一次长构建。
+if [[ "$CEF" == true ]]; then
+  CEF_DIR="${CEF_PATH:-$HOME/.local/share/cef}"
+  if [[ ! -d "$CEF_DIR/Chromium Embedded Framework.framework" ]]; then
+    echo "Error: 未找到 CEF framework($CEF_DIR)。" >&2
+    echo "       先准备 CEF 二进制(见 specs/cef-webview-minimal/TECH.md),再重试。" >&2
+    exit 1
+  fi
+  # helper 是独立 workspace 的本地构建(不跨架构);交叉架构时无法匹配主二进制。
+  if [[ -n "$DEFAULT_TARGET" && "$DEFAULT_TARGET" != "$HOST_TARGET" ]]; then
+    echo "Error: --cef 暂不支持交叉架构构建(DEFAULT_TARGET=$DEFAULT_TARGET, HOST_TARGET=$HOST_TARGET)。" >&2
+    exit 1
+  fi
+fi
 
 ###########################
 ## Step 1: Build the app ##
@@ -738,6 +764,32 @@ else
 fi
 
 ##########################################
+## Step 1.5: Embed CEF (optional)        ##
+##########################################
+
+# CEF 嵌入(Step 1.5)需要与 Step 3 相同的签名身份:否则 framework/5 个 helper 只能拿到
+# adhoc 签名,再靠 Step 3 的 `--deep` 整体重签(Apple 不建议用 --deep 签嵌套组件,
+# 317MB framework + helper 慢且易碎;评审 F12)。故把常量提前到这里。
+APPLE_TEAM_ID="2BBY89MBSN"
+
+if [[ "$CEF" == true ]]; then
+  CEF_APP_PATH="$BUNDLE_DIR/$WARP_APP_NAME.app"
+  if [[ ! -d "$CEF_APP_PATH" ]]; then
+    echo "Error: --cef 需要 app 产物(当前 ARTIFACT=$ARTIFACT)。" >&2
+    exit 1
+  fi
+  echo "Building CEF helper (tools/cef-helper)..."
+  CEF_PATH="$CEF_DIR" cargo build \
+    --manifest-path "$WORKSPACE_ROOT_DIR/tools/cef-helper/Cargo.toml" \
+    --release
+  # 签名身份透传:正式签名时用同一 team id(否则 Step 3 的 --deep 也要重签一次)。
+  CEF_EMBED_SIGN_IDENTITY="${APPLE_TEAM_ID:--}" \
+    "$WORKSPACE_ROOT_DIR/script/macos/cef_embed" "$CEF_APP_PATH" \
+      --cef-path "$CEF_DIR" \
+      --helper-executable "$WORKSPACE_ROOT_DIR/tools/cef-helper/target/release/zap_cef_helper"
+fi
+
+##########################################
 ## Step 2: Create code-signing keychain ##
 ##########################################
 
@@ -748,7 +800,7 @@ fi
 
 if [[ $CODESIGN = true ]]; then
   # TODO - does this need to change per user?  Seems like it's tied to the WARP_NOTARIZATION_PASSWORD password.
-  APPLE_TEAM_ID="2BBY89MBSN"
+  # (APPLE_TEAM_ID 已在 Step 1.5 之前赋值,见文件上方注释 —— 评审 F12。)
   CODESIGN_KEYCHAIN_NAME="warp-codesign-keychain"
 
   echo "Starting codesigning..."

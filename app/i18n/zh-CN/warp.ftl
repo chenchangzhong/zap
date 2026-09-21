@@ -3702,3 +3702,11 @@ cloud-sync-gist-error-request = 网络请求失败: { $detail }
 cloud-sync-gist-error-not-found = Gist 未找到
 cloud-sync-gist-error-no-token = Token 未配置
 cloud-sync-gist-error-api = API 错误: { $status } { $body }
+
+settings-features-webview-freeze-label = 隐藏的内嵌网页冻结超时：
+settings-features-webview-freeze-off = 不冻结
+settings-features-webview-freeze-minutes = 分钟
+settings-features-webview-freeze-one-hour = 1 小时
+
+settings-features-use-chromium-webview = 使用 Chromium 内核
+settings-features-use-chromium-webview-description = 仅 macOS 可用；切换后对新打开的 dsh pane 生效，无需重启。

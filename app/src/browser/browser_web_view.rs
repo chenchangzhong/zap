@@ -53,6 +53,12 @@ pub enum BrowserWebViewEvent {
 
 /// 页面加载完成事件的暂存区。由 wry 的 `on_page_load_handler`(主线程)
 /// 写入,由每帧 `on_frame_drawn` 消费。消费后触发地址栏同步与 pane 标题更新。
+/// CEF 浏览器创建失败(尚未登记成功)的 id,由 drain 移除对应条目。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+pub(crate) static PENDING_WEBVIEW_CREATE_FAILED: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<u64>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
 pub(crate) static PENDING_WEBVIEW_URL_CHANGED: std::sync::LazyLock<
     Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
@@ -72,12 +78,44 @@ fn is_externally_openable(url: &str) -> bool {
         .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "mailto" | "tel"))
 }
 
+/// webview 后端选择。`WebViewBackend::Cef` 仅在 macOS + `cef_webview` feature 且
+/// runtime flag 开启时生效,否则自动回退 Wry(specs/cef-webview-minimal/TECH.md 阶段 1)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WebViewBackend {
+    /// wry / WKWebView(默认路径,行为不变)。
+    Wry,
+    /// CEF(Chromium):dsh pane 专用。
+    Cef,
+}
+
+/// 取 `window` 句柄对应的容器 NSView 指针(warpui 的 `HasWindowHandle` 返回
+/// `WebViewContainerView`,见 crates/warpui/src/platform/mac/window.rs:1110-1119)。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+fn cef_parent_view(window: &impl raw_window_handle::HasWindowHandle) -> Option<*mut std::ffi::c_void> {
+    use raw_window_handle::RawWindowHandle;
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::AppKit(handle) => Some(handle.ns_view.as_ptr()),
+        _ => None,
+    }
+}
+
 /// 全局单例:管理所有 webview 的 create / navigate / set_bounds / destroy。
 pub struct BrowserWebViewManager {
     #[cfg(target_os = "macos")]
     webviews: RefCell<HashMap<u64, WebViewEntry>>,
+    /// CEF 承载的 webview 元数据(句柄在 `cef_backend` 的 UI 线程注册表里)。
+    /// 与 `webviews` 分开存放:wry 路径因此**完全不改**(仅 feature 下编译)。
+    #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+    cef_entries: RefCell<HashMap<u64, CefEntry>>,
     /// platform_view_id 的单调递增分配器(每个 pane 创建时取一个)。
     next_id: AtomicU64,
+}
+
+/// CEF webview 的宿主侧元数据(句柄/几何在 cef_backend 内)。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+struct CefEntry {
+    window_id: WindowId,
+    current_url: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -93,11 +131,39 @@ struct WebViewEntry {
     focus_ptr: std::sync::Arc<parking_lot::Mutex<*const wry::WebView>>,
 }
 
+/// 页面加载完成通知(供 CEF 后端调用):与 wry 的 `on_page_load_handler` 走同一条
+/// 事件路径(每帧 drain → emit UrlChanged),pane 据此结束"启动中"覆盖层。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+pub(crate) fn notify_webview_page_loaded(id: u64) {
+    PENDING_WEBVIEW_URL_CHANGED.lock().insert(id);
+    // 页面可能在空闲期加载完成(此时没有渲染帧),主动请求一帧让 drain 立刻执行。
+    warpui::platform::mac::Window::request_redraw_all_windows();
+}
+
+/// 渲染进程崩溃通知(供 CEF 后端调用):与 wry 的 terminate handler 同一条事件路径,
+/// pane 据此展示崩溃态并提供重新加载。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+pub(crate) fn notify_webview_crashed(id: u64) {
+    PENDING_WEBVIEW_CRASHED.lock().insert(id);
+    // 崩溃回调可能发生在空闲期(没有渲染帧),主动请求一帧让 drain 立刻执行。
+    warpui::platform::mac::Window::request_redraw_all_windows();
+}
+
+/// CEF 浏览器创建失败通知:暂存 id,由每帧 drain 移除条目,使 `has_webview` 归 false,
+/// 让 pane 下次 attach 时重新创建,避免"永久空 pane"(评审 N10)。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+pub(crate) fn notify_webview_create_failed(id: u64) {
+    PENDING_WEBVIEW_CREATE_FAILED.lock().insert(id);
+    warpui::platform::mac::Window::request_redraw_all_windows();
+}
+
 impl BrowserWebViewManager {
     pub fn new() -> Self {
         Self {
             #[cfg(target_os = "macos")]
             webviews: RefCell::new(HashMap::new()),
+            #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+            cef_entries: RefCell::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -121,6 +187,7 @@ impl BrowserWebViewManager {
     /// `incognito` 为 true 时 webview 使用非持久化数据存储(cookie 不落盘、
     /// 不跨实例累积)——dsh 每次启动都换端口与 token,其 cookie 无需持久化。
     #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
         window: &impl raw_window_handle::HasWindowHandle,
@@ -129,161 +196,53 @@ impl BrowserWebViewManager {
         rect: RectF,
         window_id: WindowId,
         incognito: bool,
+        backend: WebViewBackend,
+        background_color: Option<warpui::color::ColorU>,
     ) {
-        log::info!("[browser] create webview {id} url={url} rect={rect:?} incognito={incognito}");
+        log::info!(
+            "[browser] create webview {id} url={url} rect={rect:?} incognito={incognito} backend={backend:?}"
+        );
+        // CEF 分支:句柄由 cef_backend 持有,这里只记元数据。仅在 feature + flag
+        // 同时满足时进入;否则落到下方既有的 wry 路径(行为不变)。
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if backend == WebViewBackend::Cef && crate::browser::cef_backend::is_enabled() {
+            match cef_parent_view(window) {
+                Some(parent_view) => {
+                    let init_js = crate::dsh::loopback_ipc::shim_script();
+                    let background = background_color.map_or(0xFF1E1E1E, |color| {
+                        0xFF00_0000
+                            | (u32::from(color.r) << 16)
+                            | (u32::from(color.g) << 8)
+                            | u32::from(color.b)
+                    });
+                    crate::browser::cef_backend::create_webview(
+                        id, parent_view, rect, url, &init_js, background,
+                    );
+                    self.cef_entries.borrow_mut().insert(
+                        id,
+                        CefEntry {
+                            window_id,
+                            current_url: std::sync::Arc::new(parking_lot::Mutex::new(Some(
+                                url.to_string(),
+                            ))),
+                        },
+                    );
+                    return;
+                }
+                None => log::warn!("[cef] webview {id}: 拿不到容器视图,回退 wry 后端"),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "cef_webview")))]
+        {
+            let _ = backend;
+            let _ = background_color;
+        }
         // wry 的 child webview 会拦截 performKeyEquivalent(Cmd 快捷键不
         // 进 webview),在页面内监听 Cmd+R 触发刷新;同时:当地址栏聚焦时
         // webview 失焦,页面活跃元素的焦点应自动释放,避免两处光标共存。
         // 页面内元素获得焦点(focusin)时经 IPC 上报 Rust,让 Warp 释放
         // 地址栏的焦点与光标(地址栏与页面各一个光标 = 双光标)。
-        let init_js = r#"
-window.__ZAP_BRIDGE__ = true;
-// JS 错误/警告转发到 Rust 日志(诊断用)。
-window.addEventListener('error', (e) => {
-  window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-js-error:' + (e.message || 'unknown'));
-});
-window.addEventListener('unhandledrejection', (e) => {
-  window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-js-error:unhandledrejection:' + String(e.reason).slice(0, 200));
-});
-const __origLog = console.error;
-console.error = function(...args) {
-  window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-js-error:console:' + args.map(String).join(' ').slice(0, 300));
-  __origLog.apply(console, args);
-};
-
-document.addEventListener('keydown', (e) => {
-  if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-  // Cmd+R → 页面刷新(wry child webview 的 performKeyEquivalent 返回 NO,
-  // 不触发 KVO 刷新,需 JS 手动处理)。
-  if (e.key === 'r' || e.key === 'R') {
-    e.preventDefault();
-    location.reload();
-  }
-});
-document.addEventListener('focusin', () => {
-  if (document.activeElement && document.activeElement !== document.body) {
-    // 页面已持有文档焦点时不再上报:此时上报只会触发重复的 makeFirstResponder,
-    // 而 WebKit 在该过程中会把当前聚焦元素 blur 到 body(relatedTarget=null),
-    // 模型菜单等弹层 onBlur 即被关闭,点击落空(表现为切换模型失败)。
-    if (document.hasFocus()) return;
-    window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-focusin');
-  }
-});
-// 方向键修字符插入:DSH 输入框是 contenteditable div(DIV.uV2eYG_input,
-// contenteditable 由容器继承)。实测按方向键会经 WebKit 编辑兜底路径向光标
-// 处插入 U+001D(Group Separator,渲染为方块、复制后不可见),且不触发
-// beforeinput/input;与输入法无关,普通浏览器无此问题(Chromium 不走该
-// 兜底)。此处对 contenteditable 内的方向键 preventDefault 并用
-// Selection.modify()(WebKit 扩展 API)移动光标,完全绕开 WebKit 的字符插入路径。
-document.addEventListener('keydown', function(e) {
-  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-  if (e.isComposing) return;
-  if (e.defaultPrevented) return;
-  // 修饰键组合(Cmd+← 行首/尾、Option+← 词跳、Shift+← 扩选)交回原生路径:
-  // 兜底插入只在无修饰的裸方向键上出现,且单字符 move 会丢失词跳/扩选语义。
-  if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-  var ae = document.activeElement;
-  if (!ae || ae.tagName !== 'DIV' || !ae.isContentEditable) return;
-  e.preventDefault();
-  var sel = window.getSelection();
-  if (sel && sel.anchorNode) {
-    sel.modify('move', e.key === 'ArrowRight' ? 'forward' : 'backward', 'character');
-  }
-}, true);
-// 点击页面任意位置上报 Rust,让 WKWebView 同步成为 first responder。
-// 仅在页面尚未持有文档焦点时上报(首次从 Warp 侧点进页面);页面已持焦时
-// 重复的 makeFirstResponder 会让 WebKit 把当前聚焦元素 blur 到 body
-// (relatedTarget=null),弹层 onBlur 即关、点击落空。
-document.addEventListener('mousedown', () => {
-  if (document.hasFocus()) return;
-  window.focus();
-  window.webkit?.messageHandlers?.ipc?.postMessage('warp:webview-mousedown');
-});
-// 点击链接:一律用系统默认浏览器打开,不在 webview 内导航。
-// 锚点(#...)与 javascript: 伪协议链接不拦截。兼容 HTML 与 SVG <a>。
-document.addEventListener('click', (e) => {
-  if (e.button !== 0 && e.button !== 1) return;
-  let el = e.target;
-  while (el && el.tagName !== 'A') el = el.parentElement;
-  if (!el || el.tagName !== 'A') return;
-  const rawHref = el.getAttribute('href');
-  if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('javascript:')) return;
-  e.preventDefault();
-  // HTML <a> 的 href 是字符串;SVG <a> 的是 SVGAnimatedString,需用
-  // baseURI 重新解析。解析失败(非法 URL)则吞掉点击,不导航不外部打开。
-  let target;
-  try {
-    target = typeof el.href === 'string' ? el.href : new URL(rawHref, document.baseURI).href;
-  } catch {
-    return;
-  }
-  // <a download>(如 dsh Session 日志导出的 JS 合成下载链接):不拦。
-  // WKWebView 的原生下载管道(WKDownloadDelegate,wry 已接 download
-  // handler)会继承页面的会话 cookie 完成下载(Electron/Chromium 同款,
-  // 默认 ~/Downloads,Zap 侧另弹保存面板);若在此 preventDefault 转系统
-  // 浏览器,裸 URL 缺 dsh 的 cookie(登录 token 只在 GET / 种 cookie)
-  // 只会拿到 401。
-  if (el.hasAttribute('download')) return;
-  window.webkit?.messageHandlers?.ipc?.postMessage('warp:open-external:' + target);
-});
-// window.open():同样交给系统默认浏览器,不创建新窗口也不在当前 webview 导航。
-window.open = function(url) {
-  window.webkit?.messageHandlers?.ipc?.postMessage('warp:open-external:' + url);
-  return null;
-};
-// 切回(webview 重新获得键盘焦点)时把输入框聚焦,并把光标折叠到内容末尾。
-// dsh 页面只有一个输入框,直接按选择器找,不做失焦记录;无论 DOM 焦点是否
-// 一直残留在输入框,光标都统一到末尾。
-window.__restoreFocused = function() {
-  var el = document.querySelector('textarea[data-testid="dsh-input"]')
-           || document.querySelector('textarea[placeholder]')
-           || document.querySelector('div[contenteditable="true"][role="textbox"]')
-           || document.querySelector('div.ProseMirror')
-           || document.querySelector('.cm-content[contenteditable]');
-  if (!el || !el.isConnected) {
-    return;
-  }
-  var attempts = 0;
-  var tryFocus = function() {
-    if (!el.isConnected) {
-      return;
-    }
-    if (document.hasFocus()) {
-      el.focus();
-      // 光标一律折叠到内容末尾:不做失焦 blur 后 DOM 焦点常驻输入框,WebKit
-      // 原生保留的 caret 位置不可控(可能停在开头/任意处),按约定统一到
-      // 末尾:切回后用户要接着输入。
-      if (typeof el.setSelectionRange === 'function') {
-        try { el.setSelectionRange(el.value.length, el.value.length); } catch (e) {}
-      } else if (el.isContentEditable) {
-        try {
-          var endRange = document.createRange();
-          endRange.selectNodeContents(el);
-          endRange.collapse(false);
-          var endSel = window.getSelection();
-          endSel.removeAllRanges();
-          endSel.addRange(endRange);
-        } catch (e) {}
-      }
-    } else if (attempts++ < 20) {
-      // makeFirstResponder 后页面 hasFocus 需等 AppKit 事件循环才变 true,
-      // 故重试等待,有限次避免死循环。
-      setTimeout(tryFocus, 30);
-    }
-  };
-  tryFocus();
-};
-// WebKit 兼容:菜单内 mousedown 的默认动作会把当前聚焦元素 blur 到 body
-// (relatedTarget=null;Chromium 同场景是把焦点移入被点的按钮,故浏览器无此
-// 问题)。官方模型菜单的 onBlur 见到焦点落到 body 即收起菜单,导致「焦点已
-// 在菜单项上」的第二次点击必然先触发 focusout → 菜单卸载 → click 落空
-// (表现为切换模型失败)。对菜单内 mousedown preventDefault 阻止该默认
-// blur;click 照常派发,菜单项选择不受影响。
-document.addEventListener('mousedown', function (e) {
-  if (!e.target || !e.target.closest || !e.target.closest('[role="menu"]')) return;
-  e.preventDefault();
-}, true);
-"#;
+        let init_js = crate::browser::webview_init_js::WEBVIEW_INIT_JS;
         let current_url = std::sync::Arc::new(parking_lot::Mutex::new(Some(url.to_string())));
         let handler_url = current_url.clone();
         let ipc_id = id;
@@ -422,8 +381,11 @@ document.addEventListener('mousedown', function (e) {
         }
     }
 
-    /// 非 macOS 平台空壳。
+    /// 非 macOS 平台空壳。**形参必须与 macOS 版一致**:调用点
+    /// `BrowserPaneView::create_webview` 未按平台门控,少一个参数就会在
+    /// Linux/Windows 上 E0061(评审 B2)。
     #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
         _window: &impl raw_window_handle::HasWindowHandle,
@@ -432,6 +394,8 @@ document.addEventListener('mousedown', function (e) {
         _rect: RectF,
         _window_id: WindowId,
         _incognito: bool,
+        _backend: WebViewBackend,
+        _background_color: Option<warpui::color::ColorU>,
     ) {
     }
 
@@ -467,6 +431,12 @@ document.addEventListener('mousedown', function (e) {
     }
     /// 让 id 对应的 webview 跳转到 `url`。
     pub fn navigate(&self, id: u64, url: &str) {
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if let Some(entry) = self.cef_entries.borrow_mut().get_mut(&id) {
+            *entry.current_url.lock() = Some(url.to_string());
+            crate::browser::cef_backend::navigate(id, url);
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             if let Err(err) = entry.webview.load_url(url) {
@@ -497,6 +467,11 @@ document.addEventListener('mousedown', function (e) {
 
     /// 重新加载当前页面。
     pub fn reload(&self, id: u64) {
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if self.cef_entries.borrow().contains_key(&id) {
+            crate::browser::cef_backend::reload(id);
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             if let Err(err) = entry.webview.reload() {
@@ -525,6 +500,10 @@ document.addEventListener('mousedown', function (e) {
 
     /// 最近一次导航的目标 URL(后退/前进后同步地址栏用)。
     pub fn current_url(&self, id: u64) -> Option<String> {
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if let Some(entry) = self.cef_entries.borrow().get(&id) {
+            return entry.current_url.lock().clone();
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             return entry.current_url.lock().clone();
@@ -537,6 +516,14 @@ document.addEventListener('mousedown', function (e) {
     /// 使用 `wry::WebView::url()` 而非导航 handler 缓存的 current_url,
     /// 避免后退/前进时的竞态与 subframe 干扰。
     pub fn webview_url(&self, id: u64) -> Option<String> {
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if let Some(entry) = self.cef_entries.borrow().get(&id) {
+            // 优先用 CEF 侧记录的真实 URL(首载会经历 ?token= → 303 → 裸地址)。
+            if let Some(url) = crate::browser::cef_backend::current_url(id) {
+                return Some(url);
+            }
+            return entry.current_url.lock().clone();
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             return entry.webview.url().ok();
@@ -550,6 +537,11 @@ document.addEventListener('mousedown', function (e) {
     /// 让 webview 页面内的活跃元素(如文本输入框)失去焦点。当地址栏聚焦时
     /// 调用,避免页面内的光标与地址栏光标共存。
     pub fn blur_webview_page(&self, id: u64) {
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if self.cef_entries.borrow().contains_key(&id) {
+            crate::browser::cef_backend::evaluate(id, "document.activeElement?.blur();");
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             let _ = entry.webview.evaluate_script("document.activeElement?.blur();");
@@ -561,6 +553,11 @@ document.addEventListener('mousedown', function (e) {
     /// 都会经 IPC 走到这里,若在此恢复输入框焦点,会把用户正开着的模型菜单等
     /// 弹层的焦点抢走(菜单 onBlur 即关,点击落空,表现为切换失败)。
     pub fn focus_webview(&self, id: u64) {
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if self.cef_entries.borrow().contains_key(&id) {
+            crate::browser::cef_backend::focus(id, true);
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             let _ = entry.webview.focus();
@@ -572,6 +569,15 @@ document.addEventListener('mousedown', function (e) {
     /// 到内容末尾)。只在可见性/焦点转变时机调用(attach、pane 获得焦点、
     /// 页面加载完成),不用于页面内的点击路径。
     pub fn focus_webview_restoring_input(&self, id: u64) {
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if self.cef_entries.borrow().contains_key(&id) {
+            crate::browser::cef_backend::focus(id, true);
+            crate::browser::cef_backend::evaluate(
+                id,
+                "window.__restoreFocused && window.__restoreFocused();",
+            );
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             let _ = entry.webview.focus();
@@ -626,6 +632,11 @@ document.addEventListener('mousedown', function (e) {
 
     /// 在指定 webview 中执行 JavaScript。
     pub fn evaluate_script_on(&self, id: u64, script: &str) {
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if self.cef_entries.borrow().contains_key(&id) {
+            crate::browser::cef_backend::evaluate(id, script);
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             let _ = entry.webview.evaluate_script(script);
@@ -635,6 +646,12 @@ document.addEventListener('mousedown', function (e) {
     /// 把 id 对应的 webview 移动到 `rect`(逻辑坐标,origin 左上)。
     /// 仅在 rect 变化时调用 wry 的 `set_bounds`,避免每帧抖动。
     pub fn set_bounds(&self, id: u64, rect: RectF) {
+        // CEF 子视图不跟随洞 rect,必须每帧驱动 frame + was_resized(集成要求 #2)。
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if self.cef_entries.borrow().contains_key(&id) {
+            crate::browser::cef_backend::set_bounds(id, rect);
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow_mut().get_mut(&id) {
             let bounds = Self::to_wry_rect(rect);
@@ -653,6 +670,11 @@ document.addEventListener('mousedown', function (e) {
 
     /// 销毁 id 对应的 webview(pane 关闭时调用)。
     pub fn destroy(&self, id: u64) {
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if self.cef_entries.borrow_mut().remove(&id).is_some() {
+            crate::browser::cef_backend::destroy(id);
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow_mut().remove(&id) {
             // 先置空 IPC handler 共享的裸指针,再 drop Box(webview),
@@ -663,7 +685,12 @@ document.addEventListener('mousedown', function (e) {
 
     /// 该 id 的 webview 是否仍存在(窗口关闭 cleanup 后可能已销毁)。
     pub fn has_webview(&self, id: u64) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        {
+            return self.cef_entries.borrow().contains_key(&id)
+                || self.webviews.borrow().contains_key(&id);
+        }
+        #[cfg(all(target_os = "macos", not(feature = "cef_webview")))]
         {
             return self.webviews.borrow().contains_key(&id);
         }
@@ -680,6 +707,21 @@ document.addEventListener('mousedown', function (e) {
     /// 一旦真正关闭且不恢复,pane 的 `Closed` detach 不会发生,webview 会
     /// 永久残留在全局 manager 中。窗口关闭钩子调用本方法兜底释放。
     pub fn cleanup_window(&self, window_id: WindowId) {
+        // CEF 承载的条目同样要随窗口销毁(句柄在 cef_backend 内)。
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        {
+            let ids: Vec<u64> = self
+                .cef_entries
+                .borrow()
+                .iter()
+                .filter(|(_, entry)| entry.window_id == window_id)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ids {
+                self.cef_entries.borrow_mut().remove(&id);
+                crate::browser::cef_backend::destroy(id);
+            }
+        }
         #[cfg(target_os = "macos")]
         {
             let mut webviews = self.webviews.borrow_mut();
@@ -689,6 +731,11 @@ document.addEventListener('mousedown', function (e) {
 
     /// 显示/隐藏 id 对应的 webview(undo 关闭宽限期间隐藏,pane 恢复时重新可见)。
     pub fn set_visible(&self, id: u64, visible: bool) {
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        if self.cef_entries.borrow().contains_key(&id) {
+            crate::browser::cef_backend::set_visible(id, visible);
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(entry) = self.webviews.borrow().get(&id) {
             if let Err(err) = entry.webview.set_visible(visible) {
@@ -726,6 +773,22 @@ document.addEventListener('mousedown', function (e) {
                     }
                 }
             }
+            // CEF 承载的条目同样要参与"未上报即隐藏":否则切 tab/离开可见树时
+            // 既不释放 renderer(违背阶段 1.4 的隐藏即销毁),残留的原生视图还会
+            // 在洞被别的 pane 复用时透出。
+            #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+            {
+                let hidden: Vec<u64> = self
+                    .cef_entries
+                    .borrow()
+                    .iter()
+                    .filter(|(id, entry)| entry.window_id == window_id && !seen.contains(id))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in hidden {
+                    crate::browser::cef_backend::set_visible(id, false);
+                }
+            }
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -736,6 +799,20 @@ document.addEventListener('mousedown', function (e) {
     /// 消费暂存的页面 focusin 事件与 URL 变更事件,经 model emit 分发。
     /// (外部打开请求在 IPC handler 内同步处理,不经此处。)
     pub fn drain_pending_webview_focus(&self, ctx: &mut ModelContext<Self>) {
+        // CEF 创建失败的条目先移除:这样 pane 侧的 has_webview 归 false,下次 attach
+        // 会重新创建(与下面的事件分发无关,故放在最前)。
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        {
+            let failed: Vec<u64> = PENDING_WEBVIEW_CREATE_FAILED.lock().drain().collect();
+            if !failed.is_empty() {
+                let mut entries = self.cef_entries.borrow_mut();
+                for id in failed {
+                    entries.remove(&id);
+                    log::warn!("[cef] webview {id}: 创建失败已移除条目,等待重建");
+                }
+            }
+        }
+
         let focus_events: Vec<BrowserWebViewEvent> = PENDING_WEBVIEW_FOCUS_EVENTS
             .lock()
             .drain()
