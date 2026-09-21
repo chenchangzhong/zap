@@ -37,6 +37,19 @@ CEF 用 **windowed(子视图)** 模式:把浏览器视图挂到 `WebViewContaine
 **CEF 的既定行为**。洞内背后本应是探针的 `ProbeBackgroundView`(#12171F),实际却是纯白,
 说明浏览器视图在不透明绘制、不给下层任何透出机会。
 
+**第二轮补测(2026-09-21,更严格)**:上一轮的"清 layer"代码在修 `CGColor` 类型前就 Abort 了,
+所以只验证了"透明设置"。补测把浏览器视图的 `CALayer` 也置为**非不透明**
+(`setWantsLayer:YES` + `layer.setOpaque:NO`,不再依赖 CGColor),页面仍全透明:
+
+| 采样点(图像坐标) | 位置 | 实测 |
+|---|---|---|
+| 1120,920 | 洞内 | **#FFFFFF** |
+| 1400,1000 | 洞内 | **#FFFFFF** |
+| 1800,1000 | 洞外(对照) | #2C3D54(覆盖层色 ⇒ 采样映射正确) |
+
+⇒ **"透明设置 + layer 非不透明 + 页面透明"三管齐下仍是纯白**:白色来自 Chromium 在 windowed
+模式下强制绘制的不透明背景像素,不是 layer 不透明标记造成的。windowed 透明到此**彻底排除**。
+
 复现:`PROBE_TRANSPARENT=1 <hole-probe> --url=file://…/probes/transparent_page.html --routing=plain --hole=100,100,600,400`,
 随后 `screencapture -x` + `probes/sample_pixel`(探针里的"递归清 layer"试验代码会 panic,已确认无必要 —— 白底来自 CEF 自身,不是 layer 不透明标记)。
 
