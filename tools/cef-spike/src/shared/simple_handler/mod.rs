@@ -93,10 +93,9 @@ impl SimpleHandler {
             let _: () = msg_send![view, setWantsLayer: Bool::YES];
             let layer: *mut AnyObject = msg_send![view, layer];
             if !layer.is_null() {
-                let clear: *mut AnyObject = msg_send![objc2::class!(NSColor), clearColor];
-                // CGColor 返回类型是 CGColorRef(^{CGColor=}),声成对象指针会被 objc2 判为签名不符而 panic。
-                let cg: *mut std::ffi::c_void = msg_send![clear, CGColor];
-                let _: () = msg_send![layer, setBackgroundColor: cg];
+                // 只测"layer 不透明标记"这一假设:设背景色需要 CGColor 类型绑定(objc2 会校验
+                // 编码 ^{CGColor=}),而结论若仍是白色,则说明白色来自 Chromium 绘制的像素本身,
+                // 与 layer 背景无关 —— 那一步就没必要做。
                 let _: () = msg_send![layer, setOpaque: Bool::NO];
             }
             let subviews: *mut AnyObject = msg_send![view, subviews];
