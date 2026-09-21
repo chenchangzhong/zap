@@ -65,7 +65,13 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > `TDD Route`: mode=`off`(无用户/项目显式 TDD 要求), decision=`skipped`(FFI/GUI 路径不适合先写失败测试)。
 > 替代做法:**每个任务都给可执行验证命令或可采样证据**;纯逻辑(坐标翻转、DPI 换算、键映射表)仍补单测。
 
-### T1(spike A)—— IOSurface → CALayer 在 zap 分层下能否正确透出
+### T1(spike A)—— IOSurface → CALayer 在 zap 分层下能否正确透出 ✅ **已完成(通过)**
+> 骨架已就绪:`tools/cef-spike/src/bin/osr-probe.rs` + `probes/osr_host.m`;
+> 结果与证据见 [evidence/phase1/OSR-SPIKE-A.md](evidence/phase1/OSR-SPIKE-A.md)。
+> 结论:windowless + alpha=0 背景 + 透明页面 ⇒ 帧带 alpha(实测 82.7% 像素 alpha=0),
+> 洞内透出下层;不透明内容(红块/渐变)同样正确渲染;≈60fps。
+> **T4 必须遵守**:`view_rect`/`ScreenInfo.rect` 用 **DIP**,否则会重复缩放(实测 2400x1600 vs 1200x800)。
+
 - 位置:`tools/cef-spike`(独立 crate,不碰主仓)。
 - 做:新增 OSR 探针(可复用 `hole-probe` 的洞拓扑:底层 `ProbeBackgroundView` #12171F、容器、覆盖层带洞),
   实现 `wrap_render_handler!`(至少 `view_rect`/`screen_info`/`on_accelerated_paint`),把 IOSurface 贴进自建 NSView 的 CALayer;
@@ -75,7 +81,7 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
   - 不透明页面 ⇒ 期望页面渐变/标记色(证明内容确实渲染)。
 - 失败判据:仍为白/黑/无内容 ⇒ **停止**,把证据写入 TRANSPARENCY.md,回到方案 B/C。
 
-### T2(spike B)—— 自建 NSView 的 IME 链路能否打出中文
+### T2(spike B)—— 自建 NSView 的 IME 链路能否打出中文 ← **下一步从这里开始**
 - 做:探针的宿主 NSView 实现 `NSTextInputClient`(`setMarkedText`/`insertText`/`firstRectForCharacterRange`),
   转发到 `ime_set_composition`/`ime_commit_text`;页面放一个 `<textarea>` 并把内容 POST 到现有 `probes/loopback_receiver.py`。
 - **验证**:手动输入拼音(如 "nihao")→ 候选 → 上屏;接收端日志里出现期望中文;

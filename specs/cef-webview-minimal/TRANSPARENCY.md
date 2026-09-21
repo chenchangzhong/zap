@@ -1,5 +1,9 @@
 # dsh pane 透明背景评估（CEF/Chromium 后端）
 
+> **2026-09-21 更新**:方案 D 的**渲染链路已实测通过**(见 [evidence/phase1/OSR-SPIKE-A.md](evidence/phase1/OSR-SPIKE-A.md)):
+> windowless + `background_color` alpha=0 + 页面透明 ⇒ 帧带 alpha(82.7% 像素 alpha=0),洞内透出下层;
+> 剩余工作是输入/IME/弹层(计划见 [OSR-PLAN.md](OSR-PLAN.md))。
+>
 > 结论先行:**默认配置下不存在可见差异**;只有"窗口不透明度 < 100%"或"主题带背景图"时才会看出 CEF 区域是不透光的。
 > 若必须做到像 wry 路径那样的真透明,**只能走 OSR(windowless)渲染**;建议先做一次 2 天 spike 验证 IME 与 IOSurface 合成再决定。
 

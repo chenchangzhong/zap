@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>OSR MIX PROBE</title>
+<style>
+  /* 透明底:未绘制区域应透出宿主窗口的下层(ProbeBackgroundView #12171F)。
+     中央放一块不透明红块证明"内容确实渲染";右下角加动画持续产生 damage,避免只画首帧。 */
+  html, body { margin: 0; height: 100%; background: transparent; }
+  .solid { position: absolute; left: 50%; top: 50%; width: 200px; height: 200px;
+           transform: translate(-50%, -50%); background: #ff2d55; }
+  .tick { position: absolute; right: 8px; bottom: 8px; width: 40px; height: 40px;
+          background: #00e5ff; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div class="solid"></div>
+  <div class="tick"></div>
+</body>
+</html>
