@@ -18,6 +18,8 @@
 //!   PROBE_TRANSPARENT=1(或 touch /tmp/probe_transparent) 透明背景
 //!   PROBE_OSR_EXTERNAL_BEGIN_FRAME=1 启用 external_begin_frame(需宿主按刷新节奏驱动)
 //!   PROBE_OSR_FRAME_RATE=<n> 覆盖 windowless_frame_rate(默认 60)
+//!   PROBE_IME_SELFTEST=1 直接调用 NSTextInputClient(确定性验证 ObjC→Rust→CEF→页面)
+//!   PROBE_IME_KEYTEST=1  合成 "nihao"+空格 按键,走真实输入法
 
 #[path = "../mac/mod.rs"]
 mod mac;
@@ -26,7 +28,7 @@ pub mod shared;
 
 use cef::*;
 use std::cell::RefCell;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CStr};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -36,6 +38,10 @@ use std::sync::OnceLock;
 extern "C" {
     fn IOSurfaceGetWidth(surface: *mut c_void) -> usize;
 }
+
+// Carbon(HIToolbox):osr_host.m 打印当前输入源(TISCopyCurrentKeyboardInputSource)要用它。
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {}
 
 // 链接 build.rs 用 cc 编译出的 ObjC 静态库(hole_probe.m 的洞拓扑 + osr_host.m 的 OSR 宿主视图)。
 #[link(name = "hole_probe_host", kind = "static")]
@@ -55,6 +61,22 @@ extern "C" {
     fn osr_host_view_scale(view: *mut c_void) -> f64;
     fn osr_surface_dump(view: *mut c_void);
     fn osr_start_begin_frame_timer(interval: f64, callback: extern "C" fn());
+
+    // T2:IME 链路(宿主 NSView 实现 NSTextInputClient → 转发到 CefBrowserHost::ime_*)。
+    fn osr_host_view_set_ime_callbacks(callbacks: *const OsrImeCallbacks);
+    fn osr_host_view_set_ime_bounds(
+        view: *mut c_void,
+        sel_from: i32,
+        sel_to: i32,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        has_bounds: i32,
+    );
+    fn osr_host_view_focus(view: *mut c_void);
+    fn osr_schedule_ime_selftest(delay: f64);
+    fn osr_schedule_ime_keytest(delay: f64);
 }
 
 /// 洞位置与目标 URL:`on_context_initialized` 在 CEF 回调里取用,故用全局量传递。
@@ -89,6 +111,148 @@ fn transparent_probe() -> bool {
 
 fn external_begin_frame() -> bool {
     std::env::var_os("PROBE_OSR_EXTERNAL_BEGIN_FRAME").is_some()
+}
+
+/// T2 自检开关(与透明开关同口径:`open` 启动时环境变量不生效,可落文件)。
+fn ime_selftest() -> bool {
+    std::env::var_os("PROBE_IME_SELFTEST").is_some()
+        || std::path::Path::new("/tmp/probe_ime_selftest").exists()
+}
+
+fn ime_keytest() -> bool {
+    std::env::var_os("PROBE_IME_KEYTEST").is_some()
+        || std::path::Path::new("/tmp/probe_ime_keytest").exists()
+}
+
+/// ObjC 宿主视图 → Rust 的 IME 回调表(见 `probes/osr_host.m`)。
+/// 所有回调都在主线程被调用,与 `BROWSER` 所在线程一致。
+#[repr(C)]
+struct OsrImeCallbacks {
+    set_composition: extern "C" fn(*const c_char, i32, i32, i32, i32),
+    commit_text: extern "C" fn(*const c_char, i32, i32),
+    finish_composing: extern "C" fn(i32),
+    cancel_composition: extern "C" fn(),
+}
+
+static IME_CALLBACKS: OsrImeCallbacks = OsrImeCallbacks {
+    set_composition: ime_set_composition_trampoline,
+    commit_text: ime_commit_text_trampoline,
+    finish_composing: ime_finish_composing_trampoline,
+    cancel_composition: ime_cancel_composition_trampoline,
+};
+
+/// 在主线程持有的 browser 宿主上执行(所有 IME 转发都发生在主线程)。
+/// 返回是否真的拿到了宿主 —— 顺便当"调用有没有落到 CEF"的探针。
+fn with_host(action: impl FnOnce(&BrowserHost)) -> bool {
+    BROWSER.with(|slot| {
+        if let Some(browser) = slot.borrow().as_ref() {
+            if let Some(host) = browser.host() {
+                action(&host);
+                return true;
+            }
+        }
+        println!("[osr] ⚠ 拿不到 BrowserHost,本次 IME 调用被丢弃");
+        false
+    })
+}
+
+/// UTF-16 选区 → CEF `Range`;ObjC 侧用 -1 表示"没有要替换的既有文本"(NSNotFound)。
+///
+/// **不能用 NULL**:CEF 的 capi 对可空 `cef_range_t*` 会退化成默认值 `(0,0)`,渲染器随即
+/// 把它当成"把选区设到 0..0"去 `SelectRange`,在 `<textarea>` 这类没有文档级编辑器的页面上
+/// 会打断焦点,导致整条 composition 被静默丢弃(实测:composition 完全不上屏)。
+/// CEF 自带的 mac 客户端同样用 `CefRange::InvalidRange()`(两个 0xFFFFFFFF)表示"无替换"。
+fn replacement_range(from: i32, to: i32) -> Range {
+    if from < 0 {
+        Range {
+            from: u32::MAX,
+            to: u32::MAX,
+        }
+    } else {
+        Range {
+            from: from as u32,
+            to: to.max(from) as u32,
+        }
+    }
+}
+
+/// composition 更新:`NSTextInputClient.setMarkedText` → `ime_set_composition`。
+/// CEF 的 range 与 NSRange 同为 **UTF-16 码元**口径,故文本长度也按 `encode_utf16` 计。
+extern "C" fn ime_set_composition_trampoline(
+    text: *const c_char,
+    sel_from: i32,
+    sel_to: i32,
+    rep_from: i32,
+    rep_to: i32,
+) {
+    if text.is_null() {
+        return;
+    }
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned();
+    if text.is_empty() {
+        // 空串=清空 composition,ObjC 侧已改走 ime_cancel_composition。
+        return;
+    }
+    let utf16_len = text.encode_utf16().count() as u32;
+    println!(
+        "[osr] ime_set_composition text={text:?} sel={sel_from}..{sel_to} rep={rep_from}..{rep_to} \
+         utf16_len={utf16_len}"
+    );
+    let cef_text = CefString::from(text.as_str());
+    // Blink 的 composition 至少需要一条下划线信息(参考实现同款全串实线下划线)。
+    let underline = CompositionUnderline {
+        size: std::mem::size_of::<CompositionUnderline>(),
+        range: Range {
+            from: 0,
+            to: utf16_len,
+        },
+        color: 0xFF00_0000,
+        background_color: 0,
+        thick: 0,
+        style: CompositionUnderlineStyle::SOLID,
+    };
+    let selection = Range {
+        from: sel_from.max(0) as u32,
+        to: sel_to.max(0) as u32,
+    };
+    let replacement = replacement_range(rep_from, rep_to);
+    with_host(|host| {
+        host.ime_set_composition(
+            Some(&cef_text),
+            Some(&[underline]),
+            Some(&replacement),
+            Some(&selection),
+        );
+    });
+}
+
+/// 上屏:`NSTextInputClient.insertText` → `ime_commit_text`。
+extern "C" fn ime_commit_text_trampoline(text: *const c_char, rep_from: i32, rep_to: i32) {
+    if text.is_null() {
+        return;
+    }
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned();
+    if text.is_empty() {
+        return;
+    }
+    println!("[osr] ime_commit_text text={text:?} rep={rep_from}..{rep_to}");
+    let cef_text = CefString::from(text.as_str());
+    let replacement = replacement_range(rep_from, rep_to);
+    // relative_cursor_pos=0 ⇒ 光标落在提交文本末尾(Chromium 的
+    // InputMethodController::ComputeAbsoluteCaretPosition = 起点 + 长度 + relative)。
+    with_host(|host| host.ime_commit_text(Some(&cef_text), Some(&replacement), 0));
+}
+
+/// `NSTextInputClient.unmarkText` → `ime_finish_composing_text`。
+extern "C" fn ime_finish_composing_trampoline(keep_selection: i32) {
+    println!("[osr] ime_finish_composing_text keep_selection={keep_selection}");
+    with_host(|host| host.ime_finish_composing_text(keep_selection));
+}
+
+/// 空 composition → `ime_cancel_composition`。
+extern "C" fn ime_cancel_composition_trampoline() {
+    println!("[osr] ime_cancel_composition");
+    with_host(|host| host.ime_cancel_composition());
 }
 
 fn hole() -> (f64, f64, f64, f64) {
@@ -194,6 +358,42 @@ wrap_client! {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(OsrLifeSpanHandler::new())
         }
+
+        fn load_handler(&self) -> Option<LoadHandler> {
+            Some(OsrLoadHandler::new())
+        }
+    }
+}
+
+wrap_load_handler! {
+    struct OsrLoadHandler;
+
+    impl LoadHandler {
+        /// T2:焦点必须在**导航完成后**再给一次。on_after_created 时页面还在 about:blank,
+        /// 导航会换掉 render widget,此前 RWHV 上的 is_active_/focus 状态不会带过去,
+        /// 结果是 ime_set_composition 因 ShouldRouteEvents() 为假被静默丢弃(实测得到)。
+        fn on_load_end(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            http_status_code: i32,
+        ) {
+            println!("[osr] on_load_end status={http_status_code}");
+            let Some(browser) = browser else {
+                return;
+            };
+            if let Some(host) = browser.host() {
+                // 焦点同步(实测通过的那一组):沿用 CEF 自带 cefclient 的 Show() 顺序
+                // (先 WasHidden(false) 再 SetFocus(true)),并显式关/开一次 focus,
+                // 强制走一遍完整的状态变更消息 —— CEF 在导航后会**静默丢掉**焦点
+                // (chromiumembedded/cef#3870),不补这一次,IME 与光标都会失效。
+                host.was_hidden(0);
+                host.set_focus(0);
+                host.set_focus(1);
+            }
+            let view = HOST_VIEW.load(Ordering::SeqCst);
+            unsafe { osr_host_view_focus(view) };
+        }
     }
 }
 
@@ -208,9 +408,25 @@ wrap_life_span_handler! {
             BROWSER.with(|slot| *slot.borrow_mut() = Some(browser.clone()));
             println!("[osr] on_after_created");
 
+            // T2 前置:windowless 下浏览器没有自己的原生视图去抢焦点,必须由我们让自建
+            // 宿主视图成为 first responder,并显式告诉 CEF 浏览器已获焦(否则输入法不起来、
+            // 页面里的 <textarea> 也不会被聚焦)。
+            if let Some(host) = browser.host() {
+                host.set_focus(1);
+            }
+            let view = HOST_VIEW.load(Ordering::SeqCst);
+            unsafe { osr_host_view_focus(view) };
+
             if external_begin_frame() {
                 let rate = CONFIG.get().map(|config| config.frame_rate).unwrap_or(60).max(1);
                 unsafe { osr_start_begin_frame_timer(1.0 / f64::from(rate), begin_frame_trampoline) };
+            }
+            // T2 自检(页面加载后再跑):A=直接调用 NSTextInputClient,B=合成按键走真实输入法。
+            if ime_selftest() {
+                unsafe { osr_schedule_ime_selftest(2.0) };
+            }
+            if ime_keytest() {
+                unsafe { osr_schedule_ime_keytest(2.0) };
             }
         }
 
@@ -361,6 +577,40 @@ wrap_render_handler! {
                 );
             }
         }
+
+        /// T2:CEF 回报 composition 的选区与逐字位置(DIP、**左上原点**),
+        /// 宿主侧缓存后用于 `firstRectForCharacterRange:` 给候选框定位。
+        fn on_ime_composition_range_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            selected_range: Option<&Range>,
+            character_bounds: Option<&[Rect]>,
+        ) {
+            let selected = selected_range.map(|range| (range.from, range.to));
+            let first = character_bounds.and_then(|bounds| bounds.first()).cloned();
+            println!(
+                "[osr] on_ime_composition_range_changed sel={selected:?} bounds={} {:?}",
+                character_bounds.map(<[Rect]>::len).unwrap_or(0),
+                first
+            );
+            let (sel_from, sel_to) = selected
+                .map(|(from, to)| (from as i32, to as i32))
+                .unwrap_or((-1, -1));
+            let (x, y, w, h, has_bounds) = match &first {
+                Some(rect) => (
+                    f64::from(rect.x),
+                    f64::from(rect.y),
+                    f64::from(rect.width),
+                    f64::from(rect.height),
+                    1,
+                ),
+                None => (0.0, 0.0, 0.0, 0.0, 0),
+            };
+            let view = HOST_VIEW.load(Ordering::SeqCst);
+            unsafe {
+                osr_host_view_set_ime_bounds(view, sel_from, sel_to, x, y, w, h, has_bounds)
+            };
+        }
     }
 }
 
@@ -402,14 +652,18 @@ fn main() {
     }
 
     println!(
-        "[osr] 透明开关={} 外部 begin-frame={}",
+        "[osr] 透明开关={} 外部 begin-frame={} IME 自检A={} 自检B={}",
         transparent_probe(),
-        external_begin_frame()
+        external_begin_frame(),
+        ime_selftest(),
+        ime_keytest()
     );
 
     // 顺序约束:load_cef 会断言 NSApp 之前未被触碰(cef-rs mac 模块),故必须最先执行。
     let _library = shared::load_cef();
     unsafe {
+        // T2:宿主视图的 IME 回调必须在浏览器创建前挂好(setMarkedText 等随时可能被调)。
+        osr_host_view_set_ime_callbacks(&IME_CALLBACKS);
         probe_create_window(hx, hy, hw, hh);
         let mode = match routing.as_str() {
             "plain" => 0,
@@ -435,10 +689,18 @@ fn main() {
     }
 
     let mut app = OsrApp::new();
+    // 探针的 CEF 缓存根默认落在 ~/Library/Application Support/CEF/User Data,需要家目录写权限
+    // (受限环境下会被拒),且会与其他 CEF 实例抢进程 singleton。改放系统临时目录,让探针自包含。
+    let cache_dir = arg_value("--cache-dir")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("cef-spike-osr-cache"));
+    std::fs::create_dir_all(&cache_dir).ok();
+    println!("[osr] root_cache_path={}", cache_dir.display());
     // windowless_rendering_enabled 是**进程级**开关,必须在 initialize 之前设置。
     let settings = Settings {
         no_sandbox: 1,
         windowless_rendering_enabled: 1,
+        root_cache_path: CefString::from(cache_dir.to_string_lossy().as_ref()),
         ..Default::default()
     };
     assert_eq!(

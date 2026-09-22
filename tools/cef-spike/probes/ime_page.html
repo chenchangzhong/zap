@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CEF OSR IME PROBE (T2)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #12171f; color: #eaf7ef;
+               font: 16px/1.6 -apple-system, system-ui, sans-serif; }
+  .wrap { padding: 20px; }
+  h1 { margin: 0 0 6px; font-size: 20px; }
+  .tag { font-size: 13px; opacity: .8; margin-bottom: 14px; }
+  textarea { width: 90%; height: 130px; font-size: 22px; padding: 10px;
+             background: #1b2430; color: #eaf7ef; border: 1px solid #33465c;
+             border-radius: 6px; resize: none; }
+  .state { margin-top: 10px; font-size: 14px; opacity: .9; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>OSR IME PROBE</h1>
+  <div class="tag">点一下下面的输入框,用拼音输入法打「nihao」→ 选候选 → 上屏;内容会 POST 到回环接收端</div>
+  <textarea id="ta"></textarea>
+  <div class="state" id="state">等待输入…</div>
+</div>
+<script>
+// T2 证据通道:页面里真实的 textarea 内容(含 IME composition)POST 到
+// probes/loopback_receiver.py(127.0.0.1:9911),接收端日志即"中文是否真的上屏"的硬证据。
+const LOG = 'http://127.0.0.1:9911/webview-ipc';
+const ta = document.getElementById('ta');
+
+const send = (msg) => {
+  try {
+    fetch(LOG, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: msg });
+  } catch (e) {}
+};
+
+const report = (event, extra) => {
+  const line = `ime.${event} value="${ta.value}"${extra ? ' ' + extra : ''}`;
+  document.getElementById('state').textContent =
+    `${event}\nvalue: ${ta.value}`;
+  send(line);
+};
+
+ta.addEventListener('compositionstart', () => report('compositionstart'));
+ta.addEventListener('compositionupdate', (e) => report('compositionupdate', `data="${e.data}"`));
+ta.addEventListener('compositionend', (e) => report('compositionend', `data="${e.data}"`));
+ta.addEventListener('input', (e) => report('input', `isComposing=${e.isComposing}`));
+// 上屏只在 textarea 真的聚焦时才有意义;OSR 下焦点由宿主视图(set_focus/firstResponder)驱动。
+const focusIt = () => { ta.focus(); };
+const focusState = () =>
+  `hasFocus=${document.hasFocus()} active=${document.activeElement.tagName}` +
+  `${document.activeElement.id ? '#' + document.activeElement.id : ''}`;
+window.addEventListener('load', () => {
+  focusIt();
+  send(`ime.loaded ${focusState()}`);
+  setTimeout(() => send(`ime.after1s ${focusState()}`), 1000);
+});
+window.addEventListener('focus', () => { focusIt(); send(`ime.windowFocus ${focusState()}`); });
+window.addEventListener('blur', () => send(`ime.windowBlur ${focusState()}`));
+document.addEventListener('mousedown', focusIt);
+</script>
+</body>
+</html>
