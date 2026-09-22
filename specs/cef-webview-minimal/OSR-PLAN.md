@@ -145,9 +145,26 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 - 做:`on_popup_show`/`on_popup_size` → 独立 popup layer;右键菜单改**异步 NSMenu**(沿用现有三项:重新加载/检查元素,清空默认项)。
 - **验证**:页面内 `<select>` 能展开;右键菜单三项可用且不崩。
 
-### T7 —— IME 落地主仓
-- 做:把 T2 的宿主视图实现移入 `app/src/platform/mac/objc/`(新增 `.m` 或扩展 `cef_support.m`),Rust 侧转发。
-- **验证**:在 dsh pane 里实际输入中文(拼音→候选→上屏),候选框跟随光标。
+### T7 —— IME 落地主仓 ✅ **已完成(通过)**
+> 结果与证据见 [evidence/phase1/OSR-T7-IME.md](evidence/phase1/OSR-T7-IME.md)。
+> 做:`WarpCefOsrView` 实现 `NSTextInputClient`(端口自 T2 spike);
+> `keyDown:` 改 **deferred 模型**(`interpretKeyEvents:` 只累积状态,末尾一次决定 →
+> KEYDOWN+CHAR / `ime_set_composition` / `ime_commit_text`);render handler 接
+> `on_ime_composition_range_changed` → 候选框锚点;决策逻辑在 Rust(纯函数 + 单测)。
+> **两个必须记住的坑**:
+> 1. **不能用 T2 spike 的"直接转发 `insertText:`"**:那会让普通字母也走
+>    `ime_commit_text`,页面收不到 JS `keydown`(T5 的两段式白做)。必须 deferred。
+> 2. **`NSEventModifierFlags` 低 16 位是设备相关位**(实测每次按键都带 `0x100`
+>    `kCGEventFlagMaskNonCoalesced`、`0x8` 左 Command),**比较修饰键组合前必须先按
+>    `NSEventModifierFlagDeviceIndependentFlagsMask` 过滤**;否则"CapsLock 开着时的
+>    Cmd+A/C/V/X/Z"这类兜底判断永远不成立(T5 的兜底就因此失效,直到 T7 才发现)。
+>    另:视图级 `performKeyEquivalent:`(排在菜单之前,只认这 5 个组合)才能盖住
+>    "zap 窗口 `mods == Command` 精确比较 + CapsLock"的组合盲区。
+> 验证:两种 cfg 0 warning;`nextest -E 'test(cef_backend)'` 15/15;真机拼音→候选→
+> 中文上屏 + 候选框跟随 + 英文/Cmd 快捷键无回归(Cmd+T/Cmd+1..9 仍归 zap)。
+
+- 文件:`app/src/platform/mac/objc/cef_support.m`、`app/src/browser/cef_backend.rs`、
+  `app/src/browser/cef_backend_tests.rs`。
 
 ### T8 —— 开关、回滚与既有策略的等价性
 - 做:渲染模式开关(环境变量如 `ZAP_CEF_OSR=1` + 设置项),默认 windowed;

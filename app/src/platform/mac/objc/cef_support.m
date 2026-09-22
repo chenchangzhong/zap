@@ -166,10 +166,56 @@ typedef struct {
     const char *chars_ignoring_modifiers;
 } WarpCefOsrInputEvent;
 
+/// 输入法动作(与 Rust 侧 `WarpCefOsrImeAction` 一一对应)。
+enum {
+    WARP_CEF_OSR_IME_SET_COMPOSITION = 0,
+    WARP_CEF_OSR_IME_COMMIT = 1,
+    WARP_CEF_OSR_IME_FINISH = 2,
+    WARP_CEF_OSR_IME_CANCEL = 3,
+};
+
+/// 一次按键的完整上下文(deferred 模型):基础键字段 + `interpretKeyEvents:` 期间累积的
+/// 输入法状态。**决策**(发 KEYDOWN+CHAR 还是 commit/composition)放在 Rust 侧 ——
+/// 那里有 CEF 绑定,且纯逻辑可以单测(参考实现 CefSwift / cefclient 的
+/// HandleKeyEventBefore/AfterTextInputClient 同款拆分)。
+typedef struct {
+    uint32_t modifier_flags;
+    uint16_t key_code;
+    int32_t is_repeat;
+    /// event.characters / charactersIgnoringModifiers(UTF-8,可空)。
+    const char *chars;
+    const char *chars_ignoring_modifiers;
+    /// `interpretKeyEvents:` 期间 `insertText:` 累积的文本(可空 = 没插入)。
+    const char *text_to_insert;
+    /// 当前 composition 文本(可空 = 无)。
+    const char *marked_text;
+    int32_t marked_sel_from;
+    int32_t marked_sel_to;
+    /// -1 = 没有要替换的既有文本(NSNotFound)。
+    int32_t replacement_from;
+    int32_t replacement_to;
+    int32_t old_has_marked;
+    int32_t has_marked;
+    int32_t unmark_called;
+} WarpCefOsrKeyInput;
+
+/// 输入法在按键之外直接发起的调用(候选点击上屏、unmarkText 等)。
+typedef struct {
+    int32_t action;
+    const char *text;
+    int32_t sel_from;
+    int32_t sel_to;
+    int32_t replacement_from;
+    int32_t replacement_to;
+    int32_t keep_selection;
+} WarpCefOsrImeCommand;
+
 typedef struct {
     void (*handle_event)(uint64_t webview_id, const WarpCefOsrInputEvent *event);
     void (*handle_edit_command)(uint64_t webview_id, int32_t command);
     void (*handle_focus)(uint64_t webview_id, int32_t focused);
+    void (*handle_key)(uint64_t webview_id, const WarpCefOsrKeyInput *key);
+    void (*handle_ime)(uint64_t webview_id, const WarpCefOsrImeCommand *command);
 } WarpCefOsrInputCallbacks;
 
 static WarpCefOsrInputCallbacks gInputCallbacks;
@@ -249,7 +295,7 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
 ///
 /// 坐标系:本视图**不是 flipped**(与 WebViewContainerView 一致),frame 由 Rust 侧
 /// 用与 wry/CEF 子视图相同的翻转公式算好;事件坐标在这里翻成 CEF 的左上原点。
-@interface WarpCefOsrView : NSView {
+@interface WarpCefOsrView : NSView <NSTextInputClient> {
   @public
     /// 创建时由 Rust 侧写入:回调据此定位是哪个 webview。
     uint64_t _webviewId;
@@ -259,6 +305,22 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     /// 滚轮亚像素余量:CEF 只收整数增量,不留余量会把慢速触控板滚动吃掉。
     double _scrollResidualX;
     double _scrollResidualY;
+    /// 候选框锚点:CEF 经 on_ime_composition_range_changed 回报的 composition 几何
+    /// (DIP、**左上原点**;本视图非 flipped,firstRect 里再翻成屏幕坐标)。
+    NSRect _imeBoundsDIP;
+    BOOL _hasImeBounds;
+    /// composition 期间 CEF 回报的选区(UTF-16),答 hasMarkedText/selectedRange 用。
+    NSRange _cefSelectedRange;
+    BOOL _hasCefSelection;
+    /// deferred 模型:`interpretKeyEvents:` 期间累积的状态(见 WarpCefOsrKeyInput)。
+    BOOL _handlingKeyDown;
+    NSMutableString *_textToInsert;
+    NSString *_markedText;
+    BOOL _hasMarkedText;
+    BOOL _oldHasMarkedText;
+    NSRange _markedSelectionRange;
+    NSRange _markedReplacementRange;
+    BOOL _unmarkTextCalled;
 }
 @end
 
@@ -274,6 +336,9 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
         // surface 的像素尺寸 = 点数 × contentsScale,resize 后正好铺满。
         self.layer.contentsGravity = kCAGravityResize;
         _cursorSemantic = WARP_CEF_OSR_CURSOR_ARROW;
+        _textToInsert = [[NSMutableString alloc] init];
+        _markedReplacementRange = NSMakeRange(NSNotFound, 0);
+        _markedSelectionRange = NSMakeRange(NSNotFound, 0);
     }
     return self;
 }
@@ -284,6 +349,8 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
         [_trackingArea release];
         _trackingArea = nil;
     }
+    [_textToInsert release];
+    [_markedText release];
     [super dealloc];
 }
 
@@ -467,9 +534,47 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     [self warpSendEvent:&out];
 }
 
+/// 键盘按下(deferred 模型,参考 cefclient 的 `CefTextInputClientOSRMac`):
+/// 先让输入法经 `interpretKeyEvents:` 回调本类的 `setMarkedText:`/`insertText:`/
+/// `unmarkText` —— 那些回调**只累积状态**;本方法末尾把完整上下文交给 Rust 决策:
+/// 普通按键 → KEYDOWN+CHAR(保住 T5 的 JS keydown/光标)、组合中 → ime_set_composition、
+/// 上屏 → ime_commit_text。**只有这样做才能同时满足"英文键位保真"与"中文能上屏"**:
+/// 直接转发 `insertText:` 会让普通字母也走 ime_commit_text(页面收不到 keydown)。
 - (void)keyDown:(NSEvent *)event {
-    // 不调用 super:否则未处理的键会走 noResponderFor: 触发系统提示音。
-    [self warpSendKey:event type:0];
+    _oldHasMarkedText = _hasMarkedText;
+    _handlingKeyDown = YES;
+    [_textToInsert setString:@""];
+    _markedReplacementRange = NSMakeRange(NSNotFound, 0);
+    _unmarkTextCalled = NO;
+    [self interpretKeyEvents:@[ event ]];
+    _handlingKeyDown = NO;
+
+    WarpCefOsrKeyInput key = {0};
+    key.modifier_flags = (uint32_t)event.modifierFlags;
+    key.key_code = (uint16_t)event.keyCode;
+    key.is_repeat = event.isARepeat ? 1 : 0;
+    NSString *chars = event.characters;
+    NSString *unmodified = event.charactersIgnoringModifiers;
+    key.chars = chars.length > 0 ? chars.UTF8String : NULL;
+    key.chars_ignoring_modifiers = unmodified.length > 0 ? unmodified.UTF8String : NULL;
+    key.text_to_insert = _textToInsert.length > 0 ? _textToInsert.UTF8String : NULL;
+    key.marked_text = _markedText.length > 0 ? _markedText.UTF8String : NULL;
+    key.marked_sel_from = (int32_t)_markedSelectionRange.location;
+    key.marked_sel_to = (int32_t)(_markedSelectionRange.location + _markedSelectionRange.length);
+    key.replacement_from = (_markedReplacementRange.location == NSNotFound)
+                               ? -1
+                               : (int32_t)_markedReplacementRange.location;
+    key.replacement_to = (_markedReplacementRange.location == NSNotFound)
+                             ? -1
+                             : (int32_t)(_markedReplacementRange.location +
+                                         _markedReplacementRange.length);
+    key.old_has_marked = _oldHasMarkedText ? 1 : 0;
+    key.has_marked = _hasMarkedText ? 1 : 0;
+    key.unmark_called = _unmarkTextCalled ? 1 : 0;
+    if (gInputCallbacks.handle_key != NULL) {
+        gInputCallbacks.handle_key(_webviewId, &key);
+    }
+    _markedReplacementRange = NSMakeRange(NSNotFound, 0);
 }
 
 - (void)keyUp:(NSEvent *)event {
@@ -478,6 +583,204 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
 
 - (void)flagsChanged:(NSEvent *)event {
     [self warpSendKey:event type:2];
+}
+
+#pragma mark 输入法(NSTextInputClient)
+
+/// 转发一条输入法动作给 Rust(按键外的直接调用:候选点击上屏、unmark 等)。
+- (void)warpSendIme:(int32_t)action
+               text:(NSString *)text
+         selection:(NSRange)selection
+     replacement:(NSRange)replacement {
+    if (gInputCallbacks.handle_ime == NULL) {
+        return;
+    }
+    WarpCefOsrImeCommand command = {0};
+    command.action = action;
+    command.text = text.length > 0 ? text.UTF8String : NULL;
+    command.sel_from = (selection.location == NSNotFound) ? -1 : (int32_t)selection.location;
+    command.sel_to = (selection.location == NSNotFound)
+                         ? -1
+                         : (int32_t)(selection.location + selection.length);
+    command.replacement_from =
+        (replacement.location == NSNotFound) ? -1 : (int32_t)replacement.location;
+    command.replacement_to = (replacement.location == NSNotFound)
+                                 ? -1
+                                 : (int32_t)(replacement.location + replacement.length);
+    command.keep_selection = 1;
+    gInputCallbacks.handle_ime(_webviewId, &command);
+}
+
+/// composition 更新(拼音串)。按键期间只累积;按键之外(输入法自发组合)直接转发。
+- (void)setMarkedText:(id)string
+        selectedRange:(NSRange)selectedRange
+     replacementRange:(NSRange)replacementRange {
+    NSString *text = [string isKindOfClass:[NSAttributedString class]]
+                         ? [(NSAttributedString *)string string]
+                         : (NSString *)string;
+    if (![text isKindOfClass:[NSString class]]) {
+        text = @"";
+    }
+    [_markedText release];
+    _markedText = [text copy];
+    _hasMarkedText = text.length > 0;
+    _markedSelectionRange = selectedRange;
+    if (_handlingKeyDown) {
+        // 与 KEYDOWN/CHAR 的时序一起交给 Rust 决定(见 keyDown)。
+        _markedReplacementRange = replacementRange;
+        return;
+    }
+    if (text.length == 0) {
+        // 空串 = 输入法取消 composition。
+        [self warpSendIme:WARP_CEF_OSR_IME_CANCEL
+                     text:nil
+                selection:NSMakeRange(NSNotFound, 0)
+              replacement:NSMakeRange(NSNotFound, 0)];
+        return;
+    }
+    [self warpSendIme:WARP_CEF_OSR_IME_SET_COMPOSITION
+                 text:text
+            selection:selectedRange
+          replacement:replacementRange];
+}
+
+/// 上屏(候选提交/直接键入)。按键期间只累积(普通字母不能走 commit)。
+- (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
+    NSString *text = [string isKindOfClass:[NSAttributedString class]]
+                         ? [(NSAttributedString *)string string]
+                         : (NSString *)string;
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+        return;
+    }
+    if (_handlingKeyDown) {
+        [_textToInsert appendString:text];
+    } else {
+        [self warpSendIme:WARP_CEF_OSR_IME_COMMIT
+                     text:text
+                selection:NSMakeRange(NSNotFound, 0)
+              replacement:replacementRange];
+    }
+    // 插入文本必然清掉 composition(参考实现同结论)。
+    _hasMarkedText = NO;
+    [_markedText release];
+    _markedText = nil;
+}
+
+- (void)unmarkText {
+    _hasMarkedText = NO;
+    [_markedText release];
+    _markedText = nil;
+    if (_handlingKeyDown) {
+        _unmarkTextCalled = YES;
+        return;
+    }
+    [self warpSendIme:WARP_CEF_OSR_IME_FINISH
+                 text:nil
+            selection:NSMakeRange(NSNotFound, 0)
+          replacement:NSMakeRange(NSNotFound, 0)];
+}
+
+- (BOOL)hasMarkedText {
+    return _hasMarkedText && _markedText.length > 0;
+}
+
+- (NSRange)markedRange {
+    return [self hasMarkedText] ? NSMakeRange(0, _markedText.length) : NSMakeRange(NSNotFound, 0);
+}
+
+/// CEF 只在 composition 变化时回报选区(on_ime_composition_range_changed);
+/// 非 composition 的文档选区需要 on_text_selection_changed,暂未接。
+- (NSRange)selectedRange {
+    return _hasCefSelection ? _cefSelectedRange : NSMakeRange(NSNotFound, 0);
+}
+
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range
+                                               actualRange:(NSRangePointer)actualRange {
+    (void)range;
+    (void)actualRange;
+    return nil;
+}
+
+/// 中日韩输入法靠这些属性给 composition 分词/画下划线;返回空数组时部分输入法会判定
+/// "客户端不支持 composition",把按键原样透传(**实测微信输入法如此**)。属性集与 CEF 自带
+/// 的 mac OSR 客户端一致(它带的 NSTextInputReplacementRangeAttributeName 在 SDK 头文件里
+/// 没声明,故不带;分词依赖的是 NSMarkedClauseSegmentAttributeName)。
+- (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText {
+    return @[
+        NSUnderlineStyleAttributeName, NSUnderlineColorAttributeName,
+        NSMarkedClauseSegmentAttributeName
+    ];
+}
+
+/// 候选框/符号面板的锚点(屏幕坐标)。数据来自 CEF 的
+/// `on_ime_composition_range_changed`(composition 期间逐字的位置,DIP/左上原点)。
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
+    if (actualRange != NULL) {
+        *actualRange = range;
+    }
+    // 没有 composition 几何时锚在视图左上角,而不是屏幕原点。
+    NSRect caret = _hasImeBounds ? _imeBoundsDIP : NSMakeRect(4, 4, 1, 16);
+    // DIP(左上原点、y 向下)→ 视图坐标(左下原点、y 向上):本视图非 flipped。
+    NSRect viewRect = NSMakeRect(caret.origin.x,
+                                 self.bounds.size.height - (caret.origin.y + caret.size.height),
+                                 MAX(caret.size.width, 1.0), MAX(caret.size.height, 1.0));
+    NSRect inWindow = [self convertRect:viewRect toView:nil];
+    return self.window ? [self.window convertRectToScreen:inWindow] : inWindow;
+}
+
+- (NSUInteger)characterIndexForPoint:(NSPoint)point {
+    (void)point;
+    return NSNotFound;
+}
+
+/// 快捷键拦截(**排在 AppKit 菜单之前**):只认 Cmd+A/C/V/X/Z,其余一律交回
+/// `[super performKeyEquivalent:]`,zap 自己的 Cmd+T/Cmd+1..9 等不受影响。
+///
+/// 为什么需要它:zap 的 `WarpWindow::performKeyEquivalent:` 对嵌入视图用的是
+/// `mods == NSEventModifierFlagCommand` **精确比较**,开着 CapsLock 时会整块跳过
+/// (实测 ns_flags 带 0x10000),这组编辑快捷键就落到菜单上(Warp 自己的 Copy/Paste
+/// CustomAction)或被当普通键发给页面 —— 页面里的复制/全选/剪切随之失效。
+/// 这里用 **设备无关掩码** 判定修饰键(低位是设备相关位,实测每次按键都带 0x100/0x8)。
+- (BOOL)performKeyEquivalent:(NSEvent *)event {
+    if (event.type != NSEventTypeKeyDown || self.window.firstResponder != self) {
+        return [super performKeyEquivalent:event];
+    }
+    NSUInteger mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    if ((mods & NSEventModifierFlagCommand) == 0) {
+        return [super performKeyEquivalent:event];
+    }
+    NSUInteger others = mods & ~(NSEventModifierFlagCommand | NSEventModifierFlagShift |
+                                 NSEventModifierFlagCapsLock);
+    if (others != 0) {
+        return [super performKeyEquivalent:event];
+    }
+    NSString *key = event.charactersIgnoringModifiers.lowercaseString;
+    int32_t command = -1;
+    BOOL shift = (mods & NSEventModifierFlagShift) != 0;
+    if ([key isEqualToString:@"a"]) {
+        command = WARP_CEF_OSR_EDIT_SELECT_ALL;
+    } else if ([key isEqualToString:@"c"]) {
+        command = WARP_CEF_OSR_EDIT_COPY;
+    } else if ([key isEqualToString:@"x"]) {
+        command = WARP_CEF_OSR_EDIT_CUT;
+    } else if ([key isEqualToString:@"v"]) {
+        command = WARP_CEF_OSR_EDIT_PASTE;
+    } else if ([key isEqualToString:@"z"]) {
+        command = shift ? WARP_CEF_OSR_EDIT_REDO : WARP_CEF_OSR_EDIT_UNDO;
+    }
+    if (command < 0) {
+        return [super performKeyEquivalent:event];
+    }
+    // 转发到 focused frame 的编辑命令(Rust 侧有 `edit command N` 调试日志可循)。
+    [self warpSendEditCommand:command];
+    return YES;
+}
+
+/// 输入法未消费的"命令键"(方向键/退格/回车…):**只吞掉**。这些键已经由 keyDown 的
+/// after 阶段按普通按键转发给页面了;若调 super,NSResponder 会走 noResponderFor:
+/// 触发系统提示音(实测很吵)。
+- (void)doCommandBySelector:(SEL)selector {
+    (void)selector;
 }
 
 #pragma mark 跟踪区域与光标
@@ -546,6 +849,23 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
 }
 
 @end
+
+/// CEF 回报 composition 的几何与选区(render handler 的
+/// on_ime_composition_range_changed 调用):候选框靠它跟随光标。
+/// 坐标是 DIP、左上原点,`firstRectForCharacterRange:` 里再换算。
+void warp_cef_osr_view_set_ime_bounds(void *view, int32_t sel_from, int32_t sel_to, double x,
+                                      double y, double w, double h, int has_bounds) {
+    WarpCefOsrView *v = (WarpCefOsrView *)view;
+    if (v == nil) {
+        return;
+    }
+    v->_hasCefSelection = sel_from >= 0 && sel_to >= sel_from;
+    v->_cefSelectedRange =
+        v->_hasCefSelection ? NSMakeRange((NSUInteger)sel_from, (NSUInteger)(sel_to - sel_from))
+                            : NSMakeRange(NSNotFound, 0);
+    v->_hasImeBounds = has_bounds != 0;
+    v->_imeBoundsDIP = has_bounds ? NSMakeRect(x, y, w, h) : NSZeroRect;
+}
 
 /// 页面请求的光标(render handler 的 on_cursor_change 调用)。
 void warp_cef_osr_view_set_cursor(void *view, int32_t semantic) {

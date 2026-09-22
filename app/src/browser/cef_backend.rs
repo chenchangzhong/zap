@@ -143,6 +143,17 @@ const NS_MOD_OPTION: u32 = 1 << 19;
 const NS_MOD_COMMAND: u32 = 1 << 20;
 const NS_MOD_NUMERIC_PAD: u32 = 1 << 21;
 
+/// `NSEventModifierFlags` 的低 16 位是**设备相关**位(实测每次按键都带 0x100
+/// `kCGEventFlagMaskNonCoalesced`、0x8 左 Command 等)。**比较修饰键组合前必须先过滤** ——
+/// 否则"除了 Cmd/Shift/CapsLock 没有别的修饰键"这类判断永远为假(CapsLock 场景实测:
+/// Cmd+C/X/V 被当普通按键发给了页面,编辑命令一条都没触发)。
+const NS_MOD_DEVICE_INDEPENDENT_MASK: u32 = 0xFFFF_0000;
+
+/// 只保留设备无关的修饰键位。
+fn device_independent_modifiers(flags: u32) -> u32 {
+    flags & NS_MOD_DEVICE_INDEPENDENT_MASK
+}
+
 /// 与 ObjC `WarpCefOsrInputEvent` **逐字段对应**(顺序/类型不可改)。
 #[repr(C)]
 struct WarpCefOsrInputEvent {
@@ -163,17 +174,59 @@ struct WarpCefOsrInputEvent {
     chars_ignoring_modifiers: *const c_char,
 }
 
+/// 输入法动作(与 ObjC 侧 `WARP_CEF_OSR_IME_*` 一一对应)。
+const OSR_IME_SET_COMPOSITION: i32 = 0;
+const OSR_IME_COMMIT: i32 = 1;
+const OSR_IME_FINISH: i32 = 2;
+const OSR_IME_CANCEL: i32 = 3;
+
+/// 一次按键的完整上下文(与 ObjC `WarpCefOsrKeyInput` 逐字段对应)。
+/// 决策(普通按键 vs 组合 vs 上屏)在 [`deferred_key_plan`] 里做,便于单测。
+#[repr(C)]
+struct WarpCefOsrKeyInput {
+    modifier_flags: u32,
+    key_code: u16,
+    is_repeat: i32,
+    chars: *const c_char,
+    chars_ignoring_modifiers: *const c_char,
+    text_to_insert: *const c_char,
+    marked_text: *const c_char,
+    marked_sel_from: i32,
+    marked_sel_to: i32,
+    replacement_from: i32,
+    replacement_to: i32,
+    old_has_marked: i32,
+    has_marked: i32,
+    unmark_called: i32,
+}
+
+/// 输入法在按键之外直接发起的调用(与 ObjC `WarpCefOsrImeCommand` 逐字段对应)。
+#[repr(C)]
+struct WarpCefOsrImeCommand {
+    action: i32,
+    text: *const c_char,
+    sel_from: i32,
+    sel_to: i32,
+    replacement_from: i32,
+    replacement_to: i32,
+    keep_selection: i32,
+}
+
 #[repr(C)]
 struct WarpCefOsrInputCallbacks {
     handle_event: extern "C" fn(u64, *const WarpCefOsrInputEvent),
     handle_edit_command: extern "C" fn(u64, i32),
     handle_focus: extern "C" fn(u64, i32),
+    handle_key: extern "C" fn(u64, *const WarpCefOsrKeyInput),
+    handle_ime: extern "C" fn(u64, *const WarpCefOsrImeCommand),
 }
 
 static OSR_INPUT_CALLBACKS: WarpCefOsrInputCallbacks = WarpCefOsrInputCallbacks {
     handle_event: osr_input_event_trampoline,
     handle_edit_command: osr_edit_command_trampoline,
     handle_focus: osr_focus_trampoline,
+    handle_key: osr_key_trampoline,
+    handle_ime: osr_ime_trampoline,
 };
 
 /// 注册输入回调(幂等;必须在创建 OSR 宿主视图之前)。
@@ -363,10 +416,13 @@ fn cursor_semantic(cursor_type: CursorType) -> i32 {
 /// 不会被路由到响应者动作(实测:ns_flags 里带 0x10000),于是被当普通按键转发给页面、
 /// 复制/全选/剪切全部失效。这里在宿主侧兜住这组编辑快捷键(与 OSR-PLAN.md T5 一致)。
 fn edit_command_for_key(chars_ignoring_modifiers: Option<&str>, modifier_flags: u32) -> Option<i32> {
-    if modifier_flags & NS_MOD_COMMAND == 0 {
+    // 先滤掉设备相关位(见 NS_MOD_DEVICE_INDEPENDENT_MASK),否则下面永远判成
+    // "还带着别的修饰键",拦截形同虚设。
+    let flags = device_independent_modifiers(modifier_flags);
+    if flags & NS_MOD_COMMAND == 0 {
         return None;
     }
-    let others = modifier_flags & !(NS_MOD_COMMAND | NS_MOD_SHIFT | NS_MOD_CAPS_LOCK);
+    let others = flags & !(NS_MOD_COMMAND | NS_MOD_SHIFT | NS_MOD_CAPS_LOCK);
     if others != 0 {
         return None;
     }
@@ -468,18 +524,12 @@ extern "C" fn osr_input_event_trampoline(id: u64, event: *const WarpCefOsrInputE
             );
             send_osr_mouse(&host, event);
         }
+        // 注意:**按键按下(key_type=0)不走这条路径** —— T7 起宿主视图的 keyDown
+        // 走 deferred 模型(handle_key → osr_key_trampoline),因为要先把事件交给输入法。
+        // 这里只剩抬起(key_type=1)与修饰键变化(key_type=2)。
         OSR_EVENT_KEY => {
-            // 按下(Cmd+A/C/V/X/Z)直接走 focused frame 的编辑命令:这条路径不依赖
-            // zap 窗口的快捷键判定(见 edit_command_for_key 的注释),也不会把按键
-            // 当普通字符发给页面。
             if event.key_type == 0 {
-                let chars = cstr_to_string(event.chars_ignoring_modifiers);
-                if let Some(command) = edit_command_for_key(chars.as_deref(), event.modifier_flags)
-                {
-                    log::debug!("[cef] osr {id}: key {chars:?} → edit command {command}");
-                    osr_edit_command_trampoline(id, command);
-                    return;
-                }
+                return; // 防御:不应发生(见上)
             }
             log::debug!(
                 "[cef] osr {id}: send_key_event key_type={} code={} ns_flags=0x{:X} cef_flags=0x{:X} \
@@ -560,12 +610,9 @@ fn send_osr_key(host: &BrowserHost, event: &WarpCefOsrInputEvent) {
             };
             host.send_key_event(Some(&key));
         }
-        _ => {
-            key.type_ = KeyEventType::KEYDOWN;
-            host.send_key_event(Some(&key));
-            key.type_ = KeyEventType::CHAR;
-            host.send_key_event(Some(&key));
-        }
+        // 按下不在这里:KEYDOWN+CHAR 的两段式由 deferred 计划决定
+        // (见 osr_key_trampoline),因为要先看输入法有没有组合/上屏。
+        _ => {}
     }
 }
 
@@ -599,6 +646,247 @@ extern "C" fn osr_focus_trampoline(id: u64, focused: i32) {
     focus(id, focused != 0);
 }
 
+// ---------------------- T7:输入法(IME) ----------------------
+//
+// 决策模型照抄参考实现/CefClient 的 deferred 模型(HandleKeyEventBefore/AfterTextInputClient):
+// 输入法在 `interpretKeyEvents:` 里只**累积**状态,keyDown 结束时一次性决定该发什么。
+// 这样普通按键仍是 KEYDOWN+CHAR(保住页面 JS keydown 与光标移动),而 composition/上屏
+// 走 ime_set_composition / ime_commit_text。
+
+/// 一次按键要执行的动作(顺序:普通键 → 提交 → 组合上报 → 收尾)。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DeferredKeyPlan {
+    /// 普通按键:KEYDOWN + CHAR。
+    send_plain_key: bool,
+    /// 提交文本(粘贴、输入法上屏)。
+    commit_text: Option<String>,
+    /// composition 文本更新。
+    set_composition: Option<String>,
+    /// composition 以 finish 收尾(输入法主动 unmarkText)。
+    finish_composition: bool,
+    /// composition 以 cancel 收尾(组合被丢弃)。
+    cancel_composition: bool,
+}
+
+/// deferred 决策(纯逻辑,单测覆盖):
+/// 1. 前后都没有 composition 且最多插入 1 个字符 ⇒ 按普通按键发 KEYDOWN+CHAR;
+/// 2. 待插入文本长度超过阈值(有 composition 时阈值 0,否则 1)⇒ 提交;
+/// 3. 有 composition 且非空 ⇒ 上报组合;组合从"有"变"无" ⇒ finish 或 cancel。
+fn deferred_key_plan(
+    text_to_insert: Option<&str>,
+    marked_text: Option<&str>,
+    old_has_marked: bool,
+    has_marked: bool,
+    unmark_called: bool,
+) -> DeferredKeyPlan {
+    let text_len = text_to_insert.map_or(0, |text| text.encode_utf16().count());
+    let mut plan = DeferredKeyPlan::default();
+    plan.send_plain_key = !has_marked && !old_has_marked && text_len <= 1;
+    let commit_threshold = usize::from(!(has_marked || old_has_marked));
+    if text_len > commit_threshold {
+        plan.commit_text = text_to_insert.map(ToString::to_string);
+    }
+    if has_marked && marked_text.is_some() {
+        plan.set_composition = marked_text.map(ToString::to_string);
+    } else if old_has_marked && !has_marked {
+        plan.finish_composition = unmark_called;
+        plan.cancel_composition = !unmark_called;
+    }
+    plan
+}
+
+/// UTF-16 选区 → CEF `Range`;**没有替换目标时不能传 NULL**。
+///
+/// CEF 的 capi 会把可空指针退化成 `(0,0)`,渲染器据此 `SelectRange` 打断
+/// `<textarea>` 焦点,整条 composition 被静默丢弃(T2 spike 实测,见 OSR-SPIKE-B.md)。
+fn ime_replacement_range(from: i32, to: i32) -> Range {
+    if from < 0 {
+        Range {
+            from: u32::MAX,
+            to: u32::MAX,
+        }
+    } else {
+        Range {
+            from: from as u32,
+            to: to.max(from) as u32,
+        }
+    }
+}
+
+/// composition 下划线:Blink 至少需要一条(参考实现同款全串实线)。
+fn ime_underline(utf16_len: u32) -> CompositionUnderline {
+    CompositionUnderline {
+        size: std::mem::size_of::<CompositionUnderline>(),
+        range: Range {
+            from: 0,
+            to: utf16_len,
+        },
+        color: 0xFF00_0000,
+        background_color: 0,
+        thick: 0,
+        style: CompositionUnderlineStyle::SOLID,
+    }
+}
+
+/// 一次按键的 deferred 决策 → 实际下发。
+extern "C" fn osr_key_trampoline(id: u64, key: *const WarpCefOsrKeyInput) {
+    if key.is_null() {
+        return;
+    }
+    let key = unsafe { &*key };
+    let unmodified = cstr_to_string(key.chars_ignoring_modifiers);
+    // Cmd+A/C/V/X/Z 先走编辑命令:zap 窗口对嵌入视图用 `mods == Command` 精确比较,
+    // 开着 CapsLock 时这组键不会走响应者动作(实测 ns_flags 带 0x10000),必须在这里兜住
+    // —— 否则它们会当普通按键发给页面,复制/全选/剪切全部失效(T5 实测。
+    // 注意:这条拦截必须在 deferred 决策**之前**,否则 Cmd 组合会走普通键分支)。
+    if let Some(command) = edit_command_for_key(unmodified.as_deref(), key.modifier_flags) {
+        log::debug!("[cef] osr {id}: key {unmodified:?} → edit command {command}");
+        osr_edit_command_trampoline(id, command);
+        return;
+    }
+    let text_to_insert = cstr_to_string(key.text_to_insert);
+    let marked_text = cstr_to_string(key.marked_text);
+    let plan = deferred_key_plan(
+        text_to_insert.as_deref(),
+        marked_text.as_deref(),
+        key.old_has_marked != 0,
+        key.has_marked != 0,
+        key.unmark_called != 0,
+    );
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    let Some(host) = browser.host() else {
+        return;
+    };
+
+    // 基础键事件(普通按键与 CHAR 共用)。
+    let mut base = KeyEvent::default();
+    base.modifiers = cef_modifiers(key.modifier_flags);
+    if is_key_pad_event(key.key_code, key.modifier_flags) {
+        base.modifiers |= sys::cef_event_flags_t::EVENTFLAG_IS_KEY_PAD.0;
+    }
+    if key.is_repeat != 0 {
+        base.modifiers |= sys::cef_event_flags_t::EVENTFLAG_IS_REPEAT.0;
+    }
+    base.native_key_code = i32::from(key.key_code);
+    base.windows_key_code = windows_key_code(key.key_code, unmodified.as_deref());
+    let chars = cstr_to_string(key.chars);
+    if let Some(character) = chars.as_deref().and_then(first_utf16) {
+        base.character = character;
+    }
+    if let Some(character) = unmodified.as_deref().and_then(first_utf16) {
+        base.unmodified_character = character;
+    }
+
+    if plan.send_plain_key {
+        // 证据通道(与 T5 的 send_mouse_*/send_key_event 同口径):英文/功能键走这条路径。
+        log::debug!(
+            "[cef] osr {id}: send_key_event(KEYDOWN+CHAR) code={} chars={:?}",
+            key.key_code,
+            text_to_insert.as_deref().or(chars.as_deref())
+        );
+        base.type_ = KeyEventType::KEYDOWN;
+        host.send_key_event(Some(&base));
+        // CHAR 用输入法实际插入的字符(死键/组合键时与 event.characters 不同)。
+        if let Some(character) = text_to_insert.as_deref().and_then(first_utf16) {
+            base.character = character;
+        }
+        base.type_ = KeyEventType::CHAR;
+        host.send_key_event(Some(&base));
+    }
+    if let Some(text) = plan.commit_text.as_deref() {
+        if !text.is_empty() {
+            let cef_text = CefString::from(text);
+            let replacement = ime_replacement_range(key.replacement_from, key.replacement_to);
+            log::debug!("[cef] osr {id}: ime_commit_text {text:?}");
+            // relative_cursor_pos=0 ⇒ 光标落在提交文本末尾(Chromium 的
+            // InputMethodController::ComputeAbsoluteCaretPosition = 起点 + 长度 + relative)。
+            host.ime_commit_text(Some(&cef_text), Some(&replacement), 0);
+        }
+    }
+    if let Some(text) = plan.set_composition.as_deref() {
+        let utf16_len = text.encode_utf16().count() as u32;
+        let cef_text = CefString::from(text);
+        let underline = ime_underline(utf16_len);
+        let selection = Range {
+            from: key.marked_sel_from.max(0) as u32,
+            to: key.marked_sel_to.max(0) as u32,
+        };
+        let replacement = ime_replacement_range(key.replacement_from, key.replacement_to);
+        log::debug!("[cef] osr {id}: ime_set_composition {text:?} sel={selection:?}");
+        host.ime_set_composition(
+            Some(&cef_text),
+            Some(&[underline]),
+            Some(&replacement),
+            Some(&selection),
+        );
+    }
+    if plan.finish_composition {
+        log::debug!("[cef] osr {id}: ime_finish_composing_text");
+        host.ime_finish_composing_text(0);
+    }
+    if plan.cancel_composition {
+        log::debug!("[cef] osr {id}: ime_cancel_composition");
+        host.ime_cancel_composition();
+    }
+}
+
+/// 输入法在按键之外的直接动作(候选点击上屏、unmark 等)。
+extern "C" fn osr_ime_trampoline(id: u64, command: *const WarpCefOsrImeCommand) {
+    if command.is_null() {
+        return;
+    }
+    let command = unsafe { &*command };
+    let text = cstr_to_string(command.text);
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    let Some(host) = browser.host() else {
+        return;
+    };
+    match command.action {
+        OSR_IME_SET_COMPOSITION => {
+            let Some(text) = text.as_deref() else {
+                return;
+            };
+            let utf16_len = text.encode_utf16().count() as u32;
+            let cef_text = CefString::from(text);
+            let underline = ime_underline(utf16_len);
+            let selection = Range {
+                from: command.sel_from.max(0) as u32,
+                to: command.sel_to.max(0) as u32,
+            };
+            let replacement = ime_replacement_range(command.replacement_from, command.replacement_to);
+            log::debug!("[cef] osr {id}: ime_set_composition(直接) {text:?}");
+            host.ime_set_composition(
+                Some(&cef_text),
+                Some(&[underline]),
+                Some(&replacement),
+                Some(&selection),
+            );
+        }
+        OSR_IME_COMMIT => {
+            let Some(text) = text.as_deref() else {
+                return;
+            };
+            let cef_text = CefString::from(text);
+            let replacement = ime_replacement_range(command.replacement_from, command.replacement_to);
+            log::debug!("[cef] osr {id}: ime_commit_text(直接) {text:?}");
+            host.ime_commit_text(Some(&cef_text), Some(&replacement), 0);
+        }
+        OSR_IME_FINISH => {
+            log::debug!("[cef] osr {id}: ime_finish_composing_text(直接)");
+            host.ime_finish_composing_text(command.keep_selection);
+        }
+        OSR_IME_CANCEL => {
+            log::debug!("[cef] osr {id}: ime_cancel_composition(直接)");
+            host.ime_cancel_composition();
+        }
+        _ => {}
+    }
+}
+
 extern "C" {
     /// 见 app/src/platform/mac/objc/cef_support.m(仅 cef_webview feature 下编译)。
     fn warp_cef_start_periodic_main_timer(interval: f64, callback: extern "C" fn());
@@ -615,6 +903,16 @@ extern "C" {
     ) -> *mut c_void;
     fn warp_cef_osr_view_set_input_callbacks(callbacks: *const WarpCefOsrInputCallbacks);
     fn warp_cef_osr_view_set_cursor(view: *mut c_void, semantic: i32);
+    fn warp_cef_osr_view_set_ime_bounds(
+        view: *mut c_void,
+        sel_from: i32,
+        sel_to: i32,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        has_bounds: i32,
+    );
     fn warp_cef_osr_view_set_surface(view: *mut c_void, surface: *mut c_void);
     fn warp_cef_osr_view_set_bitmap(
         view: *mut c_void,
@@ -1737,6 +2035,41 @@ wrap_render_handler! {
             let view = self.osr_view();
             unsafe { warp_cef_osr_view_set_surface(view, info.shared_texture_io_surface) };
             self.log_surface_size_once(view);
+        }
+
+        /// 输入法:CEF 回报 composition 的选区与**逐字位置**(DIP、左上原点)。
+        /// 宿主视图据此给候选框定位(`firstRectForCharacterRange:`)。
+        fn on_ime_composition_range_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            selected_range: Option<&Range>,
+            character_bounds: Option<&[Rect]>,
+        ) {
+            let view = self.osr_view();
+            if view.is_null() {
+                return;
+            }
+            let selected = selected_range.map(|range| (range.from, range.to));
+            let first = character_bounds.and_then(|bounds| bounds.first()).cloned();
+            let (sel_from, sel_to) = selected
+                .map(|(from, to)| (from as i32, to as i32))
+                .unwrap_or((-1, -1));
+            let (x, y, w, h, has_bounds) = match &first {
+                Some(rect) => (
+                    f64::from(rect.x),
+                    f64::from(rect.y),
+                    f64::from(rect.width),
+                    f64::from(rect.height),
+                    1,
+                ),
+                None => (0.0, 0.0, 0.0, 0.0, 0),
+            };
+            log::debug!(
+                "[cef] on_ime_composition_range_changed sel={selected:?} bounds={} {:?}",
+                character_bounds.map(<[Rect]>::len).unwrap_or(0),
+                first
+            );
+            unsafe { warp_cef_osr_view_set_ime_bounds(view, sel_from, sel_to, x, y, w, h, has_bounds) };
         }
 
         /// CPU 兜底:共享纹理不可用(如 GPU 进程异常、或 ZAP_CEF_OSR_CPU_PAINT=1)
