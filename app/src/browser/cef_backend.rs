@@ -280,7 +280,12 @@ fn browser_snapshot(id: u64) -> Option<Browser> {
     if is_shutting_down() {
         return None;
     }
-    WEBVIEWS.with(|map| map.borrow().get(&id).and_then(|state| state.browser.clone()))
+    // 与 with_browser 同口径:所有 extern "C" 回调入口都可能被同步重入,
+    // 借不到(调用方正持借用)就跳过,不要 panic(在 C 回调里 panic = abort)。
+    WEBVIEWS.with(|map| {
+        let map = map.try_borrow().ok()?;
+        map.get(&id).and_then(|state| state.browser.clone())
+    })
 }
 
 /// 视图坐标(DIP,可能是小数)→ CEF 的整数坐标。
@@ -1709,7 +1714,12 @@ fn with_browser<R>(id: u64, f: impl FnOnce(&Browser, &mut CefWebview) -> R) -> O
         return None;
     }
     WEBVIEWS.with(|map| {
-        let mut map = map.borrow_mut();
+        // **必须用 try_borrow_mut**:本模块的对外调用(ObjC/CEF)会**同步**回调进 Rust
+        // —— 最典型的是 `set_hidden:` 让 first responder 让位 → `resignFirstResponder`
+        // → focus 回调 → 又回到这里,而调用方此时正持着借用。用 `borrow_mut` 会 panic,
+        // 而 panic 发生在 `extern "C"` 回调里会**直接 abort**(实机崩溃:切 tab 隐藏 pane)。
+        // 借不到就说明是这种重入,跳过这次操作即可(调用方仍在完成它自己的语义)。
+        let mut map = map.try_borrow_mut().ok()?;
         let state = map.get_mut(&id)?;
         let browser = state.browser.clone()?;
         Some(f(&browser, state))
@@ -1752,8 +1762,9 @@ pub(crate) fn focus(id: u64, focused: bool) {
     // **必须在借用之外调用**:makeFirstResponder 会同步回调 becomeFirstResponder,
     // 那条路径会再进 focus()(见 warp_cef_osr_view_focus 的 `_syncingFocus`)。
     let view = WEBVIEWS.with(|map| {
-        map.borrow()
-            .get(&id)
+        // 同 with_browser:这是 AppKit 会同步回调进来的路径,借不到就跳过。
+        let map = map.try_borrow().ok()?;
+        map.get(&id)
             .and_then(|state| state.osr.as_ref().map(|osr| osr.view()))
     });
     let was_first_responder = view.is_some_and(|view| {

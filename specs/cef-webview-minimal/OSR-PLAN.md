@@ -203,10 +203,17 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > 6. mac OSR 下 `windows_key_code` **不被 CEF 采用**(合成 NSEvent 后由 Chromium 反推),
 >    不要把它写成"已在 mac 生效"的行为。
 
-### T8 —— 开关、回滚与既有策略的等价性
-- 做:渲染模式开关(环境变量如 `ZAP_CEF_OSR=1` + 设置项),默认 windowed;
-  确认隐藏/冻结(CDP `Page.setWebLifecycleState`)/懒初始化/renderer 崩溃在 OSR 下同样工作。
-- **验证**:开关来回切换;pane 隐藏→切回;设置里开关 Chromium 内核后新开 pane;kill renderer 后 pane 进崩溃态。
+### T8 —— 开关、回滚与既有策略的等价性 ⚠️ **进行中**
+> 见 [evidence/phase1/OSR-T8-SWITCH-EQUIV.md](evidence/phase1/OSR-T8-SWITCH-EQUIV.md)。
+> **已完成**:渲染模式升级为设置项 `general.webview.use_osr_rendering`(默认 false)+ 设置页开关
+> + `resolve_render_mode(env, setting)` 纯函数与单测(env 显式非空才覆盖设置);`ZAP_CEF_OSR` 仍可用。
+> **实机命中并已修一个 Critical**:切 tab 必闪退 —— `setHidden:` 让 first responder 让位 ⇒
+> `resignFirstResponder` 同步回调进 Rust ⇒ `focus()` 在调用方已持 `WEBVIEWS.borrow_mut()` 时重入
+> 借用 ⇒ panic;而 `extern "C"` 回调里的 panic 会**直接 abort**。修法:所有回调入口的公共路径
+> (`with_browser`/`browser_snapshot`)改 `try_borrow[_mut]`,借不到就跳过;`focus()` 同理。
+> **这是 T7 审核时标为"残余风险"却没修的那条,教训:标为残余风险的借用重入要当场修。**
+> **未完成**:冻结→解冻完整路径(需隐藏 ≥20s;若仍无"已冻结/解冻"日志则要查 OSR 下 `send_cdp`
+> 是否真的成功,失败分支当前静默重试)、设置页切换+重启验证、renderer 崩溃态、懒初始化。
 
 ### T9 —— 证据与文档归档
 - 更新 `TRANSPARENCY.md`(实测像素证据 + 结论)、`RUNTIME-VERIFICATION.md`(OSR 实跑)、`TECH.md`(模式与开关)。
