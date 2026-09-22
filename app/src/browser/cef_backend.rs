@@ -1457,7 +1457,7 @@ pub(crate) fn set_freeze_after_secs(secs: u32) {
 /// **覆盖范围**:目前只有 `on_before_close` / `on_after_created` 改用了它;
 /// `on_load_end`(3 处)与 `on_render_process_terminated`(1 处)仍是裸 `borrow`/`borrow_mut` ——
 /// 它们今天从"借用内"不可达(所有持借调用都不触达这些回调),属纵深防御的下一批候选。
-/// 读路径请用 `try_read_webviews`(待补),不要直接 `map.borrow()`。
+/// 若将来要把它们也收口,读路径需要一个 `try_borrow()` 版本(目前没有,不要照抄 `borrow_mut` 版)。
 fn try_with_webviews<R>(f: impl FnOnce(&mut HashMap<u64, CefWebview>) -> R) -> Option<R> {
     WEBVIEWS.with(|map| match map.try_borrow_mut() {
         Ok(mut map) => Some(f(&mut map)),
