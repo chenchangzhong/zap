@@ -81,3 +81,44 @@ CEF_PATH=... cargo nextest run -p warp --features cef_webview \
 
 **本轮按用户要求不做 GUI 测试**;上述修复涉及的行为(Shift 形态快捷键回到 zap 链路、重试窗口)
 待下次实机时顺带确认。
+
+## 5 Rust 侧审查(第一位审查者运行失败后收窄范围重派)
+
+结论:**无 Critical**;1 个 Important(结构性)、6 个 Minor。逐条处置:
+
+### 已修
+
+| # | 问题 | 修法 |
+|---|------|------|
+| #2 | `on_before_close` 在借用内 `state.browser = None`(drop = CEF `release`,持借期 drop 即"借用内调外部") | 改成 `take` 出来、借用外 `drop`(与 `destroy`/`shutdown` 一致) |
+| #3 | `create_webview` 直接 `insert` 覆盖同 id 旧条目 ⇒ 借用内 drop `Browser`,且旧 `Rc<OsrState>` 无 `Drop` ⇒ 旧 NSView 永久留在容器(幽灵页)、旧 browser 无人关 | insert 前先 `remove` 取旧条目:借用外 `close_and_detach` + `take_and_release_osr_view`,并告警(防御路径) |
+| #4 | `on_after_created` 借用内 `browser.clone()`/覆盖旧值(add_ref/release) | 同样 take 旧值、借用外 drop |
+| #6 | `set_visible`/`set_bounds`/`apply_geometry` 用 `osr.is_some()` 选分支:若 `osr=None` 而进程是 OSR,会落到 windowed 臂去操作 **warpui 父容器**(`host.window_handle()` 在 OSR 下就是容器) | 三处都补 `None if render_mode() == RenderMode::Osr => {}`(什么都不做),与 `detach_view` 口径一致 |
+| #1(部分) | 四个 handler 入口用**会 panic** 的 `borrow_mut()`(从借用内被同步触达 = `extern "C"` 里 panic = abort) | 新增 `try_with_webviews()`:借不到就 `log::warn!` + 跳过,回调入口不再可能 abort |
+
+### 有意不改(附判据)
+
+- **#5「`deferred_key_plan` 缺 `!textInserted` 守卫」**:**不改**。cefclient 里 `BOOL textInserted = NO;`
+  在提交分支**从未置 YES**(我逐行读过 `text_input_client_osr_mac.mm:289-337`)⇒ 该守卫在 cefclient 里
+  **恒真(形同虚设)** ⇒ 它的**实际行为**与"commit + cancel 同发"一致,而这正是我们的实现;
+  主参考 CefSwift 同样没有该守卫。**更强的判据是我们的实机证据**:T7 里 `ime_commit_text "敬他是发"`
+  紧接 `ime_cancel_composition`,中文上屏正确、光标正常(详见 OSR-T7-IME.md)。
+  即:参考实现的注释描述了意图,但代码没实现;我们跟随的是**两者共同的实际行为**。
+- **#7** 共享 scale 会被"视图无窗口时兜底 2.0"写入(≥1x 屏、窗口拆除中):影响 ≤1 帧(下一帧纠正),记录。
+- **#1 的结构**(`with_browser` 闭包在借用内执行):今天不可达 —— 审查者已逐个核对 render/display/
+  keyboard handler 完全不碰 `WEBVIEWS`(T4 的设计),ObjC 的 `setFrameSize:` 只碰 layer;
+  但这是"安全依赖别处不变量"的位置,**记录并把 handler 入口全部改成 try**(见上表 #1),
+  将来若有人给 handler 加一次 `WEBVIEWS` 读取,症状会是"几何/焦点被静默跳过 + 一条 warn",而不是 abort。
+
+### 记录项(未验证疑点,触发未证实)
+
+| 项 | 判据 | 触发条件 |
+|----|------|----------|
+| `focus()` 的焦点三联不检查 `visible`(而 `on_load_end` 同一组有守卫) | 代码;调用侧只找到 `handle_attach` | 隐藏 pane 收到 `focus(id,true)` 且此前不是 first responder ⇒ CEF 被改成 visible(60fps 出图)直到冻结 |
+| 关机后仍可能调 CEF:`create_webview`/`spawn_browser`/`set_bounds`/`destroy` 无 `is_shutting_down` 门控(`shutdown` 也不复位 `INITIALIZED`) | 代码 | shutdown 之后再有 create/destroy;缓解事实:`on_window_will_close` 在 Terminating 阶段直接 return,故窗口清理不会在 shutdown 后跑 |
+| `set_bounds` windowed 臂第二次 `window_handle()` 无 null 检查 | 两次取用之间无 CEF 调用,当前被第一次检查覆盖 | 未来在该区间插入 CEF 调用即可能解引用 null |
+| `has_marked`/`marked_text` 语义与参考不同(我们传持久 composition 文本,参考是 per-key 累积量) | `cef_support.m` 的 producer + `text_input_client_osr_mac.mm` | 组合期间按下不经 `setMarkedText` 的键(如 F5)⇒ 多发一次同文本的 `ime_set_composition`(参考不发);影响未证实 |
+| `on_accelerated_paint`/`on_paint` 不做 null 检查 | 但 ObjC 四个 setter 都有 NULL 早返回 ⇒ **无 UAF**(审查者确认) | — |
+
+审查者同时确认:释放路径三条幂等、`drive_external_begin_frame`/6 个 trampoline 借用纪律正确、
+"先写共享几何再通知 CEF"的不变量成立、`resolve_render_mode` 与三处推入的顺序正确。

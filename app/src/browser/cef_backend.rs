@@ -1451,6 +1451,20 @@ pub(crate) fn set_freeze_after_secs(secs: u32) {
     FREEZE_AFTER_SECS.store(u64::from(secs), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// 回调里访问 `WEBVIEWS`:**借不到(说明是同步重入)就跳过并告警**,绝不 panic。
+///
+/// `extern "C"` 回调里 panic 会**直接 abort**(Rust 不能跨 C 边界 unwind,实机崩过一次);
+/// 而 CEF/AppKit 会在我们持借期间同步回调进来,所以回调入口一律走这个 helper。
+fn try_with_webviews<R>(f: impl FnOnce(&mut HashMap<u64, CefWebview>) -> R) -> Option<R> {
+    WEBVIEWS.with(|map| match map.try_borrow_mut() {
+        Ok(mut map) => Some(f(&mut map)),
+        Err(_) => {
+            log::warn!("[cef] WEBVIEWS 借用冲突(同步重入),跳过本次回调的注册表更新");
+            None
+        }
+    })
+}
+
 /// 当前生效的冻结阈值;`None` 表示不冻结(设置为 0)。
 fn freeze_after() -> Option<std::time::Duration> {
     let secs = std::env::var("ZAP_CEF_FREEZE_AFTER_SECS")
@@ -1598,6 +1612,20 @@ pub(crate) fn create_webview(
             ns_rect,
             render_mode()
         );
+    }
+    // 先把同 id 的旧条目**取出来**,再插入新条目:直接在借用内 `insert` 会 drop 旧 `CefWebview`
+    // —— 其中 `Browser` 是引用计数对象(drop = CEF release),而旧 `Rc<OsrState>` 也没有 Drop,
+    // 它的宿主视图只能经 `take_and_release_osr_view` 释放,否则永久留在容器里(幽灵页)。
+    // (正常流程由调用方的 `has_webview` 守卫,这里只是防御。)
+    let replaced = WEBVIEWS.with(|map| map.borrow_mut().remove(&id));
+    if let Some(old) = replaced {
+        log::warn!("[cef] webview {id}: 已存在同 id 条目,先清理旧实例(防御路径)");
+        if let Some(browser) = old.browser {
+            close_and_detach(&browser);
+        }
+        if let Some(osr) = old.osr {
+            take_and_release_osr_view(osr);
+        }
     }
     WEBVIEWS.with(|map| {
         map.borrow_mut().insert(
@@ -1909,6 +1937,8 @@ pub(crate) fn set_visible(id: u64, visible: bool) {
     }
     if let Some(host) = browser.host() {
         match osr_view {
+            // 进程是 OSR 但没有宿主视图:什么都不做,绝不落到 windowed 臂碰父容器。
+            None if render_mode() == RenderMode::Osr => {}
             None => {
                 let view = host.window_handle() as *mut NSView;
                 if !view.is_null() {
@@ -1987,6 +2017,8 @@ pub(crate) fn set_bounds(id: u64, rect: RectF) {
         }
         state.rect = ns_rect;
         match state.osr.as_ref() {
+            // 同上:OSR 进程但没有宿主视图时不做任何事。
+            None if render_mode() == RenderMode::Osr => {}
             Some(osr) => {
                 unsafe {
                     warp_cef_osr_view_set_frame(
@@ -2064,6 +2096,8 @@ fn apply_geometry(id: u64) {
     with_browser(id, |browser, state| {
         if let Some(host) = browser.host() {
             match state.osr.as_ref() {
+                // 同上:OSR 进程但没有宿主视图时不做任何事。
+                None if render_mode() == RenderMode::Osr => {}
                 None => {
                     let view = host.window_handle() as *mut NSView;
                     if !view.is_null() {
@@ -2530,18 +2564,25 @@ wrap_life_span_handler! {
             let Some(browser) = browser.cloned() else {
                 return;
             };
-            let accepted = WEBVIEWS.with(|map| {
-                let mut map = map.borrow_mut();
+            let Some((stored, replaced)) = try_with_webviews(|map| {
                 match map.get_mut(&self.id) {
                     // 只接受当前代际:被取代的旧实例直接关掉。
+                    // **take 出旧句柄在借用外 drop**:`Browser` 的 clone/drop 是 CEF 的
+                    // add_ref/release,持借期间做就是"借用内调外部"。
                     Some(state) if state.generation == self.generation => {
-                        state.browser = Some(browser.clone());
-                        true
+                        let old = state.browser.take();
+                        (Some(browser.clone()), old)
                     }
-                    _ => false,
+                    _ => (None, None),
                 }
-            });
-            if !accepted {
+            })
+            else {
+                // 同步重入:借不到注册表 ⇒ 放弃本次登记(状态由外层负责)。
+                return;
+            };
+            // 借用外 drop 被替换掉的旧句柄(= CEF release)。
+            drop(replaced);
+            if stored.is_none() {
                 close_and_detach(&browser);
                 log::info!(
                     "[cef] webview {} 丢弃过期代际 {} 的浏览器",
@@ -2566,16 +2607,18 @@ wrap_life_span_handler! {
             // 顺带把 OSR 宿主视图一起摘掉:它属于这个浏览器实例,页面自行关闭
             // (window.close() 等)后不该继续显示最后一帧 —— windowed 路径在
             // detach_view 里已经这么做,两种模式保持一致。
-            let osr = WEBVIEWS.with(|map| {
-                let mut map = map.borrow_mut();
+            let (osr, _old_browser) = try_with_webviews(|map| {
                 match map.get_mut(&self.id) {
-                    Some(state) if state.generation == self.generation => {
-                        state.browser = None;
-                        state.osr.take()
-                    }
-                    _ => None,
+                    Some(state) if state.generation == self.generation => (
+                        state.osr.take(),
+                        // **take 出来在借用外 drop**:`Browser` 是引用计数对象,drop 可能触发
+                        // CEF 的同步销毁/回调,持借期间 drop 就是"借用内调外部"。
+                        state.browser.take(),
+                    ),
+                    _ => (None, None),
                 }
-            });
+            })
+            .unwrap_or((None, None));
             // 借用外释放:不把 `WEBVIEWS` 借用跨过对外(ObjC/CEF)调用。
             if let Some(osr) = osr {
                 take_and_release_osr_view(osr);
