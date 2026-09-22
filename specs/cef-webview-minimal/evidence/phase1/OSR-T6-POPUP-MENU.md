@@ -101,7 +101,7 @@ NSPoint screen_position = NSPointFromCGPoint(screen_point.ToCGPoint());
 | `setFrameSize:` 在 `initWithFrame:` 早期(ivar 仍为 nil)是否安全 | ✅ | 对 nil 发消息是 no-op;init 里随后显式设 `_contentLayer.frame = bounds` |
 | 菜单 `NSMenu`/`NSMenuItem` 在 `popUpMenuPositioningItem:` 返回后释放 | ✅ | 该方法跑完菜单事件循环才返回(期间 action 已执行完);`target` 是 assign,不会形成 retain 环 |
 | 弹层 y 翻转 | ✅(公式) | `bounds.height - (y + h)` 与已验证过的 `flip_rect_to_appkit`(`parentHeight - y - h`,有单测)同形 |
-| 层树重构不破坏原有渲染 | ✅(间接) | 本轮实机里页面渲染/点击/输入全部正常;证据函数 `surface_size` 也已改为读内容层 |
+| 层树重构不破坏原有渲染 | ✅(日志) | T6 实例里 `OSR surface 3836x1908px (view_rect=(1918,954) DIP, scale=2.0)` —— 1918×954 DIP × 2 = 3836×1908,说明内容层确实拿到了 IOSurface(证据函数已改为读内容层,故这行同时证明贴图路由落在内容层) |
 | `screen_point` 原点 | ✅(源码) | 见 §3.1,CEF 消费方直接交给 AppKit |
 | `contentsScale` 跨屏后是否过期 | 无需处理 | `contentsGravity = resize` 下 contents 会被拉伸到层边界,`contentsScale` 不参与显示尺寸;跨屏时 CEF 已收到 `notify_screen_info_changed` 按新 DPI 出图 |
 | 菜单弹出期间 CEF pump 暂停 | 已知 | 模态菜单跑在 `NSEventTrackingRunLoopMode`,默认模式的定时器不触发 ⇒ 期间页面不刷新(标准菜单行为),关闭后继续 |
