@@ -50,10 +50,28 @@ set_visible(false) → with_browser【已持 WEBVIEWS.borrow_mut()】
 | 默认 windowed(windowed 回归) | ✅ | T4 证据 + 本次默认值 false 的解析单测 |
 | OSR 下渲染/输入/IME/弹层/菜单 | ✅ | T4/T5/T7/T6 各轮实机 |
 | **切 tab(隐藏)不崩溃** | ✅ | 本节 §2;实机确认 |
-| **冻结 → 解冻**完整路径 | ⏳ **未跑通** | 启动时给了 `ZAP_CEF_FREEZE_AFTER_SECS=5`,但日志里没有"隐藏超时,已冻结页面"/"重新可见,解冻页面"(用户切回约 <5s)。需要**切走后停 20s 以上**再回来;若仍无日志,则要查 `send_cdp` 在 OSR 下是否真的下发成功(失败分支目前是静默重试) |
+| **冻结 → 解冻**完整路径 | ✅ **已实机验证** | 见 §3.1 的日志闭环:冻结与解冻**都成功**,且**未 panic**(上轮 Critical 所在路径第一次真正跑通) |
 | 设置页切换开关 + 重启 | ⏳ 未验证 | 需先在设置页打开「使用无窗口(OSR)渲染」,再用**不带 `ZAP_CEF_OSR`** 的命令启动,确认走 OSR(可看日志 `mode=Osr` 或 `OSR surface …`) |
 | renderer 崩溃 → pane 进崩溃态 | ⏳ 未验证 | 需 pane 打开时 kill 掉 `--type=renderer` 的 helper(自建实例的 helper 路径含 `target/cef-smoke/ZapCEF.app`) |
 | 懒初始化(先 windowed 后开 Chromium 内核) | ⏳ 未验证 | CEF 按需初始化路径未在 OSR 开关下复测 |
+
+### 3.1 冻结/解冻实机日志(闭环)
+
+```
+06:23:19 [warpui_core::platform::app] active window changed: None            ← pane 被隐藏/应用失活
+06:23:22 [warp::browser::cef_backend] [cef] webview 1: 隐藏超时,已冻结页面(CDP setWebLifecycleState=frozen)
+06:44:39 [warpui_core::platform::app] application did become active           ← 切回
+06:44:41 [warpui_core::core::app] dispatching typed action: …WorkspaceAction::FocusPane(PaneId{ pane_type: DeepSeek … })
+06:44:41 [warp::browser::cef_backend] [cef] webview 1: 重新可见,解冻页面
+```
+
+- 运行参数:`ZAP_CEF_WEBVIEW=1 ZAP_CEF_OSR=1 ZAP_CEF_FREEZE_AFTER_SECS=5`(把阈值调小便于观察);
+  实例全程存活(pid 71932),**无新增崩溃报告**。
+- 由此确认两件事:① `send_cdp`(CDP `Page.setWebLifecycleState`)在 OSR 下**确实下发成功**
+  ——冻结成功即证明,不是此前担心的"静默失败";② "隐藏 → 冻结 → 切回 → 解冻"整条等价性路径成立,
+  且**不再触发**上轮修掉的借着重入 abort(`set_visible` 已改为借用外调外部)。
+- 备注:冻结只在 pane 隐藏且超过阈值时发生(`freeze_after_secs`,默认 300s;0 = 不冻结),
+  与 dsh 的 Node 服务端/agent 任务无关(只停页面 JS 与渲染)。
 
 ## 4 复验命令
 
