@@ -248,6 +248,56 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 >   `tools/cef-spike`(阶段 0/T2 的独立探针 crate,372 KB,无任何构建引用)**已按计划删除**
 >   (经用户确认,删除记录在 git 历史里可恢复);`tools/cef-helper` 是构建必需资产,保留。
 
+## 3.5 T10 —— 对齐补齐(后续任务,新会话执行)
+
+> 来源:与参考实现(CefSwift)的逐层比对,清单与判据见
+> [evidence/phase1/OSR-ALIGNMENT-VS-REFSWIFT.md](evidence/phase1/OSR-ALIGNMENT-VS-REFSWIFT.md)。
+> **先读该文档 §0–§5**:§0 是我对 T6 归因的自我更正,§5 是用户对各项的决定(右键菜单保持两项、
+> P0-4/P1-5 只记录)。下面三项是**用户指定要做的**,每项做完都要:两种 cfg `cargo check` 0 warning、
+> `cargo nextest` 窄过滤、`script/macos/cef_smoke` 构建,并**由用户实机验证**(单元测试覆盖不到)。
+
+### T10.1(P0-3)拖放双向 —— 优先
+- **缺口**:既不能从 Finder 拖文件/文本进 pane,也不能从页面往 Finder/终端拖(实测两个方向都无反应)。
+- **参考**:`/tmp/CefSwift-main/Sources/CefSwiftUI/CefMetalHostView+DragDrop.swift:34-127`、
+  `/tmp/CefSwift-main/Sources/CefKit/CefRenderHandler.swift:188-209`(拖放部分)、
+  其测试断言 `Tests/CefKitTests/OSRInputPassthroughTests.swift:17-36`(拖放掩码)。
+- **改动点**:`app/src/platform/mac/objc/cef_support.m`(OSR 宿主视图 `WarpCefOsrView`,**非 ARC**;
+  `registerForDraggedTypes` + `draggingEntered/draggingUpdated/draggingExited/prepareForDragOperation/
+  performDragOperation/draggingEnded`,并正确返回 `NSDragOperation`)、
+  `app/src/browser/cef_backend.rs`(handler + `extern "C"` trampoline;拖放数据用 CEF 的
+  `cef_drag_data_create` 构造;从页面往外拖走 `CefDragHandler::on_drag_enter` → `start_dragging`,
+  以及 `update_drag_cursor`(若 cef-rs 有))。
+- **若 cef-rs 缺必需 API**:先报缺失点与最小替代方案,**不要编造 API**。
+- **验收(用户实机)**:①从 Finder 拖一个文件到 pane 上 → 页面收到 drag/drop(例如输入框插入路径、
+  或页面 dragover 高亮);②在页面里选中内容往终端/Finder 拖 → 产生拖拽会话。
+
+### T10.2(P1-7)焦点跟随窗口 key 状态
+- **缺口**:点一下页面后用 Cmd+Tab 切走,页面里光标**仍一直闪烁**(实测)。
+- **参考**:`/tmp/CefSwift-main/Sources/CefSwiftUI/CefMetalHostView.swift:143-169`(观察
+  `didBecomeKey/didResignKey`)。
+- **改动点**:OSR 视图观察 `NSWindowDidBecomeKeyNotification`/`NSWindowDidResignKeyNotification`
+  (视图进出窗口/窗口重建时正确注册与注销 observer,**非 ARC 下必须 release**,不得在 dealloc 后还收通知)
+  → 新增一条 ObjC→Rust 回调 → `browser.host().set_focus(0/1)`。
+  **不要破坏**现有 `becomeFirstResponder/resignFirstResponder` 逻辑与 `_syncingFocus` 重入守卫;
+  回调路径遵守"不得在持有 `WEBVIEWS` 借用时调外部"。
+- **验收(用户实机)**:点页面 → Cmd+Tab 切走 → 页面光标停止闪烁;切回来 → 恢复闪烁且可继续输入/上屏中文。
+
+### T10.3(P0-2)下载保存面板/进度 UI
+- **现状(实测)**:没有保存面板,**但下载直接完成** ⇒ CEF 默认下载管道可用,缺的是 UI。
+  (`assets/webview_init.js:95-101` 明确对 `<a download>` 不拦截,依赖"原生下载管道"。)
+- **参考**:`/tmp/CefSwift-main/Sources/CefKit/BrowserClient.swift:294-341` + `CefDownloads.swift:53-72`。
+- **可对齐的交互**:wry 侧的保存面板实现在 `app/src/browser/browser_web_view.rs:336-360,402-420`
+  (两条后端最好表现一致)。
+- **改动点**:加 CEF 的 download handler(`on_before_download` 决定走默认还是自己接管)+ Rust 侧
+  会话/进度状态 + 保存面板与进度 UI(`app/src/browser/` 内,复用现有 webview 相关 UI 风格)。
+- **验收(用户实机)**:触发一次下载(dsh 的 Session/日志导出,或页面里任意 `<a download>`)
+  → 出现保存面板(或按产品决定直接落到 `~/Downloads` 并给出进度/完成提示)。
+
+### 不在本轮范围(仅记录,用户已定)
+P0-4(编辑快捷键改为转发按键事件,让页面 JS `keydown`/`preventDefault` 生效)、
+P1-5(手势与缩放:magnify/smartMagnify/swipe/touch、`zoomLevel`)、
+以及比对文档 §1 的 P1-6/8/9/10/11 与全部 P2 项 —— 需要时按同一格式扩写。
+
 ## 4 验证命令速查
 
 ```bash
