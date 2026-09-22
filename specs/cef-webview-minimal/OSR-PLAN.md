@@ -98,7 +98,7 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 - 位置:`tools/cef-spike/probes/osr_host.m`(宿主视图)+ `src/bin/osr-probe.rs`(转发)+
   `probes/ime_page.html`(textarea + 回环上报);`probes/loopback_receiver.py` 直接复用。
 
-### T3 —— 决策点
+### T3 —— 决策点 ✅ **已裁决:T1/T2 均通过 ⇒ 进 T4**
 - T1、T2 都通过 ⇒ 进 T4;任一失败 ⇒ 记录结论、停止,不进入主仓改动。
 
 ### T4 —— 主仓:cef_backend 增加 OSR 渲染模式 ✅ **已完成(通过)**
