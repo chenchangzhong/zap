@@ -1323,17 +1323,21 @@ pub(crate) fn pump() {
 }
 
 /// 给所有 OSR 浏览器喂一帧(仅在启用外部 begin-frame 时有意义)。
+///
+/// **借用内只收集句柄,借用外再调 CEF** —— 本模块的硬纪律:`send_external_begin_frame`
+/// 可能同步回调 render handler,而回调里若再借 `WEBVIEWS` 就会重入(见 with_browser 的注释;
+/// `try_borrow` 只是把 abort 降级为跳过,根因仍是"持借调外部")。
 fn drive_external_begin_frame() {
-    WEBVIEWS.with(|map| {
-        for state in map.borrow().values() {
-            if state.osr.is_none() {
-                continue;
-            }
-            if let Some(host) = state.browser.as_ref().and_then(|browser| browser.host()) {
-                host.send_external_begin_frame();
-            }
-        }
+    let hosts: Vec<BrowserHost> = WEBVIEWS.with(|map| {
+        map.borrow()
+            .values()
+            .filter(|state| state.osr.is_some())
+            .filter_map(|state| state.browser.as_ref().and_then(|browser| browser.host()))
+            .collect()
     });
+    for host in hosts {
+        host.send_external_begin_frame();
+    }
 }
 
 wrap_app! {
@@ -2016,7 +2020,14 @@ pub(crate) fn set_bounds(id: u64, rect: RectF) {
 /// 销毁 webview。CEF 的 `on_before_close` 会再清一次(幂等)。
 pub(crate) fn destroy(id: u64) {
     debug_assert_ui_thread();
-    let browser = WEBVIEWS.with(|map| map.borrow().get(&id).and_then(|state| state.browser.clone()));
+    // **先取出句柄**(状态里置 None)再关闭:释放自建视图时 `removeFromSuperview` 会同步
+    // 回调 focus,那条路径会 `with_browser`;若此刻句柄还在,就会对一个"已请求关闭"的
+    // browser 调 `set_focus`(与 on_before_close/shutdown 先把句柄取空的做法不一致)。
+    let browser = WEBVIEWS.with(|map| {
+        map.borrow_mut()
+            .get_mut(&id)
+            .and_then(|state| state.browser.take())
+    });
     if let Some(browser) = browser {
         close_and_detach(&browser);
     }

@@ -864,8 +864,16 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
         return [super performKeyEquivalent:event];
     }
     NSString *key = event.charactersIgnoringModifiers.lowercaseString;
-    int32_t command = -1;
     BOOL shift = (mods & NSEventModifierFlagShift) != 0;
+    // a/c/v/x **必须不带 Shift**:zap 自己绑定了 `cmd-shift-A`(ToggleConversationListView)
+    // 与 `cmd-shift-C`(CopyBlockCommand),而窗口对嵌入视图的要求是 `mods == Command`
+    // **精确相等** ⇒ Shift 形态会落到 `[super performKeyEquivalent:]` 交给菜单;我们若在这里
+    // 吞掉,菜单就永远收不到(实测派发顺序:内容视图层级先于主菜单)。z 例外 —— Shift 形态
+    // 正是 redo。
+    if (shift && ![key isEqualToString:@"z"]) {
+        return [super performKeyEquivalent:event];
+    }
+    int32_t command = -1;
     if ([key isEqualToString:@"a"]) {
         command = WARP_CEF_OSR_EDIT_SELECT_ALL;
     } else if ([key isEqualToString:@"c"]) {
@@ -923,10 +931,13 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
 
 #pragma mark 编辑命令(响应者链)
 
-// Cmd+C/V/X/A 由 WarpWindow::performKeyEquivalent: 的"嵌入视图"分支直接发
-// copy:/cut:/paste:/selectAll: 给 first responder(见 crates/warpui/.../window.m),
-// 故这里必须实现,否则这些快捷键在页面里静默失效。Cmd+Z/Shift+Cmd+Z 走 warp 自己的
-// Edit 菜单(CustomAction),与 windowed 现状一致,故不在这里拦截。
+// 两条入口都会到这里:
+// 1. WarpWindow::performKeyEquivalent: 的"嵌入视图"分支(`mods == Command` 精确相等时)
+//    直接发 copy:/cut:/paste:/selectAll: 给 first responder(见 crates/warpui/.../window.m);
+// 2. 本视图的 performKeyEquivalent:(排在菜单之前,覆盖 CapsLock/Shift 形态),见上面的注释。
+// 注意:Cmd+Z / Shift+Cmd+Z **也会**被本视图的 performKeyEquivalent 拦下(走 redo/undo),
+// 因此下面的 undo:/redo: 只在"菜单路径"可达时生效 —— 保留它们是为了与 windowed 的响应者
+// 链行为一致,不是键盘路径的主入口。
 - (void)warpSendEditCommand:(int32_t)command {
     if (gInputCallbacks.handle_edit_command != NULL) {
         gInputCallbacks.handle_edit_command(_webviewId, command);

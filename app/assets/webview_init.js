@@ -110,7 +110,10 @@ window.open = function(url) {
 // dsh 页面只有一个输入框,直接按选择器找,不做失焦记录;无论 DOM 焦点是否
 // 一直残留在输入框,光标都统一到末尾。
 window.__restoreFocused = function() {
-  var attempts = 0;
+  // 两个独立计数:元素缺失(SPA 首渲染晚于 load,需要 ~3s 窗口)与页面未就绪
+  // (makeFirstResponder 后 hasFocus 要等 AppKit 事件循环,原实现是 ~600ms)。
+  var missingAttempts = 0;
+  var focusAttempts = 0;
   var tryFocus = function() {
     var el = document.querySelector('textarea[data-testid="dsh-input"]')
              || document.querySelector('textarea[placeholder]')
@@ -122,7 +125,7 @@ window.__restoreFocused = function() {
     // 找不到输入框),原来直接 return 会让"打开 pane 后不点页面直接打字"完全
     // 没有反应 —— 焦点永远留在 body。有限次(≈3s)避免死循环。
     if (!el || !el.isConnected) {
-      if (attempts++ < 60) {
+      if (missingAttempts++ < 60) {
         setTimeout(tryFocus, 50);
       }
       return;
@@ -144,10 +147,11 @@ window.__restoreFocused = function() {
           endSel.addRange(endRange);
         } catch (e) {}
       }
-    } else if (attempts++ < 60) {
-      // makeFirstResponder 后页面 hasFocus 需等 AppKit 事件循环才变 true,
-      // 故重试等待,有限次避免死循环。
-      setTimeout(tryFocus, 50);
+    } else if (focusAttempts++ < 20) {
+      // makeFirstResponder 后页面 hasFocus 需等 AppKit 事件循环才变 true,故重试等待,
+      // 有限次避免死循环。**窗口保持原来的 ~600ms**:拉长到 3s 会把"聚焦 + 光标折叠到末尾"
+      // 推迟太久,期间用户自己移动光标/选择会被这条链覆盖(且该脚本 wry 路径共用)。
+      setTimeout(tryFocus, 30);
     }
   };
   tryFocus();
