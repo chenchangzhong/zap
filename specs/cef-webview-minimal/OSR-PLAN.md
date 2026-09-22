@@ -226,6 +226,18 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > `pkill -f 'Helper \(Renderer\)'`,把用户机器的微信/Arc/Lark/VS Code 的 renderer 一起杀了
 > (均已自动重建,无持久影响)。
 
+### T9.5 —— 计划全量代码审核(第三轮)✅ **已完成**
+> 见 [evidence/phase1/OSR-REVIEW-3.md](evidence/phase1/OSR-REVIEW-3.md)。范围:`433bdb206..HEAD` 全部 18 个提交。
+> - 修:`performKeyEquivalent:` 放行 Shift 导致 `Cmd+Shift+A/C` 被吞(自证绑定存在)、
+>   `destroy()` 的关闭/释放顺序、`drive_external_begin_frame` 的"持借调外部"(最后一处)、
+>   `webview_init.js` 的 hasFocus 重试窗口回退、两处与实现相反的注释。
+> - 复核确认无问题:MRC 配对(运行期探针实证)、释放幂等、windowed 纯净、NSEvent 字段纪律、
+>   层语义、坐标换算、`clang -Wall -Wextra` 0 warning。
+> - 记录项(有判据、当前无可见影响):子层 contentsScale、`otherMouse` 的 buttonNumber、
+>   CPU 兜底缓冲区未拷贝、IOSurface 生命周期、光标离开视图、`selectedRange` 未接选区回调、
+>   弹层在 mac 不可执行 —— 逐条写在证据文档 §3 表格里,**将来触发条件明确**。
+> - Rust 侧第一位审查者运行失败,已收窄范围重派;其结论到达后按同样纪律处理。
+
 ### T9 —— 证据与文档归档 ✅ **已完成**
 > - `TRANSPARENCY.md` 追加 §7「落地结果」:方案 D 已实现、默认 windowed、开关与硬约束清单;
 >   并明确 **仍未做的验收 1/2(真实 pane 里的像素级透明比对)**。
