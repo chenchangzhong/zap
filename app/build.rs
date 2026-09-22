@@ -44,13 +44,18 @@ fn main() -> Result<()> {
             .file("src/platform/mac/objc/services.m")
             .compile("warp_objc");
 
-        // CEF 后端的宿主原语(周期定时器 + NSApplication 协议桥)只在
+        // CEF 后端的宿主原语(周期定时器 + NSApplication 协议桥 + OSR 宿主视图)只在
         // cef_webview feature 下编译;默认构建完全不含这部分代码。
+        // OSR 宿主视图直接用 CALayer/CGImage/IOSurface,故显式声明这三个 framework
+        // (不依赖其他 crate 的传递链接指令)。
         if env::var("CARGO_FEATURE_CEF_WEBVIEW").is_ok() {
             println!("cargo:rerun-if-changed=src/platform/mac/objc/cef_support.m");
             cc::Build::new()
                 .file("src/platform/mac/objc/cef_support.m")
                 .compile("warp_objc_cef_support");
+            println!("cargo:rustc-link-lib=framework=QuartzCore");
+            println!("cargo:rustc-link-lib=framework=CoreGraphics");
+            println!("cargo:rustc-link-lib=framework=IOSurface");
         }
 
         // Build the dock tile plugin

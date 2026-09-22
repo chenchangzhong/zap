@@ -44,3 +44,167 @@ fn flip_rect_to_appkit_matches_bottom_origin_convention() {
 // 注:不在这里测 `handle_subprocess_or_continue` —— 它调用进程级的 CEF
 // `execute_process`(会修改 CEF 全局状态),在测试宿主进程里没有意义且不可靠。
 // 该路径由端到端受控冒烟覆盖(script/macos/cef_smoke)。
+
+/// OSR 模式开关解析:只有显式 `1`/`true` 才启用 OSR;未设置/空串/其他值一律
+/// windowed —— 保证默认路径逐字节不变、可回滚(OSR-PLAN.md T4/T8)。
+#[test]
+fn parse_render_mode_defaults_to_windowed() {
+    assert_eq!(parse_render_mode(None), RenderMode::Windowed);
+    assert_eq!(parse_render_mode(Some("")), RenderMode::Windowed);
+    assert_eq!(parse_render_mode(Some("0")), RenderMode::Windowed);
+    assert_eq!(parse_render_mode(Some("yes")), RenderMode::Windowed);
+    assert_eq!(parse_render_mode(Some("1")), RenderMode::Osr);
+    assert_eq!(parse_render_mode(Some(" true ")), RenderMode::Osr);
+}
+
+/// OSR 视图尺寸必须是 **DIP(逻辑点)**:CEF 自己乘 device_scale_factor。
+/// T1 实测:这里若返回像素、`screen_info` 又报 scale=2,surface 会被缩放两次
+/// (2400x1600 而非 1200x800)。0 尺寸要夹到 1(CEF 不接受 0 宽高)。
+#[test]
+fn osr_view_size_is_dip_and_clamped() {
+    assert_eq!(osr_view_size(600.0, 400.0), (600, 400));
+    assert_eq!(osr_view_size(600.4, 399.6), (600, 400));
+    assert_eq!(osr_view_size(0.0, 0.0), (1, 1));
+    assert_eq!(osr_view_size(-5.0, 3.0), (1, 3));
+}
+
+/// windowed 是默认模式:未设开关时 render_mode() 必须与现状一致
+/// (测试进程里没设 ZAP_CEF_OSR;若外部设了则跳过,避免误判)。
+#[test]
+fn render_mode_is_windowed_without_switch() {
+    if std::env::var_os("ZAP_CEF_OSR").is_some() {
+        return;
+    }
+    assert_eq!(render_mode(), RenderMode::Windowed);
+    assert!(!external_begin_frame());
+    assert!(!cpu_paint());
+}
+
+/// NSEventModifierFlags → cef_event_flags_t 位(鼠标/键盘共用)。
+/// 位值取自 cef_types.h:CAPS_LOCK_ON=1<<0、SHIFT_DOWN=1<<1、CONTROL_DOWN=1<<2、
+/// ALT_DOWN=1<<3、COMMAND_DOWN=1<<7。
+#[test]
+fn cef_modifiers_maps_appkit_flags() {
+    assert_eq!(cef_modifiers(0), 0);
+    assert_eq!(cef_modifiers(NS_MOD_CAPS_LOCK), 1 << 0);
+    assert_eq!(cef_modifiers(NS_MOD_SHIFT), 1 << 1);
+    assert_eq!(cef_modifiers(NS_MOD_CONTROL), 1 << 2);
+    assert_eq!(cef_modifiers(NS_MOD_OPTION), 1 << 3);
+    assert_eq!(cef_modifiers(NS_MOD_COMMAND), 1 << 7);
+    // 组合:Shift+Cmd 是"另存/新开"类快捷键的常见组合。
+    assert_eq!(
+        cef_modifiers(NS_MOD_SHIFT | NS_MOD_COMMAND),
+        (1 << 1) | (1 << 7)
+    );
+    // NumericPad 只用于 IS_KEY_PAD 判定,不进通用修饰键位。
+    assert_eq!(cef_modifiers(NS_MOD_NUMERIC_PAD), 0);
+}
+
+/// mac 虚拟键码 → Windows VK:字符无关的键查表,普通键用大写码点。
+#[test]
+fn windows_key_code_matches_cef_convention() {
+    // 字母/数字:VK_A..VK_Z / VK_0..VK_9 就是大写码点。
+    assert_eq!(windows_key_code(0, Some("a")), i32::from(b'A'));
+    assert_eq!(windows_key_code(0, Some("A")), i32::from(b'A'));
+    assert_eq!(windows_key_code(29, Some("0")), i32::from(b'0'));
+    // 字符无关的键必须查表(不能退化成字符码)。
+    assert_eq!(windows_key_code(0x24, Some("\r")), 0x0D); // Return
+    assert_eq!(windows_key_code(0x30, Some("\t")), 0x09); // Tab
+    assert_eq!(windows_key_code(0x33, Some("\u{8}")), 0x08); // 退格
+    assert_eq!(windows_key_code(0x7B, None), 0x25); // 左方向键
+    assert_eq!(windows_key_code(0x7E, None), 0x26); // 上方向键
+    assert_eq!(windows_key_code(0x35, Some("\u{1b}")), 0x1B); // Escape
+    assert_eq!(windows_key_code(0x37, None), 0x5B); // Command
+    assert_eq!(windows_key_code(0x7A, None), 0x70); // F1
+    assert_eq!(windows_key_code(0x6F, None), 0x7B); // F12
+    // 非 ASCII 字符没有 VK,返回 0(字符由 character 字段承载)。
+    assert_eq!(windows_key_code(0, Some("中")), 0);
+    assert_eq!(windows_key_code(0, None), 0);
+}
+
+/// flagsChanged:按修饰键的当前状态决定 KEYDOWN/KEYUP。
+#[test]
+fn is_modifier_pressed_reads_flag_state() {
+    assert!(is_modifier_pressed(56, NS_MOD_SHIFT)); // 左 Shift
+    assert!(!is_modifier_pressed(56, 0));
+    assert!(is_modifier_pressed(60, NS_MOD_SHIFT)); // 右 Shift
+    assert!(is_modifier_pressed(55, NS_MOD_COMMAND)); // 左 Cmd
+    assert!(!is_modifier_pressed(55, NS_MOD_SHIFT));
+    assert!(is_modifier_pressed(62, NS_MOD_CONTROL)); // 右 Control
+    assert!(is_modifier_pressed(61, NS_MOD_OPTION)); // 右 Option
+    assert!(is_modifier_pressed(57, NS_MOD_CAPS_LOCK)); // CapsLock
+}
+
+/// 小键盘:既有 modifier flag 覆盖,也有键码兜底。
+#[test]
+fn is_key_pad_event_covers_flag_and_keycodes() {
+    assert!(is_key_pad_event(0, NS_MOD_NUMERIC_PAD));
+    assert!(is_key_pad_event(65, 0)); // 小键盘 0
+    assert!(is_key_pad_event(76, 0)); // 小键盘 Enter
+    assert!(!is_key_pad_event(0, 0)); // 主键盘 a
+    assert!(!is_key_pad_event(0x24, 0)); // 主键盘 Return
+}
+
+/// 视图坐标(DIP,可能小数)→ CEF 整数坐标:截断(与 cefclient 的
+/// "先乘 scale 取整再除回" 在 scale ≥ 1 时等价)。
+#[test]
+fn to_dip_coord_truncates() {
+    assert_eq!(to_dip_coord(0.0), 0);
+    assert_eq!(to_dip_coord(100.7), 100);
+    assert_eq!(to_dip_coord(100.2), 100);
+    assert_eq!(to_dip_coord(-3.4), -3);
+}
+
+/// Cmd+A/C/V/X/Z → 网页编辑命令;**CapsLock 不能挡住它**
+/// (zap 窗口对嵌入视图用 `mods == Command` 精确比较,开着 CapsLock 时这组快捷键
+/// 会漏给页面,实测踩到)。非 Cmd 组合、带别的修饰键、以及 zap 自己的 Cmd+T 等
+/// 都必须返回 None(交回 zap 的正常路径)。
+#[test]
+fn edit_command_for_key_covers_editing_shortcuts() {
+    let cmd = NS_MOD_COMMAND;
+    assert_eq!(edit_command_for_key(Some("a"), cmd), Some(OSR_EDIT_SELECT_ALL));
+    assert_eq!(edit_command_for_key(Some("c"), cmd), Some(OSR_EDIT_COPY));
+    assert_eq!(edit_command_for_key(Some("v"), cmd), Some(OSR_EDIT_PASTE));
+    assert_eq!(edit_command_for_key(Some("x"), cmd), Some(OSR_EDIT_CUT));
+    assert_eq!(edit_command_for_key(Some("z"), cmd), Some(OSR_EDIT_UNDO));
+    assert_eq!(
+        edit_command_for_key(Some("z"), cmd | NS_MOD_SHIFT),
+        Some(OSR_EDIT_REDO)
+    );
+    // 大写/带 CapsLock 同样命中(用户 CapsLock 开着时实测踩到)。
+    assert_eq!(
+        edit_command_for_key(Some("A"), cmd | NS_MOD_CAPS_LOCK),
+        Some(OSR_EDIT_SELECT_ALL)
+    );
+    assert_eq!(
+        edit_command_for_key(Some("C"), cmd | NS_MOD_SHIFT | NS_MOD_CAPS_LOCK),
+        Some(OSR_EDIT_COPY)
+    );
+    // 不是编辑快捷键:交回 zap(Cmd+T 新标签、Cmd+Ctrl+F 全屏等)。
+    assert_eq!(edit_command_for_key(Some("t"), cmd), None);
+    assert_eq!(edit_command_for_key(Some("f"), cmd | NS_MOD_CONTROL), None);
+    // 没有 Cmd(裸字母)一律不认领。
+    assert_eq!(edit_command_for_key(Some("a"), 0), None);
+    assert_eq!(edit_command_for_key(Some("a"), NS_MOD_OPTION), None);
+    assert_eq!(edit_command_for_key(None, cmd), None);
+}
+
+/// 页面请求的光标 → 宿主语义 id(链接/文本/缩放等)。
+#[test]
+fn cursor_semantic_maps_common_types() {
+    assert_eq!(cursor_semantic(CursorType::HAND), 1);
+    assert_eq!(cursor_semantic(CursorType::IBEAM), 2);
+    assert_eq!(cursor_semantic(CursorType::CROSS), 3);
+    assert_eq!(cursor_semantic(CursorType::EASTWESTRESIZE), 4);
+    assert_eq!(cursor_semantic(CursorType::NORTHSOUTHRESIZE), 5);
+    assert_eq!(cursor_semantic(CursorType::GRAB), 6);
+    assert_eq!(cursor_semantic(CursorType::GRABBING), 7);
+    assert_eq!(cursor_semantic(CursorType::NOTALLOWED), 8);
+    assert_eq!(cursor_semantic(CursorType::ZOOMIN), 9);
+    assert_eq!(cursor_semantic(CursorType::ZOOMOUT), 10);
+    assert_eq!(cursor_semantic(CursorType::MOVE), 11);
+    // 未映射(含 CT_NONE/CUSTOM)一律箭头,避免出现卡住的怪光标。
+    assert_eq!(cursor_semantic(CursorType::POINTER), 0);
+    assert_eq!(cursor_semantic(CursorType::NONE), 0);
+    assert_eq!(cursor_semantic(CursorType::CUSTOM), 0);
+}

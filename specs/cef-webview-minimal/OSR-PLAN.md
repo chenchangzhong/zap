@@ -81,26 +81,65 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
   - 不透明页面 ⇒ 期望页面渐变/标记色(证明内容确实渲染)。
 - 失败判据:仍为白/黑/无内容 ⇒ **停止**,把证据写入 TRANSPARENCY.md,回到方案 B/C。
 
-### T2(spike B)—— 自建 NSView 的 IME 链路能否打出中文 ← **下一步从这里开始**
-- 做:探针的宿主 NSView 实现 `NSTextInputClient`(`setMarkedText`/`insertText`/`firstRectForCharacterRange`),
-  转发到 `ime_set_composition`/`ime_commit_text`;页面放一个 `<textarea>` 并把内容 POST 到现有 `probes/loopback_receiver.py`。
-- **验证**:手动输入拼音(如 "nihao")→ 候选 → 上屏;接收端日志里出现期望中文;
-  并验证候选框位置(`on_ime_composition_range_changed` 有回调,日志可证)。
-- 失败判据:打不出中文 ⇒ **停止**(IME 是否决级风险,见 TRANSPARENCY.md §3.3)。
+### T2(spike B)—— 自建 NSView 的 IME 链路能否打出中文 ✅ **已完成(通过)**
+> 结果与证据见 [evidence/phase1/OSR-SPIKE-B.md](evidence/phase1/OSR-SPIKE-B.md)。
+> 结论:宿主视图实现 `NSTextInputClient` → `ime_set_composition`/`ime_commit_text` 后,
+> 微信输入法**拼音→候选→中文上屏**跑通(人工确认),候选框锚点(`firstRectForCharacterRange`
+> ← `on_ime_composition_range_changed`)也被真实输入法实际调用。
+> **T4/T7 必须遵守的两条硬约束**:
+> 1. 转发 IME 时 `replacement_range` **必须传显式 `(0xFFFFFFFF,0xFFFFFFFF)`**,不能传 NULL/`None`
+>    —— CEF 的 capi 会把 NULL 退化成 `(0,0)`,渲染器据此 `SelectRange` 打断 `<textarea>` 焦点,
+>    整条 composition 被**静默丢弃**(无任何报错,排查花了整轮)。
+> 2. 焦点必须在**导航完成后**补一次(CEF 导航后静默丢焦点,`chromiumembedded/cef#3870`),
+>    否则 IME 与光标都失效。
+> 另:合成 NSEvent 驱动不了第三方输入法进程 ⇒ IME 的自动化只能覆盖"直接调用 `NSTextInputClient`"
+> 那一段,真实输入法必须人工验证。
+
+- 位置:`tools/cef-spike/probes/osr_host.m`(宿主视图)+ `src/bin/osr-probe.rs`(转发)+
+  `probes/ime_page.html`(textarea + 回环上报);`probes/loopback_receiver.py` 直接复用。
 
 ### T3 —— 决策点
 - T1、T2 都通过 ⇒ 进 T4;任一失败 ⇒ 记录结论、停止,不进入主仓改动。
 
-### T4 —— 主仓:cef_backend 增加 OSR 渲染模式
-- 文件:`app/src/browser/cef_backend.rs`(现 900+ 行)、`app/src/browser/browser_web_view.rs`。
-- 做:`WindowInfo`/`BrowserSettings` 按模式分支;`wrap_render_handler!` 实现 `view_rect`/`screen_info`/`on_accelerated_paint`(+`on_paint` 兜底);
-  IOSurface → CALayer;几何/DPI(`was_resized`/`notify_screen_info_changed`);`was_hidden`/`invalidate`/`send_external_begin_frame`。
-- **验证**:`cargo check` 两种 cfg 0 warning;`nextest -E 'test(cef_backend)'` 全绿(坐标/DPI 纯逻辑补单测);
-  真机打开 pane,DevTools 里确认页面渲染与尺寸正确(retina 无模糊)。
+### T4 —— 主仓:cef_backend 增加 OSR 渲染模式 ✅ **已完成(通过)**
+> 结果与证据见 [evidence/phase1/OSR-T4-MAIN-REPO.md](evidence/phase1/OSR-T4-MAIN-REPO.md)。
+> 开关:`ZAP_CEF_OSR=1`(默认 windowed,逐字节等价);另有
+> `ZAP_CEF_OSR_EXTERNAL_BEGIN_FRAME`(默认关)、`ZAP_CEF_OSR_CPU_PAINT`(验证 on_paint 兜底)。
+> **真机暴露的两个硬坑(必须记住)**:
+> 1. `host.was_resized()` / `invalidate()` 会**同步**回调 render handler(GetViewRect/GetScreenInfo),
+>    而调用点通常正持有 `WEBVIEWS.borrow_mut()` ⇒ 回调里再借用就 `already mutably borrowed`
+>    **直接崩**(首次真机跑必崩)。修法:render handler 只读独立的 `OsrState`(`Rc`+`Cell`),
+>    **不得借用 `WEBVIEWS`**;几何要在通知 CEF **之前**写入。
+> 2. windowless 下 `CefBrowserHost::GetWindowHandle()` 返回的是**父容器**
+>    (`browser_platform_delegate_osr_mac.mm`),windowed 那套 `setHidden:`/`setFrame:`/
+>    `removeFromSuperview` 会把 warpui 的 `WebViewContainerView` 整个藏掉/摘掉。
+> 证据要点:真机 3 轮(OSR 加速 / windowed 回归 / OSR+CPU 兜底)全部正常;
+> `surface 2556x1526px = view_rect(1278,763) DIP × scale 2.0`,retina 无重复缩放。
 
-### T5 —— 输入与编辑命令
-- 做:自建宿主视图转发 mouse/key/wheel/focus;编辑命令走 focused frame;`performKeyEquivalent` 处理 Cmd+A/C/V/X/Z。
-- **验证**:逐项手工用例(选中、复制粘贴、滚轮、鼠标进出、光标形状变化),与 windowed 现状对照;日志可证 `send_mouse_*`/`send_key_event` 被调用。
+- 文件:`app/src/browser/cef_backend.rs`、`app/src/platform/mac/objc/cef_support.m`、
+  `app/build.rs`(QuartzCore/CoreGraphics/IOSurface 显式链接)、`app/src/browser/cef_backend_tests.rs`。
+- 验证:`cargo check` 两种 cfg **0 warning**;`nextest -E 'test(cef_backend)'` 6/6;
+  真机打开 pane(含窗口缩放跟随)渲染与尺寸正确。
+
+### T5 —— 输入与编辑命令 ✅ **已完成(通过)**
+> 结果与证据见 [evidence/phase1/OSR-T5-INPUT.md](evidence/phase1/OSR-T5-INPUT.md)。
+> 做:宿主视图转发鼠标/滚轮/键盘/焦点 + 光标 + 响应者链编辑动作;Rust 侧构造 CEF 事件
+> (修饰键位映射、mac→Windows 键码表、KEYDOWN+CHAR 两段式),编辑命令走 focused frame。
+> **真机暴露的三个坑(必须记住)**:
+> 1. `-[NSEvent clickCount]` 对 mouseEntered/Exited 会抛 ObjC 异常直接崩进程;
+>    `characters`/`isARepeat` 同理只对 keyDown/keyUp 有效 —— 按事件类型取字段。
+> 2. **CEF 会把"页面未处理的按键"交给应用主菜单**
+>    (`CefBrowserPlatformDelegateNativeMac::HandleKeyboardEvent` →
+>    `[[NSApp mainMenu] performKeyEquivalent:]`),而 zap 的窗口菜单经 `setWindowsMenu:`
+>    带了 AppKit 自动加的 "Enter Full Screen"(keyEquivalent 就是**裸 `f`**)
+>    ⇒ 页面里打 `f` 会把窗口切全屏。修法:`CefKeyboardHandler::on_key_event` 返回 1 认领。
+> 3. 开着 **CapsLock** 时 `WarpWindow::performKeyEquivalent:` 的
+>    `mods == NSEventModifierFlagCommand` 精确比较会漏掉 Cmd+A/C/V/X ⇒ 宿主侧补
+>    `edit_command_for_key`(纯函数 + 单测)。**没有**在视图里实现 `performKeyEquivalent:`
+>    —— 那会抢在菜单前吞掉 zap 自己的 Cmd+T/Cmd+1..9(参考实现 CefSwift 的策略与 zap 不兼容)。
+> 验证:两种 cfg `cargo check` 0 warning;`nextest -E 'test(cef_backend)'` 13/13;
+> 真机逐项(点击/拖选/滚轮/进出/光标/英文/`f` 不全屏/Cmd+C·V·A·X)全部通过,无崩溃。
+> 中文输入不在本任务(主仓宿主视图尚未实现 `NSTextInputClient`)⇒ T7。
 
 ### T6 —— 弹层与右键菜单
 - 做:`on_popup_show`/`on_popup_size` → 独立 popup layer;右键菜单改**异步 NSMenu**(沿用现有三项:重新加载/检查元素,清空默认项)。

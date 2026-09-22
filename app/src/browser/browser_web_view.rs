@@ -808,6 +808,9 @@ impl BrowserWebViewManager {
                 let mut entries = self.cef_entries.borrow_mut();
                 for id in failed {
                     entries.remove(&id);
+                    // 同时清 cef_backend 侧的状态:OSR 下自建宿主视图**先于浏览器**创建,
+                    // 只删这里的条目会让那个 NSView 永久留在容器里(泄漏,且重建时再叠一层)。
+                    crate::browser::cef_backend::destroy(id);
                     log::warn!("[cef] webview {id}: 创建失败已移除条目,等待重建");
                 }
             }

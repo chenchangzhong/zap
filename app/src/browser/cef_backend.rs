@@ -11,7 +11,8 @@
 //! (`isHandlingSendEvent`/`setHandlingSendEvent:`),zap 目前没有 —— 需在启用本后端时
 //! 用运行时 category/swizzle 补齐(spec 已记录,未实现)。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::ffi::c_char;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -22,10 +23,611 @@ use crate::features::FeatureFlag;
 /// CEF 泵间隔:60Hz。CEF 官方无固定值;过密浪费 CPU,过疏会拖慢流式更新。
 const PUMP_INTERVAL_SECONDS: f64 = 1.0 / 60.0;
 
+/// OSR(windowless)的绘制帧率上限。CEF 默认 30;60 与显示器刷新对齐
+/// (specs/cef-webview-minimal/OSR-PLAN.md §1)。
+const OSR_FRAME_RATE: i32 = 60;
+
+/// 渲染模式:windowed(默认,现状)与 osr(windowless,真透明路线)。
+///
+/// OSR 是**进程级**能力(见 `initialize_inner`),故模式必须在 CefInitialize 之前
+/// 就能判定 —— 这也是它先用环境变量而非设置项的原因(设置项见 OSR-PLAN.md T8)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RenderMode {
+    /// CEF 自建原生子视图(windowed):**做不到真透明**,是当前默认路径。
+    Windowed,
+    /// windowless(OSR):宿主自建视图 + IOSurface,唯一能真透明的路径。
+    Osr,
+}
+
+/// 解析模式开关(纯函数,便于单测):只有显式 `1`/`true` 才启用 OSR,
+/// 未设置、空串、其他值一律 windowed —— 保证默认行为不变、可回滚。
+fn parse_render_mode(value: Option<&str>) -> RenderMode {
+    match value.map(str::trim) {
+        Some("1") | Some("true") => RenderMode::Osr,
+        _ => RenderMode::Windowed,
+    }
+}
+
+/// 当前渲染模式(进程内固定:env 不会在运行中变化,故缓存一次)。
+pub(crate) fn render_mode() -> RenderMode {
+    static MODE: OnceLock<RenderMode> = OnceLock::new();
+    *MODE.get_or_init(|| parse_render_mode(std::env::var("ZAP_CEF_OSR").ok().as_deref()))
+}
+
+/// 是否由宿主驱动外部 begin-frame。默认关闭:T1 实测 CEF 内部 60fps 节奏已可用,
+/// 而外部驱动要求宿主严格按显示刷新喂帧(见 OSR-PLAN.md §5 性能风险)。
+fn external_begin_frame() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ZAP_CEF_OSR_EXTERNAL_BEGIN_FRAME").is_some())
+}
+
+/// 关掉共享纹理,强制走 `on_paint`(CPU 位图)兜底路径:用于验证兜底实现
+/// (GPU 进程异常时 CEF 也会自动回落到这条路径)。
+fn cpu_paint() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ZAP_CEF_OSR_CPU_PAINT").is_some())
+}
+
+/// OSR 视图尺寸(**DIP / 逻辑点**,不是像素)。
+///
+/// CEF 会自己乘 `device_scale_factor`:T1 实测若这里返回像素、`screen_info` 又报
+/// scale=2,surface 会被缩放两次(2400x1600 而非 1200x800,浪费显存且可能模糊)。
+/// CEF 不接受 0 宽高,故下限夹到 1。
+fn osr_view_size(width: f64, height: f64) -> (i32, i32) {
+    (
+        (width.round() as i32).max(1),
+        (height.round() as i32).max(1),
+    )
+}
+
+/// OSR 的每-webview 原生状态(宿主视图指针 + 几何),由 webview 状态与 render handler
+/// **共享**(`Rc`,UI 线程内单线程使用)。
+///
+/// 为什么不直接读 `WEBVIEWS`:CEF 的 `was_resized()` / `invalidate()` 会**同步**回调
+/// render handler(GetViewRect/GetScreenInfo),而调用点通常正持有 `WEBVIEWS` 的
+/// `borrow_mut()` —— 回调里再 `borrow()` 就是 `already mutably borrowed` panic
+/// (T4 首次真机跑必崩,已实测)。故几何/视图指针走这个独立单元,render handler 只碰它。
+struct OsrState {
+    view: Cell<*mut c_void>,
+    /// 视图尺寸(DIP):每帧 set_bounds 写入,CEF 同步回调时读到的就是最新值。
+    size: Cell<(i32, i32)>,
+    /// backing scale(2.0 = retina)。
+    scale: Cell<f64>,
+    /// 最近贴上去的 surface 像素尺寸(仅用于"surface = 点数 × scale"的证据日志)。
+    surface: Cell<(i32, i32)>,
+}
+
+impl OsrState {
+    fn new(view: *mut c_void, size: (i32, i32), scale: f64) -> std::rc::Rc<Self> {
+        std::rc::Rc::new(Self {
+            view: Cell::new(view),
+            size: Cell::new(size),
+            scale: Cell::new(scale),
+            surface: Cell::new((0, 0)),
+        })
+    }
+
+    fn view(&self) -> *mut c_void {
+        self.view.get()
+    }
+}
+
+// ===================== OSR 输入转发(T5) =====================
+//
+// windowless 下 CEF 没有自己的原生视图,AppKit 事件不会自动进渲染器,必须由宿主
+// 采集后转成 CEF 事件。采集在 ObjC(见 cef_support.m),这里负责:修饰键位映射、
+// mac→Windows 键码表、构造 cef_key_event_t / cef_mouse_event_t、编辑命令路由到
+// focused frame。纯逻辑(键码表/修饰键位)都有单测。
+
+/// 输入事件类型(与 ObjC 侧 `WARP_CEF_OSR_EVENT_*` 一一对应)。
+const OSR_EVENT_MOUSE_MOVE: i32 = 0;
+const OSR_EVENT_MOUSE_CLICK: i32 = 1;
+const OSR_EVENT_MOUSE_WHEEL: i32 = 2;
+const OSR_EVENT_KEY: i32 = 3;
+
+/// 标准编辑动作(与 ObjC 侧 `WARP_CEF_OSR_EDIT_*` 一一对应)。
+const OSR_EDIT_COPY: i32 = 0;
+const OSR_EDIT_CUT: i32 = 1;
+const OSR_EDIT_PASTE: i32 = 2;
+const OSR_EDIT_SELECT_ALL: i32 = 3;
+const OSR_EDIT_UNDO: i32 = 4;
+const OSR_EDIT_REDO: i32 = 5;
+
+/// AppKit 修饰键位(`NSEventModifierFlags`)。这些是稳定的 ABI 常量,与
+/// `NSEventModifierFlag*` 一致;这里显式列出,避免为一个常量表引入 objc2 的
+/// NSEvent feature(采集侧在 ObjC,本来就有这些常量)。
+const NS_MOD_CAPS_LOCK: u32 = 1 << 16;
+const NS_MOD_SHIFT: u32 = 1 << 17;
+const NS_MOD_CONTROL: u32 = 1 << 18;
+const NS_MOD_OPTION: u32 = 1 << 19;
+const NS_MOD_COMMAND: u32 = 1 << 20;
+const NS_MOD_NUMERIC_PAD: u32 = 1 << 21;
+
+/// 与 ObjC `WarpCefOsrInputEvent` **逐字段对应**(顺序/类型不可改)。
+#[repr(C)]
+struct WarpCefOsrInputEvent {
+    type_: i32,
+    x: f64,
+    y: f64,
+    modifier_flags: u32,
+    click_count: i32,
+    button: i32,
+    mouse_up: i32,
+    mouse_leave: i32,
+    delta_x: i32,
+    delta_y: i32,
+    key_type: i32,
+    key_code: u16,
+    is_repeat: i32,
+    chars: *const c_char,
+    chars_ignoring_modifiers: *const c_char,
+}
+
+#[repr(C)]
+struct WarpCefOsrInputCallbacks {
+    handle_event: extern "C" fn(u64, *const WarpCefOsrInputEvent),
+    handle_edit_command: extern "C" fn(u64, i32),
+    handle_focus: extern "C" fn(u64, i32),
+}
+
+static OSR_INPUT_CALLBACKS: WarpCefOsrInputCallbacks = WarpCefOsrInputCallbacks {
+    handle_event: osr_input_event_trampoline,
+    handle_edit_command: osr_edit_command_trampoline,
+    handle_focus: osr_focus_trampoline,
+};
+
+/// 注册输入回调(幂等;必须在创建 OSR 宿主视图之前)。
+fn install_osr_input_callbacks() {
+    static INSTALLED: OnceLock<bool> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        unsafe { warp_cef_osr_view_set_input_callbacks(&OSR_INPUT_CALLBACKS) };
+        true
+    });
+}
+
+/// 取浏览器句柄副本:**不持有 `WEBVIEWS` 借用再调 CEF**(CEF 可能同步回调
+/// render handler,那条路径不得再借 `WEBVIEWS`,见 OsrState 注释)。
+fn browser_snapshot(id: u64) -> Option<Browser> {
+    if is_shutting_down() {
+        return None;
+    }
+    WEBVIEWS.with(|map| map.borrow().get(&id).and_then(|state| state.browser.clone()))
+}
+
+/// 视图坐标(DIP,可能是小数)→ CEF 的整数坐标。
+/// cefclient 的做法是"先乘 scale 取整、再除回 scale",对 scale ≥ 1 等价于截断。
+fn to_dip_coord(value: f64) -> i32 {
+    value.trunc() as i32
+}
+
+/// `NSEventModifierFlags` → `cef_event_flags_t` 位(鼠标/键盘共用)。
+fn cef_modifiers(flags: u32) -> u32 {
+    let mut out = 0;
+    if flags & NS_MOD_SHIFT != 0 {
+        out |= sys::cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0;
+    }
+    if flags & NS_MOD_CONTROL != 0 {
+        out |= sys::cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0;
+    }
+    if flags & NS_MOD_OPTION != 0 {
+        out |= sys::cef_event_flags_t::EVENTFLAG_ALT_DOWN.0;
+    }
+    if flags & NS_MOD_COMMAND != 0 {
+        out |= sys::cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0;
+    }
+    if flags & NS_MOD_CAPS_LOCK != 0 {
+        out |= sys::cef_event_flags_t::EVENTFLAG_CAPS_LOCK_ON.0;
+    }
+    out
+}
+
+/// 小键盘判定:`NSEventModifierFlagNumericPad` 覆盖绝大多数情况,再补一份键码表
+/// (对齐 cefclient 的 `isKeyPadEvent:`)。
+fn is_key_pad_event(mac_key_code: u16, flags: u32) -> bool {
+    if flags & NS_MOD_NUMERIC_PAD != 0 {
+        return true;
+    }
+    matches!(
+        mac_key_code,
+        // Clear, =, /, *, -, +, Enter, ., 数字 0-9
+        71 | 81 | 75 | 67 | 78 | 69 | 76 | 65 | 82 | 83 | 84 | 85 | 86 | 87 | 88 | 89 | 91 | 92
+    )
+}
+
+/// macOS 虚拟键码 → Windows VK(`cef_key_event_t.windows_key_code`)。
+///
+/// CEF/Chromium 用 Windows 的 VK_* 编号;普通可打印键用**大写码点**(字母/数字正好
+/// 等于 VK_A..VK_Z / VK_0..VK_9),其余查表(对齐参考实现与 Chromium 的 mac 转换)。
+fn windows_key_code(mac_key_code: u16, chars_ignoring_modifiers: Option<&str>) -> i32 {
+    if let Some(code) = special_windows_key_code(mac_key_code) {
+        return code;
+    }
+    match chars_ignoring_modifiers.and_then(|chars| chars.chars().next()) {
+        Some(first) => {
+            // 参考实现用 `uppercased()`(对非 ASCII 也可能变长),这里只认 ASCII:
+            // 非 ASCII 字符没有对应 VK,交给 character 字段承载。
+            let code = u32::from(first.to_ascii_uppercase());
+            if code < 128 {
+                code as i32
+            } else {
+                0
+            }
+        }
+        None => 0,
+    }
+}
+
+/// 与字符无关的键(导航/功能/修饰键)的 VK 表。
+fn special_windows_key_code(mac_key_code: u16) -> Option<i32> {
+    let code = match mac_key_code {
+        0x24 => 0x0D,       // Return
+        0x4C => 0x0D,       // 小键盘 Enter
+        0x30 => 0x09,       // Tab
+        0x31 => 0x20,       // Space
+        0x33 => 0x08,       // Delete(退格)→ VK_BACK
+        0x75 => 0x2E,       // Forward Delete
+        0x35 => 0x1B,       // Escape
+        0x7B => 0x25,       // Left
+        0x7C => 0x27,       // Right
+        0x7D => 0x28,       // Down
+        0x7E => 0x26,       // Up
+        0x73 => 0x24,       // Home
+        0x77 => 0x23,       // End
+        0x74 => 0x21,       // PageUp
+        0x79 => 0x22,       // PageDown
+        0x38 | 0x3C => 0x10, // Shift / RightShift
+        0x3B | 0x3E => 0x11, // Control / RightControl
+        0x3A | 0x3D => 0x12, // Option / RightOption
+        0x37 => 0x5B,       // Command → VK_LWIN
+        0x36 => 0x5C,       // RightCommand
+        0x39 => 0x14,       // CapsLock
+        0x7A => 0x70,       // F1
+        0x78 => 0x71,       // F2
+        0x63 => 0x72,       // F3
+        0x76 => 0x73,       // F4
+        0x60 => 0x74,       // F5
+        0x61 => 0x75,       // F6
+        0x62 => 0x76,       // F7
+        0x64 => 0x77,       // F8
+        0x65 => 0x78,       // F9
+        0x6D => 0x79,       // F10
+        0x67 => 0x7A,       // F11
+        0x6F => 0x7B,       // F12
+        _ => return None,
+    };
+    Some(code)
+}
+
+/// `flagsChanged` 时该修饰键现在是按下还是松开。
+fn is_modifier_pressed(mac_key_code: u16, flags: u32) -> bool {
+    match mac_key_code {
+        56 | 60 => flags & NS_MOD_SHIFT != 0,
+        59 | 62 => flags & NS_MOD_CONTROL != 0,
+        58 | 61 => flags & NS_MOD_OPTION != 0,
+        55 | 54 => flags & NS_MOD_COMMAND != 0,
+        57 => flags & NS_MOD_CAPS_LOCK != 0,
+        _ => true,
+    }
+}
+
+/// CEF 光标类型 → 语义 id(与 ObjC 侧 `WARP_CEF_OSR_CURSOR_*` 对应)。
+/// 未映射的一律给箭头,避免出现"卡住不动"的怪光标(自定义光标位图不支持)。
+fn cursor_semantic(cursor_type: CursorType) -> i32 {
+    if cursor_type == CursorType::HAND {
+        1 // 手型(链接)
+    } else if cursor_type == CursorType::IBEAM || cursor_type == CursorType::VERTICALTEXT {
+        2 // 文本输入
+    } else if cursor_type == CursorType::CROSS {
+        3
+    } else if cursor_type == CursorType::EASTRESIZE
+        || cursor_type == CursorType::WESTRESIZE
+        || cursor_type == CursorType::EASTWESTRESIZE
+        || cursor_type == CursorType::COLUMNRESIZE
+        || cursor_type == CursorType::EASTPANNING
+        || cursor_type == CursorType::WESTPANNING
+    {
+        4 // 水平缩放
+    } else if cursor_type == CursorType::NORTHRESIZE
+        || cursor_type == CursorType::SOUTHRESIZE
+        || cursor_type == CursorType::NORTHSOUTHRESIZE
+        || cursor_type == CursorType::ROWRESIZE
+        || cursor_type == CursorType::NORTHPANNING
+        || cursor_type == CursorType::SOUTHPANNING
+    {
+        5 // 垂直缩放
+    } else if cursor_type == CursorType::GRAB {
+        6
+    } else if cursor_type == CursorType::GRABBING
+        || cursor_type == CursorType::MIDDLEPANNING
+        || cursor_type == CursorType::MIDDLE_PANNING_VERTICAL
+    {
+        7
+    } else if cursor_type == CursorType::NOTALLOWED || cursor_type == CursorType::NODROP {
+        8
+    } else if cursor_type == CursorType::ZOOMIN {
+        9
+    } else if cursor_type == CursorType::ZOOMOUT {
+        10
+    } else if cursor_type == CursorType::MOVE {
+        11
+    } else {
+        0 // 箭头
+    }
+}
+
+/// 命中"网页编辑命令"的按键 → 命令 id(否则 None)。
+///
+/// 只在带 Command、且除 Shift/CapsLock 外没有别的修饰键时生效。**CapsLock 必须放行**:
+/// zap 的 `WarpWindow::performKeyEquivalent:` 对嵌入视图用的是
+/// `mods == NSEventModifierFlagCommand` 精确比较,开着 CapsLock 时 Cmd+A/C/V/X
+/// 不会被路由到响应者动作(实测:ns_flags 里带 0x10000),于是被当普通按键转发给页面、
+/// 复制/全选/剪切全部失效。这里在宿主侧兜住这组编辑快捷键(与 OSR-PLAN.md T5 一致)。
+fn edit_command_for_key(chars_ignoring_modifiers: Option<&str>, modifier_flags: u32) -> Option<i32> {
+    if modifier_flags & NS_MOD_COMMAND == 0 {
+        return None;
+    }
+    let others = modifier_flags & !(NS_MOD_COMMAND | NS_MOD_SHIFT | NS_MOD_CAPS_LOCK);
+    if others != 0 {
+        return None;
+    }
+    let key = chars_ignoring_modifiers?.to_ascii_lowercase();
+    let shift = modifier_flags & NS_MOD_SHIFT != 0;
+    Some(match key.as_str() {
+        "a" => OSR_EDIT_SELECT_ALL,
+        "c" => OSR_EDIT_COPY,
+        "v" => OSR_EDIT_PASTE,
+        "x" => OSR_EDIT_CUT,
+        "z" => {
+            if shift {
+                OSR_EDIT_REDO
+            } else {
+                OSR_EDIT_UNDO
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// 鼠标键位 → CEF 枚举。
+fn mouse_button(button: i32) -> MouseButtonType {
+    match button {
+        1 => MouseButtonType::RIGHT,
+        2 => MouseButtonType::MIDDLE,
+        _ => MouseButtonType::LEFT,
+    }
+}
+
+/// 按住的是哪个键(用于拖拽/点击时的 `EVENTFLAG_*_MOUSE_BUTTON`;cefclient 对
+/// 按下与抬起都会置位)。
+fn mouse_button_flag(button: i32) -> u32 {
+    match button {
+        1 => sys::cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0,
+        2 => sys::cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON.0,
+        _ => sys::cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0,
+    }
+}
+
+/// C 字符串 → String(空指针/空串 → None)。
+fn cstr_to_string(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+/// 取首个 UTF-16 码元(CEF 的 `character`/`unmodified_character` 口径)。
+fn first_utf16(text: &str) -> Option<u16> {
+    text.encode_utf16().next()
+}
+
+extern "C" fn osr_input_event_trampoline(id: u64, event: *const WarpCefOsrInputEvent) {
+    if event.is_null() {
+        return;
+    }
+    let event = unsafe { &*event };
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    let Some(host) = browser.host() else {
+        return;
+    };
+    // 转发日志:鼠标移动按 trace(否则每次移动都刷屏),其余按 debug。
+    // `RUST_LOG=warp::browser::cef_backend=debug` 可打开 —— 这是"send_mouse_*/send_key_event
+    // 确实被调用"的证据通道(OSR-PLAN.md T5 的验证要求)。
+    match event.type_ {
+        OSR_EVENT_MOUSE_MOVE => {
+            log::trace!(
+                "[cef] osr {id}: send_mouse_move ({:.0},{:.0}) leave={}",
+                event.x,
+                event.y,
+                event.mouse_leave
+            );
+            send_osr_mouse(&host, event);
+        }
+        OSR_EVENT_MOUSE_CLICK => {
+            log::debug!(
+                "[cef] osr {id}: send_mouse_click button={} up={} count={} ({:.0},{:.0})",
+                event.button,
+                event.mouse_up,
+                event.click_count,
+                event.x,
+                event.y
+            );
+            send_osr_mouse(&host, event);
+        }
+        OSR_EVENT_MOUSE_WHEEL => {
+            log::debug!(
+                "[cef] osr {id}: send_mouse_wheel ({},{}) at ({:.0},{:.0})",
+                event.delta_x,
+                event.delta_y,
+                event.x,
+                event.y
+            );
+            send_osr_mouse(&host, event);
+        }
+        OSR_EVENT_KEY => {
+            // 按下(Cmd+A/C/V/X/Z)直接走 focused frame 的编辑命令:这条路径不依赖
+            // zap 窗口的快捷键判定(见 edit_command_for_key 的注释),也不会把按键
+            // 当普通字符发给页面。
+            if event.key_type == 0 {
+                let chars = cstr_to_string(event.chars_ignoring_modifiers);
+                if let Some(command) = edit_command_for_key(chars.as_deref(), event.modifier_flags)
+                {
+                    log::debug!("[cef] osr {id}: key {chars:?} → edit command {command}");
+                    osr_edit_command_trampoline(id, command);
+                    return;
+                }
+            }
+            log::debug!(
+                "[cef] osr {id}: send_key_event key_type={} code={} ns_flags=0x{:X} cef_flags=0x{:X} \
+                 chars={:?}",
+                event.key_type,
+                event.key_code,
+                event.modifier_flags,
+                cef_modifiers(event.modifier_flags),
+                cstr_to_string(event.chars)
+            );
+            send_osr_key(&host, event);
+        }
+        _ => {}
+    }
+}
+
+/// 鼠标/滚轮转发。坐标已是 DIP(左上原点)。
+fn send_osr_mouse(host: &BrowserHost, event: &WarpCefOsrInputEvent) {
+    let mut modifiers = cef_modifiers(event.modifier_flags);
+    if event.button >= 0 && event.type_ != OSR_EVENT_MOUSE_WHEEL {
+        modifiers |= mouse_button_flag(event.button);
+    }
+    let point = MouseEvent {
+        x: to_dip_coord(event.x),
+        y: to_dip_coord(event.y),
+        modifiers,
+    };
+    match event.type_ {
+        OSR_EVENT_MOUSE_MOVE => host.send_mouse_move_event(Some(&point), event.mouse_leave),
+        OSR_EVENT_MOUSE_CLICK => host.send_mouse_click_event(
+            Some(&point),
+            mouse_button(event.button),
+            event.mouse_up,
+            event.click_count,
+        ),
+        OSR_EVENT_MOUSE_WHEEL => {
+            host.send_mouse_wheel_event(Some(&point), event.delta_x, event.delta_y)
+        }
+        _ => {}
+    }
+}
+
+/// 键盘转发:按下走 **KEYDOWN + CHAR 两段式**。
+///
+/// 只发 KEYDOWN 的话页面 JS `keydown` 会触发但字符进不去、光标不动;只发 CHAR 则
+/// 快捷键/组合键不生效(cefclient 的 deferred 模型结论一致)。
+fn send_osr_key(host: &BrowserHost, event: &WarpCefOsrInputEvent) {
+    let chars = cstr_to_string(event.chars);
+    let unmodified = cstr_to_string(event.chars_ignoring_modifiers);
+    let mut key = KeyEvent::default();
+    key.modifiers = cef_modifiers(event.modifier_flags);
+    if is_key_pad_event(event.key_code, event.modifier_flags) {
+        key.modifiers |= sys::cef_event_flags_t::EVENTFLAG_IS_KEY_PAD.0;
+    }
+    if event.is_repeat != 0 {
+        key.modifiers |= sys::cef_event_flags_t::EVENTFLAG_IS_REPEAT.0;
+    }
+    key.native_key_code = i32::from(event.key_code);
+    key.windows_key_code = windows_key_code(event.key_code, unmodified.as_deref());
+    key.is_system_key = 0;
+    if let Some(character) = chars.as_deref().and_then(first_utf16) {
+        key.character = character;
+    }
+    if let Some(character) = unmodified.as_deref().and_then(first_utf16) {
+        key.unmodified_character = character;
+    }
+    match event.key_type {
+        1 => {
+            key.type_ = KeyEventType::KEYUP;
+            host.send_key_event(Some(&key));
+        }
+        2 => {
+            // flagsChanged:按下发 KEYDOWN、松开发 KEYUP。
+            key.type_ = if is_modifier_pressed(event.key_code, event.modifier_flags) {
+                KeyEventType::KEYDOWN
+            } else {
+                KeyEventType::KEYUP
+            };
+            host.send_key_event(Some(&key));
+        }
+        _ => {
+            key.type_ = KeyEventType::KEYDOWN;
+            host.send_key_event(Some(&key));
+            key.type_ = KeyEventType::CHAR;
+            host.send_key_event(Some(&key));
+        }
+    }
+}
+
+/// 编辑命令 → focused frame(取不到时退回主 frame,与参考实现一致)。
+extern "C" fn osr_edit_command_trampoline(id: u64, command: i32) {
+    // 证据通道(与 send_mouse_*/send_key_event 同口径)。两条入口都会到这里:
+    // 1. 宿主视图 keyDown 里识别出的 Cmd+A/C/V/X/Z(见 edit_command_for_key);
+    // 2. Cmd+C/V/X/A 由 WarpWindow::performKeyEquivalent: 的嵌入视图分支直接发到
+    //    本视图的 copy:/paste:/cut:/selectAll:(以及菜单经响应者链的 undo:/redo:)。
+    log::debug!("[cef] osr {id}: edit command {command}");
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    let Some(frame) = browser.focused_frame().or_else(|| browser.main_frame()) else {
+        return;
+    };
+    match command {
+        OSR_EDIT_COPY => frame.copy(),
+        OSR_EDIT_CUT => frame.cut(),
+        OSR_EDIT_PASTE => frame.paste(),
+        OSR_EDIT_SELECT_ALL => frame.select_all(),
+        OSR_EDIT_UNDO => frame.undo(),
+        OSR_EDIT_REDO => frame.redo(),
+        _ => {}
+    }
+}
+
+/// 宿主视图成为/失去 first responder → 同步给 CEF(页面光标、IME、键盘都依赖它)。
+extern "C" fn osr_focus_trampoline(id: u64, focused: i32) {
+    log::debug!("[cef] osr {id}: focus={focused}");
+    focus(id, focused != 0);
+}
+
 extern "C" {
     /// 见 app/src/platform/mac/objc/cef_support.m(仅 cef_webview feature 下编译)。
     fn warp_cef_start_periodic_main_timer(interval: f64, callback: extern "C" fn());
     fn warp_cef_install_app_protocol_support();
+
+    // OSR(windowless)宿主视图:生命周期由本模块显式持有(+1),销毁时 release。
+    fn warp_cef_osr_view_new(
+        container: *mut c_void,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        webview_id: u64,
+    ) -> *mut c_void;
+    fn warp_cef_osr_view_set_input_callbacks(callbacks: *const WarpCefOsrInputCallbacks);
+    fn warp_cef_osr_view_set_cursor(view: *mut c_void, semantic: i32);
+    fn warp_cef_osr_view_set_surface(view: *mut c_void, surface: *mut c_void);
+    fn warp_cef_osr_view_set_bitmap(
+        view: *mut c_void,
+        buffer: *const u8,
+        width: i32,
+        height: i32,
+        bytes_per_row: i32,
+    );
+    fn warp_cef_osr_view_set_frame(view: *mut c_void, x: f64, y: f64, w: f64, h: f64);
+    fn warp_cef_osr_view_set_hidden(view: *mut c_void, hidden: i32);
+    fn warp_cef_osr_view_scale(view: *mut c_void) -> f64;
+    fn warp_cef_osr_view_surface_size(view: *mut c_void, out_width: *mut i32, out_height: *mut i32);
+    fn warp_cef_osr_view_release(view: *mut c_void);
 }
 
 extern "C" fn pump_trampoline() {
@@ -167,6 +769,9 @@ fn initialize_inner() -> bool {
     let settings = Settings {
         no_sandbox: 1,
         external_message_pump: 1,
+        // OSR 是进程级能力:必须在 CefInitialize 之前置位,浏览器级 WindowInfo 再逐个开。
+        // 反过来(libcef 的告警)会"降低性能或运行时报错",见 browser_host_create.cc。
+        windowless_rendering_enabled: i32::from(render_mode() == RenderMode::Osr),
         cache_path: CefString::from(cache_path.as_str()),
         root_cache_path: CefString::from(root_cache_path.as_str()),
         ..Default::default()
@@ -217,6 +822,11 @@ pub(crate) fn shutdown() {
         for state in map.values_mut() {
             if let Some(browser) = state.browser.take() {
                 close_and_detach(&browser);
+            }
+            // OSR 宿主视图是我们自建的原生视图,同样必须在 CefShutdown 前拆掉并释放
+            // (否则留下一个指向已销毁 CEF 内容的 layer)。
+            if let Some(osr) = state.osr.take() {
+                unsafe { warp_cef_osr_view_release(osr.view()) };
             }
         }
         map.clear();
@@ -301,7 +911,25 @@ pub(crate) fn pump() {
         if ticks % 60 == 0 {
             freeze_hidden_overdue();
         }
+        // OSR 外部 begin-frame:CEF 只在宿主喂帧后才绘制(默认关闭,见 external_begin_frame)。
+        if external_begin_frame() {
+            drive_external_begin_frame();
+        }
     }
+}
+
+/// 给所有 OSR 浏览器喂一帧(仅在启用外部 begin-frame 时有意义)。
+fn drive_external_begin_frame() {
+    WEBVIEWS.with(|map| {
+        for state in map.borrow().values() {
+            if state.osr.is_none() {
+                continue;
+            }
+            if let Some(host) = state.browser.as_ref().and_then(|browser| browser.host()) {
+                host.send_external_begin_frame();
+            }
+        }
+    });
 }
 
 wrap_app! {
@@ -363,6 +991,9 @@ struct CefWebview {
     frozen: bool,
     /// 浏览器背景色(0xAARRGGBB,opaque)。重建时复用。
     background: u32,
+    /// OSR 共享状态(仅 OSR 模式;windowed 下为 None)。宿主视图由本模块 +1 持有,
+    /// 销毁时交给 `warp_cef_osr_view_release` 配平。
+    osr: Option<std::rc::Rc<OsrState>>,
 }
 
 /// 隐藏多久后冻结页面。来源:`CefWebviewSettings::freeze_after_secs`(默认 300s,
@@ -488,16 +1119,39 @@ pub(crate) fn create_webview(
     background: u32,
 ) {
     let ns_rect = to_appkit_rect(parent_view, rect);
+    // OSR:宿主视图必须**先于浏览器**存在 —— on_accelerated_paint 随时可能到来,
+    // 且 view_rect/screen_info 要靠它读 backing scale(T4)。
+    let osr = if render_mode() == RenderMode::Osr {
+        install_osr_input_callbacks();
+        let view = unsafe {
+            warp_cef_osr_view_new(
+                parent_view,
+                ns_rect.origin.x,
+                ns_rect.origin.y,
+                ns_rect.size.width,
+                ns_rect.size.height,
+                id,
+            )
+        };
+        Some(OsrState::new(
+            view,
+            osr_view_size(ns_rect.size.width, ns_rect.size.height),
+            unsafe { warp_cef_osr_view_scale(view) },
+        ))
+    } else {
+        None
+    };
     // 诊断:父视图必须已在某个窗口内,否则 CEF 行为不可预期(排查"多出一个窗口")。
     {
         let parent = unsafe { &*(parent_view as *const NSView) };
         let parent_window = parent.window();
         log::info!(
-            "[cef] webview {id} parent={:p} in_window={} parent_frame={:?} rect={:?}",
+            "[cef] webview {id} parent={:p} in_window={} parent_frame={:?} rect={:?} mode={:?}",
             parent_view,
             parent_window.is_some(),
             parent.frame(),
-            ns_rect
+            ns_rect,
+            render_mode()
         );
     }
     WEBVIEWS.with(|map| {
@@ -515,6 +1169,7 @@ pub(crate) fn create_webview(
                 hidden_since: None,
                 frozen: false,
                 background,
+                osr,
             },
         );
     });
@@ -533,20 +1188,48 @@ fn spawn_browser(
     url: &str,
     background: u32,
 ) {
-    let window_info = WindowInfo {
+    let mut window_info = WindowInfo {
         runtime_style: RuntimeStyle::ALLOY,
         ..WindowInfo::default()
-            .set_as_child(parent_view as sys::cef_window_handle_t, &cef_rect(ns_rect))
     };
-    let mut client = WebviewClient::new(id, generation);
-    // **CEF 的 windowed 浏览器做不到真透明**:按 cef_types.h,浏览器背景 alpha 透明时
-    // 会回退到 CefSettings.background_color,而那个再透明就退化成"不透明白"。wry 那套
-    // (WKWebView 私有 KVC `drawsBackground`)在 CEF 里没有对应键 —— 真透明只有 windowless
-    // (OSR)渲染一条路。所以这里显式填 zap 的工作区底色,避免白底。
-    let settings = BrowserSettings {
-        background_color: background,
-        ..Default::default()
+    let settings = match render_mode() {
+        RenderMode::Windowed => {
+            window_info = window_info
+                .set_as_child(parent_view as sys::cef_window_handle_t, &cef_rect(ns_rect));
+            // **CEF 的 windowed 浏览器做不到真透明**:按 cef_types.h,浏览器背景 alpha 透明时
+            // 会回退到 CefSettings.background_color,而那个再透明就退化成"不透明白"。wry 那套
+            // (WKWebView 私有 KVC `drawsBackground`)在 CEF 里没有对应键 —— 真透明只有 windowless
+            // (OSR)渲染一条路。所以这里显式填 zap 的工作区底色,避免白底。
+            BrowserSettings {
+                background_color: background,
+                ..Default::default()
+            }
+        }
+        RenderMode::Osr => {
+            // windowless 三开关 + DIP bounds(OSR-PLAN.md §1)。
+            window_info.windowless_rendering_enabled = 1;
+            window_info.shared_texture_enabled = i32::from(!cpu_paint());
+            window_info.external_begin_frame_enabled = i32::from(external_begin_frame());
+            let (width, height) = osr_view_size(ns_rect.size.width, ns_rect.size.height);
+            window_info.bounds = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            // windowless 下 `background_color` 的 alpha=0 即"启用透明绘制"(cef_types.h:701-708):
+            // 这正是走 OSR 的唯一理由 —— windowed 填什么都不透明。
+            BrowserSettings {
+                windowless_frame_rate: OSR_FRAME_RATE,
+                background_color: 0,
+                ..Default::default()
+            }
+        }
     };
+    // render handler 需要 OSR 共享状态;此处**没有**持有 WEBVIEWS 借用(浏览器创建本身
+    // 会同步回调 render handler,不能带借用进去)。
+    let osr = WEBVIEWS.with(|map| map.borrow().get(&id).and_then(|state| state.osr.clone()));
+    let mut client = WebviewClient::new(id, generation, osr);
     let url = CefString::from(url);
     let created = browser_host_create_browser(
         Some(&window_info),
@@ -570,11 +1253,41 @@ fn spawn_browser(
 /// 拆视图/发关闭通知;若我们只调 `close_browser` 而不管视图,浏览器会成为僵尸
 /// ——实测表现为切到别的 tab 后底下仍显示着旧 webview,且重建时叠加第二层。
 fn detach_view(browser: &Browser) {
+    if render_mode() == RenderMode::Osr {
+        // windowless 下 `GetWindowHandle()` 返回的是**父容器**
+        // (browser_platform_delegate_osr_mac.mm:GetHostWindowHandle ⇒
+        // window_info.parent_view),拿它 removeFromSuperview 会把 warpui 的
+        // WebViewContainerView 整个摘掉。OSR 的原生视图是我们自建的,走
+        // `release_osr_view`。
+        return;
+    }
     if let Some(host) = browser.host() {
         let view = host.window_handle() as *mut NSView;
         if !view.is_null() {
             unsafe { (*view).removeFromSuperview() };
         }
+    }
+}
+
+/// 摘掉一个 OSR 宿主视图:**先置空共享指针,再释放 NSView**。
+///
+/// 顺序不能反:`close_browser` 是**异步**的(CEF 文档明确),关闭完成前 CEF 仍可能投递
+/// `on_accelerated_paint`/`on_paint`,而 render handler 持有同一个 `OsrState` ——
+/// 指针不清空就会对已释放的 NSView 发消息(use-after-free)。置空后所有回调都会
+/// 早返回(null 检查),渲染/光标/几何安全降级。
+fn take_and_release_osr_view(osr: std::rc::Rc<OsrState>) {
+    let view = osr.view();
+    osr.view.set(std::ptr::null_mut());
+    if !view.is_null() {
+        unsafe { warp_cef_osr_view_release(view) };
+    }
+}
+
+/// 从注册表取出并释放 OSR 宿主视图(幂等:状态被 take 走后不会二次释放)。
+fn release_osr_view(id: u64) {
+    let osr = WEBVIEWS.with(|map| map.borrow_mut().get_mut(&id).and_then(|state| state.osr.take()));
+    if let Some(osr) = osr {
+        take_and_release_osr_view(osr);
     }
 }
 
@@ -686,7 +1399,7 @@ pub(crate) fn set_visible(id: u64, visible: bool) {
             None => false,
         }
     });
-    with_browser(id, |browser, _| {
+    with_browser(id, |browser, state| {
         if visible && was_frozen {
             log::info!("[cef] webview {id}: 重新可见,解冻页面");
             // 解冻失败则保留 frozen:下一帧(仍不可见时的冻结扫描不会再碰它,
@@ -700,9 +1413,22 @@ pub(crate) fn set_visible(id: u64, visible: bool) {
             }
         }
         if let Some(host) = browser.host() {
-            let view = host.window_handle() as *mut NSView;
-            if !view.is_null() {
-                unsafe { (*view).setHidden(!visible) };
+            match state.osr.as_ref() {
+                None => {
+                    let view = host.window_handle() as *mut NSView;
+                    if !view.is_null() {
+                        unsafe { (*view).setHidden(!visible) };
+                    }
+                }
+                Some(osr) => {
+                    // OSR:windowless 的 `window_handle()` 是父容器(见 detach_view),
+                    // 必须操作自建宿主视图;隐藏期间 CEF 不绘制,重新可见时主动请求一帧,
+                    // 否则切回来看到的是旧画面。
+                    unsafe { warp_cef_osr_view_set_hidden(osr.view(), i32::from(!visible)) };
+                    if visible {
+                        host.invalidate(PaintElementType::VIEW);
+                    }
+                }
             }
             host.was_hidden(i32::from(!visible));
         }
@@ -724,14 +1450,20 @@ pub(crate) fn set_bounds(id: u64, rect: RectF) {
         let Some(host) = browser.host() else {
             return;
         };
-        let view = host.window_handle() as *mut NSView;
-        if view.is_null() {
-            return;
-        }
-        let parent_height = unsafe { (*view).superview() }
-            .map(|superview| superview.frame().size.height);
-        let Some(parent_height) = parent_height else {
-            return;
+        let is_osr = state.osr.is_some();
+        // 父视图高度:windowed 从 CEF 子视图的 superview 取;OSR 没有 CEF 子视图,
+        // 用创建时记下的容器(同一个 WebViewContainerView)。
+        let parent_height = if is_osr {
+            unsafe { (*(state.parent_view as *const NSView)).frame().size.height }
+        } else {
+            let view = host.window_handle() as *mut NSView;
+            if view.is_null() {
+                return;
+            }
+            let Some(superview) = (unsafe { (*view).superview() }) else {
+                return;
+            };
+            superview.frame().size.height
         };
         let ns_rect = flip_rect_to_appkit(rect, parent_height);
         // 调用点每帧都会上报几何;wry 分支同样"先比较再下发"。每帧无条件
@@ -739,9 +1471,36 @@ pub(crate) fn set_bounds(id: u64, rect: RectF) {
         if ns_rect == state.rect {
             return;
         }
-        unsafe { (*view).setFrame(ns_rect) };
         state.rect = ns_rect;
-        host.was_resized();
+        match state.osr.as_ref() {
+            Some(osr) => {
+                unsafe {
+                    warp_cef_osr_view_set_frame(
+                        osr.view(),
+                        ns_rect.origin.x,
+                        ns_rect.origin.y,
+                        ns_rect.size.width,
+                        ns_rect.size.height,
+                    )
+                };
+                // 先更新共享几何再通知 CEF:was_resized 会**同步**回调
+                // GetViewRect/GetScreenInfo,那时读到的必须是新尺寸。
+                osr.size
+                    .set(osr_view_size(ns_rect.size.width, ns_rect.size.height));
+                host.was_resized();
+                // 跨屏(backing scale 变化)时补一次屏幕信息,否则沿用旧 DPI 渲染会糊。
+                let scale = unsafe { warp_cef_osr_view_scale(osr.view()) };
+                if (scale - osr.scale.get()).abs() > f64::EPSILON {
+                    osr.scale.set(scale);
+                    host.notify_screen_info_changed();
+                }
+            }
+            None => {
+                let view = host.window_handle() as *mut NSView;
+                unsafe { (*view).setFrame(ns_rect) };
+                host.was_resized();
+            }
+        }
     });
 }
 
@@ -752,6 +1511,8 @@ pub(crate) fn destroy(id: u64) {
     if let Some(browser) = browser {
         close_and_detach(&browser);
     }
+    // OSR 宿主视图由我们持有:先释放(幂等),再从注册表移除。
+    release_osr_view(id);
     WEBVIEWS.with(|map| {
         map.borrow_mut().remove(&id);
     });
@@ -782,9 +1543,25 @@ fn apply_geometry(id: u64) {
     };
     with_browser(id, |browser, state| {
         if let Some(host) = browser.host() {
-            let view = host.window_handle() as *mut NSView;
-            if !view.is_null() {
-                unsafe { (*view).setFrame(rect) };
+            match state.osr.as_ref() {
+                None => {
+                    let view = host.window_handle() as *mut NSView;
+                    if !view.is_null() {
+                        unsafe { (*view).setFrame(rect) };
+                    }
+                }
+                Some(osr) => {
+                    unsafe {
+                        warp_cef_osr_view_set_frame(
+                            osr.view(),
+                            rect.origin.x,
+                            rect.origin.y,
+                            rect.size.width,
+                            rect.size.height,
+                        )
+                    };
+                    osr.size.set(osr_view_size(rect.size.width, rect.size.height));
+                }
             }
             host.was_hidden(i32::from(!state.visible));
             host.was_resized();
@@ -796,6 +1573,9 @@ wrap_client! {
     struct WebviewClient {
         id: u64,
         generation: u64,
+        // OSR 共享状态(仅 OSR 模式):render handler 靠它读视图指针/几何,不碰 WEBVIEWS。
+        // (宏内字段不支持 /// 文档注释,故用行注释。)
+        osr: Option<std::rc::Rc<OsrState>>,
     }
 
     impl Client {
@@ -814,6 +1594,208 @@ wrap_client! {
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(WebviewLoad::new(self.id, self.generation))
         }
+
+        /// OSR 必须提供 RenderHandler:libcef 在创建 windowless 浏览器时**硬性要求**
+        /// 它非空(browser_host_create.cc: "Windowless rendering requires a
+        /// CefRenderHandler implementation"),否则创建直接失败。windowed 模式不提供
+        /// (CEF 也不会调用)。
+        fn render_handler(&self) -> Option<RenderHandler> {
+            self.osr
+                .clone()
+                .map(|osr| WebviewRenderHandler::new(osr))
+        }
+
+        /// OSR 下 CEF 不会自己设 NSCursor,必须由宿主转发(见 on_cursor_change)。
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            self.osr
+                .clone()
+                .map(|osr| WebviewDisplayHandler::new(osr))
+        }
+
+        /// 认领"页面未消费"的按键,阻止 CEF 把它递给应用菜单(见 WebviewKeyboardHandler)。
+        fn keyboard_handler(&self) -> Option<KeyboardHandler> {
+            self.osr.clone().map(|_| WebviewKeyboardHandler::new())
+        }
+    }
+}
+
+wrap_keyboard_handler! {
+    struct WebviewKeyboardHandler;
+
+    impl KeyboardHandler {
+        /// 返回 1 = 客户端已处理,**不再走 CEF 的平台回退**。
+        ///
+        /// 为什么必须认领(源码链路,实测踩到"在页面里打 f 会把 zap 窗口切全屏"):
+        /// 1. 页面没有 `preventDefault()` 的按键,渲染器会回报"未处理";
+        /// 2. `AlloyBrowserHostImpl::HandleKeyboardEvent` 先问客户端
+        ///    `CefKeyboardHandler::OnKeyEvent`,没人认领就调
+        ///    `platform_delegate_->HandleKeyboardEvent`;
+        /// 3. mac 的 OSR 委托实现是
+        ///    `CefBrowserPlatformDelegateNativeMac::HandleKeyboardEvent`:
+        ///    `[[NSApp mainMenu] performKeyEquivalent:合成 NSEvent]`;
+        /// 4. 而 zap 的窗口菜单经 `NSApplication::setWindowsMenu:` 让 AppKit 自动加了
+        ///    "Enter Full Screen" 项,它的 keyEquivalent 就是**裸 `f`**(Fn+F,掩码是
+        ///    `NSEventModifierFlagFunction`)—— 于是页面里的 `f` 命中了菜单的全屏项。
+        ///
+        /// 这些键我们已经转发给渲染器了(见 send_osr_key),页面才是它们的主人;
+        /// AppKit 的快捷键(含 Cmd+Ctrl+F 全屏、Cmd+T 新标签)在**窗口的
+        /// key equivalent 阶段**就已经被 zap 处理,根本到不了这里,故不受影响。
+        fn on_key_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            _event: Option<&KeyEvent>,
+            _os_event: *mut u8,
+        ) -> i32 {
+            1
+        }
+    }
+}
+
+wrap_display_handler! {
+    struct WebviewDisplayHandler {
+        osr: std::rc::Rc<OsrState>,
+    }
+
+    impl DisplayHandler {
+        /// 页面请求光标形状(链接/文本/缩放…)。返回 1 = 客户端已处理。
+        fn on_cursor_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            _cursor: *mut u8,
+            type_: CursorType,
+            _custom_cursor_info: Option<&CursorInfo>,
+        ) -> i32 {
+            let view = self.osr.view();
+            if view.is_null() {
+                return 0;
+            }
+            unsafe { warp_cef_osr_view_set_cursor(view, cursor_semantic(type_)) };
+            1
+        }
+    }
+}
+
+wrap_render_handler! {
+    struct WebviewRenderHandler {
+        osr: std::rc::Rc<OsrState>,
+    }
+
+    impl RenderHandler {
+        /// OSR 视图尺寸:**DIP(逻辑点)**,不是像素 —— CEF 自己会乘
+        /// `device_scale_factor`(见 osr_view_size 的注释)。
+        fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
+            let Some(rect) = rect else {
+                return;
+            };
+            let (width, height) = self.view_size_dip();
+            rect.x = 0;
+            rect.y = 0;
+            rect.width = width;
+            rect.height = height;
+        }
+
+        /// 屏幕信息:retina 缩放、色深、可用区(同样全部是 DIP)。
+        fn screen_info(
+            &self,
+            _browser: Option<&mut Browser>,
+            screen_info: Option<&mut ScreenInfo>,
+        ) -> i32 {
+            let Some(info) = screen_info else {
+                return 0;
+            };
+            let (width, height) = self.view_size_dip();
+            info.device_scale_factor = self.scale() as f32;
+            info.depth = 32;
+            info.depth_per_component = 8;
+            info.is_monochrome = 0;
+            info.rect = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            info.available_rect = info.rect.clone();
+            1
+        }
+
+        /// 加速绘制:macOS 上给的是 IOSurface 指针,直接贴进自建视图的
+        /// CALayer.contents(零拷贝;句柄每帧会变,故每帧都贴)。
+        fn on_accelerated_paint(
+            &self,
+            _browser: Option<&mut Browser>,
+            type_: PaintElementType,
+            _dirty_rects: Option<&[Rect]>,
+            info: Option<&AcceleratedPaintInfo>,
+        ) {
+            let Some(info) = info else {
+                return;
+            };
+            if type_ == PaintElementType::POPUP {
+                // 页面内弹层(`<select>` 等)用独立 popup layer,见 OSR-PLAN.md T6。
+                return;
+            }
+            let view = self.osr_view();
+            unsafe { warp_cef_osr_view_set_surface(view, info.shared_texture_io_surface) };
+            self.log_surface_size_once(view);
+        }
+
+        /// CPU 兜底:共享纹理不可用(如 GPU 进程异常、或 ZAP_CEF_OSR_CPU_PAINT=1)
+        /// 时 CEF 走这条路径,把 BGRA 位图交给宿主。
+        fn on_paint(
+            &self,
+            _browser: Option<&mut Browser>,
+            type_: PaintElementType,
+            _dirty_rects: Option<&[Rect]>,
+            buffer: *const u8,
+            width: i32,
+            height: i32,
+        ) {
+            if type_ == PaintElementType::POPUP {
+                return;
+            }
+            // CEF 的 on_paint 缓冲区是紧凑的 BGRA(width*4 字节/行)。
+            unsafe { warp_cef_osr_view_set_bitmap(self.osr_view(), buffer, width, height, width * 4) };
+        }
+    }
+}
+
+impl WebviewRenderHandler {
+    /// 宿主视图指针(CEF 可能同步回调,故只读共享单元,不碰 WEBVIEWS)。
+    fn osr_view(&self) -> *mut c_void {
+        self.osr.view()
+    }
+
+    /// 视图尺寸(DIP)。每帧 `set_bounds` 在通知 CEF **之前**写入,故 CEF 同步回调
+    /// GetViewRect/GetScreenInfo 时读到的一定是最新值。
+    fn view_size_dip(&self) -> (i32, i32) {
+        self.osr.size.get()
+    }
+
+    /// 当前 backing scale(2.0 = retina;1.0 = 普通屏)。
+    fn scale(&self) -> f64 {
+        self.osr.scale.get()
+    }
+
+    /// surface 尺寸变化时记一次日志(首帧也会记):这是"retina 无模糊 / 没有重复缩放"
+    /// 的硬证据 —— surface 应等于 `view_rect`(DIP)× device_scale_factor。
+    fn log_surface_size_once(&self, view: *mut c_void) {
+        if view.is_null() {
+            return;
+        }
+        let (mut width, mut height) = (0i32, 0i32);
+        unsafe { warp_cef_osr_view_surface_size(view, &mut width, &mut height) };
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        if self.osr.surface.get() == (width, height) {
+            return;
+        }
+        self.osr.surface.set((width, height));
+        log::info!(
+            "[cef] OSR surface {width}x{height}px (view_rect={:?} DIP, scale={:.1})",
+            self.view_size_dip(),
+            self.scale()
+        );
     }
 }
 
@@ -935,23 +1917,29 @@ wrap_life_span_handler! {
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             // 防御性移除原生视图:CEF 的 child-view 归属由宿主负责,残留的
             // CefBrowserHostView 会在洞被别的 pane 复用时透出旧页面。
+            // (OSR 下 window_handle() 是父容器,不能碰 —— 见 detach_view。)
             if let Some(browser) = browser {
-                if let Some(host) = browser.host() {
-                    let view = host.window_handle() as *mut NSView;
-                    if !view.is_null() {
-                        unsafe { (*view).removeFromSuperview() };
-                    }
-                }
+                detach_view(browser);
             }
             // 只清句柄,不删状态:"隐藏即销毁"下同一 id 之后还会重建;
-            // **只清当前代际**(否则迟到的旧回调会清掉新句柄)。
-            WEBVIEWS.with(|map| {
-                if let Some(state) = map.borrow_mut().get_mut(&self.id) {
-                    if state.generation == self.generation {
+            // **只清当前代际**(否则迟到的旧回调会清掉新句柄/新视图)。
+            // 顺带把 OSR 宿主视图一起摘掉:它属于这个浏览器实例,页面自行关闭
+            // (window.close() 等)后不该继续显示最后一帧 —— windowed 路径在
+            // detach_view 里已经这么做,两种模式保持一致。
+            let osr = WEBVIEWS.with(|map| {
+                let mut map = map.borrow_mut();
+                match map.get_mut(&self.id) {
+                    Some(state) if state.generation == self.generation => {
                         state.browser = None;
+                        state.osr.take()
                     }
+                    _ => None,
                 }
             });
+            // 借用外释放:不把 `WEBVIEWS` 借用跨过对外(ObjC/CEF)调用。
+            if let Some(osr) = osr {
+                take_and_release_osr_view(osr);
+            }
             log::info!("[cef] webview {} closed (gen {})", self.id, self.generation);
         }
     }
