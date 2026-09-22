@@ -220,9 +220,15 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > `pkill -f 'Helper \(Renderer\)'`,把用户机器的微信/Arc/Lark/VS Code 的 renderer 一起杀了
 > (均已自动重建,无持久影响)。
 
-### T9 —— 证据与文档归档
-- 更新 `TRANSPARENCY.md`(实测像素证据 + 结论)、`RUNTIME-VERIFICATION.md`(OSR 实跑)、`TECH.md`(模式与开关)。
-- 探针用完即删(临时探针规则);证据文件放 `specs/cef-webview-minimal/evidence/phase1/`(文本为主,截图仅必要几张)。
+### T9 —— 证据与文档归档 ✅ **已完成**
+> - `TRANSPARENCY.md` 追加 §7「落地结果」:方案 D 已实现、默认 windowed、开关与硬约束清单;
+>   并明确 **仍未做的验收 1/2(真实 pane 里的像素级透明比对)**。
+> - `RUNTIME-VERIFICATION.md` 追加 §8「OSR 阶段实跑(T4–T8)」:一张汇总表 + 各任务证据文档索引。
+> - `TECH.md` 追加「渲染模式与开关(定稿)」:两种模式、两级开关与优先级、生效时机、
+>   以及"设置不会被静默忽略"的两条保证与永久观测点日志。
+> - **临时探针已清理**:主仓代码内无 `printf/NSLog/dbg!/eprintln`、无探针残留(已核对);
+>   `tools/cef-spike`(阶段 0/T2 的独立探针 crate,372 KB,无任何构建引用)**已按计划删除**
+>   (经用户确认,删除记录在 git 历史里可恢复);`tools/cef-helper` 是构建必需资产,保留。
 
 ## 4 验证命令速查
 

@@ -1,4 +1,0 @@
-/target
-
-# run_hole_probe.sh 用 swiftc 现场编译的采样器(缺失时会自动重建)
-sample_pixel
