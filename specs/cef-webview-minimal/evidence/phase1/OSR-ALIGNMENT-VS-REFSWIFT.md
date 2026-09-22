@@ -68,3 +68,18 @@ CapsLock 设备无关掩码、隐藏超时 CDP 冻结、实例代际号、借用
 JSDialog/权限映射(`HandlerLogicTests.swift:12-70`)。
 我们的 `cef_backend_tests.rs` 只覆盖:cef_modifiers / windows_key_code / is_modifier_pressed / is_key_pad /
 deferred_key_plan / ime_replacement_range / cursor_semantic。
+
+## 5 实机验证与用户决定(2026-09-22,实例 pid 83540 / OSR 模式)
+
+| 项 | 用户实测 | 决定 |
+|----|----------|------|
+| P0-1 右键菜单 | — | **保持现在的两项(重新加载/检查元素)就够** ⇒ **不实现 `run_context_menu`**。于是 `on_before_context_menu`(填模型)、`on_context_menu_command`、`WebviewContextMenu`、`handle_menu_command` 属**已确认不用**的死代码 —— 建议单独一轮清理(改动虽小但跨 Rust/ObjC/回调声明,需重建验证) |
+| P0-2 下载 | **没有保存面板,但下载直接完成**(CEF 默认行为可用,只是无 UI) | 记录现状;是否需要保存面板/进度 UI 待定 |
+| P0-3 拖放 | **两个方向都没反应**(与预期一致) | 记录为已确认缺口(计划外,后续路线图) |
+| P0-4 编辑快捷键转发 | 未测 | **仅记录**(页面 JS 收不到按键;我们走 CEF API) |
+| P1-5 手势/缩放 | 未测 | **仅记录** |
+| P1-7 焦点随窗口 key | **确实一直有光标**(窗口失焦后页面仍显示光标,缺口成立) | 记录为已确认缺口 |
+
+**验证方式说明**:上表为**用户实机观察**;"P0-1 死代码""P0-3 无响应"与代码判据一致(见 §0/§2);
+P0-2 的"下载直接完成"说明 CEF 默认下载管道可用 ⇒ 缺的只是保存面板/进度 UI(原判断"完全缺失"应细化为
+"缺 handler,但默认行为会静默落盘")。
