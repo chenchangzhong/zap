@@ -141,7 +141,7 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > 真机逐项(点击/拖选/滚轮/进出/光标/英文/`f` 不全屏/Cmd+C·V·A·X)全部通过,无崩溃。
 > 中文输入不在本任务(主仓宿主视图尚未实现 `NSTextInputClient`)⇒ T7。
 
-### T6 —— 弹层与右键菜单 ⚠️ **部分完成**:右键菜单 ✅;**弹层已实现但 mac 上无触发路径**(实测结论,见下)
+### T6 —— 弹层与右键菜单 ✅ **已关闭**(右键菜单通过;`<select>` 弹层经用户决定不做 —— 没用到)
 > 结果与证据见 [evidence/phase1/OSR-T6-POPUP-MENU.md](evidence/phase1/OSR-T6-POPUP-MENU.md)。
 > 做:层树拆成 root + 内容层 + **popup 层**(照 CefSwift),`on_popup_show`/`on_popup_size`
 > 与 POPUP 类型的 paint 回调路由到弹层(原来直接丢弃);**右键菜单按计划改宿主异步 NSMenu**
@@ -166,8 +166,9 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > 菜单路径,而 CEF mac 侧没有实现它(`PopupMenu`/`WebMenuRunner` 在 CEF 源码里无命中),
 > `OnPopupShow` 只在 `InitAsPopup`(渲染器创建 popup widget)时触发 ⇒ **链路在 mac 不可达**。
 > 实现保留(与 CefSwift 同构,供其他平台/将来);**产品行为**:mac 上 CEF pane 里 `<select>` 打不开
-> (windowed 同理,非 OSR 特有)⇒ 需要 `<select>` 的页面用 **wry 内核**。故验收项
-> "页面内 `<select>` 能展开"在 mac 上无法达成,原因不在本实现。
+> (windowed 同理,非 OSR 特有)⇒ 需要 `<select>` 的页面用 **wry 内核**。
+> **2026-09-22 用户决定:`<select>` 场景不用到,该验收项撤销、T6 关闭**(右键菜单与
+> `screen_point` 两项能力仍为已验证交付)。
 
 ### T7 —— IME 落地主仓 ✅ **已完成(通过)**
 > 结果与证据见 [evidence/phase1/OSR-T7-IME.md](evidence/phase1/OSR-T7-IME.md)。

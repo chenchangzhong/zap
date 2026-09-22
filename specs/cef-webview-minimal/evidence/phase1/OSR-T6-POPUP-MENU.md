@@ -171,3 +171,11 @@ ZAP_CEF_WEBVIEW=1 ZAP_CEF_OSR=1 RUST_LOG="warp::browser::cef_backend=debug" \
 # 弹层:`grep -a 'on_popup_show\|on_popup_size' ~/Library/Logs/zap.log`
 # 菜单:`grep -a '右键' ~/Library/Logs/zap.log`
 ```
+
+## 5 收尾(2026-09-22,用户决定)
+
+- **`<select>` 弹层不做**:用户明确"没用到"。本文件的弹层实现与实测结论保留作为记录,
+  验收项"页面内 `<select>` 能展开"撤销;T6 以"右键菜单 + `screen_point`"两项已验证能力关闭。
+- **真透明已生效**:用户在实机确认"现在已经可以透明了"(OSR 模式下 dsh pane 的透明背景生效)。
+  配合阶段 0 探针的像素证据(透明页 82.7% 像素 alpha=0、中央红块 alpha=255,见
+  `OSR-SPIKE-A.md`)与主仓实跑的 `OSR surface = DIP×2`,透明这条目标的证据链闭合。
