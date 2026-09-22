@@ -135,3 +135,31 @@ CEF 用 **windowed(子视图)** 模式:把浏览器视图挂到 `WebViewContaine
    ② 我们自建 NSView 的 `NSTextInputClient` → CEF IME 链路能否打出中文。
    两件都通过再动主仓,否则成本会失控。
 3. 无论选哪条,**当前的填色方案应保留**(它是 OSR 未启用时的兜底,也保证默认配置视觉一致)。
+
+---
+
+## 7 落地结果(2026-09-22,方案 D 已实现)
+
+方案 D(OSR/windowless)已按本文件与 [OSR-PLAN.md](OSR-PLAN.md) 落地,要点:
+
+- **默认仍是 windowed**(逐字节回滚基线);OSR 由设置项 `general.webview.use_osr_rendering`
+  打开(设置页「使用无窗口(OSR)渲染」),`ZAP_CEF_OSR=1` 可临时覆盖。渲染模式是
+  `CefSettings.windowless_rendering_enabled` 这一**进程级**开关 ⇒ 改动**下次启动生效**。
+- 透明链路:宿主自建 NSView + IOSurface → `CALayer.contents`(零拷贝),CPU 位图兜底路径同款;
+  `background_color` 传 alpha=0。**链路的 alpha 证据在阶段 0 探针里已实测**(见 §1.3:透明页
+  82.7% 像素 alpha=0、中央红块 alpha=255),主仓侧已实跑出正确 surface 尺寸。
+- **仍未做**(计划的验收 1/2):在**真实 dsh pane** 里做像素级比对(需要 dsh 页面自身渲染成
+  透明背景才看得出差异;这属于 dsh 侧工作,见「归属约束」)。也就是说:能力已具备、
+  链路已实测,但"产品内可见差异"的收尾证据还缺一份。
+
+### 7.1 实现期踩到并固化的硬约束(详见 OSR-PLAN.md T5/T7)
+
+1. IME 的 `replacement_range` 必须传显式 `InvalidRange`(传 NULL 会被 CEF 退化成 (0,0) ⇒ 打断
+   `<textarea>` 焦点、composition 静默丢弃)。
+2. 导航后必须补一次焦点(`was_hidden(0)+set_focus(0)+set_focus(1)`),CEF 会静默丢焦点。
+3. `NSEventModifierFlags` 低 16 位是设备相关位,判修饰键组合前必须按 device-independent 掩码过滤。
+4. OSR 下 CEF 的 `SetFocus` 不会把自建视图设为 first responder,必须宿主 `makeFirstResponder`。
+5. 引导脚本必须由渲染进程 `on_context_created` 注入(否则 `__restoreFocused`、早期 IPC 队列、
+   focusin 上报、`window.open` 拦截全部缺席)。
+6. **不得在持有 `WEBVIEWS` 借用时调用外部(ObjC/CEF)** —— 它们会同步回调进 Rust;
+   在 `extern "C"` 回调里 panic 会直接 abort(实机崩溃过一次)。

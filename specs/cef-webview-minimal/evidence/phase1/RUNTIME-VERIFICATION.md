@@ -93,3 +93,29 @@ CEF_PATH="$HOME/.local/share/cef" cargo build -p warp --features cef_webview --b
 # 组装/嵌入(同 script/macos/cef_smoke),然后:
 ZAP_CEF_WEBVIEW=1 <app>/Contents/MacOS/zap-oss
 ```
+
+---
+
+# 8 OSR 阶段实跑(T4–T8,2026-09-22)
+
+阶段 1 之后 OSR(windowless)渲染模式落地,逐任务实跑结果与完整判据见
+`OSR-T4-MAIN-REPO.md` / `OSR-T5-INPUT.md` / `OSR-T6-POPUP-MENU.md` / `OSR-T7-IME.md` /
+`OSR-T8-SWITCH-EQUIV.md` / `OSR-REVIEW-2.md`。汇总:
+
+| 能力 | 状态 | 关键证据 |
+|------|------|----------|
+| OSR 渲染(IOSurface→CALayer + CPU 兜底) | ✅ | `OSR surface 3836x1908px (view_rect=(1918,954) DIP, scale=2.0)`(=DIP×2,无重复缩放) |
+| 鼠标/滚轮/拖曳/进入离开/光标 | ✅ | `send_mouse_click`/`send_mouse_wheel` 日志 + 用户逐项确认 |
+| 键盘(英文)+ 编辑命令 | ✅ | `send_key_event(KEYDOWN+CHAR)`;`edit command 0/1/2/3`;Cmd+C/V/A/X/Z(CapsLock 开关两态) |
+| 中文输入法(拼音→候选→上屏)+ 候选框跟随 | ✅ | `ime_set_composition "jing'ta's'fa"` → `ime_commit_text "敬他是发"`;`on_ime_composition_range_changed` 几何随组合变化 |
+| 右键菜单(宿主 NSMenu) | ✅ | `右键重新加载` / `右键检查元素 (669.5,203.2)`;事件对称 `up=0/up=1` 成对 |
+| 弹层(`<select>` 等) | ⚠️ 已实现未实测 | 需页面里存在可触发的 `<select>`;观察清单见 OSR-T6 证据 |
+| 开关(设置项 + env 覆盖) | ✅ | `render mode = Osr (env ZAP_CEF_OSR="(unset)", setting use_osr_rendering=true)` |
+| 懒初始化 | ✅ | 不带 `ZAP_CEF_WEBVIEW` 启动,开 pane 时才初始化并取到设置项 |
+| 冻结 → 解冻 | ✅ | `隐藏超时,已冻结页面` → `重新可见,解冻页面`,无 panic(`send_cdp` 在 OSR 下生效) |
+| renderer 崩溃 → 崩溃态 | ✅ | `[dsh] webview crashed, showing reload prompt` |
+| 切 tab(隐藏)不崩 | ✅ | 修掉借着重入 abort 后用户确认 |
+| 真透明像素比对(计划验收 1/2) | ⚠️ 未做 | 阶段 0 探针已证链路;产品内比对需 dsh 侧渲染透明背景 |
+
+**用户可见结论**:OSR 模式下 dsh pane 的渲染、输入、中文输入法、右键菜单与 windowed 路径
+功能对齐;隐藏/冻结/崩溃等既有策略在 OSR 下同样工作。

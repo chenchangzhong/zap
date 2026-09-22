@@ -156,3 +156,32 @@ flowchart LR
 - **Spike 验收(合并判定,2026-09-21 评审后校准)**:b/d/f + 挖洞外的 c(裸窗)通过;a/e 超限按「可入产品账」提请用户决策;c(挖洞/OSR 合并)降级为**阶段 1 第一项生死 criterion**。原始输出归档 `evidence/SPIKE-EVIDENCE.md`。
 - **阶段 1**:feature `cef` 下 `cargo check` 零警告;`cargo nextest run -p warp -E 'test(bridge)'` 全绿(协议未变);手动验证:dsh pane 开启 flag 后 IPC 4 方法(switch_project/open_file_explorer/open_file/notify)与 WKWebView 行为一致;`FeatureFlag::CefWebview` 关闭 → 原路径行为逐字节不变(WkBackend 是搬运非重写)。
 - **内存验证**:`footprint` 工具(或 `vmmap` 读 CEF helper 进程 RSS)对照,关闭 dsh pane 后恢复到无 CEF 基线。
+
+---
+
+## 渲染模式与开关(2026-09-22 定稿)
+
+CEF 后端支持两种渲染模式,**默认 windowed**:
+
+| 模式 | 实现 | 适用 |
+|------|------|------|
+| `Windowed`(默认) | CEF 自建原生子视图挂进 warpui 的 `WebViewContainerView` | 与阶段 1 完全一致;半透明窗口下 CEF 区域**不透光**(见 `TRANSPARENCY.md`) |
+| `Osr`(windowless) | 宿主自建 `WarpCefOsrView`:`on_accelerated_paint` 的 IOSurface 直接贴 `CALayer.contents`(零拷贝),CPU 位图兜底 | 真透明所需;输入/IME/弹层/菜单全部由宿主转接 |
+
+**开关(二者的优先级)**:
+
+1. `general.webview.use_osr_rendering`(设置项,设置页「使用无窗口(OSR)渲染」,默认 false)
+2. 环境变量 `ZAP_CEF_OSR`:**非空即覆盖**设置项(dev 排查/灰度用;`=0` 或 `=yes` 这类非真值
+   也算显式覆盖 ⇒ 回落 windowed)
+
+**生效时机**:`windowless_rendering_enabled` 是 `CefSettings` 上的**进程级**开关 ⇒ 一旦
+`CefInitialize` 就不能改,设置改动**下次启动生效**。为避免"设置被静默忽略",实现上有两条保证:
+
+- 启动期的 eager 初始化被**推迟到首帧**(设置已在帧回调最前面推入),懒初始化则在
+  `BrowserPaneView::new_dsh` 里 `ensure_initialized()` **之前**补推一次;
+- `render_mode()` 打印**永久观测点**:`[cef] render mode = … (env …, setting …)`,
+  日志里能直接确认"到底听了谁"。
+
+**OSR 实现期固化的硬约束**(违反会导致静默失效或崩溃)见 `OSR-PLAN.md` 的 T5/T7/T8 小节与
+`TRANSPARENCY.md` §7.1;其中最容易踩的是两条:**IME `replacement_range` 必须显式 InvalidRange**、
+**不得在持有 `WEBVIEWS` 借用时调用外部(ObjC/CEF)**。
