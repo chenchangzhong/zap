@@ -2502,50 +2502,17 @@ wrap_context_menu_handler! {
             let Some(model) = model else {
                 return;
             };
+            // **只清空,不再往里塞项**:OSR 下 CEF 的菜单模型没有任何消费方
+            // (我们没实现 `run_context_menu`),清了就够 —— 清空是为了抑制 CEF 尝试弹它自己的
+            // 默认菜单(OSR 下那条路径本就不可用,这里只是双保险)。真正显示的菜单由宿主在
+            // `rightMouseUp:` 里弹(`cef_support.m`),点击经 `handle_menu_command` 回调进 Rust。
+            // (2026-09-22 用户决定:右键菜单保持"重新加载/检查元素"两项即可,不实现
+            // `run_context_menu` —— 详见 evidence/phase1/OSR-ALIGNMENT-VS-REFSWIFT.md §5。)
             let removed = model.count();
-            let labels: Vec<String> = (0..removed)
-                .map(|index| CefString::from(&model.label_at(index)).to_string())
-                .collect();
             model.clear();
-            log::debug!("[cef] 右键菜单:清空 {removed} 个默认项 {labels:?}");
-            model.add_item(MENU_ID_RELOAD, Some(&CefString::from("重新加载")));
-            model.add_item(
-                MENU_ID_INSPECT_ELEMENT,
-                Some(&CefString::from("检查元素")),
-            );
+            log::debug!("[cef] 右键菜单:清空 {removed} 个 CEF 默认项(菜单由宿主自建)");
         }
 
-        /// 处理"检查元素":打开 DevTools 并定位到右键点中的元素。
-        /// 返回 1 = 已处理;返回 0 = 交回 CEF 处理默认命令。
-        fn on_context_menu_command(
-            &self,
-            browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
-            params: Option<&mut ContextMenuParams>,
-            command_id: i32,
-            _event_flags: EventFlags,
-        ) -> i32 {
-            let Some(browser) = browser else {
-                return 1;
-            };
-            if command_id == MENU_ID_RELOAD {
-                log::info!("[cef] webview {} 右键重新加载", self.id);
-                browser.reload();
-                return 1;
-            }
-            if command_id != MENU_ID_INSPECT_ELEMENT {
-                return 0;
-            }
-            let inspect_at = params.map(|params| Point {
-                x: params.xcoord(),
-                y: params.ycoord(),
-            });
-            if let Some(host) = browser.host() {
-                log::info!("[cef] webview {} 右键检查元素", self.id);
-                host.show_dev_tools(None, None, None, inspect_at.as_ref());
-            }
-            1
-        }
     }
 }
 
