@@ -20,8 +20,22 @@
   故 y 翻成底部原点(`warp_cef_osr_view_set_popup_rect`)。
 - 子层不继承父层 `contentsScale`,内容层/弹层各自设(否则 IOSurface 按错倍率贴)。
 
-**未验证风险**:上述 y 翻转与层结构只做过代码级核对(与 CefSwift 逐行对齐),没有实机触发过
-popup。等 dsh 页面出现 `<select>`(或设置面板)时按本文末尾命令复验。
+**实机结论(2026-09-22,已实测):mac 上 `<select>` 不产生 PET_POPUP ⇒ 弹层链路无触发路径**
+
+- 做法:临时探针往页面注入一个可见 `<select>`(左上角),让用户点击。日志显示点击确实到达
+  CEF(坐标 (53,19) 正是注入位置,`send_mouse_click` 连续多次),但
+  **`on_popup_show`/`on_popup_size` 一次都没出现**,下拉也不展开。
+- 判据:CEF 的 mac 侧没有实现 `<select>` 所需的嵌入方菜单路径 —— 在 CEF 源码里搜
+  `PopupMenu`/`WebMenuRunner`/`ShowPopupMenu` 无命中(`libcef/browser/native/menu_runner_mac.mm`
+  等),而 CEF 的 `OnPopupShow` 只在 `CefRenderWidgetHostViewOSR::InitAsPopup`
+  (`render_widget_host_view_osr.cc:643-670`)里触发 —— 即**渲染器必须创建 popup widget**。
+  mac 上 `<select>` 走的是另一条路(嵌入方菜单),CEF 未提供 ⇒ 链路不可达。
+- 影响与结论:
+  1. 本节的弹层实现(层树 + `on_popup_show/size` + POPUP 绘制路由)按参考实现写就、代码级核对通过,
+     但**在 mac 上没有触发路径**,属"为将来/其他平台保留"的能力(不删,保持与 CefSwift 同构);
+  2. **产品行为**:mac 上 CEF pane 里的 `<select>` 下拉**打不开**(windowed 模式同理,属 CEF-mac 限制,
+     非 OSR 特有);需要 `<select>` 的页面请用 **wry 内核**(WKWebView 原生支持)。
+- 因此 T6 的验收项"页面内 `<select>` 能展开"在 mac 上**无法达成**,原因不在本实现。
 
 ## 2 右键菜单(✅ 已通过)
 

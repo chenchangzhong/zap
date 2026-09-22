@@ -141,7 +141,7 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > 真机逐项(点击/拖选/滚轮/进出/光标/英文/`f` 不全屏/Cmd+C·V·A·X)全部通过,无崩溃。
 > 中文输入不在本任务(主仓宿主视图尚未实现 `NSTextInputClient`)⇒ T7。
 
-### T6 —— 弹层与右键菜单 ⚠️ **未完成**:右键菜单已通过;**弹层已实现但完全没有实机证据**(计划的"`<select>` 能展开"未验证,故本条不闭环)
+### T6 —— 弹层与右键菜单 ⚠️ **部分完成**:右键菜单 ✅;**弹层已实现但 mac 上无触发路径**(实测结论,见下)
 > 结果与证据见 [evidence/phase1/OSR-T6-POPUP-MENU.md](evidence/phase1/OSR-T6-POPUP-MENU.md)。
 > 做:层树拆成 root + 内容层 + **popup 层**(照 CefSwift),`on_popup_show`/`on_popup_size`
 > 与 POPUP 类型的 paint 回调路由到弹层(原来直接丢弃);**右键菜单按计划改宿主异步 NSMenu**
@@ -161,8 +161,13 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 >    交给 `popUpMenuPositioningItem:…inView:nil`。**它跟右键菜单出不出现无关**(原因见上一条)。
 >    另:`GetScreenInfo` 的矩形留空会回退 `GetViewRect`,故"填视图矩形"是合规实现。
 > 3. 弹层坐标是 **DIP、左上原点**,而我们的视图**非 flipped** ⇒ y 必须翻转(未实机验证)。
-> 验证:右键菜单两项实机 + 日志通过;弹层等 dsh 页面出现 `<select>` 再按证据文档复验
-> (`grep on_popup_show ~/Library/Logs/zap.log`)。
+> **弹层实测结论(2026-09-22)**:注入可见 `<select>` 并点击,点击确实到达 CEF(坐标吻合),
+> 但 **`on_popup_show`/`on_popup_size` 一次都没触发**、下拉不展开 ⇒ mac 上 `<select>` 走嵌入方
+> 菜单路径,而 CEF mac 侧没有实现它(`PopupMenu`/`WebMenuRunner` 在 CEF 源码里无命中),
+> `OnPopupShow` 只在 `InitAsPopup`(渲染器创建 popup widget)时触发 ⇒ **链路在 mac 不可达**。
+> 实现保留(与 CefSwift 同构,供其他平台/将来);**产品行为**:mac 上 CEF pane 里 `<select>` 打不开
+> (windowed 同理,非 OSR 特有)⇒ 需要 `<select>` 的页面用 **wry 内核**。故验收项
+> "页面内 `<select>` 能展开"在 mac 上无法达成,原因不在本实现。
 
 ### T7 —— IME 落地主仓 ✅ **已完成(通过)**
 > 结果与证据见 [evidence/phase1/OSR-T7-IME.md](evidence/phase1/OSR-T7-IME.md)。
