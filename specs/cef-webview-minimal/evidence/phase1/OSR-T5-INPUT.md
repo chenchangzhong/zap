@@ -9,7 +9,7 @@
 | 文件 | 改动 |
 |------|------|
 | [app/src/platform/mac/objc/cef_support.m](../../../../app/src/platform/mac/objc/cef_support.m) | `WarpCefOsrView` 增加:鼠标(move/down/up/drag/right/other/enter/exit)、滚轮(CGEvent point delta + 亚像素余量)、键盘(keyDown/keyUp/flagsChanged)、`acceptsFirstResponder`/`becomeFirstResponder`/`resignFirstResponder`、tracking area、光标(`cursorUpdate:`/`resetCursorRects`)、响应者链编辑动作(`copy:`/`cut:`/`paste:`/`selectAll:`/`undo:`/`redo:`)。事件只做"原始采集",经一个回调结构体交给 Rust。 |
-| [app/src/browser/cef_backend.rs](../../../../app/src/browser/cef_backend.rs) | `WarpCefOsrInputEvent`(与 ObjC 逐字段对齐)+ 3 个回调(mouse/key、edit command、focus);修饰键位映射 `cef_modifiers`、mac→Windows 键码表 `windows_key_code`、小键盘/修饰键状态判定、光标语义归一化;KEYDOWN+CHAR 两段式;编辑命令 → `focused_frame`(缺省回退主 frame);新增 `CefDisplayHandler::on_cursor_change` 与 `CefKeyboardHandler::on_key_event`。 |
+| [app/src/browser/cef_backend.rs](../../../../app/src/browser/cef_backend.rs) | `WarpCefOsrInputEvent`(与 ObjC 逐字段对齐)+ 3 个回调(mouse/key、edit command、focus);修饰键位映射 `cef_modifiers`、mac→Windows 键码表 `windows_key_code`(**更正:mac OSR 下 CEF 会合成 NSEvent 让 Chromium 反推该字段,本表在 mac 不生效,只为与 cefclient/CefSwift 的跨平台构造一致**)、小键盘/修饰键状态判定、光标语义归一化;KEYDOWN+CHAR 两段式;编辑命令 → `focused_frame`(缺省回退主 frame);新增 `CefDisplayHandler::on_cursor_change` 与 `CefKeyboardHandler::on_key_event`。 |
 | [app/src/browser/cef_backend_tests.rs](../../../../app/src/browser/cef_backend_tests.rs) | 新增 6 个纯逻辑单测(修饰键位、键码表、修饰键状态、小键盘、DIP 坐标截断、光标语义、编辑快捷键判定)。 |
 
 ## 2 真机暴露的三个问题(都值得记住)

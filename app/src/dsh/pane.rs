@@ -305,7 +305,17 @@ impl DshPaneView {
                         // pane(用户切走)则不抢,由切回时 on_focus 正常切换。
                         // 判据含子视图:pane 内容的焦点由 focus_contents 下传给
                         // BrowserPaneView,严格 is_self_focused 会漏判。
-                        if ctx.is_self_or_child_focused() {
+                        // **但还要补上 pane 级判据**:新开 pane 时 `focus_contents` 会因为
+                        // webview 尚未可见而早返回(见那里的注释),焦点只停在 pane 上、
+                        // 没落进内容 ⇒ `is_self_or_child_focused` 恒假,页面永远拿不到键盘
+                        // 焦点(表现为"打开 pane 后不点页面直接打字没有任何反应",
+                        // CEF/wry 两种后端同样如此)。`is_focused` 是"本 pane 是否为当前
+                        // 焦点 pane"的权威判据;真正切走时它也为假,不会抢焦点。
+                        let pane_focused = view
+                            .focus_handle
+                            .as_ref()
+                            .is_some_and(|handle| handle.is_focused(ctx));
+                        if ctx.is_self_or_child_focused() || pane_focused {
                             BrowserWebViewManager::as_ref(ctx)
                                 .focus_webview_restoring_input(webview_id);
                         }

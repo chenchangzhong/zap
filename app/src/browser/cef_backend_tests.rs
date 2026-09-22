@@ -155,51 +155,6 @@ fn to_dip_coord_truncates() {
     assert_eq!(to_dip_coord(-3.4), -3);
 }
 
-/// Cmd+A/C/V/X/Z → 网页编辑命令;**CapsLock 不能挡住它**
-/// (zap 窗口对嵌入视图用 `mods == Command` 精确比较,开着 CapsLock 时这组快捷键
-/// 会漏给页面,实测踩到)。非 Cmd 组合、带别的修饰键、以及 zap 自己的 Cmd+T 等
-/// 都必须返回 None(交回 zap 的正常路径)。
-#[test]
-fn edit_command_for_key_covers_editing_shortcuts() {
-    let cmd = NS_MOD_COMMAND;
-    assert_eq!(edit_command_for_key(Some("a"), cmd), Some(OSR_EDIT_SELECT_ALL));
-    assert_eq!(edit_command_for_key(Some("c"), cmd), Some(OSR_EDIT_COPY));
-    assert_eq!(edit_command_for_key(Some("v"), cmd), Some(OSR_EDIT_PASTE));
-    assert_eq!(edit_command_for_key(Some("x"), cmd), Some(OSR_EDIT_CUT));
-    assert_eq!(edit_command_for_key(Some("z"), cmd), Some(OSR_EDIT_UNDO));
-    assert_eq!(
-        edit_command_for_key(Some("z"), cmd | NS_MOD_SHIFT),
-        Some(OSR_EDIT_REDO)
-    );
-    // 大写/带 CapsLock 同样命中(用户 CapsLock 开着时实测踩到)。
-    assert_eq!(
-        edit_command_for_key(Some("A"), cmd | NS_MOD_CAPS_LOCK),
-        Some(OSR_EDIT_SELECT_ALL)
-    );
-    assert_eq!(
-        edit_command_for_key(Some("C"), cmd | NS_MOD_SHIFT | NS_MOD_CAPS_LOCK),
-        Some(OSR_EDIT_COPY)
-    );
-    // 设备相关位必须被滤掉:NSEvent 每次按键都带 0x100(kCGEventFlagMaskNonCoalesced)
-    // 与 0x8(左 Command)等低位 —— 不滤的话这组快捷键全部失效(实测踩到)。
-    assert_eq!(
-        edit_command_for_key(Some("c"), cmd | 0x100 | 0x8),
-        Some(OSR_EDIT_COPY)
-    );
-    assert_eq!(
-        edit_command_for_key(Some("C"), cmd | NS_MOD_SHIFT | 0x100 | 0x2),
-        Some(OSR_EDIT_COPY)
-    );
-
-    // 不是编辑快捷键:交回 zap(Cmd+T 新标签、Cmd+Ctrl+F 全屏等)。
-    assert_eq!(edit_command_for_key(Some("t"), cmd), None);
-    assert_eq!(edit_command_for_key(Some("f"), cmd | NS_MOD_CONTROL), None);
-    // 没有 Cmd(裸字母)一律不认领。
-    assert_eq!(edit_command_for_key(Some("a"), 0), None);
-    assert_eq!(edit_command_for_key(Some("a"), NS_MOD_OPTION), None);
-    assert_eq!(edit_command_for_key(None, cmd), None);
-}
-
 /// deferred 按键决策(T7 输入法,照 cefclient/CefSwift 的
 /// HandleKeyEventBefore/AfterTextInputClient):普通按键必须仍是 KEYDOWN+CHAR,
 /// 组合中上报 composition,上屏走 commit —— 三者不能混。

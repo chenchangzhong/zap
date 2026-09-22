@@ -110,17 +110,21 @@ window.open = function(url) {
 // dsh 页面只有一个输入框,直接按选择器找,不做失焦记录;无论 DOM 焦点是否
 // 一直残留在输入框,光标都统一到末尾。
 window.__restoreFocused = function() {
-  var el = document.querySelector('textarea[data-testid="dsh-input"]')
-           || document.querySelector('textarea[placeholder]')
-           || document.querySelector('div[contenteditable="true"][role="textbox"]')
-           || document.querySelector('div.ProseMirror')
-           || document.querySelector('.cm-content[contenteditable]');
-  if (!el || !el.isConnected) {
-    return;
-  }
   var attempts = 0;
   var tryFocus = function() {
-    if (!el.isConnected) {
+    var el = document.querySelector('textarea[data-testid="dsh-input"]')
+             || document.querySelector('textarea[placeholder]')
+             || document.querySelector('div[contenteditable="true"][role="textbox"]')
+             || document.querySelector('div.ProseMirror')
+             || document.querySelector('.cm-content[contenteditable]');
+    // 元素还没挂载时必须**重试**:load 事件早于 SPA 首次渲染,此刻输入框往往
+    // 还不在 DOM 里(CEF pane 实测:加载完成时 document.activeElement 是 BODY、
+    // 找不到输入框),原来直接 return 会让"打开 pane 后不点页面直接打字"完全
+    // 没有反应 —— 焦点永远留在 body。有限次(≈3s)避免死循环。
+    if (!el || !el.isConnected) {
+      if (attempts++ < 60) {
+        setTimeout(tryFocus, 50);
+      }
       return;
     }
     if (document.hasFocus()) {
@@ -140,10 +144,10 @@ window.__restoreFocused = function() {
           endSel.addRange(endRange);
         } catch (e) {}
       }
-    } else if (attempts++ < 20) {
+    } else if (attempts++ < 60) {
       // makeFirstResponder 后页面 hasFocus 需等 AppKit 事件循环才变 true,
       // 故重试等待,有限次避免死循环。
-      setTimeout(tryFocus, 30);
+      setTimeout(tryFocus, 50);
     }
   };
   tryFocus();

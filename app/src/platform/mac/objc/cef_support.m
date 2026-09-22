@@ -312,6 +312,10 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     /// composition 期间 CEF 回报的选区(UTF-16),答 hasMarkedText/selectedRange 用。
     NSRange _cefSelectedRange;
     BOOL _hasCefSelection;
+    /// 程序化焦点同步期间置位:`makeFirstResponder:` 会**同步**回调
+    /// `becomeFirstResponder`/`resignFirstResponder`,若那时再通知 Rust
+    /// (`focus()` → 又调回 `warp_cef_osr_view_focus`)就会递归,故这两处回调要看它。
+    BOOL _syncingFocus;
     /// deferred 模型:`interpretKeyEvents:` 期间累积的状态(见 WarpCefOsrKeyInput)。
     BOOL _handlingKeyDown;
     NSMutableString *_textToInsert;
@@ -368,14 +372,16 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
 
 - (BOOL)becomeFirstResponder {
     // 让 CEF 知道浏览器获得焦点:否则页面里没有光标、键盘/IME 也不工作。
-    if (gInputCallbacks.handle_focus != NULL) {
+    // `_syncingFocus` 期间不回调:那是 Rust 的 focus() 主动设焦点,CEF 侧由它自己
+    // 同步(见 warp_cef_osr_view_focus),回调会绕回 focus() 造成递归。
+    if (!_syncingFocus && gInputCallbacks.handle_focus != NULL) {
         gInputCallbacks.handle_focus(_webviewId, 1);
     }
     return [super becomeFirstResponder];
 }
 
 - (BOOL)resignFirstResponder {
-    if (gInputCallbacks.handle_focus != NULL) {
+    if (!_syncingFocus && gInputCallbacks.handle_focus != NULL) {
         gInputCallbacks.handle_focus(_webviewId, 0);
     }
     return [super resignFirstResponder];
@@ -607,6 +613,9 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     command.replacement_to = (replacement.location == NSNotFound)
                                  ? -1
                                  : (int32_t)(replacement.location + replacement.length);
+    // keep_selection=1 取自参考实现 CefSwift(其 imeFinishComposing 默认
+    // keepSelection: true);cefclient 的同名调用传 false,两者不一致,这里跟随
+    // 我们的对照实现。**注意**:deferred(按键内)那条路径用的是 0,与 CefSwift 一致。
     command.keep_selection = 1;
     gInputCallbacks.handle_ime(_webviewId, &command);
 }
@@ -849,6 +858,33 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
 }
 
 @end
+
+/// 让自建宿主视图成为窗口 first responder。
+///
+/// **OSR 必须自己做这件事**:CEF 的 `SetFocus(true)` 在 mac 上只对 content native view
+/// 调 `makeFirstResponder`(browser_platform_delegate_native_mac.mm),windowless 下该
+/// view 为 null ⇒ 只调 CEF 的话,键盘事件仍发给 WarpHostView,页面收不到输入(要先用鼠标
+/// 点一下页面才行)。wry 后端 `focus()` 内部就是 makeFirstResponder,这里对齐。
+/// `focused == 0` 时不动作(与 wry 的 focus() 一致:失焦由 AppKit 自己走响应者链)。
+void warp_cef_osr_view_focus(void *view, int32_t focused) {
+    WarpCefOsrView *v = (WarpCefOsrView *)view;
+    if (v == nil || focused == 0 || v.window == nil) {
+        return;
+    }
+    v->_syncingFocus = YES;
+    [v.window makeFirstResponder:v];
+    v->_syncingFocus = NO;
+}
+
+/// 宿主视图当前是否是窗口的 first responder(加载完成后据此决定要不要补 CEF 焦点:
+/// 只有"输入本来就在页面上"时才补,避免把用户在终端里的焦点抢走)。
+int32_t warp_cef_osr_view_is_first_responder(void *view) {
+    WarpCefOsrView *v = (WarpCefOsrView *)view;
+    if (v == nil || v.window == nil) {
+        return 0;
+    }
+    return v.window.firstResponder == v ? 1 : 0;
+}
 
 /// CEF 回报 composition 的几何与选区(render handler 的
 /// on_ime_composition_range_changed 调用):候选框靠它跟随光标。

@@ -166,6 +166,24 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 - 文件:`app/src/platform/mac/objc/cef_support.m`、`app/src/browser/cef_backend.rs`、
   `app/src/browser/cef_backend_tests.rs`。
 
+### T5.5 —— 交付前独立审核与修复轮 ✅ **已完成**
+> 详细结论见 [evidence/phase1/OSR-REVIEW-2.md](evidence/phase1/OSR-REVIEW-2.md)。
+> 两位独立审查者(缺陷清单 + canonical 模板分级)提出 5 条确认缺陷与 8 条次要项;每条都
+> 先复核证据再决策,共修复 8 处、明确不改 5 处(含"cefclient 的 `textInserted` 是死变量,
+> 不该加上那条守卫")。
+> **新增/固化的硬约束(后续任务必须遵守)**:
+> 1. `app/assets/webview_init.js` **必须由渲染进程 `on_context_created` 注入**(CEF 后端此前
+>    从未实现 ⇒ `__restoreFocused`、早期 IPC 队列、focusin 上报、`window.open` 拦截全部缺席)。
+> 2. OSR 下 CEF 的 `SetFocus` **不会**把自建视图设为 first responder,必须由宿主
+>    `makeFirstResponder`(带可重入守卫)。
+> 3. 焦点交接要认 pane 级权威判据 `PaneFocusHandle::is_focused`:新开 pane 时
+>    `focus_contents` 会因 webview 未可见而早返回,`is_self_or_child_focused` 因此恒假。
+> 4. **解冻路径不得嵌套借用 `WEBVIEWS`**(既有 panic,已修);新增"借用内调 CEF/ObjC"前
+>    先按本文件的借用纪律核对。
+> 5. `__restoreFocused` 对"输入框尚未挂载"必须重试(load 早于 SPA 首渲染)。
+> 6. mac OSR 下 `windows_key_code` **不被 CEF 采用**(合成 NSEvent 后由 Chromium 反推),
+>    不要把它写成"已在 mac 生效"的行为。
+
 ### T8 —— 开关、回滚与既有策略的等价性
 - 做:渲染模式开关(环境变量如 `ZAP_CEF_OSR=1` + 设置项),默认 windowed;
   确认隐藏/冻结(CDP `Page.setWebLifecycleState`)/懒初始化/renderer 崩溃在 OSR 下同样工作。

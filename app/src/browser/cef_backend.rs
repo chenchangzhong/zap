@@ -58,14 +58,21 @@ pub(crate) fn render_mode() -> RenderMode {
 /// 而外部驱动要求宿主严格按显示刷新喂帧(见 OSR-PLAN.md §5 性能风险)。
 fn external_begin_frame() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("ZAP_CEF_OSR_EXTERNAL_BEGIN_FRAME").is_some())
+    // 口径与 `parse_render_mode` 一致:只有显式 "1"/"true" 才是开;设 `=0`/`=false`
+    // 不能被当成开启(否则"关掉"这个开关反而生效)。
+    *ENABLED.get_or_init(|| env_flag("ZAP_CEF_OSR_EXTERNAL_BEGIN_FRAME"))
+}
+
+/// 环境变量按"真值"解析:口径与 `parse_render_mode` 完全一致(只有 "1"/"true" 为真)。
+fn env_flag(name: &str) -> bool {
+    matches!(std::env::var(name).ok().as_deref(), Some("1") | Some("true"))
 }
 
 /// 关掉共享纹理,强制走 `on_paint`(CPU 位图)兜底路径:用于验证兜底实现
 /// (GPU 进程异常时 CEF 也会自动回落到这条路径)。
 fn cpu_paint() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("ZAP_CEF_OSR_CPU_PAINT").is_some())
+    *ENABLED.get_or_init(|| env_flag("ZAP_CEF_OSR_CPU_PAINT"))
 }
 
 /// OSR 视图尺寸(**DIP / 逻辑点**,不是像素)。
@@ -142,17 +149,6 @@ const NS_MOD_CONTROL: u32 = 1 << 18;
 const NS_MOD_OPTION: u32 = 1 << 19;
 const NS_MOD_COMMAND: u32 = 1 << 20;
 const NS_MOD_NUMERIC_PAD: u32 = 1 << 21;
-
-/// `NSEventModifierFlags` 的低 16 位是**设备相关**位(实测每次按键都带 0x100
-/// `kCGEventFlagMaskNonCoalesced`、0x8 左 Command 等)。**比较修饰键组合前必须先过滤** ——
-/// 否则"除了 Cmd/Shift/CapsLock 没有别的修饰键"这类判断永远为假(CapsLock 场景实测:
-/// Cmd+C/X/V 被当普通按键发给了页面,编辑命令一条都没触发)。
-const NS_MOD_DEVICE_INDEPENDENT_MASK: u32 = 0xFFFF_0000;
-
-/// 只保留设备无关的修饰键位。
-fn device_independent_modifiers(flags: u32) -> u32 {
-    flags & NS_MOD_DEVICE_INDEPENDENT_MASK
-}
 
 /// 与 ObjC `WarpCefOsrInputEvent` **逐字段对应**(顺序/类型不可改)。
 #[repr(C)]
@@ -311,6 +307,14 @@ fn windows_key_code(mac_key_code: u16, chars_ignoring_modifiers: Option<&str>) -
 }
 
 /// 与字符无关的键(导航/功能/修饰键)的 VK 表。
+/// mac 键码 → Windows VK。
+///
+/// **注意:本平台(CEF macOS OSR)这个值不会被 CEF 采用** ——
+/// `CefBrowserPlatformDelegateNativeMac::TranslateWebKeyEvent` 会用我们给的字符/键码
+/// **合成一个 NSEvent**,再由 Chromium 的 `NativeWebKeyboardEvent(NSEvent*)` 反推
+/// windowsKeyCode(CEF 源码注释直言这是"唯一无法直接翻译的成员")。保留此表是为了与
+/// 参考实现(cefclient/CefSwift,跨平台共用同一份 KeyEvent 构造)保持一致,不要把它
+/// 当作 mac 上的生效行为(证据文档曾误把它写成交付项,已更正)。
 fn special_windows_key_code(mac_key_code: u16) -> Option<i32> {
     let code = match mac_key_code {
         0x24 => 0x0D,       // Return
@@ -408,42 +412,6 @@ fn cursor_semantic(cursor_type: CursorType) -> i32 {
     }
 }
 
-/// 命中"网页编辑命令"的按键 → 命令 id(否则 None)。
-///
-/// 只在带 Command、且除 Shift/CapsLock 外没有别的修饰键时生效。**CapsLock 必须放行**:
-/// zap 的 `WarpWindow::performKeyEquivalent:` 对嵌入视图用的是
-/// `mods == NSEventModifierFlagCommand` 精确比较,开着 CapsLock 时 Cmd+A/C/V/X
-/// 不会被路由到响应者动作(实测:ns_flags 里带 0x10000),于是被当普通按键转发给页面、
-/// 复制/全选/剪切全部失效。这里在宿主侧兜住这组编辑快捷键(与 OSR-PLAN.md T5 一致)。
-fn edit_command_for_key(chars_ignoring_modifiers: Option<&str>, modifier_flags: u32) -> Option<i32> {
-    // 先滤掉设备相关位(见 NS_MOD_DEVICE_INDEPENDENT_MASK),否则下面永远判成
-    // "还带着别的修饰键",拦截形同虚设。
-    let flags = device_independent_modifiers(modifier_flags);
-    if flags & NS_MOD_COMMAND == 0 {
-        return None;
-    }
-    let others = flags & !(NS_MOD_COMMAND | NS_MOD_SHIFT | NS_MOD_CAPS_LOCK);
-    if others != 0 {
-        return None;
-    }
-    let key = chars_ignoring_modifiers?.to_ascii_lowercase();
-    let shift = modifier_flags & NS_MOD_SHIFT != 0;
-    Some(match key.as_str() {
-        "a" => OSR_EDIT_SELECT_ALL,
-        "c" => OSR_EDIT_COPY,
-        "v" => OSR_EDIT_PASTE,
-        "x" => OSR_EDIT_CUT,
-        "z" => {
-            if shift {
-                OSR_EDIT_REDO
-            } else {
-                OSR_EDIT_UNDO
-            }
-        }
-        _ => return None,
-    })
-}
-
 /// 鼠标键位 → CEF 枚举。
 fn mouse_button(button: i32) -> MouseButtonType {
     match button {
@@ -528,9 +496,6 @@ extern "C" fn osr_input_event_trampoline(id: u64, event: *const WarpCefOsrInputE
         // 走 deferred 模型(handle_key → osr_key_trampoline),因为要先把事件交给输入法。
         // 这里只剩抬起(key_type=1)与修饰键变化(key_type=2)。
         OSR_EVENT_KEY => {
-            if event.key_type == 0 {
-                return; // 防御:不应发生(见上)
-            }
             log::debug!(
                 "[cef] osr {id}: send_key_event key_type={} code={} ns_flags=0x{:X} cef_flags=0x{:X} \
                  chars={:?}",
@@ -619,7 +584,7 @@ fn send_osr_key(host: &BrowserHost, event: &WarpCefOsrInputEvent) {
 /// 编辑命令 → focused frame(取不到时退回主 frame,与参考实现一致)。
 extern "C" fn osr_edit_command_trampoline(id: u64, command: i32) {
     // 证据通道(与 send_mouse_*/send_key_event 同口径)。两条入口都会到这里:
-    // 1. 宿主视图 keyDown 里识别出的 Cmd+A/C/V/X/Z(见 edit_command_for_key);
+    // 1. 视图级 `performKeyEquivalent:` 拦下的 Cmd+A/C/V/X/Z(见 cef_support.m);
     // 2. Cmd+C/V/X/A 由 WarpWindow::performKeyEquivalent: 的嵌入视图分支直接发到
     //    本视图的 copy:/paste:/cut:/selectAll:(以及菜单经响应者链的 undo:/redo:)。
     log::debug!("[cef] osr {id}: edit command {command}");
@@ -734,16 +699,10 @@ extern "C" fn osr_key_trampoline(id: u64, key: *const WarpCefOsrKeyInput) {
         return;
     }
     let key = unsafe { &*key };
+    // **这里不再拦截 Cmd+A/C/V/X/Z**:那条路径已被视图级 `performKeyEquivalent:`
+    // (cef_support.m,排在 AppKit 菜单之前、覆盖 CapsLock 形态)完整接管并消费,
+    // keyDown 根本收不到这组键 ⇒ 原来这层兜底不可达(评审判定为重复 owner,已删)。
     let unmodified = cstr_to_string(key.chars_ignoring_modifiers);
-    // Cmd+A/C/V/X/Z 先走编辑命令:zap 窗口对嵌入视图用 `mods == Command` 精确比较,
-    // 开着 CapsLock 时这组键不会走响应者动作(实测 ns_flags 带 0x10000),必须在这里兜住
-    // —— 否则它们会当普通按键发给页面,复制/全选/剪切全部失效(T5 实测。
-    // 注意:这条拦截必须在 deferred 决策**之前**,否则 Cmd 组合会走普通键分支)。
-    if let Some(command) = edit_command_for_key(unmodified.as_deref(), key.modifier_flags) {
-        log::debug!("[cef] osr {id}: key {unmodified:?} → edit command {command}");
-        osr_edit_command_trampoline(id, command);
-        return;
-    }
     let text_to_insert = cstr_to_string(key.text_to_insert);
     let marked_text = cstr_to_string(key.marked_text);
     let plan = deferred_key_plan(
@@ -780,6 +739,15 @@ extern "C" fn osr_key_trampoline(id: u64, key: *const WarpCefOsrKeyInput) {
     }
 
     if plan.send_plain_key {
+        // 小键盘 Clear(键码 71)只发 KEYDOWN、**不发 CHAR**:cefclient 在此直接 return
+        // (见 text_input_client_osr_mac.mm 的 `native_key_code == 71`),因为它的
+        // characters 是 ESC(0x1B),当文本发出去会往页面插控制字符。
+        if is_key_pad_event(key.key_code, key.modifier_flags) && key.key_code == 71 {
+            log::debug!("[cef] osr {id}: send_key_event(KEYDOWN only, 小键盘 Clear)");
+            base.type_ = KeyEventType::KEYDOWN;
+            host.send_key_event(Some(&base));
+            return;
+        }
         // 证据通道(与 T5 的 send_mouse_*/send_key_event 同口径):英文/功能键走这条路径。
         log::debug!(
             "[cef] osr {id}: send_key_event(KEYDOWN+CHAR) code={} chars={:?}",
@@ -798,7 +766,11 @@ extern "C" fn osr_key_trampoline(id: u64, key: *const WarpCefOsrKeyInput) {
     if let Some(text) = plan.commit_text.as_deref() {
         if !text.is_empty() {
             let cef_text = CefString::from(text);
-            let replacement = ime_replacement_range(key.replacement_from, key.replacement_to);
+            // **提交时不带 replacement range**(对齐参考实现 `imeCommitText(text, replacementRange: nil)`):
+            // 组装的文本已经在 composition 阶段进了文档,再给一个"有效"的替换区间会让
+            // 渲染器走 SelectRange —— 在 `<textarea>` 上这正是 T2 记录过的、会把焦点打断、
+            // composition 静默丢弃的路径(见 OSR-SPIKE-B.md)。
+            let replacement = ime_replacement_range(-1, -1);
             log::debug!("[cef] osr {id}: ime_commit_text {text:?}");
             // relative_cursor_pos=0 ⇒ 光标落在提交文本末尾(Chromium 的
             // InputMethodController::ComputeAbsoluteCaretPosition = 起点 + 长度 + relative)。
@@ -903,6 +875,8 @@ extern "C" {
     ) -> *mut c_void;
     fn warp_cef_osr_view_set_input_callbacks(callbacks: *const WarpCefOsrInputCallbacks);
     fn warp_cef_osr_view_set_cursor(view: *mut c_void, semantic: i32);
+    fn warp_cef_osr_view_focus(view: *mut c_void, focused: i32);
+    fn warp_cef_osr_view_is_first_responder(view: *mut c_void) -> i32;
     fn warp_cef_osr_view_set_ime_bounds(
         view: *mut c_void,
         sel_from: i32,
@@ -1115,20 +1089,26 @@ pub(crate) fn shutdown() {
     // 先逐个关闭浏览器并清空注册表,再 CefShutdown:CEF 文档明确"调用本函数后不得再
     // 调用任何 CEF 函数",而我们持有的 `Browser` 是引用计数对象 —— 若留到 thread_local
     // 析构时 drop,就会在关机后调用 release()(评审 N3)。
-    WEBVIEWS.with(|map| {
+    let osr_views: Vec<std::rc::Rc<OsrState>> = WEBVIEWS.with(|map| {
         let mut map = map.borrow_mut();
+        let mut views = Vec::new();
         for state in map.values_mut() {
             if let Some(browser) = state.browser.take() {
                 close_and_detach(&browser);
             }
-            // OSR 宿主视图是我们自建的原生视图,同样必须在 CefShutdown 前拆掉并释放
-            // (否则留下一个指向已销毁 CEF 内容的 layer)。
+            // 自建视图必须在 CefShutdown 前拆掉(否则留下指向已销毁 CEF 内容的 layer);
+            // 这里只**收集**,释放放到借用之外 —— 释放会让视图从响应者链上退下来,可能
+            // 同步回调 focus(),那条路径会再借 WEBVIEWS。
             if let Some(osr) = state.osr.take() {
-                unsafe { warp_cef_osr_view_release(osr.view()) };
+                views.push(osr);
             }
         }
         map.clear();
+        views
     });
+    for osr in osr_views {
+        take_and_release_osr_view(osr);
+    }
     log::info!("[cef] 关闭 CEF(CefShutdown)");
     cef::shutdown();
 }
@@ -1236,6 +1216,43 @@ wrap_app! {
     impl App {
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
             Some(CefBrowserProcessHandler::new(RefCell::new(None)))
+        }
+
+        /// 引导脚本必须在**渲染进程的上下文创建时**注入(见
+        /// [webview_init_js](../../browser/webview_init_js.rs) 的文件头注释):
+        /// 它定义 `window.__restoreFocused`(切回页面/重载后恢复输入框 DOM 焦点)与
+        /// 早期 IPC 队列 `window.__zapIpcQueue`(由 load_end 注入的真实 shim 回放)。
+        ///
+        /// 以前只在 load_end 注入 loopback shim,导致这个引导脚本在 CEF 模式下**从未存在**:
+        /// ① 打开 pane 后不点页面直接打字没有反应(没有 DOM 焦点);
+        /// ② 文档开始到 shim 就位之间的 zapRpc 永久丢失;
+        /// ③ `warp:webview-focusin`/`warp:webview-mousedown` 不上报(地址栏与页面双光标);
+        /// ④ `window.open` 外链拦截失效。
+        /// 与 wry 一致:注入**所有** frame(`with_initialization_script_for_main_only(js, false)`)。
+        fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+            Some(CefRenderProcessHandler::new())
+        }
+    }
+}
+
+wrap_render_process_handler! {
+    struct CefRenderProcessHandler;
+
+    impl RenderProcessHandler {
+        fn on_context_created(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _context: Option<&mut V8Context>,
+        ) {
+            let Some(frame) = frame else {
+                return;
+            };
+            let code = CefString::from(crate::browser::webview_init_js::WEBVIEW_INIT_JS);
+            let url = CefString::from("zap://webview-init.js");
+            // 与浏览器的 execute_java_script 不同:这里跑在渲染进程、文档脚本之前,
+            // 脚本自带幂等守卫(window.webkit || {} 等),重复注入无副作用。
+            frame.execute_java_script(Some(&code), Some(&url), 0);
         }
     }
 }
@@ -1643,9 +1660,40 @@ pub(crate) fn evaluate(id: u64, js: &str) {
 }
 
 pub(crate) fn focus(id: u64, focused: bool) {
+    // OSR 下 CEF 的 SetFocus 不会把自建视图设为 first responder(native mac 委托只对
+    // content native view 这么做,windowless 下它是 null)⇒ 键盘根本到不了页面。
+    // **必须在借用之外调用**:makeFirstResponder 会同步回调 becomeFirstResponder,
+    // 那条路径会再进 focus()(见 warp_cef_osr_view_focus 的 `_syncingFocus`)。
+    let view = WEBVIEWS.with(|map| {
+        map.borrow()
+            .get(&id)
+            .and_then(|state| state.osr.as_ref().map(|osr| osr.view()))
+    });
+    let was_first_responder = view.is_some_and(|view| {
+        !view.is_null() && unsafe { warp_cef_osr_view_is_first_responder(view) } == 1
+    });
+    if let Some(view) = view {
+        if !view.is_null() {
+            unsafe { warp_cef_osr_view_focus(view, i32::from(focused)) };
+        }
+    }
+    // 焦点**首次**落到页面上时,按 T2 spike 实测通过的一组补一次 CEF 焦点同步
+    // (`was_hidden(0)+set_focus(0)+set_focus(1)`,见 OSR-SPIKE-B.md 硬约束 2;
+    // 只 set_focus(1) 不够,CEF 导航后会静默丢焦点)。**只在"之前不是 first responder"
+    // 时做**:页面内每次点击也会走这里,若无条件来一遍 0→1,会产生多余的 blur/focus
+    // 抖动,而页面菜单的 onBlur 会因此误收起。
+    let first_responder = view.is_some_and(|view| {
+        !view.is_null() && unsafe { warp_cef_osr_view_is_first_responder(view) } == 1
+    });
     with_browser(id, |browser, _| {
         if let Some(host) = browser.host() {
-            host.set_focus(i32::from(focused));
+            if focused && first_responder && !was_first_responder {
+                host.was_hidden(0);
+                host.set_focus(0);
+                host.set_focus(1);
+            } else {
+                host.set_focus(i32::from(focused));
+            }
         }
     });
 }
@@ -1703,11 +1751,10 @@ pub(crate) fn set_visible(id: u64, visible: bool) {
             // 解冻失败则保留 frozen:下一帧(仍不可见时的冻结扫描不会再碰它,
             // 但下次可见时会再次尝试)重试,避免"永久冻结"(评审 N6)。
             if thaw(browser) {
-                WEBVIEWS.with(|map| {
-                    if let Some(state) = map.borrow_mut().get_mut(&id) {
-                        state.frozen = false;
-                    }
-                });
+                // **不要**在这里再 `WEBVIEWS.with(borrow_mut)`:`with_browser` 已经持有
+                // 可变借用,嵌套借用必然 `BorrowMutError` panic(评审发现的既有崩溃:
+                // 隐藏超过 freeze_after_secs 后切回即可复现)。闭包已给出 `state`。
+                state.frozen = false;
             }
         }
         if let Some(host) = browser.host() {
@@ -1764,9 +1811,29 @@ pub(crate) fn set_bounds(id: u64, rect: RectF) {
             superview.frame().size.height
         };
         let ns_rect = flip_rect_to_appkit(rect, parent_height);
+        // **跨屏检查必须在几何早返回之前**:窗口在 1x/2x 屏之间拖动时逻辑几何不变,
+        // 若跟着几何一起早返回,backing scale 变化就永远检测不到,CEF 会一直按旧 DPI
+        // 出图(糊/浪费)。这里只读一次窗口的 backing scale,不产生 CEF 调用。
+        let scale_changed = match state.osr.as_ref() {
+            Some(osr) => {
+                let view = osr.view();
+                if view.is_null() {
+                    false
+                } else {
+                    let scale = unsafe { warp_cef_osr_view_scale(view) };
+                    if (scale - osr.scale.get()).abs() > f64::EPSILON {
+                        osr.scale.set(scale);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
         // 调用点每帧都会上报几何;wry 分支同样"先比较再下发"。每帧无条件
         // setFrame + was_resized 会让 Chromium 做无意义重排(评审 F8)。
-        if ns_rect == state.rect {
+        if ns_rect == state.rect && !scale_changed {
             return;
         }
         state.rect = ns_rect;
@@ -1787,9 +1854,8 @@ pub(crate) fn set_bounds(id: u64, rect: RectF) {
                     .set(osr_view_size(ns_rect.size.width, ns_rect.size.height));
                 host.was_resized();
                 // 跨屏(backing scale 变化)时补一次屏幕信息,否则沿用旧 DPI 渲染会糊。
-                let scale = unsafe { warp_cef_osr_view_scale(osr.view()) };
-                if (scale - osr.scale.get()).abs() > f64::EPSILON {
-                    osr.scale.set(scale);
+                // scale 已在函数开头写好(见那里的注释:必须在几何早返回之前检测)。
+                if scale_changed {
                     host.notify_screen_info_changed();
                 }
             }
@@ -2371,6 +2437,33 @@ wrap_load_handler! {
                 // 面板一直显示"启动中"(只能等 15s 超时兜底)——实测踩到。
                 // 放在上面的代际判定内:旧实例的 load_end 不得影响新实例(评审 F9)。
                 crate::browser::browser_web_view::notify_webview_page_loaded(self.id);
+
+            }
+
+            // CEF 导航后会**静默丢掉焦点**(chromiumembedded/cef#3870):只 set_focus(1)
+            // 不够 —— T2 spike 实测通过的是 `was_hidden(0)+set_focus(0)+set_focus(1)`
+            // 这一组(见 OSR-SPIKE-B.md 硬约束 2),否则页面里的光标与 IME 全部失效。
+            // 仅在"本视图仍是 first responder"(输入本来就在页面上)时补,免得把用户
+            // 在终端里的焦点抢走;pane 侧另有 focus_webview_restoring_input 负责 DOM 焦点。
+            let osr_view = WEBVIEWS.with(|map| {
+                let map = map.borrow();
+                match map.get(&self.id) {
+                    Some(state) if state.generation == self.generation && state.visible => {
+                        state.osr.as_ref().map(|osr| osr.view())
+                    }
+                    _ => None,
+                }
+            });
+            if let Some(view) = osr_view {
+                if !view.is_null() && unsafe { warp_cef_osr_view_is_first_responder(view) } == 1 {
+                    with_browser(self.id, |browser, _| {
+                        if let Some(host) = browser.host() {
+                            host.was_hidden(0);
+                            host.set_focus(0);
+                            host.set_focus(1);
+                        }
+                    });
+                }
             }
         }
     }
