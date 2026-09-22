@@ -166,6 +166,12 @@ typedef struct {
     const char *chars_ignoring_modifiers;
 } WarpCefOsrInputEvent;
 
+/// 宿主右键菜单命令(与 Rust 侧 `OSR_MENU_*` 一一对应)。
+enum {
+    WARP_CEF_OSR_MENU_RELOAD = 0,
+    WARP_CEF_OSR_MENU_INSPECT = 1,
+};
+
 /// 输入法动作(与 Rust 侧 `WarpCefOsrImeAction` 一一对应)。
 enum {
     WARP_CEF_OSR_IME_SET_COMPOSITION = 0,
@@ -216,6 +222,8 @@ typedef struct {
     void (*handle_focus)(uint64_t webview_id, int32_t focused);
     void (*handle_key)(uint64_t webview_id, const WarpCefOsrKeyInput *key);
     void (*handle_ime)(uint64_t webview_id, const WarpCefOsrImeCommand *command);
+    /// 宿主右键菜单命令(`warpShowContextMenu:` 里选中的项)→ Rust 走 CEF API。
+    void (*handle_menu_command)(uint64_t webview_id, int32_t command, double x, double y);
 } WarpCefOsrInputCallbacks;
 
 static WarpCefOsrInputCallbacks gInputCallbacks;
@@ -300,6 +308,14 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     /// 创建时由 Rust 侧写入:回调据此定位是哪个 webview。
     uint64_t _webviewId;
     NSTrackingArea *_trackingArea;
+    /// 页面内容的 CALayer(原实现直接写 self.layer.contents;T6 起拆成独立子层,
+    /// 以便给 `<select>` 这类弹层单独一层叠加在上面)。
+    CALayer *_contentLayer;
+    /// 最近一次右键位置(DIP、左上原点):"检查元素"用它把 DevTools 定位到点中的元素。
+    NSPoint _lastContextMenuPointDIP;
+    /// 弹层(`<select>` 下拉、自动填充等):尺寸来自 on_popup_size(DIP、左上原点),
+    /// 显隐来自 on_popup_show,绘制走 POPUP 类型的 paint 回调。
+    CALayer *_popupLayer;
     /// 页面请求的光标语义(见 WARP_CEF_OSR_CURSOR_*)。
     int32_t _cursorSemantic;
     /// 滚轮亚像素余量:CEF 只收整数增量,不留余量会把慢速触控板滚动吃掉。
@@ -334,11 +350,21 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     self = [super initWithFrame:frame];
     if (self) {
         self.wantsLayer = YES;
-        // 透明:OSR 的意义就是让带 alpha 的网页像素与下层 Metal 背景合成。
-        self.layer.backgroundColor = NSColor.clearColor.CGColor;
-        self.layer.opaque = NO;
+        // 层树(T6):root 透明、**不裁剪**(弹层可能伸出视图边界),下挂内容层与弹层。
+        CALayer *root = [CALayer layer];
+        root.backgroundColor = NSColor.clearColor.CGColor;
+        root.opaque = NO;
+        root.masksToBounds = NO;
         // surface 的像素尺寸 = 点数 × contentsScale,resize 后正好铺满。
-        self.layer.contentsGravity = kCAGravityResize;
+        _contentLayer = [[CALayer alloc] init];
+        _contentLayer.contentsGravity = kCAGravityResize;
+        _contentLayer.frame = self.bounds;
+        _popupLayer = [[CALayer alloc] init];
+        _popupLayer.contentsGravity = kCAGravityResize;
+        _popupLayer.hidden = YES;
+        [root addSublayer:_contentLayer];
+        [root addSublayer:_popupLayer];
+        self.layer = root;
         _cursorSemantic = WARP_CEF_OSR_CURSOR_ARROW;
         _textToInsert = [[NSMutableString alloc] init];
         _markedReplacementRange = NSMakeRange(NSNotFound, 0);
@@ -355,6 +381,8 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     }
     [_textToInsert release];
     [_markedText release];
+    [_contentLayer release];
+    [_popupLayer release];
     [super dealloc];
 }
 
@@ -368,6 +396,15 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
 /// 否则用户从别的 app 切回来点输入框,那一下只用来激活窗口,页面收不到点击。
 - (BOOL)acceptsFirstMouse:(NSEvent *)event {
     return YES;
+}
+
+/// 视图尺寸变化时内容层跟着铺满(弹层的位置由 CEF 的 on_popup_size 给,不在此调整)。
+- (void)setFrameSize:(NSSize)newSize {
+    [super setFrameSize:newSize];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _contentLayer.frame = self.bounds;
+    [CATransaction commit];
 }
 
 - (BOOL)becomeFirstResponder {
@@ -437,11 +474,59 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     [self warpSendMouse:event type:WARP_CEF_OSR_EVENT_MOUSE_MOVE button:0 isUp:NO leaving:NO];
 }
 
+/// 宿主右键菜单(异步 NSMenu)。
+///
+/// **为什么不用 CEF 的原生菜单**:OSR 下这条链走不通 —— `CefMenuManager::CreateContextMenu`
+/// (即 `on_before_context_menu` 的唯一调用点)在实测里一次都没被调用过,菜单自然不出现。
+/// 按 OSR-PLAN.md T6 的约定由宿主自己弹面板,选中项经回调回 Rust 走 CEF API。
+- (void)warpShowContextMenu:(NSEvent *)event {
+    NSPoint inView = [self convertPoint:event.locationInWindow fromView:nil];
+    _lastContextMenuPointDIP = NSMakePoint(inView.x, self.bounds.size.height - inView.y);
+
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    menu.autoenablesItems = NO;
+    NSMenuItem *reload = [[NSMenuItem alloc] initWithTitle:@"重新加载"
+                                                   action:@selector(warpMenuReload:)
+                                            keyEquivalent:@""];
+    reload.target = self;
+    NSMenuItem *inspect = [[NSMenuItem alloc] initWithTitle:@"检查元素"
+                                                    action:@selector(warpMenuInspect:)
+                                             keyEquivalent:@""];
+    inspect.target = self;
+    [menu addItem:reload];
+    [menu addItem:inspect];
+    // 位置用视图坐标(inView:self),避免自己换算屏幕坐标。
+    [menu popUpMenuPositioningItem:nil atLocation:inView inView:self];
+    [reload release];
+    [inspect release];
+    [menu release];
+}
+
+- (void)warpSendMenuCommand:(int32_t)command {
+    if (gInputCallbacks.handle_menu_command == NULL) {
+        return;
+    }
+    gInputCallbacks.handle_menu_command(_webviewId, command, _lastContextMenuPointDIP.x,
+                                        _lastContextMenuPointDIP.y);
+}
+
+- (void)warpMenuReload:(id)sender {
+    (void)sender;
+    [self warpSendMenuCommand:WARP_CEF_OSR_MENU_RELOAD];
+}
+
+- (void)warpMenuInspect:(id)sender {
+    (void)sender;
+    [self warpSendMenuCommand:WARP_CEF_OSR_MENU_INSPECT];
+}
+
 - (void)rightMouseDown:(NSEvent *)event {
     if (self.window.firstResponder != self) {
         [self.window makeFirstResponder:self];
     }
+    // 先照常把右键转发给页面(页面的 contextmenu JS 事件/自定义菜单照旧),再弹宿主菜单。
     [self warpSendMouse:event type:WARP_CEF_OSR_EVENT_MOUSE_CLICK button:1 isUp:NO leaving:NO];
+    [self warpShowContextMenu:event];
 }
 
 - (void)rightMouseUp:(NSEvent *)event {
@@ -927,7 +1012,11 @@ void *warp_cef_osr_view_new(void *container, double x, double y, double w, doubl
     view->_webviewId = webview_id;
     [parent addSubview:view];
     // contentsScale 必须在进窗口之后设:窗口的 backingScaleFactor 才是真的 retina 比例。
-    view.layer.contentsScale = parent.window ? parent.window.backingScaleFactor : 2.0;
+    CGFloat scale = parent.window ? parent.window.backingScaleFactor : 2.0;
+    view.layer.contentsScale = scale;
+    // 子层不自动继承父层的 contentsScale,内容层/弹层要各自设(IOSurface 按像素贴)。
+    view->_contentLayer.contentsScale = scale;
+    view->_popupLayer.contentsScale = scale;
     return (void *)view;
 }
 
@@ -939,7 +1028,7 @@ void warp_cef_osr_view_set_surface(void *view, void *surface) {
     WarpCefOsrView *v = (WarpCefOsrView *)view;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    v.layer.contents = (id)surface;
+    v->_contentLayer.contents = (id)surface;
     [CATransaction commit];
 }
 
@@ -962,7 +1051,7 @@ void warp_cef_osr_view_set_bitmap(void *view, const void *buffer, int width, int
     if (image != NULL) {
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
-        v.layer.contents = (id)image;
+        v->_contentLayer.contents = (id)image;
         [CATransaction commit];
         CGImageRelease(image);
     }
@@ -999,6 +1088,87 @@ double warp_cef_osr_view_scale(void *view) {
     return 2.0;
 }
 
+/// 贴一帧**弹层**内容(与 set_surface 同款,只是落到 popup 层)。
+void warp_cef_osr_view_set_popup_surface(void *view, void *surface) {
+    WarpCefOsrView *v = (WarpCefOsrView *)view;
+    if (v == nil || v->_popupLayer == nil) {
+        return;
+    }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    v->_popupLayer.contents = (id)surface;
+    [CATransaction commit];
+}
+
+/// 贴一帧**弹层**位图(CPU 兜底路径)。
+void warp_cef_osr_view_set_popup_bitmap(void *view, const void *buffer, int width, int height,
+                                        int bytesPerRow) {
+    WarpCefOsrView *v = (WarpCefOsrView *)view;
+    if (v == nil || v->_popupLayer == nil || buffer == NULL || width <= 0 || height <= 0) {
+        return;
+    }
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, buffer,
+                                                              (size_t)bytesPerRow * (size_t)height, NULL);
+    CGImageRef image = CGImageCreate(width, height, 8, 32, (size_t)bytesPerRow, colorSpace,
+                                     kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
+                                     provider, NULL, false, kCGRenderingIntentDefault);
+    if (image != NULL) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        v->_popupLayer.contents = (id)image;
+        [CATransaction commit];
+        CGImageRelease(image);
+    }
+    CGDataProviderRelease(provider);
+    CGColorSpaceRelease(colorSpace);
+}
+
+/// view DIP(左上原点)→ **屏幕坐标**(macOS 屏幕坐标即 DIP,原点在左下)。
+///
+/// CEF 用它给右键菜单、DevTools、拖拽这些原生 UI 定位;CefRenderHandler 的默认实现
+/// 返回 false ⇒ 不实现的话 OSR 下右键菜单根本不会出现(实测)。
+int32_t warp_cef_osr_view_screen_point(void *view, double view_x, double view_y, double *out_x,
+                                       double *out_y) {
+    WarpCefOsrView *v = (WarpCefOsrView *)view;
+    if (v == nil || v.window == nil || out_x == NULL || out_y == NULL) {
+        return 0;
+    }
+    // DIP 左上原点 → 视图坐标(非 flipped,故 y 翻转)→ 窗口坐标 → 屏幕坐标。
+    NSPoint inView = NSMakePoint(view_x, v.bounds.size.height - view_y);
+    NSPoint inWindow = [v convertPoint:inView toView:nil];
+    NSPoint inScreen = [v.window convertPointToScreen:inWindow];
+    *out_x = inScreen.x;
+    *out_y = inScreen.y;
+    return 1;
+}
+
+/// 弹层显隐(on_popup_show)。
+void warp_cef_osr_view_show_popup(void *view, int visible) {
+    WarpCefOsrView *v = (WarpCefOsrView *)view;
+    if (v == nil || v->_popupLayer == nil) {
+        return;
+    }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    v->_popupLayer.hidden = visible == 0;
+    [CATransaction commit];
+}
+
+/// 弹层位置与尺寸(on_popup_size):**DIP、左上原点**(与 view_rect 同口径);
+/// 本视图非 flipped,故 y 翻成底部原点。
+void warp_cef_osr_view_set_popup_rect(void *view, double x, double y, double w, double h) {
+    WarpCefOsrView *v = (WarpCefOsrView *)view;
+    if (v == nil || v->_popupLayer == nil) {
+        return;
+    }
+    CGRect rect = CGRectMake(x, v.bounds.size.height - (y + h), MAX(w, 1.0), MAX(h, 1.0));
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    v->_popupLayer.frame = rect;
+    [CATransaction commit];
+}
+
 /// 读回当前 layer.contents 的 IOSurface 像素尺寸(证据用:确认 surface =
 /// 逻辑点 × scale,没有重复缩放/没糊)。contents 不是 IOSurface(CPU 兜底路径)
 /// 或还没贴过帧时写 0。
@@ -1013,7 +1183,7 @@ void warp_cef_osr_view_surface_size(void *view, int *out_width, int *out_height)
         return;
     }
     WarpCefOsrView *v = (WarpCefOsrView *)view;
-    id contents = v.layer.contents;
+    id contents = v->_contentLayer.contents;
     if (contents == nil || CFGetTypeID((CFTypeRef)contents) != IOSurfaceGetTypeID()) {
         return;
     }
@@ -1032,7 +1202,8 @@ void warp_cef_osr_view_release(void *view) {
         return;
     }
     WarpCefOsrView *v = (WarpCefOsrView *)view;
-    v.layer.contents = nil;
+    v->_contentLayer.contents = nil;
+    v->_popupLayer.contents = nil;
     [v removeFromSuperview];
     [v release];
 }

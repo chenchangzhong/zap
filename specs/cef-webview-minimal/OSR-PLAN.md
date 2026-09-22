@@ -141,9 +141,21 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > 真机逐项(点击/拖选/滚轮/进出/光标/英文/`f` 不全屏/Cmd+C·V·A·X)全部通过,无崩溃。
 > 中文输入不在本任务(主仓宿主视图尚未实现 `NSTextInputClient`)⇒ T7。
 
-### T6 —— 弹层与右键菜单
-- 做:`on_popup_show`/`on_popup_size` → 独立 popup layer;右键菜单改**异步 NSMenu**(沿用现有三项:重新加载/检查元素,清空默认项)。
-- **验证**:页面内 `<select>` 能展开;右键菜单三项可用且不崩。
+### T6 —— 弹层与右键菜单 ⚠️ **右键菜单已通过;弹层已实现但缺实机证据**
+> 结果与证据见 [evidence/phase1/OSR-T6-POPUP-MENU.md](evidence/phase1/OSR-T6-POPUP-MENU.md)。
+> 做:层树拆成 root + 内容层 + **popup 层**(照 CefSwift),`on_popup_show`/`on_popup_size`
+> 与 POPUP 类型的 paint 回调路由到弹层(原来直接丢弃);**右键菜单按计划改宿主异步 NSMenu**
+> (「重新加载」「检查元素」),命令回 Rust 走 CEF API。
+> **必须记住的坑**:
+> 1. **OSR 下 CEF 原生菜单触发链不通**:`CefMenuManager::CreateContextMenu` 是
+>    `on_before_context_menu` 的唯一调用点(CEF 源码 menu_manager.cc),而实测该回调
+>    **一次都没被调用** ⇒ 必须由宿主自己弹菜单(计划的"异步 NSMenu"就是这个原因)。
+> 2. **必须实现 `CefRenderHandler::GetScreenPoint`**:CEF 头文件明写视图→屏幕坐标由客户端提供,
+>    默认 false ⇒ 右键菜单/DevTools/拖拽等原生 UI 拿不到坐标(实测菜单完全不出现)。
+>    另:`GetScreenInfo` 的矩形留空会回退 `GetViewRect`,故"填视图矩形"是合规实现。
+> 3. 弹层坐标是 **DIP、左上原点**,而我们的视图**非 flipped** ⇒ y 必须翻转(未实机验证)。
+> 验证:右键菜单两项实机 + 日志通过;弹层等 dsh 页面出现 `<select>` 再按证据文档复验
+> (`grep on_popup_show ~/Library/Logs/zap.log`)。
 
 ### T7 —— IME 落地主仓 ✅ **已完成(通过)**
 > 结果与证据见 [evidence/phase1/OSR-T7-IME.md](evidence/phase1/OSR-T7-IME.md)。

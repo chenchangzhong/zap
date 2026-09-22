@@ -170,6 +170,10 @@ struct WarpCefOsrInputEvent {
     chars_ignoring_modifiers: *const c_char,
 }
 
+/// 宿主右键菜单的命令(与 ObjC 侧 `WARP_CEF_OSR_MENU_*` 一一对应)。
+const OSR_MENU_RELOAD: i32 = 0;
+const OSR_MENU_INSPECT: i32 = 1;
+
 /// 输入法动作(与 ObjC 侧 `WARP_CEF_OSR_IME_*` 一一对应)。
 const OSR_IME_SET_COMPOSITION: i32 = 0;
 const OSR_IME_COMMIT: i32 = 1;
@@ -215,6 +219,7 @@ struct WarpCefOsrInputCallbacks {
     handle_focus: extern "C" fn(u64, i32),
     handle_key: extern "C" fn(u64, *const WarpCefOsrKeyInput),
     handle_ime: extern "C" fn(u64, *const WarpCefOsrImeCommand),
+    handle_menu_command: extern "C" fn(u64, i32, f64, f64),
 }
 
 static OSR_INPUT_CALLBACKS: WarpCefOsrInputCallbacks = WarpCefOsrInputCallbacks {
@@ -223,6 +228,7 @@ static OSR_INPUT_CALLBACKS: WarpCefOsrInputCallbacks = WarpCefOsrInputCallbacks 
     handle_focus: osr_focus_trampoline,
     handle_key: osr_key_trampoline,
     handle_ime: osr_ime_trampoline,
+    handle_menu_command: osr_menu_command_trampoline,
 };
 
 /// 注册输入回调(幂等;必须在创建 OSR 宿主视图之前)。
@@ -804,6 +810,33 @@ extern "C" fn osr_key_trampoline(id: u64, key: *const WarpCefOsrKeyInput) {
     }
 }
 
+/// 宿主右键菜单的命令(见 cef_support.m 的 `warpShowContextMenu:`:OSR 下 CEF 原生的
+/// 菜单触发链不走通 —— `CefMenuManager::CreateContextMenu` 从不被调用,实测
+/// `on_before_context_menu` 一次都没进过 —— 故按 OSR-PLAN.md T6 由宿主自己弹 NSMenu,
+/// 命令回到这里走 CEF API)。
+extern "C" fn osr_menu_command_trampoline(id: u64, command: i32, x: f64, y: f64) {
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    match command {
+        OSR_MENU_RELOAD => {
+            log::info!("[cef] webview {id} 右键重新加载");
+            browser.reload();
+        }
+        OSR_MENU_INSPECT => {
+            log::info!("[cef] webview {id} 右键检查元素 ({x},{y})");
+            if let Some(host) = browser.host() {
+                let point = Point {
+                    x: x as i32,
+                    y: y as i32,
+                };
+                host.show_dev_tools(None, None, None, Some(&point));
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 输入法在按键之外的直接动作(候选点击上屏、unmark 等)。
 extern "C" fn osr_ime_trampoline(id: u64, command: *const WarpCefOsrImeCommand) {
     if command.is_null() {
@@ -888,6 +921,23 @@ extern "C" {
         has_bounds: i32,
     );
     fn warp_cef_osr_view_set_surface(view: *mut c_void, surface: *mut c_void);
+    fn warp_cef_osr_view_set_popup_surface(view: *mut c_void, surface: *mut c_void);
+    fn warp_cef_osr_view_set_popup_bitmap(
+        view: *mut c_void,
+        buffer: *const u8,
+        width: i32,
+        height: i32,
+        bytes_per_row: i32,
+    );
+    fn warp_cef_osr_view_show_popup(view: *mut c_void, visible: i32);
+    fn warp_cef_osr_view_screen_point(
+        view: *mut c_void,
+        view_x: f64,
+        view_y: f64,
+        out_x: *mut f64,
+        out_y: *mut f64,
+    ) -> i32;
+    fn warp_cef_osr_view_set_popup_rect(view: *mut c_void, x: f64, y: f64, w: f64, h: f64);
     fn warp_cef_osr_view_set_bitmap(
         view: *mut c_void,
         buffer: *const u8,
@@ -2094,13 +2144,89 @@ wrap_render_handler! {
             let Some(info) = info else {
                 return;
             };
+            let view = self.osr_view();
             if type_ == PaintElementType::POPUP {
-                // 页面内弹层(`<select>` 等)用独立 popup layer,见 OSR-PLAN.md T6。
+                // 页面内弹层(`<select>` 等)画到独立弹层,尺寸由 on_popup_size 定。
+                unsafe { warp_cef_osr_view_set_popup_surface(view, info.shared_texture_io_surface) };
                 return;
             }
-            let view = self.osr_view();
             unsafe { warp_cef_osr_view_set_surface(view, info.shared_texture_io_surface) };
             self.log_surface_size_once(view);
+        }
+
+        /// view DIP → 屏幕坐标。**必须实现**:默认实现返回 false,OSR 下右键菜单、
+        /// DevTools、拖拽等原生 UI 会因为没有屏幕坐标而不出现/位置错乱(实测:右键
+        /// 菜单完全没反应)。mac 交给 AppKit 换算(屏幕坐标即 DIP)。
+        fn screen_point(
+            &self,
+            _browser: Option<&mut Browser>,
+            view_x: i32,
+            view_y: i32,
+            screen_x: Option<&mut i32>,
+            screen_y: Option<&mut i32>,
+        ) -> i32 {
+            let (Some(screen_x), Some(screen_y)) = (screen_x, screen_y) else {
+                return 0;
+            };
+            let view = self.osr_view();
+            if view.is_null() {
+                return 0;
+            }
+            let mut x = 0.0_f64;
+            let mut y = 0.0_f64;
+            let ok = unsafe {
+                warp_cef_osr_view_screen_point(
+                    view,
+                    f64::from(view_x),
+                    f64::from(view_y),
+                    &mut x,
+                    &mut y,
+                )
+            };
+            if ok == 0 {
+                return 0;
+            }
+            log::debug!("[cef] screen_point ({view_x},{view_y}) → ({x},{y})");
+            *screen_x = x as i32;
+            *screen_y = y as i32;
+            1
+        }
+
+        /// 页面内弹层(`<select>` 下拉等)显隐。
+        fn on_popup_show(&self, _browser: Option<&mut Browser>, show: i32) {
+            let view = self.osr_view();
+            if view.is_null() {
+                return;
+            }
+            log::debug!("[cef] on_popup_show show={show}");
+            unsafe { warp_cef_osr_view_show_popup(view, show) };
+        }
+
+        /// 页面内弹层的位置与尺寸(**DIP、左上原点**,与 view_rect 同口径)。
+        fn on_popup_size(&self, _browser: Option<&mut Browser>, rect: Option<&Rect>) {
+            let view = self.osr_view();
+            let Some(rect) = rect else {
+                return;
+            };
+            if view.is_null() {
+                return;
+            }
+            log::debug!(
+                "[cef] on_popup_size ({},{}) {}x{}",
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height
+            );
+            unsafe {
+                warp_cef_osr_view_set_popup_rect(
+                    view,
+                    f64::from(rect.x),
+                    f64::from(rect.y),
+                    f64::from(rect.width),
+                    f64::from(rect.height),
+                )
+            };
         }
 
         /// 输入法:CEF 回报 composition 的选区与**逐字位置**(DIP、左上原点)。
@@ -2149,11 +2275,15 @@ wrap_render_handler! {
             width: i32,
             height: i32,
         ) {
+            // CEF 的 on_paint 缓冲区是紧凑的 BGRA(width*4 字节/行)。
+            let view = self.osr_view();
             if type_ == PaintElementType::POPUP {
+                unsafe {
+                    warp_cef_osr_view_set_popup_bitmap(view, buffer, width, height, width * 4)
+                };
                 return;
             }
-            // CEF 的 on_paint 缓冲区是紧凑的 BGRA(width*4 字节/行)。
-            unsafe { warp_cef_osr_view_set_bitmap(self.osr_view(), buffer, width, height, width * 4) };
+            unsafe { warp_cef_osr_view_set_bitmap(view, buffer, width, height, width * 4) };
         }
     }
 }
