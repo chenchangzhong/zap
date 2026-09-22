@@ -114,6 +114,16 @@ impl BrowserPaneView {
     pub fn new_dsh(url: String, ctx: &mut ViewContext<Self>) -> Self {
         // 后端选择:仅当 CEF 已初始化(feature + flag + framework 就绪)时用 CEF,
         // 否则自动回退 wry —— 保证未打包 CEF 的构建/环境行为不变。
+        // **必须在 ensure_initialized() 之前推入渲染模式设置**:它是进程级开关
+        // (`CefSettings.windowless_rendering_enabled`),`render_mode()` 首次读取时用
+        // OnceLock 定下来。而"每帧推入设置"那条路径在**恢复会话**时可能晚于 pane 创建
+        // (工作区先恢复 pane、再跑第一帧)⇒ 不在这里补推一次,设置项会被静默忽略。
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        {
+            crate::browser::cef_backend::set_use_osr_rendering(
+                *crate::settings::CefWebviewSettings::as_ref(ctx).use_osr_rendering,
+            );
+        }
         #[cfg(all(target_os = "macos", feature = "cef_webview"))]
         // 由设置项决定是否用 Chromium 内核;若尚未初始化则此刻按需初始化(无需重启)。
         let backend = if *crate::settings::CefWebviewSettings::as_ref(ctx).use_chromium

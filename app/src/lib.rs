@@ -566,15 +566,16 @@ pub fn run() -> Result<()> {
     // 日志里 CefInitialize 出现两次,主进程随后被杀)。
     // 还要排除 CLI 子命令进程:`zap-oss terminal-server …` 同样会走到这里,而它只需要
     // 跑终端服务,不需要(也不应该)初始化 CEF。仅主 app 启动(无子命令)才初始化。
+    // **只登记请求,不在这里初始化**:渲染模式是设置项,而设置要等 app 起来才读得到
+    // (见 cef_backend::render_mode 的 OnceLock 说明与 `request_eager_init` 的注释)。
+    // 真正的初始化在首帧、设置推入之后补做(那里也会走 install_app_protocol_support +
+    // start_pump,顺序与原来一致:初始化失败则完全不碰 NSApplication)。
     #[cfg(all(target_os = "macos", feature = "cef_webview"))]
     if browser::cef_backend::is_requested()
         && !browser::cef_backend::is_crash_recovery_process()
         && args.command().is_none()
     {
-        if browser::cef_backend::initialize_runtime() {
-            browser::cef_backend::install_app_protocol_support();
-            browser::cef_backend::start_pump();
-        }
+        browser::cef_backend::request_eager_init();
     }
 
     if let Some(command) = args.command() {
@@ -1482,6 +1483,29 @@ fn initialize_app(
     // on_frame_drawn 是覆盖式单回调(核心层 Some(Box::new))，所有每帧工作必须合并在同一注册内，
     // 无条件注册一次，内部分支按 flag 守卫（避免 crash_recovery 被 BrowserPane/DshPane 门控误伤丢失登录态）。
     ctx.on_frame_drawn(move |ctx, window_id| {
+        // CEF 的两项设置必须**最先**推入、且不挂在任何 flag 分支下:
+        // - 它们是 `render_mode()`(OnceLock 首读即定死)的输入,windowsless 又是
+        //   CefSettings 上的进程级开关;
+        // - 启动期 eager init 与 BrowserPaneView::new_dsh 里的懒初始化都会读它。
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        {
+            browser::cef_backend::set_freeze_after_secs(
+                *crate::settings::CefWebviewSettings::as_ref(ctx).freeze_after_secs,
+            );
+            browser::cef_backend::set_use_osr_rendering(
+                *crate::settings::CefWebviewSettings::as_ref(ctx).use_osr_rendering,
+            );
+            // 启动期登记的 eager init:此刻设置已就位,才初始化 CEF。
+            // (若本次会话已有 pane 先走了懒初始化——比如恢复会话——则跳过:桥/泵都已就位,
+            //  不必重复;`is_enabled()` 即"CEF 已初始化"。)
+            if browser::cef_backend::take_eager_init_request()
+                && !browser::cef_backend::is_enabled()
+                && browser::cef_backend::initialize_runtime()
+            {
+                browser::cef_backend::install_app_protocol_support();
+                browser::cef_backend::start_pump();
+            }
+        }
         // crash_recovery 仅在登录用户下执行(对齐原 `if user_is_logged_in` 分支)。
         if user_is_logged_in {
             #[cfg(enable_crash_recovery)]
@@ -1541,17 +1565,6 @@ fn initialize_app(
                         _ => {}
                     }
                 });
-                // CEF 后端的冻结阈值来自设置(每帧推入一次原子量,代价可忽略)。
-                #[cfg(all(target_os = "macos", feature = "cef_webview"))]
-                browser::cef_backend::set_freeze_after_secs(
-                    *crate::settings::CefWebviewSettings::as_ref(ctx).freeze_after_secs,
-                );
-                // 渲染模式(OSR/windowed)也来自设置:进程级开关,故只在 CefInitialize
-                // 之前读一次(设置改动下次启动生效);见 cef_backend::render_mode。
-                #[cfg(all(target_os = "macos", feature = "cef_webview"))]
-                browser::cef_backend::set_use_osr_rendering(
-                    *crate::settings::CefWebviewSettings::as_ref(ctx).use_osr_rendering,
-                );
 
                 // 消费 IPC 推入的待处理事件(SwitchProject, Notify 等)。
                 dsh::DshRuntime::handle(ctx).update(ctx, |_runtime, ctx| {

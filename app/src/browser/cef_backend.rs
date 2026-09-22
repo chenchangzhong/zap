@@ -41,11 +41,32 @@ pub(crate) enum RenderMode {
 
 /// 解析模式开关(纯函数,便于单测):只有显式 `1`/`true` 才启用 OSR,
 /// 未设置、空串、其他值一律 windowed —— 保证默认行为不变、可回滚。
+/// **注意优先级**:在 `resolve_render_mode` 里,环境变量只要**非空**就算"显式覆盖"
+/// (包括 `ZAP_CEF_OSR=0`/`=yes` 这类非真值 —— 它们会覆盖设置项、回落到 windowed),
+/// 只有**空/空白**才视为"没设"、回落到设置项。
 fn parse_render_mode(value: Option<&str>) -> RenderMode {
     match value.map(str::trim) {
         Some("1") | Some("true") => RenderMode::Osr,
         _ => RenderMode::Windowed,
     }
+}
+
+/// 启动期登记的"尽早初始化 CEF"请求(环境开关/flag 显式要求时,见 lib.rs)。
+///
+/// **为什么不在启动期直接初始化**:渲染模式(OSR/windowed)现在是设置项,而设置要等 app
+/// 起来才读得到;`windowless_rendering_enabled` 又是 `CefSettings` 上的**进程级**开关,
+/// `render_mode()` 用 OnceLock 首读即定死 ⇒ 若在读到设置之前初始化,设置项会被静默忽略
+/// (审查 C1)。故启动期只登记请求,真正初始化推到"设置已推入之后"的首帧。
+static EAGER_INIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 启动期登记 eager init 请求(幂等)。
+pub(crate) fn request_eager_init() {
+    EAGER_INIT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 取出并清零 eager init 请求(首帧调用一次,返回是否曾被请求)。
+pub(crate) fn take_eager_init_request() -> bool {
+    EAGER_INIT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// 设置项推入的"是否用 OSR"(见 app/src/settings/cef_webview.rs 的 use_osr_rendering,
@@ -1181,12 +1202,17 @@ pub(crate) fn shutdown() {
     // 先逐个关闭浏览器并清空注册表,再 CefShutdown:CEF 文档明确"调用本函数后不得再
     // 调用任何 CEF 函数",而我们持有的 `Browser` 是引用计数对象 —— 若留到 thread_local
     // 析构时 drop,就会在关机后调用 release()(评审 N3)。
-    let osr_views: Vec<std::rc::Rc<OsrState>> = WEBVIEWS.with(|map| {
+    let (osr_views, browsers): (Vec<std::rc::Rc<OsrState>>, Vec<Browser>) = WEBVIEWS.with(|map| {
         let mut map = map.borrow_mut();
         let mut views = Vec::new();
+        let mut browsers = Vec::new();
         for state in map.values_mut() {
+            // 只**收集**,关闭同样放到借用之外:`close_browser` 的完成时机 CEF 文档说的是
+            // "may complete either synchronously or asynchronously",若它同步回调
+            // `on_before_close`(那里会 `borrow_mut`)就是借着重入 ⇒ panic ⇒ 在关机路径上
+            // abort。与本文件"借用内只取指针/句柄,借用外再调外部"的既有模式一致。
             if let Some(browser) = state.browser.take() {
-                close_and_detach(&browser);
+                browsers.push(browser);
             }
             // 自建视图必须在 CefShutdown 前拆掉(否则留下指向已销毁 CEF 内容的 layer);
             // 这里只**收集**,释放放到借用之外 —— 释放会让视图从响应者链上退下来,可能
@@ -1196,8 +1222,11 @@ pub(crate) fn shutdown() {
             }
         }
         map.clear();
-        views
+        (views, browsers)
     });
+    for browser in browsers {
+        close_and_detach(&browser);
+    }
     for osr in osr_views {
         take_and_release_osr_view(osr);
     }
@@ -1843,39 +1872,52 @@ pub(crate) fn set_visible(id: u64, visible: bool) {
             None => false,
         }
     });
-    with_browser(id, |browser, state| {
-        if visible && was_frozen {
-            log::info!("[cef] webview {id}: 重新可见,解冻页面");
-            // 解冻失败则保留 frozen:下一帧(仍不可见时的冻结扫描不会再碰它,
-            // 但下次可见时会再次尝试)重试,避免"永久冻结"(评审 N6)。
-            if thaw(browser) {
-                // **不要**在这里再 `WEBVIEWS.with(borrow_mut)`:`with_browser` 已经持有
-                // 可变借用,嵌套借用必然 `BorrowMutError` panic(评审发现的既有崩溃:
-                // 隐藏超过 freeze_after_secs 后切回即可复现)。闭包已给出 `state`。
-                state.frozen = false;
+    // **借用内只取句柄/指针,所有对外调用(ObjC/CEF)放到借用之外** —— 这是本模块的硬纪律:
+    // 例如 `setHidden:` 会让 first responder 让位,AppKit 随即同步回调我们的
+    // `resignFirstResponder` → `focus()` → 又要借 WEBVIEWS;持借期间调它必然重入
+    // (曾经用 `borrow_mut` 时直接 abort,见 OSR-T8 的崩溃报告)。
+    let Some((browser, osr_view)) = WEBVIEWS.with(|map| {
+        let mut map = map.borrow_mut();
+        let state = map.get_mut(&id)?;
+        state.browser
+            .clone()
+            .map(|browser| (browser, state.osr.as_ref().map(|osr| osr.view())))
+    }) else {
+        return;
+    };
+    if visible && was_frozen {
+        log::info!("[cef] webview {id}: 重新可见,解冻页面");
+        // 解冻失败则保留 frozen:下一帧(仍不可见时的冻结扫描不会再碰它,
+        // 但下次可见时会再次尝试)重试,避免"永久冻结"(评审 N6)。
+        if thaw(&browser) {
+            // 写回用**独立**的短借用(不与任何对外调用重叠)。
+            WEBVIEWS.with(|map| {
+                if let Some(state) = map.borrow_mut().get_mut(&id) {
+                    state.frozen = false;
+                }
+            });
+        }
+    }
+    if let Some(host) = browser.host() {
+        match osr_view {
+            None => {
+                let view = host.window_handle() as *mut NSView;
+                if !view.is_null() {
+                    unsafe { (*view).setHidden(!visible) };
+                }
+            }
+            Some(osr_view) => {
+                // OSR:windowless 的 `window_handle()` 是父容器(见 detach_view),
+                // 必须操作自建宿主视图;隐藏期间 CEF 不绘制,重新可见时主动请求一帧,
+                // 否则切回来看到的是旧画面。
+                unsafe { warp_cef_osr_view_set_hidden(osr_view, i32::from(!visible)) };
+                if visible {
+                    host.invalidate(PaintElementType::VIEW);
+                }
             }
         }
-        if let Some(host) = browser.host() {
-            match state.osr.as_ref() {
-                None => {
-                    let view = host.window_handle() as *mut NSView;
-                    if !view.is_null() {
-                        unsafe { (*view).setHidden(!visible) };
-                    }
-                }
-                Some(osr) => {
-                    // OSR:windowless 的 `window_handle()` 是父容器(见 detach_view),
-                    // 必须操作自建宿主视图;隐藏期间 CEF 不绘制,重新可见时主动请求一帧,
-                    // 否则切回来看到的是旧画面。
-                    unsafe { warp_cef_osr_view_set_hidden(osr.view(), i32::from(!visible)) };
-                    if visible {
-                        host.invalidate(PaintElementType::VIEW);
-                    }
-                }
-            }
-            host.was_hidden(i32::from(!visible));
-        }
-    });
+        host.was_hidden(i32::from(!visible));
+    }
 }
 
 /// 每帧布局驱动(集成要求 #2):CEF 子视图不跟随洞 rect,必须显式设 frame 并
