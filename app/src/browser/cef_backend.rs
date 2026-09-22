@@ -2057,7 +2057,8 @@ pub(crate) fn destroy(id: u64) {
     debug_assert_ui_thread();
     // **先取出句柄**(状态里置 None)再关闭:释放自建视图时 `removeFromSuperview` 会同步
     // 回调 focus,那条路径会 `with_browser`;若此刻句柄还在,就会对一个"已请求关闭"的
-    // browser 调 `set_focus`(与 on_before_close/shutdown 先把句柄取空的做法不一致)。
+    // browser 调 `set_focus`(`shutdown` 同样是先把句柄取空再处理;`on_before_close` 因为
+    // 要先 detach_view 再 take,顺序不同,但 OSR 下 detach_view 本就早返回)。
     let browser = WEBVIEWS.with(|map| {
         map.borrow_mut()
             .get_mut(&id)
@@ -2623,24 +2624,36 @@ wrap_life_span_handler! {
             // 顺带把 OSR 宿主视图一起摘掉:它属于这个浏览器实例,页面自行关闭
             // (window.close() 等)后不该继续显示最后一帧 —— windowed 路径在
             // detach_view 里已经这么做,两种模式保持一致。
-            let (osr, old_browser) = try_with_webviews(|map| {
+            let outcome = try_with_webviews(|map| {
                 match map.get_mut(&self.id) {
-                    Some(state) if state.generation == self.generation => (
+                    Some(state) if state.generation == self.generation => Some((
                         state.osr.take(),
                         // **take 出来在借用外 drop**:`Browser` 是引用计数对象,drop 可能触发
                         // CEF 的同步销毁/回调,持借期间 drop 就是"借用内调外部"。
                         state.browser.take(),
-                    ),
-                    _ => (None, None),
+                    )),
+                    // 状态不存在/是别的代际:本来就没有要清理的东西(与同步重入是两回事)。
+                    _ => None,
                 }
-            })
-            .unwrap_or((None, None));
+            });
+            let Some(cleaned) = outcome else {
+                // 同步重入:借不到注册表 ⇒ 既不能清句柄、也不能释放自建视图(视图所有权在状态里,
+                // 由持有借用的那个外层操作负责 —— 通常是 `destroy`)。
+                // **这里不能打印 "closed"**:那会让排查者以为清理完成了。
+                log::warn!(
+                    "[cef] webview {}: 关闭回调遇到注册表借用冲突,跳过清理(句柄/视图留给外层)",
+                    self.id
+                );
+                return;
+            };
             // 借用外释放:不把 `WEBVIEWS` 借用跨过对外(ObjC/CEF)调用。
             // 旧句柄**显式**在这里 drop(= CEF `release`):下划线命名的绑定虽然也会在作用域末尾
             // drop,但那是隐式行为,容易被后人挪进借用里。
-            drop(old_browser);
-            if let Some(osr) = osr {
-                take_and_release_osr_view(osr);
+            if let Some((osr, old_browser)) = cleaned {
+                drop(old_browser);
+                if let Some(osr) = osr {
+                    take_and_release_osr_view(osr);
+                }
             }
             log::info!("[cef] webview {} closed (gen {})", self.id, self.generation);
         }

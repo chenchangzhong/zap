@@ -181,3 +181,16 @@ CEF_PATH=... cargo nextest run -p warp --features cef_webview \
 **仍待实机确认的两项行为变化**(非缺陷,只是没验):`Cmd+Shift+A/C` 放行给 zap 后的行为
 (连带 `Cmd+Shift+V/X` 也放行,事件经菜单后仍回到 `keyDown` 转发页面);hasFocus 重试窗口
 由 3s 收回 600ms 后"开 pane 不点页面直接打字"是否仍够。
+
+## 8 窄范围复核(第四次,只审 a22cb4153/8faeea950/58dbaa641 这批高危修复)
+
+结论:**可合入**;1 条非阻塞建议(P1)已修,无 Critical。
+
+- **P1(已修)**:`on_before_close` 在"借不到 `WEBVIEWS`"时静默跳过清理却**仍打印 `closed`**,与
+  `on_after_created` 的自救口径不对称。已改为:重入(借不到)⇒ 只打一条明确的 warn 并返回
+  (不谎报 closed);**状态不存在/过期代际是另一回事**,照旧走完并打印 closed(不会误报借用冲突)。
+- 复核确认:`create_webview`/`destroy`/`set_visible`/`apply_geometry` 的写入与四步顺序完整;
+  `on_after_created` 主路径与改坏前**逐行等价**(多出的只是"重入自救分支"与一条 warn,
+  且 `take` 后再 `clone` 不会让 refcount 归零、无 UAF);无新增死代码/未使用字段。
+- 既有小瑕疵(非本批引入):`CefWebview.background` 只写不读(被 crate 级 `allow(dead_code)` 掩盖);
+  `destroy` 的一处注释与实际顺序有出入 —— 注释已修正。
