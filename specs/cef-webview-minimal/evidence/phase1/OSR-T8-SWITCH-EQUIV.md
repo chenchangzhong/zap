@@ -51,9 +51,9 @@ set_visible(false) → with_browser【已持 WEBVIEWS.borrow_mut()】
 | OSR 下渲染/输入/IME/弹层/菜单 | ✅ | T4/T5/T7/T6 各轮实机 |
 | **切 tab(隐藏)不崩溃** | ✅ | 本节 §2;实机确认 |
 | **冻结 → 解冻**完整路径 | ✅ **已实机验证** | 见 §3.1 的日志闭环:冻结与解冻**都成功**,且**未 panic**(上轮 Critical 所在路径第一次真正跑通) |
-| 设置页切换开关 + 重启 | ⏳ 未验证 | 需先在设置页打开「使用无窗口(OSR)渲染」,再用**不带 `ZAP_CEF_OSR`** 的命令启动,确认走 OSR(可看日志 `mode=Osr` 或 `OSR surface …`) |
-| renderer 崩溃 → pane 进崩溃态 | ⏳ 未验证 | 需 pane 打开时 kill 掉 `--type=renderer` 的 helper(自建实例的 helper 路径含 `target/cef-smoke/ZapCEF.app`) |
-| 懒初始化(先 windowed 后开 Chromium 内核) | ⏳ 未验证 | CEF 按需初始化路径未在 OSR 开关下复测 |
+| 设置页切换开关 + 重启 | ✅ **已实机验证** | 见 §3.3:设置页打开开关后,用**不带 `ZAP_CEF_OSR`** 的命令启动 ⇒ `render mode = Osr (env ZAP_CEF_OSR="(unset)", setting use_osr_rendering=true)` + `OSR surface 3836x1908px` |
+| renderer 崩溃 → pane 进崩溃态 | ✅ **已实机验证** | pane 打开时杀掉自建实例的 renderer helper,日志立刻出现 `[ERROR] [warp::dsh::pane] [dsh] webview crashed, showing reload prompt (webview_id=Some(1))`,pane 停在崩溃态(带重新加载提示),renderer 未被自动重建 |
+| 懒初始化(启动期不初始化 CEF,由第一个 pane 触发) | ✅ **已实机验证** | 见 §3.3:不带 `ZAP_CEF_WEBVIEW`/`ZAP_CEF_OSR` 启动 ⇒ 启动后无模式日志,开 pane 时才出 `render mode = Osr (…setting=true)` + `OSR surface …`,用户确认 pane 正常可用。**这条同时验证了 `BrowserPaneView::new_dsh` 里"初始化前补推设置"的修复** |
 
 ### 3.1 冻结/解冻实机日志(闭环)
 
@@ -70,8 +70,39 @@ set_visible(false) → with_browser【已持 WEBVIEWS.borrow_mut()】
 - 由此确认两件事:① `send_cdp`(CDP `Page.setWebLifecycleState`)在 OSR 下**确实下发成功**
   ——冻结成功即证明,不是此前担心的"静默失败";② "隐藏 → 冻结 → 切回 → 解冻"整条等价性路径成立,
   且**不再触发**上轮修掉的借着重入 abort(`set_visible` 已改为借用外调外部)。
+### 3.2 renderer 崩溃态(实机)
+
+```
+06:48:45 [ERROR] [warp::dsh::pane] [dsh] webview crashed, showing reload prompt (webview_id=Some(1))
+```
+
+杀 renderer 后:pane 立刻进崩溃态并提供重新加载入口;主进程存活、无崩溃报告。
+**教训(操作层面)**:杀进程必须用**只匹配自建实例**的模式(例如
+`.../target/cef-smoke/ZapCEF.app/Contents/Frameworks/zap-oss Helper (Renderer).app`),
+不要用 `Helper \(Renderer\)` 这类会命中所有 Chromium 应用的宽模式 —— 本轮误用过一次,
+把用户机器的微信/Arc/Lark/VS Code 的 renderer 一起杀了(它们均已自动重建,无持久影响)。
+
 - 备注:冻结只在 pane 隐藏且超过阈值时发生(`freeze_after_secs`,默认 300s;0 = 不冻结),
   与 dsh 的 Node 服务端/agent 任务无关(只停页面 JS 与渲染)。
+
+### 3.3 设置项单独生效 + 懒初始化(实机日志)
+
+把设置页的「使用无窗口(OSR)渲染」打开后,分别用两种启动方式验证:
+
+```
+# A. 只有 ZAP_CEF_WEBVIEW=1(启动期 eager init;不带 ZAP_CEF_OSR)
+06:54:44 [INFO] [cef] render mode = Osr (env ZAP_CEF_OSR="(unset)", setting use_osr_rendering=true)
+
+# B. 两者都不带(启动期不初始化 CEF,由第一个 pane 懒初始化)
+06:55:58 [INFO] [cef] render mode = Osr (env ZAP_CEF_OSR="(unset)", setting use_osr_rendering=true)
+06:56:00 [INFO] [cef] OSR surface 3836x1908px (view_rect=(1918, 954) DIP, scale=2.0)
+```
+
+- 两次的模式决策都**只来自设置项**(env 为 unset)⇒ C1 的顺序问题已修实。
+- B 是**懒初始化**路径(启动后先无模式日志,开 pane 才初始化)⇒ 同时验证了
+  `BrowserPaneView::new_dsh` 在 `ensure_initialized()` 之前补推设置的修复。
+- 新增**永久观测点**:`[cef] render mode = … (env …, setting …)` —— 进程级模式只在此刻定一次,
+  以后排查"到底听了谁"直接看这行(评审建议)。
 
 ## 4 复验命令
 

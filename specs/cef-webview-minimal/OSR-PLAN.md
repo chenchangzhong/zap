@@ -203,7 +203,7 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > 6. mac OSR 下 `windows_key_code` **不被 CEF 采用**(合成 NSEvent 后由 Chromium 反推),
 >    不要把它写成"已在 mac 生效"的行为。
 
-### T8 —— 开关、回滚与既有策略的等价性 ⚠️ **进行中**
+### T8 —— 开关、回滚与既有策略的等价性 ✅ **已完成(通过)**
 > 见 [evidence/phase1/OSR-T8-SWITCH-EQUIV.md](evidence/phase1/OSR-T8-SWITCH-EQUIV.md)。
 > **已完成**:渲染模式升级为设置项 `general.webview.use_osr_rendering`(默认 false)+ 设置页开关
 > + `resolve_render_mode(env, setting)` 纯函数与单测(env 显式非空才覆盖设置);`ZAP_CEF_OSR` 仍可用。
@@ -212,8 +212,13 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > 借用 ⇒ panic;而 `extern "C"` 回调里的 panic 会**直接 abort**。修法:所有回调入口的公共路径
 > (`with_browser`/`browser_snapshot`)改 `try_borrow[_mut]`,借不到就跳过;`focus()` 同理。
 > **这是 T7 审核时标为"残余风险"却没修的那条,教训:标为残余风险的借用重入要当场修。**
-> **未完成**:冻结→解冻完整路径(需隐藏 ≥20s;若仍无"已冻结/解冻"日志则要查 OSR 下 `send_cdp`
-> 是否真的成功,失败分支当前静默重试)、设置页切换+重启验证、renderer 崩溃态、懒初始化。
+> **已全部验证**:冻结→解冻完整路径(日志闭环、未 panic,顺带证明 OSR 下 `send_cdp` 生效)、
+> 切 tab(隐藏)不崩、renderer 崩溃→pane 进崩溃态、设置页开关单独生效(env 不设也是 OSR)、
+> 懒初始化路径(启动不初始化,由第一个 pane 触发且取到设置项)。
+> **新增永久观测点**:`[cef] render mode = … (env …, setting …)`。
+> **操作教训(记录)**:杀进程必须用只匹配自建实例的模式 —— 本轮误用过
+> `pkill -f 'Helper \(Renderer\)'`,把用户机器的微信/Arc/Lark/VS Code 的 renderer 一起杀了
+> (均已自动重建,无持久影响)。
 
 ### T9 —— 证据与文档归档
 - 更新 `TRANSPARENCY.md`(实测像素证据 + 结论)、`RUNTIME-VERIFICATION.md`(OSR 实跑)、`TECH.md`(模式与开关)。

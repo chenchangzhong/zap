@@ -86,10 +86,15 @@ pub(crate) fn set_use_osr_rendering(enabled: bool) {
 pub(crate) fn render_mode() -> RenderMode {
     static MODE: OnceLock<RenderMode> = OnceLock::new();
     *MODE.get_or_init(|| {
-        resolve_render_mode(
-            std::env::var("ZAP_CEF_OSR").ok().as_deref(),
-            OSR_SETTING.load(std::sync::atomic::Ordering::Relaxed),
-        )
+        let env = std::env::var("ZAP_CEF_OSR").ok();
+        let setting = OSR_SETTING.load(std::sync::atomic::Ordering::Relaxed);
+        let mode = resolve_render_mode(env.as_deref(), setting);
+        // 观测点(评审建议):进程级模式只在此刻定一次,必须能从日志确认"到底听了谁"。
+        log::info!(
+            "[cef] render mode = {mode:?} (env ZAP_CEF_OSR={:?}, setting use_osr_rendering={setting})",
+            env.as_deref().unwrap_or("(unset)")
+        );
+        mode
     })
 }
 
