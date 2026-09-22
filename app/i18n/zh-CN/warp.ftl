@@ -3710,3 +3710,5 @@ settings-features-webview-freeze-one-hour = 1 小时
 
 settings-features-use-chromium-webview = 使用 Chromium 内核
 settings-features-use-chromium-webview-description = 仅 macOS 可用；切换后对新打开的 dsh pane 生效，无需重启。
+settings-features-use-osr-rendering = 使用无窗口(OSR)渲染
+settings-features-use-osr-rendering-description = 需重启生效;真透明必须用它(windowed 路径做不到透明)。

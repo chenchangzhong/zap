@@ -3830,3 +3830,5 @@ settings-features-webview-freeze-one-hour = 1 hour
 
 settings-features-use-chromium-webview = Use the Chromium engine for embedded web pages
 settings-features-use-chromium-webview-description = Applies to newly opened dsh panes.
+settings-features-use-osr-rendering = Use windowless (OSR) rendering for embedded web pages
+settings-features-use-osr-rendering-description = Requires a restart. Needed for true transparency; the windowed path cannot be transparent.

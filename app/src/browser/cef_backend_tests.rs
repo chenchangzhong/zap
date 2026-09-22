@@ -207,6 +207,21 @@ fn ime_replacement_range_never_null() {
     assert_eq!((reversed.from, reversed.to), (5, 5));
 }
 
+/// 渲染模式解析:环境变量优先于设置项;两者都没有时默认 windowed(T8 的回滚基线)。
+#[test]
+fn resolve_render_mode_env_wins_then_setting() {
+    // 都没有 ⇒ windowed(默认,与改动前逐字节等价)。
+    assert_eq!(resolve_render_mode(None, false), RenderMode::Windowed);
+    // 只有设置项 ⇒ 跟随设置。
+    assert_eq!(resolve_render_mode(None, true), RenderMode::Osr);
+    // 环境变量显式给值 ⇒ 覆盖设置项(两个方向都覆盖)。
+    assert_eq!(resolve_render_mode(Some("1"), false), RenderMode::Osr);
+    assert_eq!(resolve_render_mode(Some("0"), true), RenderMode::Windowed);
+    // 空/空白环境变量视为"没设",回落到设置项(避免 `ZAP_CEF_OSR=` 静默推翻设置)。
+    assert_eq!(resolve_render_mode(Some(""), true), RenderMode::Osr);
+    assert_eq!(resolve_render_mode(Some("  "), true), RenderMode::Osr);
+}
+
 /// 页面请求的光标 → 宿主语义 id(链接/文本/缩放等)。
 #[test]
 fn cursor_semantic_maps_common_types() {

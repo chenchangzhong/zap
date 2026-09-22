@@ -48,10 +48,44 @@ fn parse_render_mode(value: Option<&str>) -> RenderMode {
     }
 }
 
-/// 当前渲染模式(进程内固定:env 不会在运行中变化,故缓存一次)。
+/// 设置项推入的"是否用 OSR"(见 app/src/settings/cef_webview.rs 的 use_osr_rendering,
+/// 由 app 每帧推入,与 freeze_after_secs 同一模式)。
+static OSR_SETTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 由 app 推入设置值(每帧调用,代价是一次原子写)。
+pub(crate) fn set_use_osr_rendering(enabled: bool) {
+    OSR_SETTING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 当前渲染模式。
+///
+/// **进程内固定**:`windowless_rendering_enabled` 是 `CefSettings` 上的进程级开关,
+/// 一旦 CefInitialize 就不能改,故这里缓存一次(因此设置项"下次启动生效")。
+/// 优先级:环境变量 `ZAP_CEF_OSR`(显式设了就听它的,dev 排查用)→ 设置项 → windowed。
 pub(crate) fn render_mode() -> RenderMode {
     static MODE: OnceLock<RenderMode> = OnceLock::new();
-    *MODE.get_or_init(|| parse_render_mode(std::env::var("ZAP_CEF_OSR").ok().as_deref()))
+    *MODE.get_or_init(|| {
+        resolve_render_mode(
+            std::env::var("ZAP_CEF_OSR").ok().as_deref(),
+            OSR_SETTING.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    })
+}
+
+/// 渲染模式的解析规则(**纯函数,单测覆盖**):
+/// 环境变量显式非空 ⇒ 听它的(dev 排查/灰度);否则听设置项(`use_osr_rendering`,
+/// 默认 windowed)。
+fn resolve_render_mode(env_override: Option<&str>, setting_enabled: bool) -> RenderMode {
+    match env_override {
+        Some(value) if !value.trim().is_empty() => parse_render_mode(Some(value)),
+        _ => {
+            if setting_enabled {
+                RenderMode::Osr
+            } else {
+                RenderMode::Windowed
+            }
+        }
+    }
 }
 
 /// 是否由宿主驱动外部 begin-frame。默认关闭:T1 实测 CEF 内部 60fps 节奏已可用,

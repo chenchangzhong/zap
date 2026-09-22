@@ -21,6 +21,23 @@ define_settings_group!(CefWebviewSettings, settings: [
         toml_path: "general.webview.use_chromium",
         description: "Whether the dsh pane uses the Chromium (CEF) engine on macOS.",
     },
+    // 是否用 OSR(windowless)渲染 dsh pane 的 webview。
+    //
+    // 背景:windowed 模式下 CEF 自建的原生子视图在半透明窗口里**做不到真透明**
+    // (浏览器背景 alpha 透明会退化成不透明白);OSR 由宿主自建视图 + IOSurface,
+    // 才能让带 alpha 的网页像素与下层 Metal 背景合成。代价是实现面更大(输入/IME/
+    // 弹层都要宿主转接),故默认仍走 windowed。
+    // 生效时机:进程级开关(`CefSettings.windowless_rendering_enabled`),**下次启动
+    // 生效**;`ZAP_CEF_OSR=1` 可临时覆盖(dev 排查用,见 `cef_backend::render_mode`)。
+    use_osr_rendering: UseOsrRendering {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::MAC,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "general.webview.use_osr_rendering",
+        description: "Whether the dsh pane uses windowless (OSR) rendering instead of a native child view on macOS. Takes effect after restarting Zap.",
+    },
     // 隐藏超过该秒数后冻结页面;0 = 不冻结(仅隐藏,renderer 保活)。
     freeze_after_secs: CefWebviewFreezeAfterSecs {
         type: u32,

@@ -701,6 +701,8 @@ pub enum FeaturesPageAction {
     SetWebviewFreezeSecs(u32),
     /// 切换"使用 Chromium 内核"(仅 macOS)。
     ToggleUseChromiumWebview,
+    /// 切换 OSR(windowless)渲染(进程级开关,重启后生效)。
+    ToggleUseOsrRendering,
     ToggleShowWarningBeforeQuitting,
     ToggleQuitOnLastWindowClosed,
     ToggleSmartSelection,
@@ -1237,6 +1239,10 @@ impl FeaturesPageAction {
             Self::ToggleUseChromiumWebview => TelemetryEvent::FeaturesPageAction {
                 action: "ToggleUseChromiumWebview".to_string(),
                 value: to_string(*CefWebviewSettings::as_ref(ctx).use_chromium),
+            },
+            Self::ToggleUseOsrRendering => TelemetryEvent::FeaturesPageAction {
+                action: "ToggleUseOsrRendering".to_string(),
+                value: to_string(*CefWebviewSettings::as_ref(ctx).use_osr_rendering),
             },
             Self::ToggleAgentInAppNotifications => TelemetryEvent::FeaturesPageAction {
                 action: "ToggleAgentInAppNotifications".to_string(),
@@ -1981,6 +1987,11 @@ impl TypedActionView for FeaturesPageView {
                     report_if_error!(settings.use_chromium.toggle_and_save_value(ctx));
                 });
             }
+            ToggleUseOsrRendering => {
+                CefWebviewSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.use_osr_rendering.toggle_and_save_value(ctx));
+                });
+            }
             SetWebviewFreezeSecs(secs) => {
                 CefWebviewSettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(settings.freeze_after_secs.set_value(*secs, ctx));
@@ -2619,6 +2630,7 @@ impl FeaturesPageView {
         #[cfg(all(target_os = "macos", feature = "cef_webview"))]
         {
             general_widgets.push(Box::new(UseChromiumWebviewWidget::default()));
+            general_widgets.push(Box::new(UseOsrRenderingWidget::default()));
             general_widgets.push(Box::new(WebviewFreezeWidget::default()));
         }
 
@@ -7524,5 +7536,54 @@ impl SettingsWidget for GraphicsBackendWidget {
             );
         }
         col.finish()
+    }
+}
+
+/// OSR(windowless)渲染开关:真透明必须用它;进程级开关,**重启后**生效。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+#[derive(Default)]
+struct UseOsrRenderingWidget {
+    switch_state: SwitchStateHandle,
+}
+
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+impl SettingsWidget for UseOsrRenderingWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "osr windowless rendering transparency macos dsh cef"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_body_item::<FeaturesPageAction>(
+            crate::t!("settings-features-use-osr-rendering"),
+            None,
+            LocalOnlyIconState::for_setting(
+                crate::settings::UseOsrRendering::storage_key(),
+                crate::settings::UseOsrRendering::sync_to_cloud(),
+                &mut view
+                    .button_mouse_states
+                    .local_only_icon_tooltip_states
+                    .borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*CefWebviewSettings::as_ref(app).use_osr_rendering)
+                .build()
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(FeaturesPageAction::ToggleUseOsrRendering);
+                })
+                .finish(),
+            Some(crate::t!("settings-features-use-osr-rendering-description")),
+        )
     }
 }

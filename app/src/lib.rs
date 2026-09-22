@@ -1546,6 +1546,12 @@ fn initialize_app(
                 browser::cef_backend::set_freeze_after_secs(
                     *crate::settings::CefWebviewSettings::as_ref(ctx).freeze_after_secs,
                 );
+                // 渲染模式(OSR/windowed)也来自设置:进程级开关,故只在 CefInitialize
+                // 之前读一次(设置改动下次启动生效);见 cef_backend::render_mode。
+                #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+                browser::cef_backend::set_use_osr_rendering(
+                    *crate::settings::CefWebviewSettings::as_ref(ctx).use_osr_rendering,
+                );
 
                 // 消费 IPC 推入的待处理事件(SwitchProject, Notify 等)。
                 dsh::DshRuntime::handle(ctx).update(ctx, |_runtime, ctx| {
