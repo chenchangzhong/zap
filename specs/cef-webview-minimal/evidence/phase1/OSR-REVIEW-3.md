@@ -163,3 +163,21 @@ CEF_PATH=... cargo nextest run -p warp --features cef_webview \
   或者干脆先写一行断言式日志;
 - 这也是本项目第三次由**实机**发现"编译 + 单测全绿但功能已死"的问题(前两次是焦点与键盘事件);
   单元测试覆盖不到的状态机改动,必须留一次实机验证。
+
+### 7.1 同类回归审计(修完后按"同一类错误"再扫一遍)
+
+对这轮所有修复做过状态写入审计:逐提交 `git show` 里被改动的 `state.<field> =` / `.set(` / `.take()` /
+`.insert(` / `.remove(` 行,并核对三处关键写入路径:
+
+| 路径 | 结论 |
+|------|------|
+| `destroy` | ✅ `take` 句柄 → `close_and_detach` → `release_osr_view` → `map.remove(&id)` 全在 |
+| `create_webview` | ✅ `insert(... pending_rect/visible/osr ...)` 字段完整 |
+| `set_visible` | ✅ `state.visible`、`hidden_since`(两分支)、解冻写回 `state.frozen = false` 都在 |
+| 等价改写 | `state.browser = None` → `.take()`(等价且把 drop 移出借用);`destroy` 的 `clone()` → `take()`(本意即让重入回调看到 None) |
+
+⇒ **同类的"写入丢失"只有 §7 那一处**,其余无。实机复验:输入(英文)/中文上屏/Cmd+C·V 全部正常。
+
+**仍待实机确认的两项行为变化**(非缺陷,只是没验):`Cmd+Shift+A/C` 放行给 zap 后的行为
+(连带 `Cmd+Shift+V/X` 也放行,事件经菜单后仍回到 `keyDown` 转发页面);hasFocus 重试窗口
+由 3s 收回 600ms 后"开 pane 不点页面直接打字"是否仍够。
