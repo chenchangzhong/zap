@@ -62,6 +62,50 @@ screen DIP coordinates**. Return true if the requested coordinates were provided
 同一份头文件还写明:`GetScreenInfo` 的矩形**留空会回退到 `GetViewRect`**,所以"填视图矩形"
 是合规实现(上一轮审查里那条 minor 可以结案)。
 
+## 3.1 `screen_point` 的原点约定(由消费方源码坐实)
+
+CEF 的 mac 菜单 runner(`libcef/browser/native/menu_runner_mac.mm`)是这么用客户端给的点:
+
+```cpp
+const gfx::Point& screen_point = browser->GetScreenPoint(...);
+NSPoint screen_position = NSPointFromCGPoint(screen_point.ToCGPoint());
+[[menu_controller_ menu] popUpMenuPositioningItem:nil
+                                       atLocation:screen_position
+                                         inView:nil];       // inView:nil ⇒ AppKit 屏幕坐标(左下原点)
+```
+
+⇒ 客户端应当返回 **AppKit 的屏幕坐标(左下原点,单位点/DIP)**,我们的实现
+(`[v convertPoint:inView toView:nil]` → `[window convertPointToScreen:]`,**不翻转**)正确。
+(CefSwift 未实现 `GetScreenPoint`,故它没有可对照的实现;这里以 CEF 消费方为准。)
+
+## 3.2 与参考实现的差异(刻意)
+
+参考实现 CefSwift 的右键菜单走 **CEF 的 `RunContextMenu` 回调**,其注释还写明"CEF 禁止在回调里
+跑 OS 模态循环(只有 start_dragging 除外),所以同步快照菜单项、下一拍再弹 NSMenu"。
+问题是:这条链的前提是 CEF 会先调 `on_before_context_menu` —— 而实测在 OSR 下**它从未被调用**
+(见 §2),所以那条路在我们这里会得到"没有任何菜单"。
+
+我们的做法是**在 `rightMouseDown:` 里由宿主直接弹菜单**。`rightMouseDown:` 是 AppKit 回调、
+不是 CEF 回调,因此不受"CEF 回调里禁跑模态循环"那条限制,可以直接弹。
+
+代价(已知):宿主菜单不再受页面 `contextmenu` 事件影响 —— 页面即使 `preventDefault()` 也会看到
+我们的菜单(CEF 不告诉我们它是否处理了)。当前 dsh 页面没有自定义右键菜单,故可接受;
+若将来要精确对齐浏览器语义,需要另找通路(CEF 侧触发链或页面侧约定)。
+
+## 3.3 交付前自查(本轮,逐项有判据)
+
+| 项 | 结论 | 判据 |
+|----|------|------|
+| `WarpCefOsrInputCallbacks` 新增字段的两侧一致 | ✅ | 脚本逐字段比对:ObjC 与 Rust 都是 `handle_event/handle_edit_command/handle_focus/handle_key/handle_ime/handle_menu_command`,顺序类型一致 |
+| 新 ivar(`_contentLayer`/`_popupLayer`/`_lastContextMenuPointDIP`)在 `@public` 块内 | ✅ | C 函数需直接访问,已确认在 `@public` 之后 |
+| `setFrameSize:` 在 `initWithFrame:` 早期(ivar 仍为 nil)是否安全 | ✅ | 对 nil 发消息是 no-op;init 里随后显式设 `_contentLayer.frame = bounds` |
+| 菜单 `NSMenu`/`NSMenuItem` 在 `popUpMenuPositioningItem:` 返回后释放 | ✅ | 该方法跑完菜单事件循环才返回(期间 action 已执行完);`target` 是 assign,不会形成 retain 环 |
+| 弹层 y 翻转 | ✅(公式) | `bounds.height - (y + h)` 与已验证过的 `flip_rect_to_appkit`(`parentHeight - y - h`,有单测)同形 |
+| 层树重构不破坏原有渲染 | ✅(间接) | 本轮实机里页面渲染/点击/输入全部正常;证据函数 `surface_size` 也已改为读内容层 |
+| `screen_point` 原点 | ✅(源码) | 见 §3.1,CEF 消费方直接交给 AppKit |
+| `contentsScale` 跨屏后是否过期 | 无需处理 | `contentsGravity = resize` 下 contents 会被拉伸到层边界,`contentsScale` 不参与显示尺寸;跨屏时 CEF 已收到 `notify_screen_info_changed` 按新 DPI 出图 |
+| 菜单弹出期间 CEF pump 暂停 | 已知 | 模态菜单跑在 `NSEventTrackingRunLoopMode`,默认模式的定时器不触发 ⇒ 期间页面不刷新(标准菜单行为),关闭后继续 |
+
 ## 4 复验命令
 
 ```bash
