@@ -28,15 +28,17 @@ define_settings_group!(CefWebviewSettings, settings: [
     // 才能让带 alpha 的网页像素与下层 Metal 背景合成。代价是实现面更大(输入/IME/
     // 弹层都要宿主转接),故默认仍走 windowed。
     // 生效时机:进程级开关(`CefSettings.windowless_rendering_enabled`),**下次启动
-    // 生效**;`ZAP_CEF_OSR=1` 可临时覆盖(dev 排查用,见 `cef_backend::render_mode`)。
+    // 生效**;`ZAP_CEF_OSR` 可临时覆盖(dev 排查用,见 `cef_backend::render_mode`)。
+    // **默认 true**(2026-09-22 用户决定):透明是这条分支的唯一目的,默认关着等于多数人
+    // 拿不到;开关保留作为**回滚入口**(改成 false + 重启即退回 windowed)。
     use_osr_rendering: UseOsrRendering {
         type: bool,
-        default: false,
+        default: true,
         supported_platforms: SupportedPlatforms::MAC,
         sync_to_cloud: SyncToCloud::Never,
         private: false,
         toml_path: "general.webview.use_osr_rendering",
-        description: "Whether the dsh pane uses windowless (OSR) rendering instead of a native child view on macOS. Takes effect after restarting Zap.",
+        description: "Whether the dsh pane uses windowless (OSR) rendering instead of a native child view on macOS (enabled by default; required for a transparent background). Takes effect after restarting Zap.",
     },
     // 隐藏超过该秒数后冻结页面;0 = 不冻结(仅隐藏,renderer 保活)。
     freeze_after_secs: CefWebviewFreezeAfterSecs {

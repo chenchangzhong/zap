@@ -207,10 +207,13 @@ fn ime_replacement_range_never_null() {
     assert_eq!((reversed.from, reversed.to), (5, 5));
 }
 
-/// 渲染模式解析:环境变量优先于设置项;两者都没有时默认 windowed(T8 的回滚基线)。
+/// 渲染模式解析:环境变量优先于设置项;都"没给值"时回落到 windowed。
+///
+/// 注意:**设置项的默认值是 true**(见 settings/cef_webview.rs),这里传的 `false` 表示
+/// "设置项为 false"(用户关掉或旧配置),不是"未设置"。
 #[test]
 fn resolve_render_mode_env_wins_then_setting() {
-    // 都没有 ⇒ windowed(默认,与改动前逐字节等价)。
+    // 设置项 false 且无 env ⇒ windowed(回滚入口)。
     assert_eq!(resolve_render_mode(None, false), RenderMode::Windowed);
     // 只有设置项 ⇒ 跟随设置。
     assert_eq!(resolve_render_mode(None, true), RenderMode::Osr);

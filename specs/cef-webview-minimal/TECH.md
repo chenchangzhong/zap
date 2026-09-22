@@ -165,7 +165,7 @@ CEF 后端支持两种渲染模式,**默认 windowed**:
 
 | 模式 | 实现 | 适用 |
 |------|------|------|
-| `Windowed`(默认) | CEF 自建原生子视图挂进 warpui 的 `WebViewContainerView` | 与阶段 1 完全一致;半透明窗口下 CEF 区域**不透光**(见 `TRANSPARENCY.md`) |
+| `Windowed`(默认已改为 OSR,见下;此为回滚用) | CEF 自建原生子视图挂进 warpui 的 `WebViewContainerView` | 与阶段 1 完全一致;半透明窗口下 CEF 区域**不透光**(见 `TRANSPARENCY.md`) |
 | `Osr`(windowless) | 宿主自建 `WarpCefOsrView`:`on_accelerated_paint` 的 IOSurface 直接贴 `CALayer.contents`(零拷贝),CPU 位图兜底 | 真透明所需;输入/IME/弹层/菜单全部由宿主转接 |
 
 **开关(二者的优先级)**:
