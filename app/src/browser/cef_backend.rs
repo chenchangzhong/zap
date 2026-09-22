@@ -2574,9 +2574,13 @@ wrap_life_span_handler! {
                     // add_ref/release,持借期间做就是"借用内调外部"。
                     Some(state) if state.generation == self.generation => {
                         let old = state.browser.take();
-                        (Some(browser.clone()), old)
+                        // **必须真的登记句柄**(否则 with_browser 全程空转:pane 停在创建时的
+                        // 1×1 surface,表现为"加载不出来")。`clone()` 是 add_ref(不回调),留在
+                        // 借用内无害;危险的 release 已经通过 take + 借用外 drop 处理。
+                        state.browser = Some(browser.clone());
+                        (true, old)
                     }
-                    _ => (None, None),
+                    _ => (false, None),
                 }
             })
             else {
@@ -2594,7 +2598,7 @@ wrap_life_span_handler! {
             };
             // 借用外 drop 被替换掉的旧句柄(= CEF release)。
             drop(replaced);
-            if stored.is_none() {
+            if !stored {
                 close_and_detach(&browser);
                 log::info!(
                     "[cef] webview {} 丢弃过期代际 {} 的浏览器",

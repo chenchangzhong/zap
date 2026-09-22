@@ -139,3 +139,27 @@ CEF_PATH=... cargo nextest run -p warp --features cef_webview \
 | `_old_browser`(下划线绑定)当时就已正确,`f38a98242` 只是改显式 | 采纳:非冗余,保留显式 drop 写法 |
 | **重要验证缺口 ①**:"24/24" 不能作为这两轮修复的验证证据(那些用例是纯逻辑,不碰 `create_webview`/`destroy`/`on_before_close`/`on_after_created`/`try_with_webviews`/`drive_external_begin_frame`;ObjC/JS 改动亦无自动化覆盖) | 如实记录:**这两轮修复的验证 = 编译 + 代码级核对 + 审查者复核,没有自动化覆盖** |
 | **重要验证缺口 ②**:M1 把 hasFocus 窗口收回 600ms 缺实机复验(此前 `5cf44c7dc` 的实机验收是"两个窗口都 3s"的组合,从未单独证伪 600ms 足够) | 列入待办:**下次实机时单独复验**"打开 pane 不点页面直接打字"与 Shift 组合键路由 |
+
+## 7 【回归】我自己的审核修复把 `on_after_created` 的句柄登记改没了(实机才发现)
+
+**症状**:最新构建下开 dsh pane「加载不出来」—— 页面其实 `loaded (shim 注入)`,但第一帧 surface 是
+`2x2px (view_rect=(1,1) DIP)`,即 OSR 视图几何永远是创建时的 1×1。
+
+**定位**(临时探针,用完即删):
+1. `set_bounds` 顶部探针:被调用 **7 次**、真实 rect `RectF(<1,36,1919,990>)` 正常传入,但状态里
+   `rect` 仍是 0×0;
+2. 原先放在 OSR 分支里的探针 **0 次** ⇒ 说明 `with_browser` 在进入闭包前就返回 None;
+3. `with_browser` 失败路径探针:**9 次「无 browser 句柄」** ⇒ 句柄从未登记。
+
+**根因(§5 那批修复引入)**:我把 `on_after_created` 的"借用内 drop 旧句柄"改成 take + 借用外 drop 时,
+顺手把**真正登记句柄的那句赋值**删掉了 —— 只 `return (Some(browser.clone()), old)`,没有写回
+`state.browser`。于是 `with_browser` 全程空转:几何不更新、焦点/输入/JS 全部静默失效。
+
+**修法**:闭包内恢复 `state.browser = Some(browser.clone())`(`clone` = CEF `add_ref`,不触发回调,
+留在借用内无害;危险的 `release` 仍走 take + 借用外 drop)。实机确认 pane 恢复正常显示。
+
+**教训(已值得记住)**:
+- 重构"状态写入路径"时,**写入本身是否还发生**编译查不出来 —— 这类改动必须用探针指认"写入后的读值",
+  或者干脆先写一行断言式日志;
+- 这也是本项目第三次由**实机**发现"编译 + 单测全绿但功能已死"的问题(前两次是焦点与键盘事件);
+  单元测试覆盖不到的状态机改动,必须留一次实机验证。
