@@ -28,9 +28,24 @@ popup。等 dsh 页面出现 `<select>`(或设置面板)时按本文末尾命令
 ### 为什么不用 CEF 原生菜单
 
 CEF 的 `CefMenuManager::CreateContextMenu` 是 `on_before_context_menu` 的**唯一**调用点
-(CEF 源码 `libcef/browser/menu_manager.cc`),而实测在 OSR 下该回调**一次都没被调用** ——
-渲染器的右键请求到不了 CEF 的菜单路径,菜单自然不出现(`screen_point` 已实现、鼠标
-RIGHT 事件也确实到达 CEF,均排除)。
+(CEF 源码 `libcef/browser/menu_manager.cc`),而实测在 OSR 下该回调**一次都没被调用**。
+真正原因是 **CEF 的 mac 菜单 runner 在 windowless 下结构性拒绝**:
+
+```cpp
+// libcef/browser/native/menu_runner_mac.mm
+if (browser->IsWindowless()) {
+  if (!browser->GetWindowHandle()) return false;   // ← 拿不到 handle 就任何菜单都不弹
+  ...
+```
+
+而 windowless 的 host window handle 取自 `WindowInfo.parent_view`(`window_info().parent_view`
+→ `host_window_handle_`)—— 本项目的 OSR 路径**从不设** `parent_view`(只有 windowed 路径
+`set_as_child`),`GetWindowHandle()` 因此是 0 ⇒ 原生菜单永不出现。
+
+**更正(初版归因错误)**:初版把原因写成"未实现 `GetScreenPoint`",这是错的 ——
+`GetScreenPoint` 与菜单是否弹出**无关**;它的真实价值是 CEF 每次鼠标事件翻译
+(`TranslateWebMouseEvent`)都要用它填 `screenX/screenY`,以及拖动/DevTools 等原生 UI。
+本仓库已实现它(见 §3),但那是**另一件事**。
 
 这正是计划里写"右键菜单改**异步 NSMenu**"的原因。
 
@@ -44,7 +59,16 @@ RIGHT 事件也确实到达 CEF,均排除)。
   point 是**右键点**的 DIP 坐标(DevTools 定位到点中的元素)。
 - CEF 的 `ContextMenuHandler` 保留:windowed 模式下它照旧走原生菜单路径,不受影响。
 
-### 实机证据(自建 ZapCEF,OSR;用户确认"菜单出来了、两项都能用")
+### 实机证据(自建 ZapCEF,OSR)
+
+事件对称性(修复后,成对):
+
+```
+[DEBUG] osr 1: send_mouse_click button=1 up=0 count=1 (838,241)
+[DEBUG] osr 1: send_mouse_click button=1 up=1 count=1 (838,241)
+```
+
+菜单命令(用户确认可用):
 
 ```
 [INFO] [warp::browser::cef_backend] [cef] webview 1 右键重新加载
@@ -56,7 +80,9 @@ RIGHT 事件也确实到达 CEF,均排除)。
 **补上缺失的 `CefRenderHandler::GetScreenPoint`**(view DIP → 屏幕坐标)。CEF 头文件原文:
 "Windows/Linux should provide screen device (pixel) coordinates and **MacOS should provide
 screen DIP coordinates**. Return true if the requested coordinates were provided" —— 默认实现
-返回 false ⇒ 不实现的话右键菜单/DevTools/拖拽这些原生 UI 拿不到屏幕坐标(实测菜单完全不出现)。
+返回 false。它的消费方是**每一次鼠标事件翻译**(`TranslateWebMouseEvent` 填
+`screenX/screenY`,见 `bpd_native_mac.mm`)以及拖动/DevTools 等原生 UI;
+**它不是**右键菜单不出现的原因(见 §2 的更正)。
 已实现并经日志验证换算正确:`screen_point (714,216) → (715,798)`。
 
 同一份头文件还写明:`GetScreenInfo` 的矩形**留空会回退到 `GetViewRect`**,所以"填视图矩形"
@@ -76,7 +102,14 @@ NSPoint screen_position = NSPointFromCGPoint(screen_point.ToCGPoint());
 
 ⇒ 客户端应当返回 **AppKit 的屏幕坐标(左下原点,单位点/DIP)**,我们的实现
 (`[v convertPoint:inView toView:nil]` → `[window convertPointToScreen:]`,**不翻转**)正确。
-(CefSwift 未实现 `GetScreenPoint`,故它没有可对照的实现;这里以 CEF 消费方为准。)
+更强的同类判据:CEF 自家 mac 的 windowed 实现(`bpd_native_mac.mm`)、OSR 实现
+(`browser_platform_delegate_osr` / `tic.mm` 把结果直接当 AppKit `NSRect` 用)都是同一口径。
+
+**更正(初版陈述错误)**:初版写"CefSwift 未实现 `GetScreenPoint`"是**错的** ——
+它在 `Sources/CefKit/CefRenderHandler.swift` 里实现了,并且返回**左上原点**的屏幕坐标
+(原点在 `CefMetalHostView.swift` 里显式翻转得到,因为它的视图是 flipped)。
+也就是说:参考实现**有**对照,而且与 zap 刻意采用的口径**不同**。
+我们以 **CEF 自家 mac 实现/消费方**为准(理由见上),这是有意选择,不要照 CefSwift 改回去。
 
 ## 3.2 与参考实现的差异(刻意)
 
@@ -103,8 +136,17 @@ NSPoint screen_position = NSPointFromCGPoint(screen_point.ToCGPoint());
 | 弹层 y 翻转 | ✅(公式) | `bounds.height - (y + h)` 与已验证过的 `flip_rect_to_appkit`(`parentHeight - y - h`,有单测)同形 |
 | 层树重构不破坏原有渲染 | ✅(日志) | T6 实例里 `OSR surface 3836x1908px (view_rect=(1918,954) DIP, scale=2.0)` —— 1918×954 DIP × 2 = 3836×1908,说明内容层确实拿到了 IOSurface(证据函数已改为读内容层,故这行同时证明贴图路由落在内容层) |
 | `screen_point` 原点 | ✅(源码) | 见 §3.1,CEF 消费方直接交给 AppKit |
-| `contentsScale` 跨屏后是否过期 | 无需处理 | `contentsGravity = resize` 下 contents 会被拉伸到层边界,`contentsScale` 不参与显示尺寸;跨屏时 CEF 已收到 `notify_screen_info_changed` 按新 DPI 出图 |
-| 菜单弹出期间 CEF pump 暂停 | 已知 | 模态菜单跑在 `NSEventTrackingRunLoopMode`,默认模式的定时器不触发 ⇒ 期间页面不刷新(标准菜单行为),关闭后继续 |
+| `contentsScale` 跨屏后是否过期 | **记录项**(当前无显示影响) | `_contentLayer`/`_popupLayer` 的 `contentsScale` 只在创建时设一次,没有 `viewDidChangeBackingProperties`;结论"无影响"依赖"永远用 `contentsGravity = resize`"这一前提(此时 contents 被拉到层边界、`contentsScale` 不参与显示尺寸)。参考实现的 `updateScale()` 会更新三层,若将来改用别的重力,必须补上 |
+| 菜单弹出期间 CEF pump 是否暂停 | **不会暂停**(初版写错已更正) | pump 定时器注册在 `NSRunLoopCommonModes`(见 `warp_cef_start_periodic_main_timer` 的注释:"滚动/拖拽等 tracking 期间也要继续推进 CEF"),common modes 含 event tracking ⇒ 菜单期间 pump 照常跑 |
+| 右键手势事件是否对称 | ✅(已修 + 实测确认) | 初版在 `rightMouseDown:` 里弹模态菜单,会吃掉随后的 mouse-up —— **实测日志只有 `up=0` 没有 `up=1`**。仅改成"延到下一拍异步弹"**不够**(下一拍 ~1ms 后菜单已进入跟踪,仍吃掉 UP)。最终改为**在 `rightMouseUp:` 里先转 UP、再弹菜单**,日志验证成对:`up=0/up=1` ×3 组;菜单两项仍可用。同时把视图跨菜单 `retain` 起来(防跟踪中视图被销毁后菜单项 target 悬垂) |
+
+### 弹层首次实测的观察清单(尚未执行)
+
+1. y 是否颠倒(翻转公式与有单测的 `flip_rect_to_appkit` 同形,但未实跑);
+2. 下拉越过 pane 边界是否被裁(root 层 `masksToBounds = NO`,但 warpui 侧未查裁剪设置);
+3. `screen_info.rect` 目前填的是**视图矩形**而非真实屏幕矩形 —— CEF 头文件明写
+   "矩形为空/非法时 popup 可能画不对",参考实现填的是真实屏幕 frame ⇒ 弹层真出问题时
+   第一嫌疑在这里。
 
 ## 4 复验命令
 

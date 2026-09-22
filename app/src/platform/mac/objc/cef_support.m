@@ -476,30 +476,42 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
 
 /// 宿主右键菜单(异步 NSMenu)。
 ///
-/// **为什么不用 CEF 的原生菜单**:OSR 下这条链走不通 —— `CefMenuManager::CreateContextMenu`
-/// (即 `on_before_context_menu` 的唯一调用点)在实测里一次都没被调用过,菜单自然不出现。
+/// **为什么不用 CEF 的原生菜单**:OSR 下 CEF 的 mac 菜单 runner 结构性拒绝 ——
+/// `menu_runner_mac.mm` 的 windowless 分支第一句就是 `if (!browser->GetWindowHandle())
+/// return false;`,而 windowless 的 host window handle 取自 `WindowInfo.parent_view`,
+/// 本项目的 OSR 路径**从不设** `parent_view`(只有 windowed 路径 `set_as_child`)⇒ handle=0
+/// ⇒ 原生菜单永远不会出现(这也解释了实测里 `on_before_context_menu` 一次都没被调用)。
 /// 按 OSR-PLAN.md T6 的约定由宿主自己弹面板,选中项经回调回 Rust 走 CEF API。
+/// **注意**:若将来给 OSR 的 `WindowInfo` 设了 `parent_view`,CEF 原生菜单会重新可用,
+/// 那时必须给宿主菜单加互斥,否则会双弹。
 - (void)warpShowContextMenu:(NSEvent *)event {
     NSPoint inView = [self convertPoint:event.locationInWindow fromView:nil];
     _lastContextMenuPointDIP = NSMakePoint(inView.x, self.bounds.size.height - inView.y);
 
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
-    menu.autoenablesItems = NO;
-    NSMenuItem *reload = [[NSMenuItem alloc] initWithTitle:@"重新加载"
-                                                   action:@selector(warpMenuReload:)
-                                            keyEquivalent:@""];
-    reload.target = self;
-    NSMenuItem *inspect = [[NSMenuItem alloc] initWithTitle:@"检查元素"
-                                                    action:@selector(warpMenuInspect:)
-                                             keyEquivalent:@""];
-    inspect.target = self;
-    [menu addItem:reload];
-    [menu addItem:inspect];
-    // 位置用视图坐标(inView:self),避免自己换算屏幕坐标。
-    [menu popUpMenuPositioningItem:nil atLocation:inView inView:self];
-    [reload release];
-    [inspect release];
-    [menu release];
+    // **延到下一拍再弹**(参考实现 CefSwift 同款做法):模态 NSMenu 会阻塞当前
+    // runloop 的 AppKit 事件投递,先让本次事件(以及紧随其后的其它事件)走完一圈更安全。
+    dispatch_async(dispatch_get_main_queue(), ^{
+      // 菜单跟踪期间视图可能被销毁(例如跟踪中关窗,`take_and_release_osr_view` 会
+      // `[v release]`);而 NSMenuItem.target 是 assign,故这里跨菜单持有自己。
+      [[self retain] autorelease];
+      NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+      menu.autoenablesItems = NO;
+      NSMenuItem *reload = [[NSMenuItem alloc] initWithTitle:@"重新加载"
+                                                     action:@selector(warpMenuReload:)
+                                              keyEquivalent:@""];
+      reload.target = self;
+      NSMenuItem *inspect = [[NSMenuItem alloc] initWithTitle:@"检查元素"
+                                                      action:@selector(warpMenuInspect:)
+                                               keyEquivalent:@""];
+      inspect.target = self;
+      [menu addItem:reload];
+      [menu addItem:inspect];
+      // 位置用视图坐标(inView:self),避免自己换算屏幕坐标。
+      [menu popUpMenuPositioningItem:nil atLocation:inView inView:self];
+      [reload release];
+      [inspect release];
+      [menu release];
+    });
 }
 
 - (void)warpSendMenuCommand:(int32_t)command {
@@ -524,13 +536,16 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     if (self.window.firstResponder != self) {
         [self.window makeFirstResponder:self];
     }
-    // 先照常把右键转发给页面(页面的 contextmenu JS 事件/自定义菜单照旧),再弹宿主菜单。
+    // 只把按下转给页面;**不在这里弹菜单** —— 菜单跟踪循环会吃掉随后的 mouse-up,
+    // 导致 CEF 只收到 RIGHT DOWN 收不到 RIGHT UP(实测日志只有 up=0)。
     [self warpSendMouse:event type:WARP_CEF_OSR_EVENT_MOUSE_CLICK button:1 isUp:NO leaving:NO];
-    [self warpShowContextMenu:event];
 }
 
 - (void)rightMouseUp:(NSEvent *)event {
+    // 先把抬起转给 CEF(事件就此刻进入 CEF 的输入路由,随后菜单阻塞 UI 线程也不影响
+    // 渲染进程收到它),再弹宿主菜单。
     [self warpSendMouse:event type:WARP_CEF_OSR_EVENT_MOUSE_CLICK button:1 isUp:YES leaving:NO];
+    [self warpShowContextMenu:event];
 }
 
 - (void)rightMouseDragged:(NSEvent *)event {

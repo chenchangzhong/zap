@@ -141,7 +141,7 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > 真机逐项(点击/拖选/滚轮/进出/光标/英文/`f` 不全屏/Cmd+C·V·A·X)全部通过,无崩溃。
 > 中文输入不在本任务(主仓宿主视图尚未实现 `NSTextInputClient`)⇒ T7。
 
-### T6 —— 弹层与右键菜单 ⚠️ **右键菜单已通过;弹层已实现但缺实机证据**
+### T6 —— 弹层与右键菜单 ⚠️ **未完成**:右键菜单已通过;**弹层已实现但完全没有实机证据**(计划的"`<select>` 能展开"未验证,故本条不闭环)
 > 结果与证据见 [evidence/phase1/OSR-T6-POPUP-MENU.md](evidence/phase1/OSR-T6-POPUP-MENU.md)。
 > 做:层树拆成 root + 内容层 + **popup 层**(照 CefSwift),`on_popup_show`/`on_popup_size`
 > 与 POPUP 类型的 paint 回调路由到弹层(原来直接丢弃);**右键菜单按计划改宿主异步 NSMenu**
@@ -150,8 +150,15 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > 1. **OSR 下 CEF 原生菜单触发链不通**:`CefMenuManager::CreateContextMenu` 是
 >    `on_before_context_menu` 的唯一调用点(CEF 源码 menu_manager.cc),而实测该回调
 >    **一次都没被调用** ⇒ 必须由宿主自己弹菜单(计划的"异步 NSMenu"就是这个原因)。
-> 2. **必须实现 `CefRenderHandler::GetScreenPoint`**:CEF 头文件明写视图→屏幕坐标由客户端提供,
->    默认 false ⇒ 右键菜单/DevTools/拖拽等原生 UI 拿不到坐标(实测菜单完全不出现)。
+> 2. **CEF 原生菜单在 OSR 下结构性不可用**:`menu_runner_mac.mm` 的 windowless 分支第一句是
+>    `if (!browser->GetWindowHandle()) return false;`,而 windowless 的 host window handle 取自
+>    `WindowInfo.parent_view` —— 本项目的 OSR 路径**从不设**它(只有 windowed 路径 `set_as_child`)
+>    ⇒ handle=0 ⇒ 原生菜单永不出现(实测 `on_before_context_menu` 一次都没被调用)。
+>    **若将来给 OSR 设了 `parent_view`,必须给宿主菜单加互斥,否则双弹。**
+> 3. **`CefRenderHandler::GetScreenPoint` 必须实现**(默认 false):CEF 每次鼠标事件翻译
+>    (`TranslateWebMouseEvent`)都要用它填 `screenX/screenY`,拖动/DevTools 等原生 UI 也需要。
+>    mac 上要返回 **AppKit 屏幕坐标(左下原点、单位 DIP)**:`menu_runner_mac.mm` 把这个点直接
+>    交给 `popUpMenuPositioningItem:…inView:nil`。**它跟右键菜单出不出现无关**(原因见上一条)。
 >    另:`GetScreenInfo` 的矩形留空会回退 `GetViewRect`,故"填视图矩形"是合规实现。
 > 3. 弹层坐标是 **DIP、左上原点**,而我们的视图**非 flipped** ⇒ y 必须翻转(未实机验证)。
 > 验证:右键菜单两项实机 + 日志通过;弹层等 dsh 页面出现 `<select>` 再按证据文档复验

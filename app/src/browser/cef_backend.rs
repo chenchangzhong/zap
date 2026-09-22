@@ -810,10 +810,13 @@ extern "C" fn osr_key_trampoline(id: u64, key: *const WarpCefOsrKeyInput) {
     }
 }
 
-/// 宿主右键菜单的命令(见 cef_support.m 的 `warpShowContextMenu:`:OSR 下 CEF 原生的
-/// 菜单触发链不走通 —— `CefMenuManager::CreateContextMenu` 从不被调用,实测
-/// `on_before_context_menu` 一次都没进过 —— 故按 OSR-PLAN.md T6 由宿主自己弹 NSMenu,
-/// 命令回到这里走 CEF API)。
+/// 宿主右键菜单的命令(见 cef_support.m 的 `warpShowContextMenu:`)。
+///
+/// 为什么是宿主菜单而不是 CEF 原生菜单:`menu_runner_mac.mm` 的 windowless 分支要求
+/// `browser->GetWindowHandle()` 非空,而 windowless 的 handle 来自 `WindowInfo.parent_view`
+/// —— 本项目的 OSR 路径从不设它(只有 windowed 路径 `set_as_child`)⇒ CEF 原生菜单在 OSR
+/// **结构性不可用**(这也是实测里 `on_before_context_menu` 一次都没被调用的原因)。
+/// 故按 OSR-PLAN.md T6 由宿主弹 NSMenu,命令回这里走 CEF API。
 extern "C" fn osr_menu_command_trampoline(id: u64, command: i32, x: f64, y: f64) {
     let Some(browser) = browser_snapshot(id) else {
         return;
@@ -2154,9 +2157,13 @@ wrap_render_handler! {
             self.log_surface_size_once(view);
         }
 
-        /// view DIP → 屏幕坐标。**必须实现**:默认实现返回 false,OSR 下右键菜单、
-        /// DevTools、拖拽等原生 UI 会因为没有屏幕坐标而不出现/位置错乱(实测:右键
-        /// 菜单完全没反应)。mac 交给 AppKit 换算(屏幕坐标即 DIP)。
+        /// view DIP → 屏幕坐标。CEF 的每一次鼠标事件翻译(`TranslateWebMouseEvent`)
+        /// 都要用它填 `screenX/screenY`,拖动/DevTools 等原生 UI 也需要,故必须实现
+        /// (默认返回 false)。mac 交给 AppKit 换算:屏幕坐标即 DIP、原点在左下
+        /// —— 与 CEF 自家 mac 实现一致(`menu_runner_mac.mm` 把它直接交给
+        /// `popUpMenuPositioningItem:…inView:nil`,AppKit 要的就是左下原点)。
+        /// **注意**:它**不是** OSR 右键菜单之前不出现的原因(那是 `WindowInfo.parent_view`
+        /// 未设 ⇒ `GetWindowHandle()`=0 ⇒ `CefMenuRunnerMac` 拒绝,见 cef_support.m)。
         fn screen_point(
             &self,
             _browser: Option<&mut Browser>,
@@ -2186,7 +2193,8 @@ wrap_render_handler! {
             if ok == 0 {
                 return 0;
             }
-            log::debug!("[cef] screen_point ({view_x},{view_y}) → ({x},{y})");
+            // 鼠标移动/点击/滚轮每条事件都会调到这里,按 trace 记(与 send_mouse_move 同口径)。
+            log::trace!("[cef] screen_point ({view_x},{view_y}) → ({x},{y})");
             *screen_x = x as i32;
             *screen_y = y as i32;
             1
