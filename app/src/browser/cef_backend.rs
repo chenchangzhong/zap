@@ -2607,7 +2607,7 @@ wrap_life_span_handler! {
             // 顺带把 OSR 宿主视图一起摘掉:它属于这个浏览器实例,页面自行关闭
             // (window.close() 等)后不该继续显示最后一帧 —— windowed 路径在
             // detach_view 里已经这么做,两种模式保持一致。
-            let (osr, _old_browser) = try_with_webviews(|map| {
+            let (osr, old_browser) = try_with_webviews(|map| {
                 match map.get_mut(&self.id) {
                     Some(state) if state.generation == self.generation => (
                         state.osr.take(),
@@ -2620,6 +2620,9 @@ wrap_life_span_handler! {
             })
             .unwrap_or((None, None));
             // 借用外释放:不把 `WEBVIEWS` 借用跨过对外(ObjC/CEF)调用。
+            // 旧句柄**显式**在这里 drop(= CEF `release`):下划线命名的绑定虽然也会在作用域末尾
+            // drop,但那是隐式行为,容易被后人挪进借用里。
+            drop(old_browser);
             if let Some(osr) = osr {
                 take_and_release_osr_view(osr);
             }
