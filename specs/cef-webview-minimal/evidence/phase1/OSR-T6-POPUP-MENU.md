@@ -20,6 +20,12 @@
   故 y 翻成底部原点(`warp_cef_osr_view_set_popup_rect`)。
 - 子层不继承父层 `contentsScale`,内容层/弹层各自设(否则 IOSurface 按错倍率贴)。
 
+> **⚠️ 归因更正(2026-09-22,见 [OSR-ALIGNMENT-VS-REFSWIFT.md](OSR-ALIGNMENT-VS-REFSWIFT.md) §0)**:
+> 本节以及 `cef_support.m` 里"OSR 下 CEF 原生菜单结构性不可用"的说法,**只对 CEF 的默认 menu runner 成立**;
+> 参考实现(CefSwift)在同样不设 `parent_view` 的 OSR 下实现了 `run_context_menu` 并消费菜单模型 ⇒
+> "只能绕过菜单模型"是错误推论;我们因此漏实现了 `run_context_menu`,导致页面自身菜单项全部拿不到、
+> `on_before_context_menu`/`on_context_menu_command`/`WebviewContextMenu` 成为死代码。
+
 **实机结论(2026-09-22,已实测):mac 上 `<select>` 不产生 PET_POPUP ⇒ 弹层链路无触发路径**
 
 - 做法:临时探针往页面注入一个可见 `<select>`(左上角),让用户点击。日志显示点击确实到达
