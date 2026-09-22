@@ -1453,8 +1453,11 @@ pub(crate) fn set_freeze_after_secs(secs: u32) {
 
 /// 回调里访问 `WEBVIEWS`:**借不到(说明是同步重入)就跳过并告警**,绝不 panic。
 ///
-/// `extern "C"` 回调里 panic 会**直接 abort**(Rust 不能跨 C 边界 unwind,实机崩过一次);
-/// 而 CEF/AppKit 会在我们持借期间同步回调进来,所以回调入口一律走这个 helper。
+/// `extern "C"` 回调里 panic 会**直接 abort**(Rust 不能跨 C 边界 unwind,实机崩过一次)。
+/// **覆盖范围**:目前只有 `on_before_close` / `on_after_created` 改用了它;
+/// `on_load_end`(3 处)与 `on_render_process_terminated`(1 处)仍是裸 `borrow`/`borrow_mut` ——
+/// 它们今天从"借用内"不可达(所有持借调用都不触达这些回调),属纵深防御的下一批候选。
+/// 读路径请用 `try_read_webviews`(待补),不要直接 `map.borrow()`。
 fn try_with_webviews<R>(f: impl FnOnce(&mut HashMap<u64, CefWebview>) -> R) -> Option<R> {
     WEBVIEWS.with(|map| match map.try_borrow_mut() {
         Ok(mut map) => Some(f(&mut map)),
@@ -2577,7 +2580,16 @@ wrap_life_span_handler! {
                 }
             })
             else {
-                // 同步重入:借不到注册表 ⇒ 放弃本次登记(状态由外层负责)。
+                // 同步重入:借不到注册表 ⇒ **不能登记句柄**。不能只 return:那会留下
+                // "浏览器已创建但句柄未登记"的僵尸 —— 页面还在画,但 mouse/key/JS/shim 全部
+                // 失效,且 manager 不知道失败(不会重建、也不会回退 wry)。故关掉它并请 manager
+                // 按失败处理(下次 attach 重建)。
+                close_and_detach(&browser);
+                crate::browser::browser_web_view::notify_webview_create_failed(self.id);
+                log::warn!(
+                    "[cef] webview {}: 注册表借用冲突,已关闭浏览器并请求重建",
+                    self.id
+                );
                 return;
             };
             // 借用外 drop 被替换掉的旧句柄(= CEF release)。

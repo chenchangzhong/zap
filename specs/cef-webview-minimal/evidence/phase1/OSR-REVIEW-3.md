@@ -122,3 +122,20 @@ CEF_PATH=... cargo nextest run -p warp --features cef_webview \
 
 审查者同时确认:释放路径三条幂等、`drive_external_begin_frame`/6 个 trampoline 借用纪律正确、
 "先写共享几何再通知 CEF"的不变量成立、`resolve_render_mode` 与三处推入的顺序正确。
+
+## 6 「审核修复」轮(2026-09-22,第三位审查者,只审 §5 那批修复)
+
+结论:**可合入(advisory only)**;8 条修复 6 条成立、2 条部分成立,**无 Critical、无新引入缺陷**;
+问题都落在"今天不可达"的防御分支。据此做的处理:
+
+| 审查意见 | 处理 |
+|----------|------|
+| `on_after_created` 的跳过会留下"浏览器已创建但句柄未登记"的僵尸(页面在画,但输入/JS/shim 全失效,且 manager 不知道失败) | **已修**:跳过分支改为 `close_and_detach(&browser)` + `notify_webview_create_failed(id)` + warn,让 manager 走失败重建 |
+| `try_with_webviews` 只覆盖 2/4 回调入口,"回调入口不再可能 abort"属**过度声明** | **已收窄声明**:注释里写明覆盖范围,并指出 `on_load_end`(3 处)/`on_render_process_terminated`(1 处)仍是裸借用、今天不可达,属纵深防御下一批候选 |
+| Shift 守卫实际把 `cmd-shift-V/X` 也放行了(提交只声明 A/C);且注释"覆盖 CapsLock/Shift 形态"与实现不符 | **已改注释**写明:`cmd-shift-V/X` 本仓无绑定,放行后不是"什么都不做"—— super 走完菜单事件仍回到本视图 `keyDown` 照常转发给页面(只是不再走 `paste:`/`cut:` 响应者动作);同时注明"内容视图先于主菜单"的派发顺序来自探针、未在本项目复现 |
+| `create_webview` 的"幽灵页"在证据里被写成活 bug(实际当前不可达) | 该缺陷的**可达性**以 §5 表为准:属防御性缺口(调用方有 `has_webview` 守卫、三条移除路径都与 `destroy` 配对) |
+| 三处模式守卫的因果缺可达路径 | 同上:属**纵深防御**(`browser=Some && osr=None` 只在 `release_osr_view`/`on_before_close` 两条清空路径之后出现,而那两处都先 take 了句柄) |
+| `on_after_created` 里 `browser.clone()` 仍在借用内 | 已核对 cef-rs:`RefGuard::Clone = add_ref`(纯引用计数、不触发回调),`Drop = release`(可能销毁+跑回调)——**危险的是 release,已移出**;`add_ref` 留在借用内无害 |
+| `_old_browser`(下划线绑定)当时就已正确,`f38a98242` 只是改显式 | 采纳:非冗余,保留显式 drop 写法 |
+| **重要验证缺口 ①**:"24/24" 不能作为这两轮修复的验证证据(那些用例是纯逻辑,不碰 `create_webview`/`destroy`/`on_before_close`/`on_after_created`/`try_with_webviews`/`drive_external_begin_frame`;ObjC/JS 改动亦无自动化覆盖) | 如实记录:**这两轮修复的验证 = 编译 + 代码级核对 + 审查者复核,没有自动化覆盖** |
+| **重要验证缺口 ②**:M1 把 hasFocus 窗口收回 600ms 缺实机复验(此前 `5cf44c7dc` 的实机验收是"两个窗口都 3s"的组合,从未单独证伪 600ms 足够) | 列入待办:**下次实机时单独复验**"打开 pane 不点页面直接打字"与 Shift 组合键路由 |

@@ -867,9 +867,11 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     BOOL shift = (mods & NSEventModifierFlagShift) != 0;
     // a/c/v/x **必须不带 Shift**:zap 自己绑定了 `cmd-shift-A`(ToggleConversationListView)
     // 与 `cmd-shift-C`(CopyBlockCommand),而窗口对嵌入视图的要求是 `mods == Command`
-    // **精确相等** ⇒ Shift 形态会落到 `[super performKeyEquivalent:]` 交给菜单;我们若在这里
-    // 吞掉,菜单就永远收不到(实测派发顺序:内容视图层级先于主菜单)。z 例外 —— Shift 形态
-    // 正是 redo。
+    // **精确相等** ⇒ Shift 形态会落到 `[super performKeyEquivalent:]`;若被本视图吞掉,
+    // 菜单就收不到这两个键(派发顺序"内容视图先于主菜单"来自探针,未在本项目复现)。z 例外
+    // —— Shift 形态正是 redo。
+    // 注意:`cmd-shift-V/X` 本仓没有绑定;放行后不是"什么都不做" —— super 走完菜单后事件仍会
+    // 回到本视图的 `keyDown`,照常转发给页面(只是不再走 `paste:`/`cut:` 那条响应者动作)。
     if (shift && ![key isEqualToString:@"z"]) {
         return [super performKeyEquivalent:event];
     }
