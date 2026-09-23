@@ -1147,3 +1147,197 @@ fn test_side_by_side_spacers_keep_height_invariant_beyond_old_line_budget() {
         "两侧 spacer 行数差必须等于新旧行数差(左={left} 右={right})"
     );
 }
+
+/// file_index_for_path:绝对路径按仓库根裁成相对路径后精确命中。
+#[test]
+fn test_file_index_for_path_strips_repo_root() {
+    let paths = [PathBuf::from("src/lib.rs"), PathBuf::from("other/src/lib.rs")];
+    assert_eq!(
+        file_index_for_path(
+            paths.iter().map(PathBuf::as_path),
+            Some(Path::new("/repo")),
+            Path::new("/repo/other/src/lib.rs"),
+        ),
+        Some(1)
+    );
+}
+
+/// file_index_for_path:仓库相对路径直接相等即命中。
+#[test]
+fn test_file_index_for_path_accepts_relative_path() {
+    let paths = [PathBuf::from("src/lib.rs")];
+    assert_eq!(
+        file_index_for_path(
+            paths.iter().map(PathBuf::as_path),
+            Some(Path::new("/repo")),
+            Path::new("src/lib.rs"),
+        ),
+        Some(0)
+    );
+}
+
+/// file_index_for_path:不做后缀兜底 —— 同名但不同目录的文件不能被误命中
+/// (滚到错文件比不滚动更糟)。
+#[test]
+fn test_file_index_for_path_does_not_fall_back_to_suffix() {
+    let paths = [PathBuf::from("lib.rs")];
+    assert_eq!(
+        file_index_for_path(
+            paths.iter().map(PathBuf::as_path),
+            Some(Path::new("/repo")),
+            Path::new("/repo/src/lib.rs"),
+        ),
+        None
+    );
+}
+
+/// file_index_for_path:取不到仓库根时只认绝对路径相等,不做任何拼接猜测。
+#[test]
+fn test_file_index_for_path_without_repo_root_requires_exact_match() {
+    let paths = [PathBuf::from("src/lib.rs")];
+    assert_eq!(
+        file_index_for_path(
+            paths.iter().map(PathBuf::as_path),
+            None,
+            Path::new("src/lib.rs")
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        file_index_for_path(
+            paths.iter().map(PathBuf::as_path),
+            None,
+            Path::new("/repo/src/lib.rs"),
+        ),
+        None
+    );
+}
+
+/// file_index_for_path:仓库外的绝对路径即使尾部与某个文件相同,也不命中
+/// (宁可不滚动,也不猜到一个前缀不同的同名文件)。
+#[test]
+fn test_file_index_for_path_rejects_out_of_repo_tail_match() {
+    let paths = [PathBuf::from("src/lib.rs")];
+    assert_eq!(
+        file_index_for_path(
+            paths.iter().map(PathBuf::as_path),
+            Some(Path::new("/repo")),
+            Path::new("/other/src/lib.rs"),
+        ),
+        None
+    );
+}
+
+/// file_index_for_path:空列表 → None。
+#[test]
+fn test_file_index_for_path_empty_list() {
+    let paths: Vec<PathBuf> = Vec::new();
+    assert_eq!(
+        file_index_for_path(
+            paths.iter().map(PathBuf::as_path),
+            Some(Path::new("/repo")),
+            Path::new("/repo/src/lib.rs"),
+        ),
+        None
+    );
+}
+
+/// scroll_to_file_index:文件的 `editor_state` 缺失(二进制/纯重命名)时也应滚动 ——
+/// 修复前该分支直接 `return false`(只有有 editor 的文件才能定位),修复后按索引
+/// 滚动并返回 true(评审 M2:此前这处行为改动没有测试)。
+#[test]
+fn test_scroll_to_file_index_without_editor_still_scrolls() {
+    App::test((), |mut app| async move {
+        let TestContext {
+            mut state,
+            code_review_view,
+            ..
+        } = TestContext::new(&mut app, PathBuf::from("src/lib.rs"), "content");
+
+        state
+            .file_states
+            .get_mut(&PathBuf::from("src/lib.rs"))
+            .expect("harness 应建出该文件的 state")
+            .editor_state = None;
+
+        code_review_view.update(&mut app, |view, view_ctx| {
+            let repo = view
+                .active_repo
+                .as_mut()
+                .expect("CodeReviewView::new(Some(repo), ..) 应带 active_repo");
+            repo.state = CodeReviewViewState::Loaded(state);
+
+            assert!(
+                view.scroll_to_file_index(0, view_ctx),
+                "无 editor 的文件也应能定位(修复前该分支返回 false)"
+            );
+            // 不能只断言返回值:`scroll_to` 会立即写入 scroll_top,顺带断言真的滚了
+            // (评审 m-1:否则"返回 true 但不滚动"的回归不会被发现)。
+            assert!(
+                view.viewported_list_state.is_scrolled_to_item(0),
+                "应真正滚到该文件"
+            );
+            assert_eq!(
+                view.viewported_list_state.get_scroll_offset(),
+                Pixels::new(10.0),
+                "应滚到文件头内 10px"
+            );
+        });
+    });
+}
+
+/// repo_prefix_candidates:仓库根存在且与其规范形式不同(符号链接)时给出两个候选;
+/// 无符号链接的环境只有一个。
+#[test]
+fn test_repo_prefix_candidates_includes_canonical_form() {
+    let repo = std::env::temp_dir();
+    let candidates = repo_prefix_candidates(Some(repo.as_path()));
+    assert_eq!(candidates.first(), Some(&repo), "原样形式必须排在最前");
+    match repo.canonicalize() {
+        Ok(canonical) if canonical != repo => {
+            assert!(candidates.contains(&canonical), "规范形式应作为候选之一");
+        }
+        _ => assert_eq!(candidates.len(), 1, "无符号链接时只应有一个候选"),
+    }
+}
+
+/// repo_prefix_candidates:没有仓库根 → 空(不猜前缀)。
+#[test]
+fn test_repo_prefix_candidates_without_repo() {
+    assert!(repo_prefix_candidates(None).is_empty());
+}
+
+/// file_index_for_path:文件侧是规范路径、仓库侧是非规范路径时,用规范前缀能命中。
+/// 评审 M-1:只 canonicalize 文件侧会漏掉这个方向。本机 `/var`→`/private/var` 可
+/// 真实复现;无符号链接的环境该场景不存在,此时测试退化为等价性检查。
+#[test]
+fn test_file_index_for_path_matches_via_canonical_repo_prefix() {
+    let repo = std::env::temp_dir();
+    let Ok(canonical) = repo.canonicalize() else {
+        return;
+    };
+    if canonical == repo {
+        return;
+    }
+
+    let file_abs = canonical.join("src/a.rs");
+    let paths = [PathBuf::from("src/a.rs")];
+    assert_eq!(
+        file_index_for_path(
+            paths.iter().map(PathBuf::as_path),
+            Some(repo.as_path()),
+            &file_abs
+        ),
+        None,
+        "非规范仓库前缀 + 规范文件路径本就不该命中(这正是 M-1 的缺口)"
+    );
+    assert_eq!(
+        file_index_for_path(
+            paths.iter().map(PathBuf::as_path),
+            Some(canonical.as_path()),
+            &file_abs
+        ),
+        Some(0),
+        "换成规范仓库前缀后应命中"
+    );
+}

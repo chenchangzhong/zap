@@ -67,7 +67,8 @@ window.__ModuleLoader__.load({
 		// 依赖 sessions/workspaces 服务(dsh-client-runtime 用 reflect.provide
 		// 注册;框架保证 apply 时已就绪)。sidebarRight 是 dsh-client-ui-sidebar-right
 		// 提供的右侧栏导航 face——dsh 0.1.5 起聊天内文件入口全部收敛到它的
-		// openResource,文件链接拦截器 patch 的即是该方法;未声明 inject 直接访问会
+		// openResource(以及侧栏内部走 openResourceIn),两者都落到 placeResource,
+		// 文件链接拦截器 patch 的是后者;未声明 inject 直接访问会
 		// 报 "cannot get property ... without inject" 并使整个 apply 失败。
 		const inject = ["sessions", "workspaces", "sidebarRight"];
 
@@ -83,8 +84,6 @@ window.__ModuleLoader__.load({
 		/// apply 期保存的插件上下文:供只在运行期才需要解析的服务(uiSession)
 		/// 惰性查找,避免 apply 期的装载顺序依赖。
 		let bridgeCtx = undefined;
-		/// 当前已安装的文件打开拦截器(插件热重载幂等用,见 installOpenFileInterceptor)。
-		let installedOpenFileInterceptor = undefined;
 		/// 上一次 running 状态(检测 running:true -> false 边沿)。
 		let prevRunning = new Map();
 		/// 上一次 completed 状态(检测 completed:false -> true 边沿;undefined=未观察)。
@@ -589,47 +588,64 @@ window.__ModuleLoader__.load({
 		function installOpenFileInterceptor(ctx) {
 			const sidebarRight = ctx.sidebarRight;
 			if (!sidebarRight || typeof sidebarRight.placeResource !== "function") {
+				// dsh 可能改名/下掉这个非公开面,留痕便于定位「文件链接静默回落 dsh」。
 				console.error("[zap-bridge-client] ctx.sidebarRight.placeResource unavailable; file links stay in dsh");
 				return;
 			}
-			// 幂等:plugin apply 可能在热重载/页面重载时重入,重复包裹既会叠加
-			// 调用层,也会让旧实例的清理把新补丁还原(2026-09-23 实测现象:重载后
-			// 文件链接全部回落 dsh 右侧预览)。已有生效的包装时直接复用。
-			if (installedOpenFileInterceptor !== undefined
-				&& installedOpenFileInterceptor.sidebarRight === sidebarRight
-				&& sidebarRight.placeResource === installedOpenFileInterceptor.wrapper) {
-				return;
-			}
-			const origPlaceResource = sidebarRight.placeResource;
+			// 幂等与还原:哨兵挂在 sidebarRight 自身(模块作用域在热重载时会重建,
+			// 挂模块变量在重载后失效)。每次都基于槽位里记下的**原始方法**重新包一层,
+			// 并只对自己的 wrapper 注册有守卫的还原:
+			// - 旧实例 cleanup 先跑:还原成原始方法;新实例随后基于原始方法包一层 → 正确。
+			// - 新实例先装、旧 cleanup 后跑:旧 cleanup 看到 placeResource 已是新 wrapper,
+			//   不做任何事 → 新补丁存活。(若这里改成"已有则跳过",新实例就不会装自己的
+			//   wrapper,旧 cleanup 于是把唯一的 wrapper 还原掉、文件链接整体失效 ——
+			//   2026-09-23 踩过的正是这一类回归,不要改回去。)
+			// - 插件真被卸载:cleanup 还原为原始方法并清理槽位,不留越界生效的补丁。
+			// 因为始终基于原始方法包装,重装也不会叠加调用层。
+			const slot = sidebarRight.__zapPlaceResource;
+			const origPlaceResource = slot !== undefined ? slot.original : sidebarRight.placeResource;
 			const wrapper = function (sessionId, actions, address, options) {
 				const path = resolveFileAddressPath(address);
 				if (path === undefined) {
 					return origPlaceResource.call(this, sessionId, actions, address, options);
 				}
-				// 与 zap-bridge 现有通知类 IPC 一致:不等 Zap ack(点击即时生效,
-				// 失败仅记日志)。
+				// 与 zap-bridge 通知类 IPC 一致:Rust 侧当前不回 ack(同 zap.open_file),
+				// 故不等结果;catch 只在将来补上 ack 后才可能触发。
 				zapRpc('zap.open_file', { path }).catch((err) => {
 					console.error("[zap-bridge-client] open_file failed:", err);
 				});
 				console.log("[zap-bridge-client] open_file ->", path);
 			};
-			installedOpenFileInterceptor = { sidebarRight, wrapper };
+			sidebarRight.__zapPlaceResource = { original: origPlaceResource, wrapper };
 			sidebarRight.placeResource = wrapper;
-			// 不注册还原:拦截器在本页面生命周期内应始终生效,而清理回调与
-			// 热重载重入的先后顺序不可控,还原会把仍活跃实例的补丁一起抹掉。
+			ctx.effect(() => () => {
+				const current = sidebarRight.__zapPlaceResource;
+				if (current !== undefined
+					&& current.wrapper === wrapper
+					&& sidebarRight.placeResource === wrapper) {
+					sidebarRight.placeResource = origPlaceResource;
+					delete sidebarRight.__zapPlaceResource;
+				}
+			}, "zap-bridge-client: open-file interceptor");
 		}
 
 		// ── 改动文件入口拦截:在 Zap 代码审核面板打开 ──
 		// deliverables 的「N 个文件已更改」卡片有两个入口:
 		// - 表头按钮(aria-label「查看改动」,onClick openReview(0)):打开整个改动集;
 		// - 每行文件按钮(onClick openReview(index)):打开并定位到该文件。
-		// 两者都经 openChangesReview → openResource
-		// (`dsh-resource://changes-review/session/<sid>/<seq>/<index>`)。该地址不含
-		// 文件路径,故 placeResource 层拿不到目标文件;但文件行旁的隐藏 span
-		// (aria-describedby 指向)里是 resolveWorkspacePath 出的绝对路径。
-		// 这里在捕获阶段拦下点击:有路径就带 path 改发 zap.open_code_review,
-		// 由 Zap 打开自己的代码审核面板并定位到该文件;表头则不带 path,只开面板。
+		// 两者都经 openChangesReview → openResource,地址形如
+		// (`dsh-resource://changes-review/session/<sid>/<seq>/<turn>`;第三段是 turn,
+		// 行下标在 openResource 的 options.params 里,不在地址中)。该地址不含
+		// 文件路径,故 placeResource 层拿不到目标文件;文件行旁隐藏 span
+		// (aria-describedby 指向)里才是路径。这里在捕获阶段拦下点击:能解析出绝对
+		// 路径就带 path 改发 zap.open_code_review,由 Zap 打开自己的代码审核面板并
+		// 定位到该文件;表头(无 aria-describedby)不带 path 只开面板;解析不出绝对
+		// 路径时不拦,交回 dsh,避免「两边都不响应」的死点击。
 		// 展开/收起按钮(aria-expanded)不属于这两个入口,不拦。
+		//
+		// 副作用(已知且可接受):捕获阶段 stopPropagation 会一并阻断 document 冒泡
+		// 阶段的「点外部收起」类处理器(如侧栏搜索),即点改动行时它们不收起;
+		// HoverCard 的关闭走 pointerdown,不受影响。
 		/// 改动卡片根节点(dsh 的稳定数据属性,非哈希类名)。
 		const CHANGED_FILES_SELECTOR = "[data-changed-files]";
 		/// 卡片内的可点入口:表头按钮与带 aria-describedby 的文件行。
@@ -656,11 +672,32 @@ window.__ModuleLoader__.load({
 				if (button.hasAttribute("aria-expanded")) return;
 				const describedBy = button.getAttribute("aria-describedby");
 				const pathEl = describedBy ? document.getElementById(describedBy) : null;
-				const path = pathEl && pathEl.textContent ? pathEl.textContent.trim() : "";
+				const raw = pathEl && pathEl.textContent ? pathEl.textContent.trim() : "";
+				// 文件行必须①文本形如路径、②能解析出绝对路径,才拦下点击:
+				// - span 里是 resolveWorkspacePath 的产物,而 dsh 在会话 cwd 取不到时会
+				//   原样给出相对路径,拦下来会被 Rust 侧绝对路径校验拒收 → 两边都不开;
+				// - 用「有 aria-describedby」当文件行的判据是负向的,若将来表头等按钮也
+				//   带上该属性且文本是普通文案,补全后会得到一个能通过绝对路径校验的假
+				//   路径(面板开在错位置);故先要求文本形如路径。
+				// 任一条件不满足就把点击交回 dsh(不 preventDefault/不 stopPropagation)。
+				const looksLikePath =
+					raw !== "" &&
+					(raw.includes("/") || /^[A-Za-z]:[/\\]/.test(raw) || raw.startsWith("\\\\"));
+				const sessionId = sessionsRef
+					? currentSessionId(sessionsRef.list.getSnapshot())
+					: undefined;
+				const path = looksLikePath ? absoluteFilePath(raw, sessionId) : undefined;
+				if (describedBy && path === undefined) {
+					console.warn(
+						"[zap-bridge-client] changed-file path unresolved; leaving click to dsh:",
+						raw
+					);
+					return;
+				}
 				// 阻止 dsh 打开其右侧 changes-review 面板。
 				event.preventDefault();
 				event.stopPropagation();
-				const params = path ? { path } : {};
+				const params = path !== undefined ? { path } : {};
 				zapRpc("zap.open_code_review", params).catch((err) => {
 					console.error("[zap-bridge-client] open_code_review failed:", err);
 				});
@@ -711,7 +748,7 @@ window.__ModuleLoader__.load({
 				// 两个入口都不可用时留痕,避免下次再以"点击无反应"的形态静默复发。
 				console.warn("[zap-bridge-client] activate_session: no session-switch entry available");
 			};
-			// 文件链接拦截:sidebarRight.openResource → Zap 内打开。
+			// 文件链接拦截:sidebarRight.placeResource(唯一漏斗)→ Zap 内打开。
 			installOpenFileInterceptor(ctx);
 			// 改动文件行:改在 Zap 代码审核面板打开并定位。
 			installChangedFileInterceptor(ctx);

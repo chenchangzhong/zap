@@ -755,6 +755,42 @@ enum CodeReviewViewState {
     NoRepoFound,
 }
 
+/// 在 diff 的文件路径列表里选出 `path` 对应的下标。
+///
+/// `path` 可能是绝对路径(dsh 上报的改动路径都是绝对的)或仓库相对路径:绝对
+/// 路径先按仓库根裁成相对路径再比较。**只做精确匹配** —— 不要退化成后缀匹配,
+/// 因为「滚到同名但不同目录的文件」比「不滚动」更糟(评审 m10/A 项)。
+fn file_index_for_path<'a>(
+    file_paths: impl Iterator<Item = &'a Path>,
+    repo_path: Option<&Path>,
+    path: &Path,
+) -> Option<usize> {
+    let relative = repo_path.and_then(|repo| path.strip_prefix(repo).ok());
+    file_paths
+        .enumerate()
+        .find_map(|(index, file_path)| {
+            (relative == Some(file_path) || file_path == path).then_some(index)
+        })
+}
+
+/// 匹配文件时可以尝试的仓库前缀:原样 + 规范化形式。
+///
+/// 评审 M-1:只把**文件**侧 canonicalize 会漏掉「仓库侧非规范、文件侧规范」的组合
+/// (首次打开 dsh pane 时 `set_dsh_repo` 拿到的是未 canonicalize 的项目路径),于是
+/// 从"能定位"退化成"只开面板不定位"。故连同仓库根的规范形式一起作为候选前缀。
+fn repo_prefix_candidates(repo_path: Option<&Path>) -> Vec<PathBuf> {
+    let Some(repo) = repo_path else {
+        return Vec::new();
+    };
+    let mut candidates = vec![repo.to_path_buf()];
+    if let Ok(canonical) = repo.canonicalize() {
+        if canonical != repo {
+            candidates.push(canonical);
+        }
+    }
+    candidates
+}
+
 struct UiStateHandles {
     sidebar_scroll_state: ClippedScrollStateHandle,
     sidebar_resizable_state: ResizableStateHandle,
@@ -2267,9 +2303,11 @@ impl CodeReviewView {
 
     /// 把列表滚动到当前 diff 里某个文件的文件头。
     ///
-    /// `path` 可以是绝对路径(dsh 上报的改动文件路径都是绝对的)或仓库相对路径。
-    /// 匹配优先按仓库相对路径精确命中,取不到仓库根(或路径在仓库外)时才退化为
-    /// 后缀匹配并取最长后缀,避免 `src/lib.rs` 与 `other/src/lib.rs` 混淆。
+    /// `path` 可以是绝对路径(dsh 上报的改动文件路径都是绝对的)或仓库相对路径:
+    /// 绝对路径先按仓库根裁成相对路径再比较。**只做精确匹配**,不做后缀兜底 ——
+    /// 滚到「同名但不同目录」的文件比不滚动更糟。
+    /// 前缀不同源(仓库根含符号链接、文件侧已被 canonicalize)时不做猜测,而是依次
+    /// 尝试仓库根的原样形式与规范形式(见 [`repo_prefix_candidates`])。
     /// 返回 `false` 表示该文件不在当前 diff 中(例如那一轮的改动已提交),
     /// 由调用方决定如何兜底。
     pub fn scroll_to_file(&mut self, path: &Path, ctx: &mut ViewContext<Self>) -> bool {
@@ -2277,22 +2315,16 @@ impl CodeReviewView {
             return false;
         };
 
-        let relative = self
-            .repo_path()
-            .and_then(|repo| path.strip_prefix(repo).ok());
-        let exact = state.file_states.iter().position(|(_, file_state)| {
-            let file_path = &file_state.file_diff.file_path;
-            relative == Some(file_path.as_path()) || file_path == path
-        });
-        let Some(editor_index) = exact.or_else(|| {
-            state
-                .file_states
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, file_state))| path.ends_with(&file_state.file_diff.file_path))
-                .max_by_key(|(_, (_, file_state))| file_state.file_diff.file_path.as_os_str().len())
-                .map(|(index, _)| index)
-        }) else {
+        let Some(editor_index) = repo_prefix_candidates(self.repo_path().map(PathBuf::as_path))
+            .iter()
+            .find_map(|prefix| {
+                file_index_for_path(
+                    state.file_states.keys().map(PathBuf::as_path),
+                    Some(prefix.as_path()),
+                    path,
+                )
+            })
+        else {
             return false;
         };
 
@@ -2302,23 +2334,23 @@ impl CodeReviewView {
     /// 定位到一个文件;diff 还没加载完时先挂起。
     ///
     /// 供 dsh 改动行入口使用:面板可能是刚创建、diff 尚未到达就收到定位请求,
-    /// 这与既有的 [`Self::pending_jump_to_comment`] 是同一类竞态。
+    /// 这与既有的 [`Self::pending_jump_to_comment`] 是同一类竞态。两个挂起请求
+    /// 同时存在时按「先评论跳转、后文件定位」的顺序消费(见加载完成处)。
     pub fn reveal_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
         if self.scroll_to_file(&path, ctx) {
             return;
         }
         if matches!(self.state(), CodeReviewViewState::Loaded(_)) {
-            // diff 已加载却没有该文件(例如那一轮改动已提交),或该文件的编辑器
-            // 尚未生成;两种情况都保持面板当前滚动位置。
+            // diff 已加载却没有该文件(例如那一轮改动已提交);保持面板当前滚动位置。
             log::info!("[code-review] cannot reveal file {}", path.display());
             return;
         }
         self.pending_reveal_file = Some(path);
     }
 
-    /// 滚动到文件头内 10px(`FILE_HEADER_HEIGHT` 为 41px)并对齐滚动上下文,
-    /// 与既有文件头滚动辅助的逻辑一致。
-    /// 返回 `false` 表示该文件的编辑器还没准备好,尚不能滚动。
+    /// 滚动到文件头内 10px(`FILE_HEADER_HEIGHT` 为 41px)。
+    /// 该文件有编辑器时顺带对齐滚动上下文;二进制/纯重命名等没有编辑器的文件
+    /// 仍按索引滚动(能定位,只是不做上下文对齐)。
     fn scroll_to_file_index(
         &mut self,
         editor_index: usize,
@@ -2328,23 +2360,27 @@ impl CodeReviewView {
             return false;
         };
 
-        let Some(editor_state) = state
+        let editor = state
             .file_states
             .get_index(editor_index)
             .and_then(|(_, file_state)| file_state.editor_state.as_ref())
-        else {
-            log::warn!("No editor state found for index {editor_index}");
-            return false;
-        };
-
-        let editor = editor_state.editor().clone();
+            .map(|editor_state| editor_state.editor().clone());
 
         self.viewported_list_state
             .scroll_to_with_offset(editor_index, Pixels::new(10.0));
 
-        let context = self.compute_scroll_context_for_index(editor_index, &editor, ctx);
-        if let Some(context) = context {
-            self.viewported_list_state.set_scroll_context(Some(context));
+        if let Some(editor) = editor {
+            let context = self.compute_scroll_context_for_index(editor_index, &editor, ctx);
+            if let Some(context) = context {
+                self.viewported_list_state.set_scroll_context(Some(context));
+            }
+        } else {
+            // 无 editor 时不做上下文对齐,并清掉上一个文件的 context:否则滚动保持
+            // 会把上一个文件的头内偏移套到这个文件上(评审 n-1)。
+            self.viewported_list_state.set_scroll_context(None);
+            log::info!(
+                "[code-review] no editor at index {editor_index}; scrolled without context alignment"
+            );
         }
         ctx.notify();
         true
