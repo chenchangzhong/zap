@@ -132,8 +132,11 @@ pub(crate) fn handle_zap_ipc(payload: &str) -> Option<BridgeEvent> {
         }
         "zap.open_code_review" => {
             // path 可选:改动卡片表头按钮只打开整个改动集,没有具体文件。
-            // 文件行带绝对路径;放宽到允许不存在(目标可能已被删除/重命名),
-            // 只做绝对路径归一,不做存在性校验,定位失败由 workspace 侧兜底。
+            // 文件行带绝对路径;放宽到允许不存在(目标可能已被删除/重命名)。
+            // canonicalize 只用于消解符号链接与 `/var`↔`/private/var` 这类前缀差异,
+            // 让面板侧 `strip_prefix(repo)` 能命中(评审 C1:两侧前缀不同源时否则会
+            // 从"能定位"退化为"只开面板不定位");解析失败(文件已删除)则保留原
+            // 绝对路径。该路径只用于面板内的路径比较,不会被打开或执行。
             let path = match params.get("path") {
                 None | Some(Value::Null) => None,
                 Some(value) => {
@@ -143,7 +146,7 @@ pub(crate) fn handle_zap_ipc(payload: &str) -> Option<BridgeEvent> {
                         log::warn!("[dsh-bridge] IPC {method} path is not absolute: {raw}");
                         return None;
                     }
-                    Some(path)
+                    Some(path.canonicalize().unwrap_or(path))
                 }
             };
             log::info!("[dsh-bridge] IPC OpenCodeReview path={path:?}");

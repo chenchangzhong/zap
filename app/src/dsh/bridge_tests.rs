@@ -320,6 +320,49 @@ fn open_code_review_relative_path_rejected() {
     assert!(PENDING_EVENTS.lock().is_empty());
 }
 
+/// zap.open_code_review:path 显式 null → 与缺 path 等价(表头点击语义)。
+#[test]
+fn open_code_review_null_path_ok() {
+    PENDING_EVENTS.lock().clear();
+    let event = handle_zap_ipc("zap.open_code_review\n1\n{\"path\":null}").unwrap();
+    match event {
+        BridgeEvent::OpenCodeReview { path } => assert_eq!(path, None),
+        other => panic!("expected OpenCodeReview, got {other:?}"),
+    }
+    PENDING_EVENTS.lock().clear();
+}
+
+/// zap.open_code_review:空串路径 → None(不是本机绝对路径)。
+#[test]
+fn open_code_review_empty_path_rejected() {
+    PENDING_EVENTS.lock().clear();
+    assert!(handle_zap_ipc("zap.open_code_review\n1\n{\"path\":\"\"}").is_none());
+    assert!(PENDING_EVENTS.lock().is_empty());
+}
+
+/// zap.open_code_review:存在的路径 → canonicalize,消解符号链接与
+/// `/var`↔`/private/var` 这类前缀差异,使面板侧 `strip_prefix(repo)` 仍能命中
+/// (评审 C1:两侧前缀不同源时否则会从"能定位"退化为"只开面板不定位")。
+#[test]
+fn open_code_review_existing_path_is_canonicalized() {
+    let dir = std::env::temp_dir().join(format!("zap-ocr-canon-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "x").unwrap();
+    PENDING_EVENTS.lock().clear();
+
+    let event = handle_zap_ipc(&open_code_review_payload(file.to_str().unwrap(), 1)).unwrap();
+    match event {
+        BridgeEvent::OpenCodeReview { path } => {
+            assert_eq!(path, Some(file.canonicalize().unwrap()));
+        }
+        other => panic!("expected OpenCodeReview, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    PENDING_EVENTS.lock().clear();
+}
+
 /// zap.open_code_review:path 非字符串 → None(缺 path 合法,见上一个用例)。
 #[test]
 fn open_code_review_malformed_params_rejected() {

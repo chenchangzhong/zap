@@ -125,8 +125,11 @@ async fn handle_webview_ipc(
     if !handled {
         // 不能静默:method 不匹配(例如前缀没剥干净)时原先只有 debug 日志,而文件
         // logger 过滤在 Info,导致整条链路"看起来正常但什么都没发生"(评审 N2)。
+        // `handle_zap_ipc` 返回 None 有两种原因:方法未知,或**已知方法但参数被拒**
+        // (例如 zap.open_code_review 收到非绝对路径),日志文案要覆盖两者,否则会
+        // 把「参数被拒」误读成「方法名写错」。
         let method = payload.split('\n').next().unwrap_or_default();
-        log::warn!("[dsh-loopback] 未识别的 IPC 方法(已丢弃): {method}");
+        log::warn!("[dsh-loopback] IPC 未被接受(方法未知或参数被拒,已丢弃): {method}");
     }
     if handled {
         // 事件在 on_frame_drawn 中 drain;空闲期没有帧就永远不会 drain,
