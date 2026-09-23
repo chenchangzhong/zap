@@ -22,7 +22,8 @@ pub fn initialize_settings_for_tests_with_mode(
             CloudSyncSettings,
             init_and_register_user_preferences,
             manager::SettingsManager, AISettings, AccessibilitySettings, AliasExpansionSettings,
-            AppEditorSettings, BlockVisibilitySettings, CodeSettings, DebugSettings,
+            AppEditorSettings, BlockVisibilitySettings, CefWebviewSettings, CodeSettings,
+            DebugSettings,
             EmacsBindingsSettings, FontSettings, GPUSettings, InputModeSettings, InputSettings,
             NativePreferenceSettings, PaneSettings, PreferencesSettings,
             language::LanguageSettings, network::NetworkSettings,
@@ -107,6 +108,10 @@ pub fn initialize_settings_for_tests_with_mode(
     TabSettings::register(app);
     TerminalSettings::register(app);
     PaneSettings::register(app);
+    // CEF 相关设置组:生产侧由 `settings::init::register_all_settings` 注册,
+    // `FeaturesPageView::new` 构造时就会读它,测试侧漏注册会让所有 Workspace
+    // 测试 panic。
+    CefWebviewSettings::register(app);
     ThemeSettings::register(app);
     UndoCloseSettings::register(app);
     VimBannerSettings::register(app);

@@ -2220,6 +2220,173 @@ fn settle_panel_progress_aligns_when_not_animating() {
     assert_eq!(settle_panel_progress(0., false, false), 0.);
 }
 
+/// 新建标签页要收起已经展开的悬浮侧栏:用户此刻指针还停在面板里,不会再有 hover out 来收起它。
+#[test]
+fn test_new_tab_collapses_revealed_auto_hide_vertical_tabs_panel() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+                report_if_error!(settings.vertical_tabs_panel_auto_hide.set_value(true, ctx));
+            });
+
+            // 模拟"悬停展开并钉住"的现场:进度满格 + pinned。
+            workspace.vertical_tabs_panel_pinned = true;
+            workspace.vertical_tabs_panel_progress.set(1.);
+
+            workspace.add_terminal_tab(false, ctx);
+
+            assert!(!workspace.vertical_tabs_panel_pinned);
+            assert_eq!(
+                workspace
+                    .vertical_tabs_panel_slide
+                    .get()
+                    .map(|slide| slide.to),
+                Some(0.),
+            );
+        });
+    });
+}
+
+/// dsh pane、浏览器预览、「在新标签页打开文件」走的是另一条新建标签页入口
+/// (`add_tab_from_existing_pane`),同样要收起悬浮侧栏。
+#[test]
+fn test_new_tab_from_existing_pane_collapses_revealed_auto_hide_vertical_tabs_panel() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+                report_if_error!(settings.vertical_tabs_panel_auto_hide.set_value(true, ctx));
+            });
+
+            workspace.vertical_tabs_panel_pinned = true;
+            workspace.vertical_tabs_panel_progress.set(1.);
+
+            let pane = crate::workspace::home::create_home_pane(ctx);
+            let new_idx = workspace.tab_count();
+            workspace.add_tab_from_existing_pane(pane, new_idx, ctx);
+
+            assert!(!workspace.vertical_tabs_panel_pinned);
+            assert_eq!(
+                workspace
+                    .vertical_tabs_panel_slide
+                    .get()
+                    .map(|slide| slide.to),
+                Some(0.),
+            );
+        });
+    });
+}
+
+/// 撤销关闭(默认 60s 宽限期内)恢复标签页走的是 `restore_closed_tab`,既不是新建标签页
+/// 入口、也不是 dsh 那条,同样要收起悬浮侧栏。
+#[test]
+fn test_restore_closed_tab_collapses_revealed_auto_hide_vertical_tabs_panel() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+                report_if_error!(settings.vertical_tabs_panel_auto_hide.set_value(true, ctx));
+            });
+
+            workspace.vertical_tabs_panel_pinned = true;
+            workspace.vertical_tabs_panel_progress.set(1.);
+
+            // 用现成的 tab 数据模拟"撤销关闭恢复"这条入口(与撤销栈走的是同一个函数)。
+            let closed_tab = workspace.tabs[0].clone();
+            workspace.restore_closed_tab(0, closed_tab, ctx);
+
+            assert!(!workspace.vertical_tabs_panel_pinned);
+            assert_eq!(
+                workspace
+                    .vertical_tabs_panel_slide
+                    .get()
+                    .map(|slide| slide.to),
+                Some(0.),
+            );
+        });
+    });
+}
+
+/// 启动引导(HOA)期间的面板是引导自己钉住的:此时新建 tab 不能收起它,否则引导 callout
+/// 的锚点位置会缺失。
+#[test]
+fn test_new_tab_keeps_revealed_auto_hide_vertical_tabs_panel_during_hoa_onboarding() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _tab_configs_guard = FeatureFlag::TabConfigs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+                report_if_error!(settings.vertical_tabs_panel_auto_hide.set_value(true, ctx));
+            });
+
+            workspace.show_hoa_onboarding_flow(ctx);
+            assert!(workspace.hoa_onboarding_flow.is_some());
+
+            // 记下引导自己钉住面板时那次滑动,一会儿要断言它没被新的收起覆盖。
+            let onboarding_slide = workspace.vertical_tabs_panel_slide.get();
+            workspace.vertical_tabs_panel_progress.set(1.);
+
+            workspace.add_terminal_tab(false, ctx);
+
+            assert!(workspace.vertical_tabs_panel_pinned);
+            assert_eq!(
+                workspace
+                    .vertical_tabs_panel_slide
+                    .get()
+                    .map(|slide| slide.to),
+                onboarding_slide.map(|slide| slide.to),
+            );
+        });
+    });
+}
+
+/// 停靠态(未开启自动隐藏)不受影响:新建标签页不该动它。
+#[test]
+fn test_new_tab_keeps_docked_vertical_tabs_panel() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+                report_if_error!(settings.vertical_tabs_panel_auto_hide.set_value(false, ctx));
+            });
+
+            workspace.vertical_tabs_panel_pinned = true;
+            workspace.vertical_tabs_panel_progress.set(1.);
+
+            workspace.add_terminal_tab(false, ctx);
+
+            assert!(workspace.vertical_tabs_panel_pinned);
+            assert!(workspace.vertical_tabs_panel_slide.get().is_none());
+        });
+    });
+}
+
 /// 最大化(全屏)的 Code Review 面板必须让窗口里的编辑器给 `escape` 让位,否则面板内嵌的
 /// 编辑器(双列 diff、评论输入框)会先吃掉按键,面板永远收不到 Esc。
 #[test]
