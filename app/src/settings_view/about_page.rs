@@ -52,6 +52,15 @@ pub enum AboutPageAction {
     /// 页之后的渠道检查范围)。
     #[cfg(not(target_family = "wasm"))]
     DshToggleChannel(String),
+    /// 用户点击 CEF 区块的"检查更新":查上游 CEF 构建索引并与**已链接版本**比较。
+    ///
+    /// **只能比版本、不能就地升级**:CEF 的 C++ wrapper 与 framework 必须同版本
+    /// (wrapper 里对 API hash 有硬 `CHECK`,不匹配即 abort),而 wrapper 是编译期静态
+    /// 链接进二进制的,framework/helpers 又必须在签名后的 app bundle 内 —— 升级是
+    /// "改 cef crate 版本 → 重编 → 重嵌 → 重签名",见
+    /// `specs/cef-webview-minimal/CEF-UPGRADE.md`。
+    #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+    CefCheckUpdate,
 }
 
 pub struct AboutPageView {
@@ -62,6 +71,22 @@ pub struct AboutPageView {
     /// 最近一次 DSH 渠道检查结果;未检查过为 `None`。
     #[cfg(not(target_family = "wasm"))]
     dsh_snapshot: Option<crate::dsh::DshChannelsSnapshot>,
+    /// CEF 内核"检查更新"的状态(仅 macOS + cef_webview 构建下渲染)。
+    #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+    cef_update_state: CefUpdateUiState,
+}
+
+/// CEF 内核"检查更新"的 UI 状态(逻辑见 `crate::browser::cef_update`)。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+#[derive(Default)]
+enum CefUpdateUiState {
+    /// 还没查过(只显示当前内核版本)。
+    #[default]
+    Idle,
+    /// 正在查(不显示链接,避免重复点)。
+    Checking,
+    /// 查完的结果。
+    Done(crate::browser::cef_update::CefUpdateCheck),
 }
 
 impl AboutPageView {
@@ -78,6 +103,8 @@ impl AboutPageView {
             dsh_checking: false,
             #[cfg(not(target_family = "wasm"))]
             dsh_snapshot: None,
+            #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+            cef_update_state: CefUpdateUiState::Idle,
         }
     }
 }
@@ -144,6 +171,19 @@ impl TypedActionView for AboutPageView {
                 }
                 ctx.notify();
             }
+            #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+            AboutPageAction::CefCheckUpdate => {
+                self.cef_update_state = CefUpdateUiState::Checking;
+                ctx.notify();
+                // 网络放后台任务(index.json 约 10MB);完成后回写状态并重绘。
+                ctx.spawn(
+                    crate::browser::cef_update::check_cef_update_future(),
+                    |view, result, ctx| {
+                        view.cef_update_state = CefUpdateUiState::Done(result);
+                        ctx.notify();
+                    },
+                );
+            }
         }
     }
 }
@@ -183,13 +223,16 @@ struct AboutPageWidget {
     dsh_next_upgrade_link_mouse_state: MouseStateHandle,
     #[cfg(not(target_family = "wasm"))]
     dsh_alpha_upgrade_link_mouse_state: MouseStateHandle,
+    /// CEF 区块"检查更新"链接的悬停 / 按下状态。
+    #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+    cef_check_link_mouse_state: MouseStateHandle,
 }
 
 impl SettingsWidget for AboutPageWidget {
     type View = AboutPageView;
 
     fn search_terms(&self) -> &str {
-        "about warp version automatic updates auto update 自动更新 检查更新 新版本 dsh deepseek harness 更新渠道 next alpha预览版 内测"
+        "about warp version automatic updates auto update 自动更新 检查更新 新版本 dsh deepseek harness 更新渠道 next alpha预览版 内测 cef chromium 内核 升级"
     }
 
     fn render(
@@ -342,6 +385,14 @@ impl SettingsWidget for AboutPageWidget {
         #[cfg(not(target_family = "wasm"))]
         content.add_child(
             Container::new(self.render_dsh_section(_view, appearance, app))
+                .with_margin_top(24.)
+                .finish(),
+        );
+
+        // CEF 内核区块(仅 macOS + cef_webview):当前版本 + "检查更新"(只比版本)。
+        #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+        content.add_child(
+            Container::new(self.render_cef_section(_view, appearance))
                 .with_margin_top(24.)
                 .finish(),
         );
@@ -529,6 +580,90 @@ impl AboutPageWidget {
         }
 
         row.finish()
+    }
+
+    /// About 页 CEF 内核区块:当前内核版本 + "检查更新"链接(查上游 index,只比版本)。
+    ///
+    /// **不提供"直接更新"**:CEF 的 C++ wrapper 与 framework 必须同版本(wrapper 里有
+    /// API hash 硬 `CHECK`),而 wrapper 是编译期静态链接进二进制的、framework/helpers 又
+    /// 必须在签名后的 app bundle 内 —— 就地下载替换既会破坏签名,也会因版本不匹配 abort。
+    /// 升级是"改 cef crate 版本 → 重编 → 重嵌 → 重签名",详见
+    /// `specs/cef-webview-minimal/CEF-UPGRADE.md`。
+    #[cfg(all(target_os = "macos", feature = "cef_webview"))]
+    fn render_cef_section(&self, view: &AboutPageView, appearance: &Appearance) -> Box<dyn Element> {
+        use crate::browser::cef_update::{CefUpdateCheck, INSTALLED_VERSION};
+
+        let ui_builder = appearance.ui_builder();
+
+        let status_text = match &view.cef_update_state {
+            CefUpdateUiState::Idle => {
+                crate::t!("settings-about-cef-installed", version = INSTALLED_VERSION)
+            }
+            CefUpdateUiState::Checking => crate::t!("settings-about-update-checking"),
+            CefUpdateUiState::Done(CefUpdateCheck::UpdateAvailable { latest }) => crate::t!(
+                "settings-about-cef-available",
+                latest = latest.as_str(),
+                installed = INSTALLED_VERSION
+            ),
+            CefUpdateUiState::Done(CefUpdateCheck::UpToDate {
+                latest: Some(latest),
+            }) => crate::t!(
+                "settings-about-cef-up-to-date",
+                version = latest.as_str()
+            ),
+            CefUpdateUiState::Done(CefUpdateCheck::UpToDate { latest: None }) => {
+                crate::t!("settings-about-cef-unknown")
+            }
+            CefUpdateUiState::Done(CefUpdateCheck::Failed { error }) => crate::t!(
+                "settings-about-cef-failed",
+                error = error.as_str()
+            ),
+        };
+
+        let mut section = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                ui_builder
+                    .span(crate::t!("settings-about-cef-title"))
+                    .build()
+                    .finish(),
+            )
+            .with_child(
+                ui_builder
+                    .span(crate::t!("settings-about-cef-description"))
+                    .with_soft_wrap()
+                    .build()
+                    .finish(),
+            );
+
+        let mut status_row = Flex::row()
+            .with_main_axis_alignment(MainAxisAlignment::Center)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(ui_builder.span(status_text).with_soft_wrap().build().finish());
+        if !matches!(view.cef_update_state, CefUpdateUiState::Checking) {
+            // 复用 Zap 自动更新区/DSH 区块同款"检查更新"链接文案与样式。
+            status_row.add_child(
+                Container::new(
+                    ui_builder
+                        .link(
+                            crate::t!("settings-about-update-check-now"),
+                            None,
+                            Some(Box::new(|ctx| {
+                                ctx.dispatch_typed_action(AboutPageAction::CefCheckUpdate);
+                            })),
+                            self.cef_check_link_mouse_state.clone(),
+                        )
+                        .soft_wrap(false)
+                        .build()
+                        .finish(),
+                )
+                .with_padding_left(8.)
+                .finish(),
+            );
+        }
+        section.add_child(status_row.finish());
+
+        section.finish()
     }
 
     /// About 页 DSH 更新区块:已装版本 + 各启用渠道的最新版本 + "检查更新"

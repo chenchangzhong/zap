@@ -244,3 +244,110 @@ fn cursor_semantic_maps_common_types() {
     assert_eq!(cursor_semantic(CursorType::NONE), 0);
     assert_eq!(cursor_semantic(CursorType::CUSTOM), 0);
 }
+
+/// 拖放掩码契约(P0-3):AppKit 的 `NSDragOperation` 与 CEF 的
+/// `cef_drag_operations_mask_t` 逐位相同(copy=1、link=2、generic=4、private=8、
+/// move=16、delete=32、every=UINT_MAX),因此 ObjC ↔ Rust 之间直接透传、不做映射表。
+///
+/// 两侧都断言:CEF 侧来自 `sys::cef_drag_operations_mask_t`,AppKit 侧来自
+/// `objc2_app_kit::NSDragOperation`(需 `NSDragging` feature,已在 `app/Cargo.toml` 启用)——
+/// 任一侧改号都会在这里红,这才真正钉住"直接透传"的前提。
+#[test]
+fn drag_operation_mask_matches_appkit_bits() {
+    use objc2_app_kit::NSDragOperation as appkit;
+    use sys::cef_drag_operations_mask_t as mask;
+    // 注:`Every` 两侧宽度不同(AppKit `NSUIntegerMax` vs CEF `UINT_MAX`),`as u32` 恰好把差异
+    // 截平 —— 这是**良性**的(生产侧 ObjC 边界同样按 `uint32_t` 传),但断言到 `Every` 时
+    // 它证明的是"低 32 位相同",不是"类型宽度相同"。
+    assert_eq!(mask::DRAG_OPERATION_NONE.0, appkit::None.0 as u32);
+    assert_eq!(mask::DRAG_OPERATION_COPY.0, appkit::Copy.0 as u32);
+    assert_eq!(mask::DRAG_OPERATION_LINK.0, appkit::Link.0 as u32);
+    assert_eq!(mask::DRAG_OPERATION_GENERIC.0, appkit::Generic.0 as u32);
+    assert_eq!(mask::DRAG_OPERATION_PRIVATE.0, appkit::Private.0 as u32);
+    assert_eq!(mask::DRAG_OPERATION_MOVE.0, appkit::Move.0 as u32);
+    assert_eq!(mask::DRAG_OPERATION_DELETE.0, appkit::Delete.0 as u32);
+    assert_eq!(mask::DRAG_OPERATION_EVERY.0, appkit::Every.0 as u32);
+}
+
+/// 拖放事件必须报"按住了左键":否则 CEF 会把拖动当成普通悬停,
+/// `drag_target_drag_enter` 之后的 over/drop 判定会错(参考实现同款处理)。
+#[test]
+fn drag_event_modifiers_reports_left_button() {
+    use sys::cef_event_flags_t as flags;
+    assert_eq!(
+        drag_event_modifiers(0),
+        flags::EVENTFLAG_LEFT_MOUSE_BUTTON.0
+    );
+    assert_eq!(
+        drag_event_modifiers(NS_MOD_OPTION | NS_MOD_SHIFT),
+        flags::EVENTFLAG_ALT_DOWN.0
+            | flags::EVENTFLAG_SHIFT_DOWN.0
+            | flags::EVENTFLAG_LEFT_MOUSE_BUTTON.0
+    );
+}
+
+/// 下载默认路径的文件名清洗:建议名来自服务端,带路径分隔符时只取最后一段,
+/// 否则保存面板会预填到下载目录之外(参考实现 `CefDownloadDestination.resolve` 同款防护)。
+#[test]
+fn download_file_name_strips_path_components() {
+    assert_eq!(
+        download_file_name("dsh-session-abc.zip"),
+        "dsh-session-abc.zip"
+    );
+    assert_eq!(download_file_name("../../evil.zip"), "evil.zip");
+    assert_eq!(download_file_name("/etc/passwd"), "passwd");
+    assert_eq!(download_file_name("sub/dir/report.md"), "report.md");
+}
+
+/// 空名 / 纯分隔符 / `..` 都不能产出空文件名(否则面板会预填一个目录路径)。
+#[test]
+fn download_file_name_falls_back_when_empty() {
+    assert_eq!(download_file_name(""), "download");
+    assert_eq!(download_file_name("/"), "download");
+    assert_eq!(download_file_name(".."), "download");
+}
+
+/// 清洗后的默认路径必须落在下载目录内(`join` 不能被建议名带出去)。
+///
+/// 不用 `else { return }` 静默跳过:这是 macOS-only 模块,`download_dir()` 为 None 本身就是
+/// 异常,静默"通过"会变成假绿(评审 M-7)。
+#[test]
+fn download_default_path_stays_in_download_dir() {
+    let dir = dirs::download_dir().expect("macOS 上应有下载目录");
+    let path = download_default_path("../../evil.zip").expect("download dir 可用");
+    assert!(
+        path.starts_with(&dir),
+        "路径逃出下载目录:{}",
+        path.display()
+    );
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("evil.zip")
+    );
+}
+
+/// 取消标记状态机(评审 M-7):进行中命中即消费且幂等;终态只清标记;未标记不取消。
+/// 这条逻辑原本只由实机验证覆盖,抽成纯函数后可回归。
+#[test]
+fn take_cancel_request_is_consumed_once_and_cleared_on_terminal() {
+    let mut canceled: HashSet<u32> = HashSet::new();
+
+    // 未标记 + 进行中 ⇒ 不取消,集合不变。
+    assert!(!take_cancel_request(&mut canceled, 7, true));
+    assert!(canceled.is_empty());
+
+    // 标记 + 进行中 ⇒ 取消,且只消费一次(后续 update 不再重复取消)。
+    canceled.insert(7);
+    assert!(take_cancel_request(&mut canceled, 7, true));
+    assert!(!take_cancel_request(&mut canceled, 7, true));
+    assert!(canceled.is_empty());
+
+    // 标记 + 终态 ⇒ 不取消,但标记被清掉(防 id 复用后误取消)。
+    canceled.insert(9);
+    assert!(!take_cancel_request(&mut canceled, 9, false));
+    assert!(canceled.is_empty());
+
+    // 未标记 + 终态 ⇒ 无副作用。
+    assert!(!take_cancel_request(&mut canceled, 11, false));
+    assert!(canceled.is_empty());
+}

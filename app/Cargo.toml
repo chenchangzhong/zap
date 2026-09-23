@@ -255,12 +255,13 @@ core-foundation.workspace = true
 dispatch2 = { workspace = true, optional = true }
 # CEF(Chromium)后端:仅 cef_webview feature 启用时编译/链接(默认构建不受影响)。
 # 构建前提:CEF 二进制就位(CEF_PATH 或 ~/.local/share/cef),见 specs/cef-webview-minimal/TECH.md。
-cef = { version = "152.4.0", optional = true }
+cef = { version = "154.0.0", optional = true }
 mach2 = "0.5"
 objc.workspace = true
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = [
     "NSApplication",
+    "NSDragging",
     "NSImage",
     "NSPanel",
     "NSResponder",

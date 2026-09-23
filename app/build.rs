@@ -56,6 +56,21 @@ fn main() -> Result<()> {
             println!("cargo:rustc-link-lib=framework=QuartzCore");
             println!("cargo:rustc-link-lib=framework=CoreGraphics");
             println!("cargo:rustc-link-lib=framework=IOSurface");
+
+            // 把"实际链接的那份 CEF 分发版"版本号传给 Rust 侧:设置页「CEF 内核更新」要显示它,
+            // 并与上游 index 比版本(见 app/src/browser/cef_update.rs)。
+            //
+            // 为什么从 Cargo.lock 取:cef-dll-sys 的 `links = "cef_dll_wrapper"` 元数据只发给
+            // **直接**依赖它的 crate,而 app 是 `cef -> cef-dll-sys` 的间接依赖,拿不到
+            // `DEP_CEF_DLL_WRAPPER_CEF_DIR`。而 cef 的 crate 版本形如
+            // `152.4.0+152.0.8`(后半段就是目标 CEF 版本),且 cef-dll-sys 构建时会用
+            // `check_archive_json` 强制 CEF 目录与它匹配 ⇒ Cargo.lock 里的版本就是链接版本。
+            if let Some(version) = cef_version_from_lockfile() {
+                println!("cargo:rustc-env=ZAP_CEF_VERSION={version}");
+            } else {
+                println!("cargo:warning=未能从 Cargo.lock 解析 cef 版本,ZAP_CEF_VERSION 将为 unknown");
+                println!("cargo:rustc-env=ZAP_CEF_VERSION=unknown");
+            }
         }
 
         // Build the dock tile plugin
@@ -549,4 +564,31 @@ END
     embed_resource::compile(resource_file_path, embed_resource::NONE)
         .manifest_required()
         .unwrap_or_else(|err| panic!("Unable to embed resource file: {err:#}"));
+}
+
+/// 从工作区 `Cargo.lock` 里取 `cef` 包的版本,并抽出目标 CEF 分发版版本
+/// (`152.4.0+152.0.8` → `152.0.8`)。
+///
+/// 只在 `cef_webview` feature 下被调用;解析失败返回 `None`,调用方降级为 `unknown`
+/// —— 不让构建因为一个展示用的版本号而失败。
+fn cef_version_from_lockfile() -> Option<String> {
+    let lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock.display());
+    let content = std::fs::read_to_string(lock).ok()?;
+    // Cargo.lock 是 TOML,但这里只需要一段固定形状的文本;不为此引入 toml 依赖。
+    let mut lines = content.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "name = \"cef\"" {
+            for next in lines.by_ref() {
+                let next = next.trim();
+                if let Some(rest) = next.strip_prefix("version = \"") {
+                    let raw = rest.strip_suffix('"')?;
+                    // `152.4.0+152.0.8` → `152.0.8`(`+` 前是 cef-rs 自己的版本)。
+                    let dist = raw.split_once('+').map_or(raw, |(_, dist)| dist);
+                    return Some(dist.to_string());
+                }
+            }
+        }
+    }
+    None
 }

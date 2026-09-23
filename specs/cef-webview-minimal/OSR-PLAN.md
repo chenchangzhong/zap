@@ -255,6 +255,9 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 > **先读该文档 §0–§5**:§0 是我对 T6 归因的自我更正,§5 是用户对各项的决定(右键菜单保持两项、
 > P0-4/P1-5 只记录)。下面三项是**用户指定要做的**,每项做完都要:两种 cfg `cargo check` 0 warning、
 > `cargo nextest` 窄过滤、`script/macos/cef_smoke` 构建,并**由用户实机验证**(单元测试覆盖不到)。
+>
+> **本轮进度(2026-09-22)**:T10.3 的**保存面板 + 取消**部分已完成并通过实机验证(**进度 UI 未做**);
+> T10.1(拖放)/T10.2(焦点随窗口 key)的实现已在工作区(未提交),**实机验收尚未做** —— 判据见各自小节。
 
 ### T10.1(P0-3)拖放双向 —— 优先
 - **缺口**:既不能从 Finder 拖文件/文本进 pane,也不能从页面往 Finder/终端拖(实测两个方向都无反应)。
@@ -264,25 +267,38 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
 - **改动点**:`app/src/platform/mac/objc/cef_support.m`(OSR 宿主视图 `WarpCefOsrView`,**非 ARC**;
   `registerForDraggedTypes` + `draggingEntered/draggingUpdated/draggingExited/prepareForDragOperation/
   performDragOperation/draggingEnded`,并正确返回 `NSDragOperation`)、
-  `app/src/browser/cef_backend.rs`(handler + `extern "C"` trampoline;拖放数据用 CEF 的
-  `cef_drag_data_create` 构造;从页面往外拖走 `CefDragHandler::on_drag_enter` → `start_dragging`,
-  以及 `update_drag_cursor`(若 cef-rs 有))。
+  `app/src/browser/cef_backend.rs`(handler + `extern "C"` trampoline;系统→页面方向由
+  **`BrowserHost`** 的 `drag_target_drag_enter/over/leave/drop` 送入,页面→系统方向由
+  `RenderHandler` 的 `start_dragging` + `update_drag_cursor` 送出 —— 该 API 归属在本计划初稿里
+  写错过两次:既不是 `CefDragHandler::on_drag_enter`,`drag_target_*` 也不在 `RenderHandler` 上)。
 - **若 cef-rs 缺必需 API**:先报缺失点与最小替代方案,**不要编造 API**。
 - **验收(用户实机)**:①从 Finder 拖一个文件到 pane 上 → 页面收到 drag/drop(例如输入框插入路径、
   或页面 dragover 高亮);②在页面里选中内容往终端/Finder 拖 → 产生拖拽会话。
+  **状态(2026-09-23,OSR 实例,用户确认"测试通过")**:①② **均通过**;日志证据(drag enter → 页面回报
+  `0x1`=Copy → drop;start_dragging → drag session ended op=0x7)见
+  [evidence/phase1/OSR-T10-DRAG.md](evidence/phase1/OSR-T10-DRAG.md) §1–§2。页面可见效果(是否插入路径、
+  高亮)与"源文件是否被移动"**日志不覆盖**。
 
 ### T10.2(P1-7)焦点跟随窗口 key 状态
 - **缺口**:点一下页面后用 Cmd+Tab 切走,页面里光标**仍一直闪烁**(实测)。
 - **参考**:`/tmp/CefSwift-main/Sources/CefSwiftUI/CefMetalHostView.swift:143-169`(观察
   `didBecomeKey/didResignKey`)。
 - **改动点**:OSR 视图观察 `NSWindowDidBecomeKeyNotification`/`NSWindowDidResignKeyNotification`
-  (视图进出窗口/窗口重建时正确注册与注销 observer,**非 ARC 下必须 release**,不得在 dealloc 后还收通知)
+  (视图进出窗口/窗口重建时正确注册与注销 observer;注意 selector 版 `addObserver:selector:name:object:`
+  **不 retain observer**,故**不应**对 observer 做 release,`dealloc` 里摘除只是兜底;不得在 dealloc 后还收通知)
   → 新增一条 ObjC→Rust 回调 → `browser.host().set_focus(0/1)`。
   **不要破坏**现有 `becomeFirstResponder/resignFirstResponder` 逻辑与 `_syncingFocus` 重入守卫;
   回调路径遵守"不得在持有 `WEBVIEWS` 借用时调外部"。
 - **验收(用户实机)**:点页面 → Cmd+Tab 切走 → 页面光标停止闪烁;切回来 → 恢复闪烁且可继续输入/上屏中文。
+  **状态(2026-09-23,OSR 实例)**:机制层证据可见(日志里 `window key=1/0` 成对出现,
+  [OSR-T10-DRAG.md](evidence/phase1/OSR-T10-DRAG.md) §3);**视觉判据**(光标停闪/恢复、中文上屏)日志
+  不覆盖,由用户在本轮整体确认"测试通过"。
 
-### T10.3(P0-2)下载保存面板/进度 UI
+### T10.3(P0-2)下载保存面板/进度 UI —— ✅ **保存面板 + 取消已完成并实机验证(2026-09-22);进度 UI 未做**
+> 落地结果、证据与两条踩坑见 [evidence/phase1/OSR-T10-DOWNLOAD.md](evidence/phase1/OSR-T10-DOWNLOAD.md)。
+> 要点:接 `download_handler` → 与 wry 共用 `NSSavePanel`;取消**不能**靠"返回 1 但不执行 callback"
+> (实测下载卡在 target-pending、数据落到隐藏临时文件、页面一直"下载中"),改用
+> `CefDownloadItemCallback::Cancel()`;面板期间用 `DOWNLOAD_PANEL_OPEN` 抑制消息泵避免重入。
 - **现状(实测)**:没有保存面板,**但下载直接完成** ⇒ CEF 默认下载管道可用,缺的是 UI。
   (`assets/webview_init.js:95-101` 明确对 `<a download>` 不拦截,依赖"原生下载管道"。)
 - **参考**:`/tmp/CefSwift-main/Sources/CefKit/BrowserClient.swift:294-341` + `CefDownloads.swift:53-72`。
@@ -292,6 +308,48 @@ CefSwift(BSD-3,`Rajaniraiyn/CefSwift`)已把 OSR 的全部原生affordance跑通
   会话/进度状态 + 保存面板与进度 UI(`app/src/browser/` 内,复用现有 webview 相关 UI 风格)。
 - **验收(用户实机)**:触发一次下载(dsh 的 Session/日志导出,或页面里任意 `<a download>`)
   → 出现保存面板(或按产品决定直接落到 `~/Downloads` 并给出进度/完成提示)。
+
+### T10 收尾:已修项与待验证项(2026-09-22 独立审查后)
+
+> **验证状态(2026-09-23 更新)**:2026-09-22 曾停止 GUI 测试;2026-09-23 在 OSR 实例上恢复了 GUI 测试,
+> **拖放双向 ①② 通过**(日志证据见 [OSR-T10-DRAG.md](evidence/phase1/OSR-T10-DRAG.md))。
+> 同日完成 **CEF 升级(`152.0.8` → `154.0.23`,见 [CEF-UPGRADE.md](CEF-UPGRADE.md) §8),升级后再次实机回归**:
+> 用户确认**除"mac `<select>` 弹层"与"保存面板后焦点恢复"两项外,其余项通过**(逐项结果表见
+> CEF-UPGRADE.md §8.3)。这两项**同属用户明确决定"暂不处理、仅记录"**。
+> **仍未单独验证**:`external begin-frame` 内部时序、`start_dragging` 坐标口径的专门取证、
+> windowed 模式下的下载面板与焦点、成功 drop 后缺 `drag leave`(未验证推测)。
+> 第二轮独立复审(下载 + 拖放)的完整发现、处置与"无 GUI 无法确认"清单见
+> [evidence/phase1/OSR-T10-REVIEW.md](evidence/phase1/OSR-T10-REVIEW.md)。
+
+**已修(审查确认项)**:
+
+| 项 | 证据/结论 | 修法 |
+|---|---|---|
+| 拖放:`start_dragging` 的 `x`/`y` 被当视图 DIP 用 | **确认是契约违反**:CEF 152 `cef_render_handler.h` 明写 screen coordinates;Blink `web_frame_widget_impl.cc:3319-3321` 用 `event.PositionInScreen()` 填,CEF `browser_platform_delegate_osr.cc:539-542` 原样透传 | ObjC **不再用 `x`/`y` 定位**,改用 AppKit 当前鼠标位置(窗口→视图坐标)——两种坐标假设下都正确,不引入新的未验证换算;`x`/`y` 仅留日志 |
+| 拖放掩码测试名不副实 | 原测试只断言 CEF 侧常量,看不到 AppKit 一侧(而"直接透传、不做映射表"正建立在该等价关系上) | 给 `objc2-app-kit` 启用 `NSDragging` feature,测试改为**两侧逐项比对**(`app/src/browser/cef_backend_tests.rs`) |
+| `_dragAllowedOps` 会话结束未复位 | 无功能影响(`start_drag` 每次覆盖),属确认的状态不一致 | `draggingSession:endedAtPoint:operation:` 里复位为 `NSDragOperationNone` |
+| **保存面板后焦点丢失**(用户实机报告:取消后页面收不到键盘) | 面板是 **app-modal**,关闭时 AppKit 不保证把 key 状态还给原窗口;前两版修复(视图焦点 / DOM 焦点)都**未解决** | 三层:① 共用面板函数里归还 key window(在 `activate()` **之前**取 `keyWindow()`、仅 `isActive()` 时 `makeKeyAndOrderFront`)② 视图/CEF 焦点(OSR 走 `focus()` 含 0→1 补同步;windowed 走 `makeFirstResponder` 原生视图)③ DOM `__restoreFocused`;**仅当弹出前焦点在页面上才做**(不抢终端焦点),立即 + 主队列下一拍各一次(DOM 只一次)。**至今无运行时证据**;⏸ **2026-09-23 用户决定:暂不追、仅记录**(见 [evidence/phase1/OSR-T10-DOWNLOAD.md](evidence/phase1/OSR-T10-DOWNLOAD.md) §5.3) |
+| 系统→页面拖放的应答掩码 | destination 返回值决定来源执行哪种操作;原实现返回"来源全掩码" = 接受 Move ⇒ 同卷文件从 Finder 拖入时 Finder 默认走 Move,**页面即使拒收也可能删掉源文件**(数据丢失) | `draggingEntered/Updated` 收敛为 `Copy|Link|Generic`(来源只给别的操作时兜底 Copy)。依据:网页不消费 Move 语义,且 windowed 下 Chromium 原生视图给的就是 Copy(实机光标为绿色 +)。**✅ 2026-09-23 用户实机:拖放双向通过**(证据 [OSR-T10-DRAG.md](evidence/phase1/OSR-T10-DRAG.md):页面回报 `0x1`=Copy、会话正常结束) |
+| 页面→系统拖拽无拖拽图像 | `setDraggingFrame:contents:nil` 按 `NSDraggingItem` 契约 = **隐藏该项** | 记为**有意接受**(与参考实现同款;注意参考实现该处注释写成 "placeholder image",与头文件相反,勿照抄) |
+
+**待验证(未确认,不据此改动)**:
+
+| 项 | 现象/判据 | 触发条件 | 怎么验 |
+|---|---|---|---|
+| ⏸ 保存面板后焦点恢复(**用户决定暂不追,仅记录**) | 三层修复是否真的把键盘焦点还回页面;**至今无运行时证据**(升级后的实机回归也未覆盖该路径,见 [OSR-T10-DRAG.md](evidence/phase1/OSR-T10-DRAG.md) §4) | 导出 → 取消 → 不点页面直接打字 | 将来要动时:看日志有无 `[cef] 面板关闭后恢复页面焦点 …`;仍不行则查"app 是否被弄成非激活"。详见 [OSR-T10-DOWNLOAD.md](evidence/phase1/OSR-T10-DOWNLOAD.md) §5.3 |
+| 页面拒收时的操作语义 | `draggingUpdated:` 恒返回来源掩码、`performDragOperation:` 恒返回 YES ⇒ 来源(Finder)可能认为"已接受" | 页面在 dragOver 里判定不收 | T10.1 实机:从 Finder 拖文件到 pane,按 Option/Cmd 观察**源文件是否被移动/删除**(windowed 下已实测**未被移走**) |
+| 拖入瞬间无 `drag_target_drag_over` | `draggingEntered:` 只发 enter(AppKit 随后会发 `draggingUpdated:`,落点前也补 over) | 页面高亮依赖首次 over | T10.1 实机:拖入时页面是否**立刻**高亮;不亮再补 |
+| `update_drag_cursor` 把 0 当"无变化" | 页面无法在拖拽中途把允许操作收窄为 None | 拖拽光标语义不对 | 实机观察拖拽途中的光标 |
+| 下载在 windowed 模式 | handler 与渲染模式无关,但只验了 OSR 下的下载行为 | 用 `ZAP_CEF_OSR=0`(或关设置项)启动 | 冒烟一次导出 |
+| 取消依赖后续 IN_PROGRESS 回调 | 该回调不来 ⇒ 下载停在 target-pending(无终态日志) | CEF 行为变化 | 若出现"取消后仍显示下载中",先看日志有无 `cancel requested` |
+| 重入防护只覆盖 `pump()` | 嵌套 run loop 期间 `set_bounds`/`focus`/`navigate`/`close` 等入口未 gate | **无已知触发输入** | 未验证推测,仅记录 |
+| 文件名截断 | 首轮存出 `e7145-…zip`(建议名尾部),次轮为完整名 | 建议名超长时 | 再出现时查 `NSSavePanel::setNameFieldStringValue` 与长名的交互 |
+| CEF "未处理下载"的成因 | 现象已确认(默认目录静默落盘);与上游 master 的 Alloy 取消分支不符 | —— | 需要时做判别实验:取消分支临时 `return 0`,看是 `state=2 CANCELLED` 还是仍落 `~/Downloads` |
+| **T10.1/T10.2 实机验收** | 拖放双向 ①② **已通过**(2026-09-23 OSR,日志证据见 [OSR-T10-DRAG.md](evidence/phase1/OSR-T10-DRAG.md));T10.2 的视觉判据与"页面可见效果"日志不覆盖,由用户整体确认 | —— | 剩余未覆盖项:保存面板路径(windowed 下的下载/焦点)、成功 drop 后缺 `drag leave` |
+| ✅ 掩码收敛后的拖放表现 | 收敛为 Copy 后光标/落下是否仍正常 | —— | **已完成**:2026-09-23 用户实机拖放双向通过(证据 [OSR-T10-DRAG.md](evidence/phase1/OSR-T10-DRAG.md)) |
+| ✅ OSR 视图遮蔽终端拖放路径 | OSR 宿主视图 `frame` = webview 矩形、无 hitTest 覆盖 ⇒ **只**在 webview 矩形内遮蔽 `WarpHostView` 的"拖文件进终端";webview 隐藏时不参与命中 | —— | **已完成**:用户实机确认"拖到终端本身"正常(2026-09-23,"三项都正常") |
+| `draggingEntered:` 未立即补 `drag_target_drag_over` | AppKit 随后会周期性发 `draggingUpdated:`(我们未实现 `wantsPeriodicDraggingUpdates`,默认行为属推断) | 页面高亮依赖首次 over | 最坏只是高亮晚一个周期;实机看"拖入瞬间是否立刻高亮" |
+| `drag over` 无日志通道 | `drag over` 完全不打日志(非 debug 级),故"高亮是否延迟"没有证据通道 | —— | 需要时加 debug + 限流 |
 
 ### 不在本轮范围(仅记录,用户已定)
 P0-4(编辑快捷键改为转发按键事件,让页面 JS `keydown`/`preventDefault` 生效)、

@@ -75,6 +75,7 @@ zap 侧改造面收敛在:webview 门面(约 25 pub fn,wry 类型全部集中)�
 | 注册表纯逻辑单测 | ✅ 3/3 | `flip_rect_to_appkit`(坐标翻转公式,集成要求 #2 的核心)、`is_enabled()` 初始化前为 false、`pump()` 未初始化 no-op;`cargo nextest -p warp --features cef_webview -E 'test(cef_backend)'` 全绿。**修复**:复核时发现 `set_bounds` 在"已挂起(无浏览器)"时不会更新缓存几何,重建会用旧 rect —— 改为无条件缓存 `pending_rect` 并在重建时按最新逻辑坐标重算 |
 | 内核开关 + 冻结设置(2026-09-21) | ✅ 已落并实跑通过 | 功能页新增「使用 Chromium 内核」(上)与「隐藏的内嵌网页冻结超时」(下),均仅 macOS;`cef_backend::ensure_initialized()` 支持按需初始化(开关即时生效、无需重启) |
 | 隐藏行为(2026-09-21 策略变更) | ✅ 已落 | **取消"隐藏即销毁"**(用户要求):隐藏只把原生视图 `setHidden:` + `was_hidden(1)`,renderer 保活、切回不重载。起因:实跑发现"隐藏时视图不消失"——`do_close` 返回 1(由客户端接管关闭)后没人完成关闭,视图残留,重建时还叠加第二层(用户报告"切到别的 tab 底下还是 webview")。**新增"隐藏超时冻结"**:隐藏超过阈值后发 CDP `Page.setWebLifecycleState=frozen`(保 DOM/会话,只停页面 JS 与渲染;dsh Node 服务端与 agent 不受影响),切回发 `active` 解冻。阈值来自设置 `general.webview.freeze_after_secs`(默认 **300s**,`0`=关闭),dev 可用 `ZAP_CEF_FREEZE_AFTER_SECS` 覆盖 |
+| 下载(2026-09-22,T10.3) | ✅ 已落并实机验证(OSR) | 接 `download_handler` → 与 wry **共用** `run_download_save_panel`(`browser_web_view.rs` 的 `pub(crate)` fn);默认路径 `~/Downloads` + 清洗过的建议文件名(防 `../` 逃逸)。**两条硬约束**:(1) 取消**不能**靠"返回 1 但不执行 callback"——实机现象是下载卡在 target-pending(数据落到隐藏临时文件、页面一直"下载中"),故必须用 `CefDownloadItemCallback::Cancel()`(机制为何如此**未验证**);(2) 面板是同步模态且在 CEF 回调内部,泵定时器在 common modes 下会重入消息循环(Apple 文档:common modes 默认含 modal 模式)⇒ 用 `DOWNLOAD_PANEL_OPEN` 抑制 `pump()`。进度 UI 未做;windowed 未验。详见 `evidence/phase1/OSR-T10-DOWNLOAD.md` |
 
 ### 实跑验证(2026-09-21,已完成)✅
 
@@ -146,7 +147,7 @@ flowchart LR
 |------|------|
 | **CEF 与 App Sandbox 不兼容**(全局 Mach port),**MAS 渠道永久不可行** | 用户已走 selfsign Developer ID(`--selfsign`),当前不受影响;本 spec 前置验收条件即"确认不进 MAS 由产品侧接受" |
 | cef-rs 单社区维护、无测试套件 | spike 先行;Phase 2 前 wrap `WebViewBackend` 让回退(wry)始终一键可用 |
-| CEF framework 内含硬编码版本号,升级节奏要自己背 | 版本按 `152.x` 语义化锁定(阶段 0 实装 152.4.0+152.0.8,弃 151 系:dev 主线已越过,macOS arm64 minimal 分发齐备);升级节奏写进 channel_versions 记录 |
+| CEF framework 内含硬编码版本号,升级节奏要自己背 | **2026-09-23 已升级:`152.4.0+152.0.8` → `154.0.0+154.0.23`**(代码零改动,只改两处版本字符串 + 两个 lock;执行记录见 [CEF-UPGRADE.md](CEF-UPGRADE.md) §8)。升级节奏仍需自己背:`channel_versions` 里**仍无** CEF 记录(待办);升级后 §5 的行为回归清单仍待 GUI 验证 |
 | 签名链(new framework + helper)与现有 bundle 流程的顺序敏感 | 按 [Unreal 案例实测](https://pgaleone.eu/unrealengine/macos/2024/07/06/codesigning-notarization-issues) 的顺序先用 throwaway bundle 验证,再改 `script/macos/bundle`;验证命令沿用 AGENTS.md §5.9(codesign -dv/--verify --deep) |
 | Metal 挖洞/背景层与 CEF NSView 共存性未知(透明跨界)a | spike 必须主动重放三个已知 hack 场景(dd2cdc47f/浮层/拖拽);失败则切 OSR 备选路径 |
 | 内存超预期(spike 实测 >200MB 私有足迹) | kill criterion:回到 WKWebView + "隐藏即销毁"优化(该优化独立价值,可先做) |

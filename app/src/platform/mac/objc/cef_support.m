@@ -216,6 +216,19 @@ typedef struct {
     int32_t keep_selection;
 } WarpCefOsrImeCommand;
 
+/// 系统 → 页面 的拖放内容(与 Rust 侧 `WarpCefOsrDragData` 逐字段对应)。
+/// **字符串只在回调期间有效**(都是 autorelease 的 NSString)。
+typedef struct {
+    /// 纯文本(UTF-8,可空)。
+    const char *text;
+    /// HTML(UTF-8,可空)。
+    const char *html;
+    /// 链接 URL(UTF-8,可空)。
+    const char *link_url;
+    /// '\n' 分隔的文件绝对路径(UTF-8,可空)。
+    const char *file_paths;
+} WarpCefOsrDragData;
+
 typedef struct {
     void (*handle_event)(uint64_t webview_id, const WarpCefOsrInputEvent *event);
     void (*handle_edit_command)(uint64_t webview_id, int32_t command);
@@ -224,6 +237,20 @@ typedef struct {
     void (*handle_ime)(uint64_t webview_id, const WarpCefOsrImeCommand *command);
     /// 宿主右键菜单命令(`warpShowContextMenu:` 里选中的项)→ Rust 走 CEF API。
     void (*handle_menu_command)(uint64_t webview_id, int32_t command, double x, double y);
+    /// 窗口 key 状态变化(1 = 窗口成为 key/前置,0 = 失焦)→ CEF `set_focus`。
+    /// 背景:窗口失焦时 first responder **不变**,故 `become/resignFirstResponder`
+    /// 那条路径收不到通知,页面里的光标会一直闪(P1-7,参考实现同款观察)。
+    void (*handle_window_key)(uint64_t webview_id, int32_t became_key);
+    /// 拖放(系统 → 页面):坐标是 DIP、左上原点;`allowed_ops` 是 AppKit 的
+    /// `NSDragOperation` 位(与 CEF 掩码**逐位相同**,Rust 侧单测锁定这一契约)。
+    void (*handle_drag_enter)(uint64_t webview_id, const WarpCefOsrDragData *data, double x,
+                              double y, uint32_t modifiers, uint32_t allowed_ops);
+    void (*handle_drag_over)(uint64_t webview_id, double x, double y, uint32_t modifiers,
+                             uint32_t allowed_ops);
+    void (*handle_drag_leave)(uint64_t webview_id);
+    void (*handle_drag_drop)(uint64_t webview_id, double x, double y, uint32_t modifiers);
+    /// 页面发起(页面 → 系统)的拖拽会话结束。
+    void (*handle_drag_session_ended)(uint64_t webview_id, double x, double y, uint32_t operation);
 } WarpCefOsrInputCallbacks;
 
 static WarpCefOsrInputCallbacks gInputCallbacks;
@@ -303,7 +330,7 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
 ///
 /// 坐标系:本视图**不是 flipped**(与 WebViewContainerView 一致),frame 由 Rust 侧
 /// 用与 wry/CEF 子视图相同的翻转公式算好;事件坐标在这里翻成 CEF 的左上原点。
-@interface WarpCefOsrView : NSView <NSTextInputClient> {
+@interface WarpCefOsrView : NSView <NSTextInputClient, NSDraggingSource> {
   @public
     /// 创建时由 Rust 侧写入:回调据此定位是哪个 webview。
     uint64_t _webviewId;
@@ -341,6 +368,11 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     NSRange _markedSelectionRange;
     NSRange _markedReplacementRange;
     BOOL _unmarkTextCalled;
+    /// 拖放:系统 → 页面 的拖拽是否正悬停在本视图上(避免重复发 leave)。
+    BOOL _dragActive;
+    /// 拖放:页面 → 系统 的拖拽会话允许的操作(来自 CEF 的 allowed_ops),用作
+    /// `draggingSession:sourceOperationMaskForDraggingContext:` 的返回值。
+    NSDragOperation _dragAllowedOps;
 }
 @end
 
@@ -369,11 +401,22 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
         _textToInsert = [[NSMutableString alloc] init];
         _markedReplacementRange = NSMakeRange(NSNotFound, 0);
         _markedSelectionRange = NSMakeRange(NSNotFound, 0);
+        // 拖放(系统 → 页面):不注册就没有 draggingEntered/Updated 回调(实测两个
+        // 方向都没反应)。类型只认这四类 —— 文本/HTML/文件 URL/普通 URL。
+        [self registerForDraggedTypes:@[
+            NSPasteboardTypeString, NSPasteboardTypeHTML, NSPasteboardTypeFileURL,
+            NSPasteboardTypeURL
+        ]];
     }
     return self;
 }
 
 - (void)dealloc {
+    // 窗口 key 观察者:正常路径在 `viewDidMoveToWindow`(窗口变 nil)已经摘过;
+    // 这里兜底再摘一次 —— 释放过程中不能再被通知回调碰到。
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center removeObserver:self name:NSWindowDidBecomeKeyNotification object:nil];
+    [center removeObserver:self name:NSWindowDidResignKeyNotification object:nil];
     if (_trackingArea != nil) {
         [self removeTrackingArea:_trackingArea];
         [_trackingArea release];
@@ -422,6 +465,52 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
         gInputCallbacks.handle_focus(_webviewId, 0);
     }
     return [super resignFirstResponder];
+}
+
+#pragma mark 窗口 key 状态(P1-7)
+
+/// 视图进出窗口时重新挂观察者:窗口外的通知收不到,而且旧窗口的通知也不能再收
+/// (视图可能被移到另一个窗口)。
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center removeObserver:self name:NSWindowDidBecomeKeyNotification object:nil];
+    [center removeObserver:self name:NSWindowDidResignKeyNotification object:nil];
+    NSWindow *window = self.window;
+    if (window == nil) {
+        return;
+    }
+    // 只收**本视图所在窗口**的通知(object: 过滤),多窗口下互不串扰。
+    [center addObserver:self
+               selector:@selector(warpWindowDidBecomeKey:)
+                   name:NSWindowDidBecomeKeyNotification
+                 object:window];
+    [center addObserver:self
+               selector:@selector(warpWindowDidResignKey:)
+                   name:NSWindowDidResignKeyNotification
+                 object:window];
+}
+
+/// 只有键盘焦点确实在本视图上时才同步给页面:否则会替终端/别的面板抢焦点
+/// (与 `warp_cef_osr_view_focus` 的判据同源)。
+- (void)warpWindowDidBecomeKey:(NSNotification *)notification {
+    (void)notification;
+    if (self.window.firstResponder != self) {
+        return;
+    }
+    if (gInputCallbacks.handle_window_key != NULL) {
+        gInputCallbacks.handle_window_key(_webviewId, 1);
+    }
+}
+
+- (void)warpWindowDidResignKey:(NSNotification *)notification {
+    (void)notification;
+    if (self.window.firstResponder != self) {
+        return;
+    }
+    if (gInputCallbacks.handle_window_key != NULL) {
+        gInputCallbacks.handle_window_key(_webviewId, 0);
+    }
 }
 
 /// 视图坐标(**左上原点、DIP**)—— CEF 鼠标事件的口径。
@@ -931,6 +1020,152 @@ static NSCursor *WarpCefOsrCursorForSemantic(int32_t semantic) {
     [self addCursorRect:self.bounds cursor:WarpCefOsrCursorForSemantic(_cursorSemantic)];
 }
 
+#pragma mark 拖放:系统 → 页面(P0-3)
+
+/// 拖动位置的 DIP(左上原点)—— 与鼠标事件同口径。
+- (NSPoint)warpDipPointForDraggingInfo:(id<NSDraggingInfo>)sender {
+    NSPoint inView = [self convertPoint:sender.draggingLocation fromView:nil];
+    return NSMakePoint(inView.x, self.bounds.size.height - inView.y);
+}
+
+/// 采集粘贴板内容交给 Rust(那边建 CEF 的 drag data 并调 drag_target_* 一族)。
+- (void)warpSendDragEnter:(id<NSDraggingInfo>)sender {
+    NSPasteboard *pasteboard = sender.draggingPasteboard;
+    NSString *text = [pasteboard stringForType:NSPasteboardTypeString];
+    NSString *html = [pasteboard stringForType:NSPasteboardTypeHTML];
+    // 文件与链接分开:文件走 CEF drag data 的 add_file,其余 URL 当链接。
+    NSMutableArray<NSString *> *filePaths = [NSMutableArray array];
+    NSString *linkURL = nil;
+    NSArray *objects = [pasteboard readObjectsForClasses:@[ [NSURL class] ] options:nil];
+    for (id object in objects) {
+        if (![object isKindOfClass:[NSURL class]]) {
+            continue;
+        }
+        NSURL *url = (NSURL *)object;
+        if (url.isFileURL) {
+            if (url.path.length > 0) {
+                [filePaths addObject:url.path];
+            }
+        } else if (linkURL == nil) {
+            linkURL = url.absoluteString;
+        }
+    }
+    NSString *joinedPaths =
+        filePaths.count > 0 ? [filePaths componentsJoinedByString:@"\n"] : nil;
+    WarpCefOsrDragData data = {0};
+    data.text = text.length > 0 ? text.UTF8String : NULL;
+    data.html = html.length > 0 ? html.UTF8String : NULL;
+    data.link_url = linkURL.length > 0 ? linkURL.UTF8String : NULL;
+    data.file_paths = joinedPaths.length > 0 ? joinedPaths.UTF8String : NULL;
+    NSPoint point = [self warpDipPointForDraggingInfo:sender];
+    if (gInputCallbacks.handle_drag_enter != NULL) {
+        gInputCallbacks.handle_drag_enter(_webviewId, &data, point.x, point.y,
+                                          (uint32_t)[NSEvent modifierFlags],
+                                          (uint32_t)sender.draggingSourceOperationMask);
+    }
+}
+
+- (void)warpSendDragOver:(id<NSDraggingInfo>)sender {
+    NSPoint point = [self warpDipPointForDraggingInfo:sender];
+    if (gInputCallbacks.handle_drag_over != NULL) {
+        gInputCallbacks.handle_drag_over(_webviewId, point.x, point.y,
+                                         (uint32_t)[NSEvent modifierFlags],
+                                         (uint32_t)sender.draggingSourceOperationMask);
+    }
+}
+
+/// 离开/结束:只有"正在悬停"时才发,避免重复的 leave(Rust 侧会转发给 CEF)。
+- (void)warpSendDragLeave {
+    if (!_dragActive) {
+        return;
+    }
+    _dragActive = NO;
+    if (gInputCallbacks.handle_drag_leave != NULL) {
+        gInputCallbacks.handle_drag_leave(_webviewId);
+    }
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    _dragActive = YES;
+    [self warpSendDragEnter:sender];
+    return warpDragAcceptedOps(sender);
+}
+
+/// 系统 → 页面:destination 应答的操作掩码。
+///
+/// **不能直接返回 `sender.draggingSourceOperationMask`**:destination 的返回值决定来源执行哪种
+/// 操作,返回全部等于声明"我接受 Copy|Move|Link";同卷文件从 Finder 拖入时 Finder 默认走 **Move**
+/// ⇒ 即使页面(CEF)最终拒收,源文件也可能已被删掉(数据丢失)。网页从不消费 Move 语义
+/// (Chromium 原生视图在 windowed 下也是 Copy:实机光标是绿色 +),故这里收敛为 Copy|Link|Generic;
+/// 来源只给了别的操作时兜底 Copy,避免退化成"不接受"。
+///
+/// 未验证推测(本轮无 GUI):收敛后拖入/落下是否仍正常,需在恢复 GUI 测试时确认。
+static NSDragOperation warpDragAcceptedOps(id<NSDraggingInfo> sender) {
+    NSDragOperation accepted = sender.draggingSourceOperationMask &
+        (NSDragOperationCopy | NSDragOperationLink | NSDragOperationGeneric);
+    return accepted != NSDragOperationNone ? accepted : NSDragOperationCopy;
+}
+
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+    [self warpSendDragOver:sender];
+    return warpDragAcceptedOps(sender);
+}
+
+- (void)draggingExited:(id<NSDraggingInfo>)sender {
+    (void)sender;
+    [self warpSendDragLeave];
+}
+
+- (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender {
+    (void)sender;
+    return YES;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    // 落下前补一次 over:CEF 需要最后一次位置才算准 drop 点(参考实现同款)。
+    [self warpSendDragOver:sender];
+    NSPoint point = [self warpDipPointForDraggingInfo:sender];
+    _dragActive = NO;
+    if (gInputCallbacks.handle_drag_drop != NULL) {
+        gInputCallbacks.handle_drag_drop(_webviewId, point.x, point.y,
+                                         (uint32_t)[NSEvent modifierFlags]);
+    }
+    return YES;
+}
+
+- (void)draggingEnded:(id<NSDraggingInfo>)sender {
+    (void)sender;
+    // 中途取消(如 Esc)不一定有 draggingExited:兜底补一次,否则 CEF 会一直停在
+    // "有拖拽悬停"的状态(页面里的 dragover 高亮不消失)。
+    [self warpSendDragLeave];
+}
+
+#pragma mark 拖放:页面 → 系统(P0-3)
+
+- (NSDragOperation)draggingSession:(NSDraggingSession *)session
+    sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+    (void)session;
+    (void)context;
+    return _dragAllowedOps;
+}
+
+- (void)draggingSession:(NSDraggingSession *)session
+             endedAtPoint:(NSPoint)screenPoint
+              operation:(NSDragOperation)operation {
+    (void)session;
+    // 会话结束:复位允许的操作,免得下一次拖拽沿用上一次的掩码
+    // (`sourceOperationMaskForDraggingContext:` 只读它)。
+    _dragAllowedOps = NSDragOperationNone;
+    // 屏幕点 → 视图 DIP(左上原点):CEF 的 drag_source_ended_at 要的就是这个口径。
+    NSWindow *window = self.window;
+    NSPoint inWindow = window != nil ? [window convertPointFromScreen:screenPoint] : screenPoint;
+    NSPoint inView = [self convertPoint:inWindow fromView:nil];
+    NSPoint dip = NSMakePoint(inView.x, self.bounds.size.height - inView.y);
+    if (gInputCallbacks.handle_drag_session_ended != NULL) {
+        gInputCallbacks.handle_drag_session_ended(_webviewId, dip.x, dip.y, (uint32_t)operation);
+    }
+}
+
 #pragma mark 编辑命令(响应者链)
 
 // 两条入口都会到这里:
@@ -987,6 +1222,43 @@ void warp_cef_osr_view_focus(void *view, int32_t focused) {
     v->_syncingFocus = YES;
     [v.window makeFirstResponder:v];
     v->_syncingFocus = NO;
+}
+
+/// 任意视图当前是否是窗口的 first responder。
+///
+/// 用途:面板弹出**之前**快照"键盘焦点是否在页面上",据此决定面板关闭后要不要把焦点抢回来
+/// (`makeFirstResponder` 对已销毁/不可见视图可能返回 NO,不能无条件设)。
+int32_t warp_cef_view_is_first_responder(void *view) {
+    NSView *v = (NSView *)view;
+    if (v == nil || v.window == nil) {
+        return 0;
+    }
+    return v.window.firstResponder == v ? 1 : 0;
+}
+
+/// 模态面板(保存面板等)关闭后把键盘焦点还给页面。
+///
+/// 面板是 app-modal 的 ⇒ 主窗 resign key;关闭后 `windowed` 下 CEF 的原生视图、
+/// OSR 下的自建视图都可能不再是 first responder,不补这一下用户必须先用鼠标点一下页面
+/// 才能继续输入(2026-09-22 实机命中)。两种模式二选一:`osr_view` 非空 = OSR,
+/// `native_view` 非空 = windowed(CEF 的 `window_handle()`,OSR 下为 null)。
+/// 失焦方向不在这里处理(AppKit 自己走响应者链,与 `warp_cef_osr_view_focus` 同口径)。
+///
+/// 返回 1 = 恢复了(或本来就已经是 first responder);返回 0 = 没能恢复(视图为空、
+/// 不在窗口里,或 `makeFirstResponder:` 被拒) —— 调用方据此记日志。
+int32_t warp_cef_restore_key_focus(void *osr_view, void *native_view) {
+    if (osr_view != NULL) {
+        warp_cef_osr_view_focus(osr_view, 1);
+        return warp_cef_view_is_first_responder(osr_view);
+    }
+    if (native_view == NULL) {
+        return 0;
+    }
+    NSView *view = (NSView *)native_view;
+    if (view.window == nil) {
+        return 0;
+    }
+    return [view.window makeFirstResponder:view] ? 1 : 0;
 }
 
 /// 宿主视图当前是否是窗口的 first responder(加载完成后据此决定要不要补 CEF 焦点:
@@ -1105,6 +1377,96 @@ void warp_cef_osr_view_set_hidden(void *view, int hidden) {
         return;
     }
     ((WarpCefOsrView *)view).hidden = hidden ? YES : NO;
+}
+
+#pragma mark 拖放(页面 → 系统)
+
+/// 页面发起拖拽(CEF render handler 的 `start_dragging`):用快照出的内容建
+/// `NSPasteboardItem` 并开始系统拖拽会话。返回 1 = 会话已开始。
+///
+/// **`x`/`y` 是屏幕坐标,不是视图坐标**(已核实:CEF `cef_render_handler.h` 明写
+/// "drag start location in screen coordinates";Blink 用 `event.PositionInScreen()` 填
+/// `DragEventSourceInfo::location`,CEF 的 `browser_platform_delegate_osr.cc` 原样透传)。
+/// 屏幕 → 视图的换算要牵扯窗口在屏幕上的位置与多屏布局,易错;故本函数**不用它定位**,
+/// 改用 AppKit 自己的"当前鼠标位置"(窗口坐标 → 视图坐标)。二者**近似等价、并非严格等价**:
+/// 鼠标位置是回调到达那一刻的值,比真实 drag start 晚一个拖拽阈值 + IPC/60Hz 泵的延迟
+/// (构造上不等价,未验证推测);鼠标已移出视图时拖拽框会落到可见区之外(AppKit 以可见区做裁剪)。
+/// `x`/`y` 仅由 Rust 侧打日志留证(`[cef] start_dragging (x,y)`),便于将来核对口径。
+///
+/// 内容只有文本/HTML/链接(与参考实现同范围):图片与文件内容不经这条路径搬运,
+/// 那种拖拽 Rust 侧已提前返回 0。
+int32_t warp_cef_osr_view_start_drag(void *view, const char *text, const char *html,
+                                     const char *link_url, double x, double y,
+                                     uint32_t allowed_ops) {
+    WarpCefOsrView *v = (WarpCefOsrView *)view;
+    if (v == nil || v.window == nil) {
+        return 0;
+    }
+    NSPasteboardItem *item = [[NSPasteboardItem alloc] init];
+    if (link_url != NULL) {
+        NSString *url = [NSString stringWithUTF8String:link_url];
+        if (url != nil) {
+            [item setString:url forType:NSPasteboardTypeURL];
+            [item setString:url forType:NSPasteboardTypeString];
+        }
+    }
+    if (text != NULL) {
+        NSString *value = [NSString stringWithUTF8String:text];
+        if (value != nil) {
+            [item setString:value forType:NSPasteboardTypeString];
+        }
+    }
+    if (html != NULL) {
+        NSString *value = [NSString stringWithUTF8String:html];
+        if (value != nil) {
+            [item setString:value forType:NSPasteboardTypeHTML];
+        }
+    }
+    if (item.types.count == 0) {
+        [item release];
+        return 0;
+    }
+    v->_dragAllowedOps = (NSDragOperation)allowed_ops;
+    NSDraggingItem *dragging = [[NSDraggingItem alloc] initWithPasteboardWriter:item];
+    // 起点取 AppKit 的当前鼠标位置(窗口坐标 → 视图坐标;本视图非 flipped,两者同口径),
+    // 不用 CEF 的 x/y(屏幕坐标,见函数头注释)。x/y 是 FFI 入参、不能删(Rust 侧要打日志),
+    // 这里显式标为未使用。
+    (void)x;
+    (void)y;
+    NSPoint viewPoint = [v convertPoint:[v.window mouseLocationOutsideOfEventStream]
+                               fromView:nil];
+    // `contents:nil` 按 NSDraggingItem 的契约 = **隐藏该项** ⇒ 页面 → 系统的拖拽**没有拖拽图像**
+    // (有意接受:与参考实现同款,只是它们的注释写成了 "placeholder image",与头文件相反)。
+    [dragging setDraggingFrame:NSMakeRect(viewPoint.x - 16.0, viewPoint.y - 16.0, 32.0, 32.0)
+                      contents:nil];
+    // 用当前事件开拖拽会话(cefclient/CefSwift 同款);页面发起的拖拽是渲染进程
+    // 回报的,可能不在某次 AppKit 事件派发之内,故没有当前事件时合成一个。
+    NSEvent *event = [NSApp currentEvent];
+    if (event == nil) {
+        event = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDragged
+                                   location:[v convertPoint:viewPoint toView:nil]
+                              modifierFlags:0
+                                  timestamp:[[NSProcessInfo processInfo] systemUptime]
+                               windowNumber:v.window.windowNumber
+                                    context:nil
+                                eventNumber:0
+                                 clickCount:1
+                                   pressure:1.0];
+    }
+    [v beginDraggingSessionWithItems:@[ dragging ] event:event source:v];
+    [dragging release];
+    [item release];
+    return 1;
+}
+
+/// 拖拽过程中 CEF 回报当前允许的操作(render handler 的 `update_drag_cursor`)。
+/// 0 = `NSDragOperationNone` 是"无变化"语义,保留上一次的值(参考实现同款)。
+void warp_cef_osr_view_update_drag_cursor(void *view, uint32_t operation) {
+    WarpCefOsrView *v = (WarpCefOsrView *)view;
+    if (v == nil || operation == 0) {
+        return;
+    }
+    v->_dragAllowedOps = (NSDragOperation)operation;
 }
 
 /// 当前 backing scale(供 CEF 的 ScreenInfo.device_scale_factor 与 DPI 变化检测)。

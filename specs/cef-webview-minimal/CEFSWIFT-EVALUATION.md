@@ -58,7 +58,7 @@ IOSurface 带 alpha,`CALayer` 合成后自然透出下层。这正是我们评�
 |------|-----------------------------------|-------------------|
 | 语言/运行时 | 全 Rust,零新增语言 | 引入 **Swift + SwiftUI + SwiftPM**;需 Rust↔Swift ABI 桥(`@_cdecl`)、Swift 并发/@MainActor 与 warpui 主线程模型共存 |
 | UI 宿主 | WarpUI(Metal)内嵌 NSView,已有分层/洞/命中方案 | SwiftUI/`NSViewRepresentable` 生命周期;与 zap 的窗口/场景模型不同源 |
-| **进程级独占资源** | 我们已占:CEF 初始化、60Hz 消息泵、helper 命名与 `--type=` 分流、bundle 组装与签名、CEF 152 版本 | 它也要独占同样这些 ⇒ **二者只能选一**,不是叠加 |
+| **进程级独占资源** | 我们已占:CEF 初始化、60Hz 消息泵、helper 命名与 `--type=` 分流、bundle 组装与签名、CEF 版本(2026-09-23 已升至 154.0.23) | 它也要独占同样这些 ⇒ **二者只能选一**,不是叠加 |
 | 构建链 | `cargo` + `script/macos/bundle`(AGENTS §5.9 强制) | 追加 SwiftPM 插件与它自己的 bundle 组装 ⇒ 与强制流程冲突 |
 | 已验证资产 | windowed 渲染/几何/隐藏与冻结/右键菜单/崩溃对齐/设置门控/回环 IPC+文档开始注入(两轮审核修复) | 全部作废(需按它的模型重写) |
 | 可复用资产 | — | **OSR 全套手法**(§1.4)是目前最有价值的参考 |

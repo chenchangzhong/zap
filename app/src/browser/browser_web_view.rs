@@ -157,6 +157,54 @@ pub(crate) fn notify_webview_create_failed(id: u64) {
     warpui::platform::mac::Window::request_redraw_all_windows();
 }
 
+/// 下载前的同步保存面板:预填默认路径(`~/Downloads` + 建议文件名),用户确认后
+/// 返回选中路径,取消返回 None(调用方拒绝下载)。
+///
+/// 两个后端共用:wry 侧由 `WKDownloadDelegate` 回调触发(见下方 download handler),
+/// CEF 侧由 `DownloadHandler::on_before_download` 触发。两者都在主线程,故直接
+/// `runModal`(与 NSAlert 的 modal 用法同理)。
+///
+/// **关闭后必须把 key window 还回去**:`runModal` 是 app-modal,面板关闭时 AppKit
+/// 不保证把 key 状态还给原来的窗口(未验证推测);没有 key window,后面无论怎么设
+/// first responder 都收不到键盘(实机:导出 → 取消后页面无法输入,得先用鼠标点一下)。
+#[cfg(target_os = "macos")]
+pub(crate) fn run_download_save_panel(default_path: &Path) -> Option<PathBuf> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSModalResponseOK, NSSavePanel};
+    use objc2_foundation::{NSString, NSURL};
+
+    let mtm = MainThreadMarker::new().expect("download handler must run on main thread");
+    let panel = NSSavePanel::savePanel(mtm);
+    if let Some(name) = default_path.file_name() {
+        panel.setNameFieldStringValue(&NSString::from_str(&name.to_string_lossy()));
+    }
+    if let Some(dir) = default_path.parent() {
+        let dir = NSString::from_str(&dir.to_string_lossy());
+        panel.setDirectoryURL(Some(&NSURL::fileURLWithPath_isDirectory(&dir, true)));
+    }
+    let app = NSApplication::sharedApplication(mtm);
+    // **必须在 activate() 之前取**:Apple 文档明说 activate 不保证立即生效(甚至不保证一定激活),
+    // 而失活的 app 没有 key window ⇒ 先 activate 再取,最需要这条兜底的场景恰好取到 None。
+    let previous_key_window = app.keyWindow();
+    // 面板若被压到其他 app 后面会不可见,先激活(对齐 alert 的做法)。
+    app.activate();
+    let response = panel.runModal();
+    // 只在本 app 仍处于激活态时把窗口拉回 key:否则会把用户切走后的前台硬抢回来。
+    if app.isActive() {
+        if let Some(window) = previous_key_window.or_else(|| app.mainWindow()) {
+            window.makeKeyAndOrderFront(None);
+        }
+    }
+    if response == NSModalResponseOK {
+        panel
+            .URL()
+            .and_then(|url| url.path())
+            .map(|path| PathBuf::from(path.to_string()))
+    } else {
+        None
+    }
+}
+
 impl BrowserWebViewManager {
     pub fn new() -> Self {
         Self {
@@ -342,7 +390,7 @@ impl BrowserWebViewManager {
                 log::info!("[browser] download started: {url} -> {}", path.display());
                 // 对齐 Electron(未设 setSavePath 的默认例程):弹原生保存
                 // 对话框让用户选位置,取消则拒绝本次下载。
-                match Self::run_download_save_panel(path) {
+                match run_download_save_panel(path) {
                     Some(chosen) => {
                         *path = chosen;
                         true
@@ -399,36 +447,6 @@ impl BrowserWebViewManager {
     ) {
     }
 
-    /// 下载前的同步保存面板:预填 wry 计算的默认路径(~/Downloads + 建议
-    /// 文件名),用户确认后返回选中路径,取消返回 None(调用方拒绝下载)。
-    /// 须在主线程调用——WKDownloadDelegate 回调即主线程,同步 runModal
-    /// 与 NSAlert 的 modal 用法同理。
-    #[cfg(target_os = "macos")]
-    fn run_download_save_panel(default_path: &Path) -> Option<PathBuf> {
-        use objc2::MainThreadMarker;
-        use objc2_app_kit::{NSApplication, NSModalResponseOK, NSSavePanel};
-        use objc2_foundation::{NSString, NSURL};
-
-        let mtm = MainThreadMarker::new().expect("download handler must run on main thread");
-        let panel = NSSavePanel::savePanel(mtm);
-        if let Some(name) = default_path.file_name() {
-            panel.setNameFieldStringValue(&NSString::from_str(&name.to_string_lossy()));
-        }
-        if let Some(dir) = default_path.parent() {
-            let dir = NSString::from_str(&dir.to_string_lossy());
-            panel.setDirectoryURL(Some(&NSURL::fileURLWithPath_isDirectory(&dir, true)));
-        }
-        // 面板若被压到其他 app 后面会不可见,先激活(对齐 alert 的做法)。
-        NSApplication::sharedApplication(mtm).activate();
-        if panel.runModal() == NSModalResponseOK {
-            panel
-                .URL()
-                .and_then(|url| url.path())
-                .map(|path| PathBuf::from(path.to_string()))
-        } else {
-            None
-        }
-    }
     /// 让 id 对应的 webview 跳转到 `url`。
     pub fn navigate(&self, id: u64, url: &str) {
         #[cfg(all(target_os = "macos", feature = "cef_webview"))]

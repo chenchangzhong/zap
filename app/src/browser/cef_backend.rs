@@ -14,6 +14,7 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::c_char;
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use cef::*;
@@ -272,6 +273,18 @@ struct WarpCefOsrImeCommand {
     keep_selection: i32,
 }
 
+/// 系统 → 页面 的拖放内容(与 ObjC `WarpCefOsrDragData` 逐字段对应)。
+/// 字符串**只在回调期间有效**(ObjC 侧是 autorelease 的 NSString),故 trampoline
+/// 里必须同步取快照。
+#[repr(C)]
+struct WarpCefOsrDragData {
+    text: *const c_char,
+    html: *const c_char,
+    link_url: *const c_char,
+    /// '\n' 分隔的文件绝对路径。文件名本身含换行属于病态输入,不在支持范围。
+    file_paths: *const c_char,
+}
+
 #[repr(C)]
 struct WarpCefOsrInputCallbacks {
     handle_event: extern "C" fn(u64, *const WarpCefOsrInputEvent),
@@ -280,6 +293,15 @@ struct WarpCefOsrInputCallbacks {
     handle_key: extern "C" fn(u64, *const WarpCefOsrKeyInput),
     handle_ime: extern "C" fn(u64, *const WarpCefOsrImeCommand),
     handle_menu_command: extern "C" fn(u64, i32, f64, f64),
+    /// 窗口 key 状态(1 = 前置,0 = 失焦);见 `osr_window_key_trampoline`。
+    handle_window_key: extern "C" fn(u64, i32),
+    /// 拖放(系统 → 页面);坐标是 DIP、左上原点。
+    handle_drag_enter: extern "C" fn(u64, *const WarpCefOsrDragData, f64, f64, u32, u32),
+    handle_drag_over: extern "C" fn(u64, f64, f64, u32, u32),
+    handle_drag_leave: extern "C" fn(u64),
+    handle_drag_drop: extern "C" fn(u64, f64, f64, u32),
+    /// 页面发起(页面 → 系统)的拖拽会话结束。
+    handle_drag_session_ended: extern "C" fn(u64, f64, f64, u32),
 }
 
 static OSR_INPUT_CALLBACKS: WarpCefOsrInputCallbacks = WarpCefOsrInputCallbacks {
@@ -289,6 +311,12 @@ static OSR_INPUT_CALLBACKS: WarpCefOsrInputCallbacks = WarpCefOsrInputCallbacks 
     handle_key: osr_key_trampoline,
     handle_ime: osr_ime_trampoline,
     handle_menu_command: osr_menu_command_trampoline,
+    handle_window_key: osr_window_key_trampoline,
+    handle_drag_enter: osr_drag_enter_trampoline,
+    handle_drag_over: osr_drag_over_trampoline,
+    handle_drag_leave: osr_drag_leave_trampoline,
+    handle_drag_drop: osr_drag_drop_trampoline,
+    handle_drag_session_ended: osr_drag_session_ended_trampoline,
 };
 
 /// 注册输入回调(幂等;必须在创建 OSR 宿主视图之前)。
@@ -513,6 +541,41 @@ fn cstr_to_string(ptr: *const c_char) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// CEF 的 userfree 字符串(mac 上是 UTF-16)取快照;空串归一成 None。
+/// 入参按值拿:`CefStringUserfree` 的 Drop 会释放 CEF 分配的那份内存。
+fn userfree_string(value: CefStringUserfree) -> Option<String> {
+    let text = CefStringUtf8::from(&CefStringUtf16::from(&value))
+        .as_str()
+        .map(ToString::to_string);
+    text.filter(|text| !text.is_empty())
+}
+
+/// `&CefString`(mac 上是 UTF-16)取快照;空串归一成 None。
+fn cef_string_to_string(value: &CefString) -> Option<String> {
+    CefStringUtf8::from(value)
+        .as_str()
+        .map(ToString::to_string)
+        .filter(|text| !text.is_empty())
+}
+
+/// 保存面板的默认路径:`~/Downloads` + 清洗后的建议文件名。
+fn download_default_path(suggested: &str) -> Option<PathBuf> {
+    Some(dirs::download_dir()?.join(download_file_name(suggested)))
+}
+
+/// 从建议文件名里取安全的一段。
+///
+/// 建议名来自服务端(或 `Content-Disposition`),可能带路径分隔符 ⇒ 只取最后一段,
+/// 否则 `join` 会把文件写到下载目录之外(参考实现 `CefDownloadDestination.resolve`
+/// 同款防护);空名/纯分隔符/`..` 退回固定名,避免产出空文件名。
+fn download_file_name(suggested: &str) -> String {
+    Path::new(suggested)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "download".to_string())
+}
+
 /// 取首个 UTF-16 码元(CEF 的 `character`/`unmodified_character` 口径)。
 fn first_utf16(text: &str) -> Option<u16> {
     text.encode_utf16().next()
@@ -680,6 +743,25 @@ extern "C" fn osr_edit_command_trampoline(id: u64, command: i32) {
 extern "C" fn osr_focus_trampoline(id: u64, focused: i32) {
     log::debug!("[cef] osr {id}: focus={focused}");
     focus(id, focused != 0);
+}
+
+/// 窗口成为/失去 key → 同步给 CEF(P1-7)。
+///
+/// 为什么需要单独一条:**窗口失焦时 first responder 不变**,`resignFirstResponder`
+/// 不会被调用,页面收不到 blur ⇒ 切走应用后页面里的光标仍一直闪(实测)。参考实现
+/// 也是观察 `didBecomeKey/didResignKey` 后调 `setFocus`。
+///
+/// 只做 `set_focus`,不复用 `focus(id, _)` —— 后者还会 `makeFirstResponder` 并做
+/// "首次落到页面"的 0→1 补焦点,那是"焦点换到页面"语义,与"窗口 key 状态"无关。
+/// 借用纪律:`browser_snapshot` 只取句柄副本,调用期间不持 `WEBVIEWS` 借用。
+extern "C" fn osr_window_key_trampoline(id: u64, became_key: i32) {
+    log::info!("[cef] osr {id}: window key={became_key}");
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    if let Some(host) = browser.host() {
+        host.set_focus(became_key);
+    }
 }
 
 // ---------------------- T7:输入法(IME) ----------------------
@@ -960,6 +1042,155 @@ extern "C" fn osr_ime_trampoline(id: u64, command: *const WarpCefOsrImeCommand) 
     }
 }
 
+// ---------------------- P0-3:拖放(双向) ----------------------
+//
+// 系统 → 页面:宿主 `NSDraggingDestination` 采集粘贴板 → 这里构造 CEF 的
+// `cef_drag_data_t` → `BrowserHost::drag_target_drag_*`(CEF 只在 windowless 下用它们)。
+// 页面 → 系统:render handler 的 `start_dragging` 把内容快照交给宿主开
+// `NSDraggingSession`;会话结束后回这里补 `drag_source_ended_at` +
+// `drag_source_system_drag_ended`(否则渲染器侧会一直以为拖拽没结束)。
+//
+// 掩码:AppKit 的 `NSDragOperation` 与 CEF 的 `cef_drag_operations_mask_t` **逐位相同**
+// (由 `drag_operation_mask_matches_appkit_bits` 单测锁定)⇒ 两侧直接透传,不做映射表。
+
+/// 拖动期间按住的正是左键:CEF 的鼠标事件要靠这个位判定"这是拖拽而非悬停"。
+/// 修饰键同样要报(拖放落到页面时页面可能按 Shift/Option 改语义)。
+fn drag_event_modifiers(ns_flags: u32) -> u32 {
+    cef_modifiers(ns_flags) | sys::cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0
+}
+
+/// 把宿主采集到的粘贴板内容装进 CEF 的 drag data(系统 → 页面)。
+///
+/// 注意:这里**不**调 `reset_file_contents` —— 那份约束针对的是"从 StartDragging
+/// 拿到的、可能带文件内容的 drag data";我们是从零构造,本来就没有内容。
+fn osr_drag_data_from_ns(data: &WarpCefOsrDragData) -> Option<DragData> {
+    let drag = cef::drag_data_create()?;
+    if let Some(text) = cstr_to_string(data.text) {
+        drag.set_fragment_text(Some(&CefString::from(text.as_str())));
+    }
+    if let Some(html) = cstr_to_string(data.html) {
+        drag.set_fragment_html(Some(&CefString::from(html.as_str())));
+    }
+    if let Some(url) = cstr_to_string(data.link_url) {
+        drag.set_link_url(Some(&CefString::from(url.as_str())));
+    }
+    if let Some(paths) = cstr_to_string(data.file_paths) {
+        for path in paths.lines().filter(|line| !line.is_empty()) {
+            // 显示名用最后一段路径(参考实现同款);不额外传名字,省掉一层 FFI。
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            drag.add_file(
+                Some(&CefString::from(path)),
+                Some(&CefString::from(name.as_str())),
+            );
+        }
+    }
+    Some(drag)
+}
+
+extern "C" fn osr_drag_enter_trampoline(
+    id: u64,
+    data: *const WarpCefOsrDragData,
+    x: f64,
+    y: f64,
+    modifiers: u32,
+    allowed_ops: u32,
+) {
+    let Some(data) = (unsafe { data.as_ref() }) else {
+        return;
+    };
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    let Some(host) = browser.host() else {
+        return;
+    };
+    let Some(mut drag) = osr_drag_data_from_ns(data) else {
+        return;
+    };
+    let point = MouseEvent {
+        x: to_dip_coord(x),
+        y: to_dip_coord(y),
+        modifiers: drag_event_modifiers(modifiers),
+    };
+    // 每次拖拽重置去重值,保证本次拖拽的"页面回报允许操作"至少记一行。
+    LAST_DRAG_ALLOWED.set(None);
+    // info 级:每次拖拽只此一行,用来判定"视图到底有没有收到拖拽"(实测踩过
+    // "两个方向都没反应"却无从区分是没收还是页面不收)。
+    log::info!("[cef] osr {id}: drag enter ({x},{y}) allowed=0x{allowed_ops:x}");
+    // `DragData` 是引用计数对象:cef-rs 传递前会 `add_ref`,CEF 消费那一份,
+    // 本地这份随作用域结束释放 —— 不泄漏、也不 double free。
+    host.drag_target_drag_enter(
+        Some(&mut drag),
+        Some(&point),
+        DragOperationsMask::from(sys::cef_drag_operations_mask_t(allowed_ops)),
+    );
+}
+
+extern "C" fn osr_drag_over_trampoline(id: u64, x: f64, y: f64, modifiers: u32, allowed_ops: u32) {
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    let Some(host) = browser.host() else {
+        return;
+    };
+    let point = MouseEvent {
+        x: to_dip_coord(x),
+        y: to_dip_coord(y),
+        modifiers: drag_event_modifiers(modifiers),
+    };
+    host.drag_target_drag_over(
+        Some(&point),
+        DragOperationsMask::from(sys::cef_drag_operations_mask_t(allowed_ops)),
+    );
+}
+
+extern "C" fn osr_drag_leave_trampoline(id: u64) {
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    log::info!("[cef] osr {id}: drag leave");
+    if let Some(host) = browser.host() {
+        host.drag_target_drag_leave();
+    }
+}
+
+extern "C" fn osr_drag_drop_trampoline(id: u64, x: f64, y: f64, modifiers: u32) {
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    let Some(host) = browser.host() else {
+        return;
+    };
+    let point = MouseEvent {
+        x: to_dip_coord(x),
+        y: to_dip_coord(y),
+        modifiers: drag_event_modifiers(modifiers),
+    };
+    log::info!("[cef] osr {id}: drag drop ({x},{y})");
+    host.drag_target_drop(Some(&point));
+}
+
+/// 页面向外拖拽的会话结束(AppKit 的 `draggingSession:endedAtPoint:operation:`)。
+extern "C" fn osr_drag_session_ended_trampoline(id: u64, x: f64, y: f64, operation: u32) {
+    let Some(browser) = browser_snapshot(id) else {
+        return;
+    };
+    let Some(host) = browser.host() else {
+        return;
+    };
+    log::info!("[cef] osr {id}: drag session ended ({x},{y}) op=0x{operation:x}");
+    // 顺序固定:先报落点与操作,再报"系统拖拽整体结束"(cef_browser_capi.h 的契约)。
+    host.drag_source_ended_at(
+        to_dip_coord(x),
+        to_dip_coord(y),
+        DragOperationsMask::from(sys::cef_drag_operations_mask_t(operation)),
+    );
+    host.drag_source_system_drag_ended();
+}
+
 extern "C" {
     /// 见 app/src/platform/mac/objc/cef_support.m(仅 cef_webview feature 下编译)。
     fn warp_cef_start_periodic_main_timer(interval: f64, callback: extern "C" fn());
@@ -977,6 +1208,11 @@ extern "C" {
     fn warp_cef_osr_view_set_input_callbacks(callbacks: *const WarpCefOsrInputCallbacks);
     fn warp_cef_osr_view_set_cursor(view: *mut c_void, semantic: i32);
     fn warp_cef_osr_view_focus(view: *mut c_void, focused: i32);
+    /// 模态面板关闭后把键盘焦点还给页面(OSR 视图 / windowed 的 CEF 原生视图二选一)。
+    /// 返回 1 = 恢复了(或本来已是 first responder)。
+    fn warp_cef_restore_key_focus(osr_view: *mut c_void, native_view: *mut c_void) -> i32;
+    /// 任意视图当前是否是窗口的 first responder(面板弹出**之前**用它快照页面焦点)。
+    fn warp_cef_view_is_first_responder(view: *mut c_void) -> i32;
     fn warp_cef_osr_view_is_first_responder(view: *mut c_void) -> i32;
     fn warp_cef_osr_view_set_ime_bounds(
         view: *mut c_void,
@@ -1017,6 +1253,22 @@ extern "C" {
     fn warp_cef_osr_view_set_hidden(view: *mut c_void, hidden: i32);
     fn warp_cef_osr_view_scale(view: *mut c_void) -> f64;
     fn warp_cef_osr_view_surface_size(view: *mut c_void, out_width: *mut i32, out_height: *mut i32);
+    /// 页面 → 系统:用快照出的内容开始一次 `NSDraggingSession`(返回 0 = 没开成)。
+    /// `x`/`y` 是 CEF 给的**屏幕坐标**(`cef_render_handler.h` 契约;Blink 用
+    /// `event.PositionInScreen()` 填,CEF 的 `browser_platform_delegate_osr.cc` 原样透传),
+    /// ObjC 侧**不用它定位**(改用 AppKit 的当前鼠标位置,两种坐标假设下都正确),只在这里
+    /// 打日志留证 —— 详见 `cef_support.m` 同名函数的注释。
+    fn warp_cef_osr_view_start_drag(
+        view: *mut c_void,
+        text: *const c_char,
+        html: *const c_char,
+        link_url: *const c_char,
+        x: f64,
+        y: f64,
+        allowed_ops: u32,
+    ) -> i32;
+    /// 页面拖拽过程中 CEF 回报当前允许的操作 → 更新宿主拖拽会话的掩码。
+    fn warp_cef_osr_view_update_drag_cursor(view: *mut c_void, operation: u32);
     fn warp_cef_osr_view_release(view: *mut c_void);
 }
 
@@ -1122,7 +1374,16 @@ pub(crate) fn initialize_runtime() -> bool {
     *INITIALIZED.get_or_init(|| initialize_inner())
 }
 
-/// CEF 的缓存目录(每实例独立,避免 Chromium ProcessSingleton 冲突)。
+/// CEF 的缓存/用户数据目录。
+///
+/// **app 级独立、实例级共享**:路径固定在 `<data_local_dir>/zap-cef` 下,与系统 Chrome、
+/// 其他 CEF 应用完全分开;但同一台机器上**多个本 app 实例会共享同一份**(没有按实例/PID 加后缀)。
+/// 历史上那次 ProcessSingleton 冲突(启动 ~30s 后被 SIGKILL 137,见
+/// `evidence/phase1/RUNTIME-VERIFICATION.md` §3.2)根因是"一次启动内 CEF 被初始化两次 +
+/// `cache_path` 被配成 `root_cache_path` 的兄弟目录",已由"只有主 app 才初始化 CEF"与
+/// "cache 放到 root 之下"修掉 —— **不是**靠每实例目录。
+/// 若将来并发多实例(或与 spike 同跑)真的再撞单例,**那时**再按实例隔离;代价是每次启动
+/// 都不复用缓存。
 fn cef_cache_paths() -> (String, String) {
     let base = dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
@@ -1149,10 +1410,10 @@ fn initialize_inner() -> bool {
 
     let args = cef::args::Args::new();
     let mut app = CefApp::new();
-    // 每实例独立的缓存/根缓存目录。**必须显式设置**:CEF 默认用共享目录时 Chromium 的
-    // ProcessSingleton 会与其他 CEF 进程(本 app 之前的实例、spike 等)冲突 ——
-    // 实测表现为新实例启动后静默消失(CEF 自身也会警告 "Please customize
-    // CefSettings.root_cache_path ... unintended process singleton behavior")。
+    // 缓存/根缓存目录:**必须显式设置** —— CEF 默认用共享目录时,Chromium 的 ProcessSingleton
+    // 会与其他 CEF 进程冲突(CEF 自身也会警告 "Please customize CefSettings.root_cache_path ...
+    // unintended process singleton behavior")。目录是 **app 级**独立(与系统 Chrome 分开),
+    // 不是实例级,详见 `cef_cache_paths` 的注释。
     let (cache_path, root_cache_path) = cef_cache_paths();
     // no_sandbox:zap 走 Developer ID 直发,不进 MAS(spec 决策)。
     // external_message_pump:消息泵由 [`pump`] 驱动(zap 已有自己的事件循环)。
@@ -1275,13 +1536,13 @@ pub(crate) fn is_crash_recovery_process() -> bool {
     std::env::args().any(|arg| arg.starts_with("--crash-recovery-mechanism"))
 }
 
-/// 运行时是否**请求**使用 CEF 后端:`ZAP_CEF_WEBVIEW` 环境开关(显式强制)或 feature
-/// flag 任一为真。
+/// 运行时是否**请求**使用 CEF 后端:`FeatureFlag::CefWebview` 或 `ZAP_CEF_WEBVIEW` 环境开关
+/// 任一为真。
 ///
-/// 为什么要环境开关作为强制项:flag 会经 `USER_PREFERENCE_MAP`(settings 里的用户偏好)
-/// 覆盖 —— 实测实例里 `ZAP_CEF_WEBVIEW=1` 已注入进程环境、二进制也含 CEF 代码,但
-/// `FeatureFlag::CefWebview.is_enabled()` 仍为 false,导致 CEF 完全不初始化。
-/// 开关只影响"是否尝试初始化",不改变默认(wry)路径。
+/// flag 自 2026-09-23 起在带 `cef_webview` feature 的构建里**默认开启**(debug/release 一致);
+/// 环境开关保留为"显式强制"的旁路 —— 它能绕过 `USER_PREFERENCE_MAP`(settings 里的用户偏好)
+/// 对 flag 的覆盖:实测出现过"环境变量已注入、二进制也含 CEF 代码,但 `is_enabled()` 仍为
+/// false ⇒ CEF 完全不初始化"。开关只影响"是否尝试初始化",不改变默认(wry)兜底路径。
 pub(crate) fn is_requested() -> bool {
     let by_env = std::env::var_os("ZAP_CEF_WEBVIEW").is_some();
     let by_flag = FeatureFlag::CefWebview.is_enabled();
@@ -1296,10 +1557,62 @@ pub(crate) fn is_enabled() -> bool {
     INITIALIZED.get().copied().unwrap_or(false)
 }
 
+thread_local! {
+    /// 保存面板(模态)打开期间抑制消息泵。面板是在 CEF 回调内同步弹的,而泵定时器
+    /// 挂在 `NSRunLoopCommonModes` ⇒ 不抑制就会在 `do_message_loop_work()` 内部**重入**它,
+    /// 而 CEF 的消息循环工作函数不可重入。依据:Apple 文档明确 Cocoa 的 common modes
+    /// 默认含 default / **modal** / event-tracking 三种模式,故模态面板期间该定时器照常触发。
+    ///
+    /// 代价(有意接受):面板期间 CEF 完全不被推进 —— 所有 webview 的 IPC/重绘、
+    /// external begin-frame、隐藏超时冻结(`freeze_hidden_overdue`)都停;这与同步 `runModal`
+    /// 阻塞 CEF UI 线程的效果一致,模态期间可接受。
+    static DOWNLOAD_PANEL_OPEN: Cell<bool> = Cell::new(false);
+}
+
+thread_local! {
+    /// 用户在保存面板里点了取消的下载 id。
+    ///
+    /// 为什么不能"返回 1 且不执行 callback"了事 —— 以下是**可观测事实**(2026-09-22 实机):
+    /// 面板取消后下载卡在 target-pending,数据照旧全落到隐藏临时文件
+    /// (`~/Downloads/.<bundle-id>.<rand>`,实测两个各 446147 字节),item 永远 IN_PROGRESS、
+    /// 页面一直显示"下载中",且 `on_download_updated` 没有任何终态回调。
+    /// 上游 `~CefBeforeDownloadCallbackImpl` 确有"析构时用空路径取消"的逻辑,但那个包装对象
+    /// 为何没被析构 **未验证**(机制推断,勿当结论;参见 OSR-T10-DOWNLOAD.md §4.1)。
+    /// 故不依赖析构时机,改为在这里记 id,由 `on_download_updated` 拿到的
+    /// `CefDownloadItemCallback` 显式取消(CEF 侧 `item->Cancel(true)`)—— 这是唯一有头文件
+    /// 依据的取消通道(`cef_download_handler.h:123-131`)。
+    static CANCELED_DOWNLOADS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+}
+
+thread_local! {
+    /// 上一次由页面回报的"允许操作",只用于"变化时才记一行"的去重(见 `update_drag_cursor`)。
+    /// 用 `Option` 而不是 `u32::MAX` 哨兵:后者与合法值 `DRAG_OPERATION_EVERY`(UINT_MAX)撞值,
+    /// 会让"本次拖拽至少记一行"的保证失效。
+    static LAST_DRAG_ALLOWED: Cell<Option<u32>> = Cell::new(None);
+}
+
+/// 面板期间抑制泵。RAII 是**防御性**写法:正常路径不会 unwind 到这里(本调用链在 cef-rs 的
+/// `extern "C"` trampoline 内,panic 越过 FFI 边界即 abort,泵停不停已无意义);保留 `Drop`
+/// 复位是为了将来若新增"提前 return"的分支不会把泵永久关掉。
+struct DownloadPanelGuard;
+
+impl DownloadPanelGuard {
+    fn enter() -> Self {
+        DOWNLOAD_PANEL_OPEN.set(true);
+        Self
+    }
+}
+
+impl Drop for DownloadPanelGuard {
+    fn drop(&mut self) {
+        DOWNLOAD_PANEL_OPEN.set(false);
+    }
+}
+
 /// 驱动 CEF 消息泵。必须在主线程**稳定周期**调用(空闲也要),否则 CEF 内部
 /// IPC/渲染任务不推进。
 pub(crate) fn pump() {
-    if is_shutting_down() {
+    if is_shutting_down() || DOWNLOAD_PANEL_OPEN.get() {
         return;
     }
     if INITIALIZED.get().copied().unwrap_or(false) {
@@ -1408,6 +1721,7 @@ wrap_browser_process_handler! {
 // `BrowserWebViewManager` 只持有 id,CEF 分支按 id 调本模块(见 browser_web_view.rs)。
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use objc2_app_kit::NSView;
 use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -2153,6 +2467,13 @@ wrap_client! {
             Some(WebviewLoad::new(self.id, self.generation))
         }
 
+        /// dsh 的 `<a download>`(如 Session 日志导出)必须由宿主接管:不实现 handler 时
+        /// Chromium 直接**静默**落盘到 `~/Downloads`,既不弹保存面板也无法取消(实测三条
+        /// 下载记录,见 `WebviewDownload`)。
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(WebviewDownload::new(self.id))
+        }
+
         /// OSR 必须提供 RenderHandler:libcef 在创建 windowless 浏览器时**硬性要求**
         /// 它非空(browser_host_create.cc: "Windowless rendering requires a
         /// CefRenderHandler implementation"),否则创建直接失败。windowed 模式不提供
@@ -2433,6 +2754,87 @@ wrap_render_handler! {
                 return;
             }
             unsafe { warp_cef_osr_view_set_bitmap(view, buffer, width, height, width * 4) };
+        }
+
+        /// 页面发起拖拽(页面 → 系统):CEF 把要拖的内容交给我们,由宿主开
+        /// `NSDraggingSession` 走 AppKit 的拖放管道(往 Finder/终端拖)。
+        ///
+        /// 借来的 `drag_data` **只在回调期间有效**(cef_render_handler.h 明示不可留存),
+        /// 故这里把链接/文本/HTML 快照成 `String` 再交给 ObjC,不把 CEF 指针传出去。
+        fn start_dragging(
+            &self,
+            _browser: Option<&mut Browser>,
+            drag_data: Option<&mut DragData>,
+            allowed_ops: DragOperationsMask,
+            x: i32,
+            y: i32,
+        ) -> i32 {
+            let view = self.osr_view();
+            if view.is_null() {
+                return 0;
+            }
+            let Some(data) = drag_data else {
+                return 0;
+            };
+            let text = userfree_string(data.fragment_text());
+            let html = userfree_string(data.fragment_html());
+            let link = (data.is_link() != 0)
+                .then(|| userfree_string(data.link_url()))
+                .flatten();
+            if text.is_none() && html.is_none() && link.is_none() {
+                // 只有图片/文件内容之类的拖拽(本实现不搬运文件内容,与参考实现同范围):
+                // 不开会话,本次拖拽停在页面内。
+                log::debug!("[cef] start_dragging: 无可搬运的内容(仅图片/文件),忽略");
+                return 0;
+            }
+            // 交给 ObjC 的字符串必须活到调用结束(ObjC 在那里同步建 NSString)。
+            let text = text.and_then(|value| std::ffi::CString::new(value).ok());
+            let html = html.and_then(|value| std::ffi::CString::new(value).ok());
+            let link = link.and_then(|value| std::ffi::CString::new(value).ok());
+            let raw: sys::cef_drag_operations_mask_t = allowed_ops.into();
+            // 页面 → 系统这条方向不经过 drag enter 那条 trampoline,去重值也在这里重置,
+            // 否则会沿用上一次(另一方向)拖拽的值、把本次第一行日志吃掉。
+            LAST_DRAG_ALLOWED.set(None);
+            log::info!(
+                "[cef] start_dragging ({x},{y}) allowed=0x{:x}",
+                raw.0
+            );
+            unsafe {
+                warp_cef_osr_view_start_drag(
+                    view,
+                    text.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                    html.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                    link.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                    f64::from(x),
+                    f64::from(y),
+                    raw.0,
+                )
+            }
+        }
+
+        /// 页面拖拽过程中 CEF 回报"当前允许的操作"(AppKit 自己管可见光标,
+        /// 这里只更新拖拽会话的操作掩码,与参考实现同款)。
+        ///
+        /// 这也是"页面到底接不接受这次拖放"的**唯一可观测信号**(CEF 只在 `DragTargetDragOver`
+        /// 之后回报它);按变化记一行,便于实机判定,同时避免拖拽过程中的噪声。
+        fn update_drag_cursor(&self, _browser: Option<&mut Browser>, operation: DragOperationsMask) {
+            let view = self.osr_view();
+            if view.is_null() {
+                return;
+            }
+            let raw: sys::cef_drag_operations_mask_t = operation.into();
+            let changed = LAST_DRAG_ALLOWED.with(|last| {
+                if last.get() == Some(raw.0) {
+                    false
+                } else {
+                    last.set(Some(raw.0));
+                    true
+                }
+            });
+            if changed {
+                log::info!("[cef] drag cursor: 页面回报允许操作 0x{:x}", raw.0);
+            }
+            unsafe { warp_cef_osr_view_update_drag_cursor(view, raw.0) };
         }
     }
 }
@@ -2747,6 +3149,226 @@ wrap_load_handler! {
                         }
                     });
                 }
+            }
+        }
+    }
+}
+
+/// 消费一次"取消请求":返回 true = 现在应当发 `Cancel()`。
+///
+/// 进行中:命中即消费(幂等 —— 同一 id 的后续 update 不会重复取消);
+/// 终态:只清标记(避免 id 复用后误取消后续下载)。
+fn take_cancel_request(canceled: &mut HashSet<u32>, id: u32, in_progress: bool) -> bool {
+    canceled.remove(&id) && in_progress
+}
+
+/// 模态保存面板关闭后把键盘焦点还给页面。
+///
+/// 三件事,少一件用户就得先用鼠标点一下页面才能继续输入(2026-09-22 实机命中):
+/// - **a. key window 归还**:在共用面板函数 `run_download_save_panel` 里做(wry 侧同样受益);
+/// - **b. 视图/CEF 焦点**:`windowed` 下 CEF 的原生视图要重新成为 first responder;
+///   OSR 走 `focus()`(它含 OSR 视图的 `makeFirstResponder` 与"首次拿到焦点"的
+///   `was_hidden(0)+set_focus(0)+set_focus(1)` 补同步,cef#3870:只 `set_focus(1)` 不够);
+/// - **c. DOM 焦点**:面板期间页面的 `activeElement` 也会失焦,内核不会自动还回去 ——
+///   让页面用 `__restoreFocused`(init_js 提供)折回光标,与 pane 的
+///   `focus_webview_restoring_input` 同款。
+///
+/// **只在面板弹出前键盘焦点确实在页面上时才做**(`page_had_key_focus`):否则若下载由后台页面
+/// 触发、用户正在终端里打字,把焦点抢到页面就是新 bug(与 `on_load_end` 的既有纪律一致)。
+///
+/// 立即做一次 + 主队列下一拍再补一次(面板关闭后 AppKit 还会走一次窗口 key 转换,可能覆盖);
+/// 两次都幂等:AppKit 的 `makeFirstResponder` 对已是 first responder 的视图是 no-op,
+/// `focus()` 也自带"已是 first responder 就不做 0→1 同步"的守卫。**DOM 那次只做一次** ——
+/// `__restoreFocused` 自带重试链(见 init_js),重复调用会开第二条链并可能折叠用户此时的选择。
+fn restore_focus_after_panel(id: u64, had_focus: bool) {
+    if !had_focus {
+        log::info!("[cef] 面板关闭:弹出前焦点不在页面上,不抢焦点 (id={id})");
+        return;
+    }
+    restore_focus_now(id, true);
+    dispatch2::DispatchQueue::main().exec_async(move || restore_focus_now(id, false));
+}
+
+/// 面板弹出**之前**快照:键盘焦点是否在页面上(见 `restore_focus_after_panel`)。
+fn page_had_key_focus(id: u64) -> bool {
+    let view = if render_mode() == RenderMode::Osr {
+        osr_view(id)
+    } else {
+        native_view(id)
+    };
+    !view.is_null() && unsafe { warp_cef_view_is_first_responder(view) } == 1
+}
+
+/// 该 webview 的 OSR 自建视图指针(无则 null)。
+fn osr_view(id: u64) -> *mut c_void {
+    WEBVIEWS.with(|map| {
+        // 同 browser_snapshot:AppKit 会同步回调进来的路径,借不到就跳过。
+        let Ok(map) = map.try_borrow() else {
+            return std::ptr::null_mut();
+        };
+        map.get(&id)
+            .and_then(|state| state.osr.as_ref().map(|osr| osr.view()))
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// windowed 下 CEF 的原生视图指针(OSR 恒为 null:CEF 未设 `parent_view`,见 `detach_view` 的注释)。
+fn native_view(id: u64) -> *mut c_void {
+    if render_mode() == RenderMode::Osr {
+        return std::ptr::null_mut();
+    }
+    browser_snapshot(id)
+        .and_then(|browser| browser.host().map(|host| host.window_handle()))
+        .map(|handle| handle.cast::<c_void>())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// 恢复动作本体(见 `restore_focus_after_panel` 的说明)。
+///
+/// 借用纪律:先快照视图指针/浏览器句柄,再调外部 —— 调用期间不持 `WEBVIEWS` 借用
+/// (`makeFirstResponder` 会同步回调 `becomeFirstResponder`,那条路径会再进 Rust)。
+fn restore_focus_now(id: u64, with_dom_focus: bool) {
+    let windowed = render_mode() != RenderMode::Osr;
+    let mut windowed_restore = false;
+    if windowed {
+        let view = native_view(id);
+        windowed_restore =
+            !view.is_null() && unsafe { warp_cef_restore_key_focus(std::ptr::null_mut(), view) } == 1;
+    }
+    // OSR 与 windowed 都要:同步 CEF 焦点(OSR 下 focus() 还负责自建视图的 makeFirstResponder)。
+    focus(id, true);
+    if with_dom_focus {
+        evaluate(id, "window.__restoreFocused && window.__restoreFocused();");
+    }
+    log::info!(
+        "[cef] 面板关闭后恢复页面焦点 (id={id}, windowed={windowed}, windowed_restore={windowed_restore}, dom={with_dom_focus})"
+    );
+}
+
+wrap_download_handler! {
+    // 下载(宿主接管)。**不实现本 handler 时 Chromium 会静默落盘**:实测三条记录
+    // 全部直接写到 `~/Downloads`(含 `dsh-session-*.zip`),既不弹保存面板也无法取消
+    // —— 与 wry 路径(弹 NSSavePanel)表现不一致,本 handler 就是为对齐这条而接的。
+    // (注:此处不能用 `///`,宏的 `$vis:vis struct` 不接受前置属性。)
+    struct WebviewDownload {
+        // 面板关闭后要用它把焦点还给对应页面(见 `restore_focus_after_panel`)。
+        // (字段上同样不能用 `///`:宏的字段模式不接受属性。)
+        id: u64,
+    }
+
+    impl DownloadHandler {
+        /// 一律放行:策略在 `on_before_download` 里定(那里才有建议文件名与 item)。
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> i32 {
+            1
+        }
+
+        /// 弹保存面板决定落盘路径。
+        ///
+        /// 取消**不能**靠"返回 1 但不执行 callback"实现:实测那样做下载会卡在 target-pending
+        /// (数据落隐藏临时文件、页面一直"下载中"),见 `CANCELED_DOWNLOADS`。这里的做法是记下 id,
+        /// 交给 `on_download_updated` 的 item callback 显式取消。
+        /// 拿不到 callback / 没有下载目录时交回默认处理 —— 那是退化路径、**不是取消**
+        /// (本 build 实测:无 handler 时是默认目录静默落盘;handler 返回 0 的语义未单独验证)。
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> i32 {
+            let Some(callback) = callback else {
+                log::warn!("[cef] download: 未拿到 callback,交回默认处理(本 build 实测:无 handler 时静默落盘)");
+                return 0;
+            };
+            let suggested = suggested_name
+                .and_then(cef_string_to_string)
+                .unwrap_or_default();
+            let Some(default_path) = download_default_path(&suggested) else {
+                log::warn!("[cef] download: 无法确定默认下载目录,交回默认处理");
+                return 0;
+            };
+            // 面板期间抑制泵(见 DOWNLOAD_PANEL_OPEN):这里是 CEF 回调内部,同步 runModal
+            // 会开一个嵌套 run loop,泵定时器在 common modes 下会重入消息循环。
+            // **弹出前**快照键盘焦点是否在页面上,关闭后据此决定要不要抢回焦点。
+            let had_focus = page_had_key_focus(self.id);
+            let chosen = {
+                let _guard = DownloadPanelGuard::enter();
+                crate::browser::browser_web_view::run_download_save_panel(&default_path)
+            };
+            match chosen {
+                Some(chosen) => {
+                    log::info!("[cef] download: {suggested} -> {}", chosen.display());
+                    let chosen_path = chosen.to_string_lossy().into_owned();
+                    let path = CefString::from(chosen_path.as_str());
+                    callback.cont(Some(&path), 0);
+                }
+                None => {
+                    // 记下 id,由 on_download_updated 显式取消(此处只"不执行 callback"不够)。
+                    match download_item {
+                        Some(item) => {
+                            let id = item.id();
+                            CANCELED_DOWNLOADS.with(|set| set.borrow_mut().insert(id));
+                            log::info!("[cef] download canceled by user: {suggested} (id={id})");
+                        }
+                        None => {
+                            // 拿不到 item 就记不了 id ⇒ 这次取消**发不出去**,下载会停在
+                            // target-pending。CEF 侧恒传非空 item,判断为不可达;真出现时用 warn
+                            // 让它在日志里显眼(而不是像 info 那样被忽略)。
+                            log::warn!(
+                                "[cef] download: 取消无法下发(未拿到 item,无法记 id):{suggested}"
+                            );
+                        }
+                    }
+                }
+            }
+            // 焦点恢复排在**提交下载决定之后**:`callback.cont(...)` / 取消标记是本回调最要紧的
+            // 动作(不执行 callback = 下载停在 target-pending,见 §4.1),不能让它排在任何 AppKit
+            // 操作后面(哪怕只是顺序风险)。
+            restore_focus_after_panel(self.id, had_focus);
+            1
+        }
+
+        /// 只在终态记一条(与 wry 的 completed/failed 日志对齐):进度回调会高频触发,
+        /// 不打日志 —— 例外是"用户取消"那条:必须在进行中就用 item callback 取消掉。
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            callback: Option<&mut DownloadItemCallback>,
+        ) {
+            let Some(item) = download_item else {
+                return;
+            };
+            let id = item.id();
+            let in_progress = item.is_in_progress() != 0;
+            // 消费一次取消请求:仅"进行中 + 被标记过"才发 Cancel;终态顺带清标记(防 id 复用)。
+            let cancel_requested = CANCELED_DOWNLOADS
+                .with(|set| take_cancel_request(&mut set.borrow_mut(), id, in_progress));
+            if in_progress {
+                // 用户在面板里取消过 ⇒ 现在显式取消(此时 item 仍在 IN_PROGRESS/target-pending)。
+                if cancel_requested {
+                    if let Some(callback) = callback {
+                        callback.cancel();
+                        log::info!("[cef] download cancel requested: id={id}");
+                    } else {
+                        log::warn!("[cef] download cancel 失败:未拿到 item callback (id={id})");
+                    }
+                }
+                return;
+            }
+            if item.is_complete() != 0 {
+                let path = userfree_string(item.full_path()).unwrap_or_default();
+                log::info!("[cef] download completed: {path}");
+            } else if item.is_interrupted() != 0 {
+                // 先判 interrupted 只为日志分级(失败用 error);不代表 is_canceled 对中断也返回真。
+                log::error!("[cef] download interrupted: id={id}");
+            } else if item.is_canceled() != 0 {
+                log::info!("[cef] download canceled: id={id}");
             }
         }
     }

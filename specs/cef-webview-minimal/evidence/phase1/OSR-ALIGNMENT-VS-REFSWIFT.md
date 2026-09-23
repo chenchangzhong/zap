@@ -23,9 +23,11 @@
 
 ### P0
 1. **上下文菜单**(见 §0):缺 `run_context_menu`;模型被清空;死代码 + 记录归因错误。
-2. **下载 handler 完全缺失**:`cef_backend.rs` 无 `download_handler`;而 `assets/webview_init.js:95-101`
+2. **下载 handler 完全缺失**(**已解决,2026-09-22**):`cef_backend.rs` 无 `download_handler`;而 `assets/webview_init.js:95-101`
    明确对 `<a download>` 不拦截、依赖"原生下载管道" ⇒ CEF 下 dsh 的 Session 日志导出等**无保存面板/无进度**。
    (wry 侧有:`browser_web_view.rs:336-360,402-420`。)参考:`BrowserClient.swift:294-341` + `CefDownloads.swift`。
+   ⇒ 已接 `download_handler`(弹共用保存面板 + 可取消 + 终态日志),实机验证与踩坑见
+   [OSR-T10-DOWNLOAD.md](OSR-T10-DOWNLOAD.md)。进度 UI 仍未做。
 3. **拖放双向缺失**:无 `registerForDraggedTypes`、无 `start_dragging`/`update_drag_cursor`
    ⇒ 不能拖文件进 pane、不能把内容拖出去(Finder/终端)。参考:`CefMetalHostView+DragDrop.swift:34-127`。
 4. **编辑快捷键"怎么发"不同**:参考在 `performKeyEquivalent` 里**把按键事件本身转发**给页面
@@ -57,7 +59,11 @@ CapsLock 设备无关掩码、隐藏超时 CDP 冻结、实例代际号、借用
 ## 3 未验证疑点(有代码依据、无实证)
 
 ① `screen_point` 原点;② `on_before_context_menu` 是否真被调用过(`cef_support.m:483` 断言"一次都没被调用",
-与参考证据冲突 —— 可用现成的 debug 日志验证);③ 无 download handler 时 CEF 默认是静默落盘还是失败;
+与参考证据冲突 —— 可用现成的 debug 日志验证);③ ~~无 download handler 时 CEF 默认是静默落盘还是失败~~
+→ **现象已确认、成因未定(2026-09-22)**:本 build 下"未处理"⇒ **默认目录静默落盘**(`~/Downloads`,
+三条 Chromium 下载记录);头文件写的 "cancel with Alloy style" 与现象不一致,最可能是 CEF 152 尚无该
+分支(**未验证** —— 我们的浏览器是 Alloy,与上游 master 的代码路径存在张力);见
+[OSR-T10-DOWNLOAD.md](OSR-T10-DOWNLOAD.md) §1;
 ④ `ime_commit_text` 传 nil(参考)vs 我们传 `u32::MAX`(我们的注释称 capi 会把 null 退化成 (0,0) ——
 若成立则参考会踩 T2 记录的问题,说明该注释可能不准);⑤ OSR 下 `show_dev_tools` 是否真有可见窗口。
 
@@ -74,7 +80,7 @@ deferred_key_plan / ime_replacement_range / cursor_semantic。
 | 项 | 用户实测 | 决定 |
 |----|----------|------|
 | P0-1 右键菜单 | — | **保持现在的两项(重新加载/检查元素)就够** ⇒ **不实现 `run_context_menu`**。于是 `on_before_context_menu`(填模型)、`on_context_menu_command`、`WebviewContextMenu`、`handle_menu_command` 属**已确认不用**的死代码 —— 建议单独一轮清理(改动虽小但跨 Rust/ObjC/回调声明,需重建验证) |
-| P0-2 下载 | **没有保存面板,但下载直接完成**(CEF 默认行为可用,只是无 UI) | 记录现状;是否需要保存面板/进度 UI 待定 |
+| P0-2 下载 | **没有保存面板,但下载直接完成**(CEF 默认行为可用,只是无 UI) | **已按"补齐面板"落地(2026-09-22,当日实机验证通过)**:接 `download_handler` → 共用 `NSSavePanel`、可取消、终态日志。取消**不能**靠"不执行 callback"(实测会卡在 target-pending),改用 `CefDownloadItemCallback::Cancel()`。证据与踩坑见 [OSR-T10-DOWNLOAD.md](OSR-T10-DOWNLOAD.md)。**进度 UI 未做**(待产品决定) |
 | P0-3 拖放 | **两个方向都没反应**(与预期一致) | 记录为已确认缺口(计划外,后续路线图) |
 | P0-4 编辑快捷键转发 | 未测 | **仅记录**(页面 JS 收不到按键;我们走 CEF API) |
 | P1-5 手势/缩放 | 未测 | **仅记录** |
@@ -82,4 +88,5 @@ deferred_key_plan / ime_replacement_range / cursor_semantic。
 
 **验证方式说明**:上表为**用户实机观察**;"P0-1 死代码""P0-3 无响应"与代码判据一致(见 §0/§2);
 P0-2 的"下载直接完成"说明 CEF 默认下载管道可用 ⇒ 缺的只是保存面板/进度 UI(原判断"完全缺失"应细化为
-"缺 handler,但默认行为会静默落盘")。
+"缺 handler,但默认行为会静默落盘")。**P0-2 已于 2026-09-22 补齐并通过实机验证**(见 §1 第 2 条与
+[OSR-T10-DOWNLOAD.md](OSR-T10-DOWNLOAD.md))。

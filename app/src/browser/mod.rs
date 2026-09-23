@@ -12,5 +12,10 @@ pub use browser_web_view::{BrowserWebViewEvent, BrowserWebViewManager};
 #[cfg(all(target_os = "macos", feature = "cef_webview"))]
 pub(crate) mod cef_backend;
 
+/// CEF 内核版本检查(设置页「CEF 内核更新」;只比版本,不下载、不改设置)。
+/// 升级流程见 `specs/cef-webview-minimal/CEF-UPGRADE.md`。
+#[cfg(all(target_os = "macos", feature = "cef_webview"))]
+pub(crate) mod cef_update;
+
 /// 后端无关的 webview 注入脚本(wry 与 CEF 共用)。
 pub(crate) mod webview_init_js;

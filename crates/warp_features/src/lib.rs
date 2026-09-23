@@ -752,7 +752,10 @@ pub enum FeatureFlag {
     /// Enables the embedded DeepSeek Harness web UI pane (dsh webview integration).
     DshPane,
     /// 用 CEF(Chromium)承载 dsh pane 的嵌入式 webview,替代 wry/WKWebView。
-    /// 见 specs/cef-webview-minimal/TECH.md;仅 dogfood,默认(WKWebView)路径不受影响。
+    /// 见 specs/cef-webview-minimal/TECH.md。
+    /// **2026-09-23 起默认启用**:带 `cef_webview` feature 的构建(debug 与 release 一致)在
+    /// `app/src/lib.rs` 的 `enabled_features()` 里无条件插入本 flag;不带该 feature 的构建
+    /// 没有这段代码,自动走 wry。
     CefWebview,
 
     /// Offloads the side-by-side diff decoration computation (`diff_lines` over
@@ -831,8 +834,6 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::BoxDrawingGlyphs,
     // DeepSeek Harness 集成(dsh webview):阶段 0-3 已实现,dev 启用。
     FeatureFlag::DshPane,
-    // dsh webview 的 CEF(Chromium)后端:阶段 1 集成中,仅 dogfood。
-    FeatureFlag::CefWebview,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Zap).

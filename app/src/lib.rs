@@ -2491,14 +2491,13 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
     // (wry webview 基建目前仅 macOS 实现)。开发期默认开启便于联调。
     #[cfg(target_os = "macos")]
     flags.insert(FeatureFlag::DshPane);
-    // dsh 的 CEF(Chromium)后端:需要 feature(代码存在)+ 显式环境开关(运行时启用)。
-    // feature 会链接 CEF 并要求 bundle 内含 framework/helpers(script/macos/cef_embed);
-    // 加环境开关是因为该路径尚未完成受控实跑验证,不能仅凭"构建带了 feature"就默认
-    // 启用(见 specs/cef-webview-minimal/TECH.md 阶段 1 与评审建议)。
+    // dsh 的 CEF(Chromium)后端:**构建带 `cef_webview` feature 即默认启用**(2026-09-23 用户决定:
+    // debug 与 release 两个环境都默认开,不再依赖 `ZAP_CEF_WEBVIEW`)。
+    // feature 会链接 CEF,并要求 bundle 内含 framework/helpers(`script/macos/cef_embed`,即
+    // `bundle --cef` / `script/macos/cef_smoke`);**不带该 feature 的构建根本没有这段代码**,
+    // 自动走 wry。环境开关保留为"显式强制"的旁路(见 `cef_backend::is_requested`)。
     #[cfg(all(target_os = "macos", feature = "cef_webview"))]
-    if std::env::var_os("ZAP_CEF_WEBVIEW").is_some() {
-        flags.insert(FeatureFlag::CefWebview);
-    }
+    flags.insert(FeatureFlag::CefWebview);
 
     // Issue #72: HTTP 代理设置页面。不走 channel 判断,所有 channel 含 zap-oss
     // 默认启用,作为企业 VPN / 公司代理场景的基本能力。
