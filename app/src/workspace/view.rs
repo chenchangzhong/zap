@@ -3516,6 +3516,13 @@ impl Workspace {
                         );
                         me.handle_dsh_open_file(path.clone(), ctx);
                     }
+                    crate::dsh::bridge::BridgeEvent::OpenCodeReview { path } => {
+                        log::info!(
+                            "[dsh-code-review] OpenCodeReview path={path:?}, has_dsh={}",
+                            me.has_dsh_pane(ctx)
+                        );
+                        me.handle_dsh_open_code_review(path.clone(), ctx);
+                    }
                     _ => {
                         log::debug!("[dsh] unhandled BridgeEvent: {:?}", event);
                     }
@@ -20770,6 +20777,81 @@ impl Workspace {
     fn handle_dsh_open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
         let window_id = ctx.window_id();
         ctx.dispatch_global_action("root_view:open_dsh_file", (window_id, path));
+    }
+
+    /// dsh 改动行点击 → 打开 Zap 代码审核面板并定位到该文件。
+    ///
+    /// 复用 dsh ↔ code review 既有管道:dsh 项目仓库已由 `set_dsh_repo` 登记为
+    /// 右侧面板的选中 repo,而 `update_right_panel_open_state` 传
+    /// `review_pane_context: None` 时会走 `setup_code_review_panel` 的
+    /// 「dsh pane group 无 terminal → 回退 dsh_repo_path」分支打开面板。
+    /// 文件定位交给视图:其内部按 git 工作区 diff 匹配,加载未完成时挂起
+    /// (见 `CodeReviewView::reveal_file`)。
+    /// 定位不到不报错也不回退打开文件:dsh 的「改动行」是某一轮 turn 的改动集,
+    /// 与工作区 diff 范围不同,面板照常打开即可。
+    #[cfg(feature = "local_fs")]
+    fn handle_dsh_open_code_review(&mut self, path: Option<PathBuf>, ctx: &mut ViewContext<Self>) {
+        if self.right_panel_view.as_ref(ctx).dsh_repo_path().is_none() {
+            // 非 git 项目:没有可审核的 diff。带路径时退回打开文件;表头按钮
+            // (无路径)则无动作。
+            log::warn!("[dsh-code-review] no dsh repo, path={path:?}");
+            if let Some(path) = path {
+                self.handle_dsh_open_file(path, ctx);
+            }
+            return;
+        }
+
+        let pane_group = self.active_tab_pane_group().clone();
+        self.update_right_panel_open_state(
+            RightPanelUpdateParams {
+                pane_group: &pane_group,
+                target_open_state: true,
+                entrypoint: Some(CodeReviewPaneEntrypoint::DshChangedFile),
+                cli_agent: None,
+                review_pane_context: None,
+            },
+            ctx,
+        );
+
+        // 表头按钮只打开面板(整个改动集),无需定位。
+        let Some(path) = path else {
+            return;
+        };
+
+        // 面板可能刚创建、diff 尚未加载:交给视图挂起并在加载完成后定位。
+        let Some(repo) = self
+            .right_panel_view
+            .as_ref(ctx)
+            .selected_repo_path()
+            .cloned()
+        else {
+            log::warn!("[dsh-code-review] no selected repo after opening panel");
+            return;
+        };
+        if let Some(view) = self
+            .working_directories_model
+            .as_ref(ctx)
+            .get_code_review_view(pane_group.id(), &repo)
+        {
+            view.update(ctx, |view, ctx| view.reveal_file(path, ctx));
+        } else {
+            log::warn!(
+                "[dsh-code-review] no code review view for {}",
+                repo.display()
+            );
+        }
+    }
+
+    /// 非 local_fs 构建(wasm)无代码审核面板:退回打开文件行为。
+    #[cfg(not(feature = "local_fs"))]
+    fn handle_dsh_open_code_review(
+        &mut self,
+        path: Option<PathBuf>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(path) = path {
+            self.handle_dsh_open_file(path, ctx);
+        }
     }
 
     /// 清除 dsh git status 订阅与右侧面板状态：解绑旧 handle 订阅（防止

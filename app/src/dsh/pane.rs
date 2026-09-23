@@ -213,7 +213,8 @@ impl DshPaneView {
                 BridgeEvent::Notify { .. }
                 | BridgeEvent::SwitchProject { .. }
                 | BridgeEvent::OpenFileExplorer { .. }
-                | BridgeEvent::OpenFile { .. } => {}
+                | BridgeEvent::OpenFile { .. }
+                | BridgeEvent::OpenCodeReview { .. } => {}
             }
         });
         Self {

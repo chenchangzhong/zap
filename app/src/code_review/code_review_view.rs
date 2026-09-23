@@ -1060,6 +1060,8 @@ pub struct CodeReviewView {
     pending_precise_scroll: Option<PendingPreciseScroll>,
     /// Comment to scroll to once the view finishes loading.
     pending_jump_to_comment: Option<CommentId>,
+    /// 视图加载完成后要定位到的文件(dsh 改动行入口)。
+    pending_reveal_file: Option<PathBuf>,
 
     active_comment_model: Option<ModelHandle<ReviewCommentBatch>>,
 
@@ -1566,6 +1568,7 @@ impl CodeReviewView {
             comment_composer: None,
             pending_precise_scroll: None,
             pending_jump_to_comment: None,
+            pending_reveal_file: None,
             active_comment_model: None,
             #[cfg(not(target_family = "wasm"))]
             open_repository_button,
@@ -2260,6 +2263,91 @@ impl CodeReviewView {
             });
 
         self.scroll_to_position(editor_index, start_offset, end_offset, buffer, ctx);
+    }
+
+    /// 把列表滚动到当前 diff 里某个文件的文件头。
+    ///
+    /// `path` 可以是绝对路径(dsh 上报的改动文件路径都是绝对的)或仓库相对路径。
+    /// 匹配优先按仓库相对路径精确命中,取不到仓库根(或路径在仓库外)时才退化为
+    /// 后缀匹配并取最长后缀,避免 `src/lib.rs` 与 `other/src/lib.rs` 混淆。
+    /// 返回 `false` 表示该文件不在当前 diff 中(例如那一轮的改动已提交),
+    /// 由调用方决定如何兜底。
+    pub fn scroll_to_file(&mut self, path: &Path, ctx: &mut ViewContext<Self>) -> bool {
+        let CodeReviewViewState::Loaded(state) = self.state() else {
+            return false;
+        };
+
+        let relative = self
+            .repo_path()
+            .and_then(|repo| path.strip_prefix(repo).ok());
+        let exact = state.file_states.iter().position(|(_, file_state)| {
+            let file_path = &file_state.file_diff.file_path;
+            relative == Some(file_path.as_path()) || file_path == path
+        });
+        let Some(editor_index) = exact.or_else(|| {
+            state
+                .file_states
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, file_state))| path.ends_with(&file_state.file_diff.file_path))
+                .max_by_key(|(_, (_, file_state))| file_state.file_diff.file_path.as_os_str().len())
+                .map(|(index, _)| index)
+        }) else {
+            return false;
+        };
+
+        self.scroll_to_file_index(editor_index, ctx)
+    }
+
+    /// 定位到一个文件;diff 还没加载完时先挂起。
+    ///
+    /// 供 dsh 改动行入口使用:面板可能是刚创建、diff 尚未到达就收到定位请求,
+    /// 这与既有的 [`Self::pending_jump_to_comment`] 是同一类竞态。
+    pub fn reveal_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        if self.scroll_to_file(&path, ctx) {
+            return;
+        }
+        if matches!(self.state(), CodeReviewViewState::Loaded(_)) {
+            // diff 已加载却没有该文件(例如那一轮改动已提交),或该文件的编辑器
+            // 尚未生成;两种情况都保持面板当前滚动位置。
+            log::info!("[code-review] cannot reveal file {}", path.display());
+            return;
+        }
+        self.pending_reveal_file = Some(path);
+    }
+
+    /// 滚动到文件头内 10px(`FILE_HEADER_HEIGHT` 为 41px)并对齐滚动上下文,
+    /// 与既有文件头滚动辅助的逻辑一致。
+    /// 返回 `false` 表示该文件的编辑器还没准备好,尚不能滚动。
+    fn scroll_to_file_index(
+        &mut self,
+        editor_index: usize,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let CodeReviewViewState::Loaded(state) = self.state() else {
+            return false;
+        };
+
+        let Some(editor_state) = state
+            .file_states
+            .get_index(editor_index)
+            .and_then(|(_, file_state)| file_state.editor_state.as_ref())
+        else {
+            log::warn!("No editor state found for index {editor_index}");
+            return false;
+        };
+
+        let editor = editor_state.editor().clone();
+
+        self.viewported_list_state
+            .scroll_to_with_offset(editor_index, Pixels::new(10.0));
+
+        let context = self.compute_scroll_context_for_index(editor_index, &editor, ctx);
+        if let Some(context) = context {
+            self.viewported_list_state.set_scroll_context(Some(context));
+        }
+        ctx.notify();
+        true
     }
 
     fn scroll_to_selected_match(&mut self, ctx: &mut ViewContext<Self>) {
@@ -3072,6 +3160,10 @@ impl CodeReviewView {
 
         if let Some(comment_id) = self.pending_jump_to_comment.take() {
             self.handle_jump_to_comment_location(&comment_id, ctx);
+        }
+
+        if let Some(path) = self.pending_reveal_file.take() {
+            self.reveal_file(path, ctx);
         }
 
         ctx.notify();

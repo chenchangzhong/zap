@@ -28,6 +28,8 @@ pub enum CodeReviewPaneEntrypoint {
     RightPanel,
     /// Opened via the CLI agent view footer (e.g., Claude Code).
     CLIAgentView,
+    /// Opened by clicking a changed-file row inside the embedded dsh pane.
+    DshChangedFile,
     /// Opened via other means (unknown entry point).
     #[default]
     Other,
@@ -46,6 +48,7 @@ impl Display for CodeReviewPaneEntrypoint {
             Self::PaneHeader => write!(f, "pane_header"),
             Self::RightPanel => write!(f, "right_panel"),
             Self::CLIAgentView => write!(f, "cli_agent_view"),
+            Self::DshChangedFile => write!(f, "dsh_changed_file"),
             Self::Other => write!(f, "other"),
         }
     }
