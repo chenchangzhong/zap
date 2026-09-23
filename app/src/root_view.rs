@@ -1953,14 +1953,21 @@ impl RootView {
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         let (pane_view_id, session_id) = args;
-        ctx.windows().show_window_and_focus_app(ctx.window_id());
+        let window_id = ctx.window_id();
+        ctx.windows().show_window_and_focus_app(window_id);
         if let AuthOnboardingState::Terminal(handle) = &self.auth_onboarding_state {
-            handle.update(ctx, |_, ctx| {
-                ctx.dispatch_typed_action(&WorkspaceAction::FocusDshSession {
+            // 显式以 workspace view 作为 responder chain 起点:此前在 `handle.update`
+            // 内用 `ctx.dispatch_typed_action`,起点是正被 `update_view` 移出窗口视图表
+            // 的 workspace 自身,链上找不到处理器,动作会被静默丢弃。
+            // 写法对齐 `open_settings_page_in_existing_window`。
+            ctx.dispatch_typed_action_for_view(
+                window_id,
+                handle.id(),
+                &WorkspaceAction::FocusDshSession {
                     pane_view_id: *pane_view_id,
                     session_id: session_id.clone(),
-                });
-            });
+                },
+            );
         }
         send_telemetry_from_ctx!(TelemetryEvent::NotificationClicked, ctx);
         true
