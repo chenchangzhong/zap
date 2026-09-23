@@ -272,3 +272,58 @@ fn open_file_malformed_params_rejected() {
     assert!(handle_zap_ipc("zap.open_file\n1\n{\"path\":123}").is_none());
     assert!(PENDING_EVENTS.lock().is_empty());
 }
+
+/// 构造 `zap.open_code_review` 的 IPC payload(与 zap-bridge-client.js 一致)。
+fn open_code_review_payload(path: &str, id: u64) -> String {
+    format!(
+        "zap.open_code_review\n{id}\n{{\"path\":{}}}",
+        serde_json::to_string(path).unwrap()
+    )
+}
+
+/// zap.open_code_review:绝对路径 → OpenCodeReview 事件。
+/// 不要求文件存在:改动行指向的文件可能已被删除/重命名,面板仍应打开。
+#[test]
+fn open_code_review_absolute_path_ok() {
+    PENDING_EVENTS.lock().clear();
+    let path = "/tmp/zap-open-code-review-missing.rs";
+    let event = handle_zap_ipc(&open_code_review_payload(path, 1)).unwrap();
+    match event {
+        BridgeEvent::OpenCodeReview { path: got } => {
+            assert_eq!(got, Some(PathBuf::from(path)));
+        }
+        other => panic!("expected OpenCodeReview, got {other:?}"),
+    }
+    PENDING_EVENTS.lock().clear();
+}
+
+/// zap.open_code_review:无 path(改动卡片表头按钮)→ 只开面板,path 为 None。
+/// 缺 params 段与 `{}` 等价(handle_zap_ipc 对空 params 回退空对象)。
+#[test]
+fn open_code_review_without_path_ok() {
+    PENDING_EVENTS.lock().clear();
+    for payload in ["zap.open_code_review\n1\n{}", "zap.open_code_review\n1\n"] {
+        let event = handle_zap_ipc(payload).unwrap();
+        match event {
+            BridgeEvent::OpenCodeReview { path } => assert_eq!(path, None),
+            other => panic!("expected OpenCodeReview, got {other:?}"),
+        }
+    }
+    PENDING_EVENTS.lock().clear();
+}
+
+/// zap.open_code_review:相对路径 → None(只接受本机绝对路径)。
+#[test]
+fn open_code_review_relative_path_rejected() {
+    PENDING_EVENTS.lock().clear();
+    assert!(handle_zap_ipc(&open_code_review_payload("src/main.rs", 1)).is_none());
+    assert!(PENDING_EVENTS.lock().is_empty());
+}
+
+/// zap.open_code_review:path 非字符串 → None(缺 path 合法,见上一个用例)。
+#[test]
+fn open_code_review_malformed_params_rejected() {
+    PENDING_EVENTS.lock().clear();
+    assert!(handle_zap_ipc("zap.open_code_review\n1\n{\"path\":123}").is_none());
+    assert!(PENDING_EVENTS.lock().is_empty());
+}

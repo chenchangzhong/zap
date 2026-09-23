@@ -34,6 +34,11 @@ pub enum BridgeEvent {
     OpenFileExplorer { path: PathBuf },
     /// dsh 侧请求在 Zap 内打开一个文件/目录(文件链接拦截)。
     OpenFile { path: PathBuf },
+    /// dsh 侧改动行点击:在 Zap 代码审核面板打开并定位到该文件。
+    /// `path` 为 dsh 上报的绝对路径;改动卡片的表头按钮没有具体文件(打开
+    /// 整个改动集),此时为 None。面板按 git 工作区 diff 定位,文件不在 diff
+    /// 中时只打开面板(见 workspace 侧处理)。
+    OpenCodeReview { path: Option<PathBuf> },
     /// runtime 就绪,`url` 为 dsh Web UI 地址。
     Ready { url: String },
     /// 崩溃后自动重启完成。
@@ -124,6 +129,25 @@ pub(crate) fn handle_zap_ipc(payload: &str) -> Option<BridgeEvent> {
             };
             log::info!("[dsh-bridge] IPC OpenFile path={}", canonical.display());
             Some(push_event(BridgeEvent::OpenFile { path: canonical }))
+        }
+        "zap.open_code_review" => {
+            // path 可选:改动卡片表头按钮只打开整个改动集,没有具体文件。
+            // 文件行带绝对路径;放宽到允许不存在(目标可能已被删除/重命名),
+            // 只做绝对路径归一,不做存在性校验,定位失败由 workspace 侧兜底。
+            let path = match params.get("path") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let raw = value.as_str()?;
+                    let path = PathBuf::from(raw);
+                    if !path.is_absolute() {
+                        log::warn!("[dsh-bridge] IPC {method} path is not absolute: {raw}");
+                        return None;
+                    }
+                    Some(path)
+                }
+            };
+            log::info!("[dsh-bridge] IPC OpenCodeReview path={path:?}");
+            Some(push_event(BridgeEvent::OpenCodeReview { path }))
         }
         "zap.notify" => {
             let title = params

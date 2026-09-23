@@ -131,38 +131,7 @@ impl CodeReviewView {
     /// Scrolls the code review to the header region of the given file.
     /// The header region is the area above the editor content (< FILE_HEADER_HEIGHT).
     pub fn scroll_to_header_for_test(&mut self, path: &Path, ctx: &mut ViewContext<Self>) -> bool {
-        let CodeReviewViewState::Loaded(state) = self.state() else {
-            return false;
-        };
-
-        let Some(editor_index) = state
-            .file_states
-            .iter()
-            .position(|(_, file_state)| file_state.file_diff.file_path == path)
-        else {
-            return false;
-        };
-        let Some(editor_state) = state
-            .file_states
-            .get_index(editor_index)
-            .and_then(|(_, file_state)| file_state.editor_state.as_ref())
-        else {
-            return false;
-        };
-
-        let editor = editor_state.editor().clone();
-
-        // Scroll to 10px into the header (FILE_HEADER_HEIGHT is 41px)
-        self.viewported_list_state
-            .scroll_to_with_offset(editor_index, Pixels::new(10.0));
-
-        let context = self.compute_scroll_context_for_index(editor_index, &editor, ctx);
-        if let Some(context) = context {
-            self.viewported_list_state.set_scroll_context(Some(context));
-        }
-
-        ctx.notify();
-        true
+        self.scroll_to_file(path, ctx)
     }
 
     /// Scrolls the code review past the end of editor content into the footer region.
