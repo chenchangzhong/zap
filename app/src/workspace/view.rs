@@ -9244,6 +9244,46 @@ impl Workspace {
         ctx.notify();
     }
 
+    /// 内容被换到前面来时收起已经展开的悬浮(自动隐藏)侧栏,别让它继续盖着新内容。
+    ///
+    /// 需要在这里**显式**收起:用户多半是"悬停展开侧栏 → 在侧栏里点新建",指针始终没离开
+    /// 面板,收起的 hover out 根本不会补发(框架只在指针真的移出时才回调)。停靠态与本来就
+    /// 没展开时什么都不做。
+    ///
+    /// 每个会新建/恢复 tab 并激活它的入口都要自己调一次:`add_tab_with_pane_layout`(终端/
+    /// Agent/标签页配置)、`add_tab_from_existing_pane`(dsh pane、浏览器预览、「在新标签页
+    /// 打开文件」)、`restore_closed_tab`(撤销关闭),以及只聚焦已有 dsh pane 的
+    /// `OpenDshPane` 分支(它不经任何一个新建入口)。
+    ///
+    /// **面板内点击 tab 切换不在此列**(`ActivateTab` → `activate_tab_internal`):悬停展开
+    /// 的语义就是"指针停在面板上就保持展开",用户点 tab 只想换内容、不想离开面板。别顺手在
+    /// `activate_tab` 里加收起,会让正常切 tab 也把面板收掉。
+    fn collapse_revealed_vertical_tabs_panel(&mut self, ctx: &mut ViewContext<Self>) {
+        if !Self::vertical_tabs_panel_auto_hides(ctx) {
+            return;
+        }
+        // HOA 引导期间的面板是引导自己钉住的(`open_vertical_tabs_panel_if_enabled` /
+        // `show_hoa_onboarding_flow`),收起会让引导 callout 的锚点位置缺失(静默不显示)或
+        // 飘在旧位置 —— 与 `Handler::UseVerticalTabs` 里"引导期间不碰面板状态"同一约定。
+        // 引导会新建 tab(完成 session config 时),这条路径真实可达。
+        if self.hoa_onboarding_flow.is_some() {
+            return;
+        }
+        // 判据与渲染那条路径共用 `panel_revealed`:没展开(进度 0 且未钉住)就没什么可收的。
+        if !panel_revealed(
+            self.vertical_tabs_panel_progress.get(),
+            self.vertical_tabs_panel_pinned,
+        ) {
+            return;
+        }
+        self.vertical_tabs_panel_pinned = false;
+        // 这两个浮层都锚在面板内部的 `SavePosition` 上,而那是 indefinite 缓存 —— 面板收起后
+        // 锚点位置仍留在窗口里,不清就会原地"挂"着(与 `toggle_vertical_tabs_panel` 同处理)。
+        self.vertical_tabs_panel.clear_detail_sidecar();
+        self.close_vertical_tabs_settings_popup();
+        self.slide_vertical_tabs_panel_to(0., ctx);
+    }
+
     fn close_vertical_tabs_settings_popup(&mut self) {
         self.vertical_tabs_panel.show_settings_popup = false;
     }
@@ -11819,6 +11859,12 @@ impl Workspace {
         self.tabs.insert(tab_index, tab_data);
         self.activate_tab(tab_index, ctx);
 
+        // 撤销关闭(默认 60s 宽限期内)恢复标签页同样是"内容被换到前面来了":悬浮侧栏不收就
+        // 会盖住它。这条入口既不经新建标签页的两个入口、也不经 dsh 那条,必须自己收起
+        // (菜单里的「重新打开已关闭的会话」与撤销快捷键都走 `UndoCloseStack::undo_close`
+        // → 这里)。
+        self.collapse_revealed_vertical_tabs_panel(ctx);
+
         ctx.notify();
     }
 
@@ -12118,6 +12164,10 @@ impl Workspace {
                 pg.set_left_panel_open(true, ctx);
             });
         }
+
+        // 悬浮侧栏此时多半还"钉"在指针下(用户刚在面板里点的新建),新建标签页后主动收起
+        // (见 `collapse_revealed_vertical_tabs_panel`)。
+        self.collapse_revealed_vertical_tabs_panel(ctx);
     }
 
     pub fn add_tab_from_existing_pane(
@@ -12147,6 +12197,10 @@ impl Workspace {
             self.tabs.insert(new_idx, TabData::new(new_pane_group));
             self.activate_tab_internal(new_idx, ctx);
         }
+
+        // 悬浮侧栏此时多半还"钉"在指针下(dsh pane / 浏览器预览 /「在新标签页打开文件」
+        // 都走这条入口),新建标签页后主动收起(见 `collapse_revealed_vertical_tabs_panel`)。
+        self.collapse_revealed_vertical_tabs_panel(ctx);
 
         // 与 `add_tab_with_shell` 等路径一致:显式请求重绘,否则 tab bar
         // 不会立即显示新 tab(要等下一次用户交互触发渲染)。
@@ -22074,6 +22128,10 @@ impl TypedActionView for Workspace {
                     return;
                 }
                 self.open_dsh_pane(ctx);
+                // 已经有 dsh pane 时这条入口只聚焦它所在的 tab(见 `focus_existing_dsh_pane`),
+                // 完全不经过新建标签页的那两个入口 —— 收起必须在这里补一次,否则从悬浮侧栏点
+                // 「DeepSeek Harness」时,面板会一直盖着刚聚焦的 dsh pane(第二次点才出现)。
+                self.collapse_revealed_vertical_tabs_panel(ctx);
             }
             AttachDshErrorAsContext { error } => {
                 self.attach_dsh_error_as_context(error, ctx);
