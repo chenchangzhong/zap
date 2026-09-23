@@ -9,6 +9,10 @@
 #     --cef-path <dir>          CEF 二进制目录(默认 $CEF_PATH 或 ~/.local/share/cef)
 #     --helper-executable <p>   放进 helper.app 的可执行文件(默认:主可执行文件;
 #                               相对路径按 app 内 Contents/MacOS 解析)
+#     --helper-entitlements <p> helper.app 的 entitlements plist(默认:与脚本同目录的
+#                               cef-helper-entitlements.plist;renderer/GPU 的 V8 需要
+#                               allow-jit + allow-unsigned-executable-memory,缺了在
+#                               hardened runtime 下 EXC_BREAKPOINT/SIGTRAP)
 #     --no-sign                 只嵌入不签名(调试用;正式打包不要)
 #
 # 为什么 helper 可以指向主可执行文件:CEF 以 `--type=<process>` 启动 helper,
@@ -24,12 +28,14 @@ shift || true
 
 CEF_DIR="${CEF_PATH:-$HOME/.local/share/cef}"
 HELPER_EXECUTABLE=""
+HELPER_ENTITLEMENTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cef-helper-entitlements.plist"
 DO_SIGN=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cef-path) CEF_DIR="$2"; shift 2 ;;
     --helper-executable) HELPER_EXECUTABLE="$2"; shift 2 ;;
+    --helper-entitlements) HELPER_ENTITLEMENTS="$2"; shift 2 ;;
     --no-sign) DO_SIGN=0; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -112,7 +118,12 @@ if [[ "$DO_SIGN" == "1" ]]; then
   # 且非 deep 的 --verify 会给出**假绿**(评审实测:libvk_swiftshader.dylib 仍是 adhoc)。
   codesign --force --deep --sign "$IDENTITY" "$FRAMEWORKS_DIR/$FRAMEWORK"
   for helper in "${HELPERS[@]}"; do
-    codesign --force --sign "$IDENTITY" "$FRAMEWORKS_DIR/${MAIN_EXE_NAME} ${helper}.app"
+    if [[ -n "$HELPER_ENTITLEMENTS" && -f "$HELPER_ENTITLEMENTS" ]]; then
+      codesign --force --options runtime --entitlements "$HELPER_ENTITLEMENTS" \
+        --sign "$IDENTITY" "$FRAMEWORKS_DIR/${MAIN_EXE_NAME} ${helper}.app"
+    else
+      codesign --force --sign "$IDENTITY" "$FRAMEWORKS_DIR/${MAIN_EXE_NAME} ${helper}.app"
+    fi
   done
   echo "==> 校验嵌入结构(deep)"
   codesign --verify --deep --strict "$FRAMEWORKS_DIR/$FRAMEWORK" \

@@ -19,11 +19,38 @@
 
   > 注意：必须带 `--features cli`，否则 cargo-about 0.9+ 默认不安装二进制。
 
+- **CEF(Chromium)二进制分发**（只有 `--cef` 打包 / 跑 CEF 开发版才需要）：放在 `$CEF_PATH`，
+  默认 `~/.local/share/cef`。要求见下：
+
+  - 该目录必须**直接包含** `Chromium Embedded Framework.framework`（即"平铺"布局；若用版本化
+    下载目录，要指向内层的 `<版本>/cef_macos_aarch64/`）。
+  - 缺失时 `cargo` 构建会**自动下载**对应版本（实测压缩包 ~132MB，解开约 336MB）到
+    `$CEF_PATH/<版本>/cef_macos_aarch64/`；此时需把 `CEF_PATH` 指向该内层目录，或把它上移成平铺。
+  - 版本由 `app/Cargo.toml` 与 `tools/cef-helper/Cargo.toml` 的 `cef = "…"` 决定，**必须两处一致**；
+    升级步骤、目录布局陷阱与回滚见 [specs/cef-webview-minimal/CEF-UPGRADE.md](../specs/cef-webview-minimal/CEF-UPGRADE.md)。
+
 ## 快速构建（debug 运行）
 
 ```bash
 cargo run --bin zap-oss
 ```
+
+**CEF(Chromium) 内核需要 `.app` 形态**：`cef_webview` feature 会链接 CEF，framework 必须位于
+bundle 内；裸二进制（`target/debug/zap-oss`）启动时**加载失败并自动回退 wry**（日志里有一行
+`[cef] failed to load Chromium Embedded Framework (需以 .app 形态运行)`）。要跑带 CEF 的 debug 版本：
+
+```bash
+script/macos/cef_smoke          # 构建 + 组装 .app + 嵌 framework/5 个 helper + 分层签名
+script/macos/cef_smoke --run    # 再启动、校验 CEF 初始化成功、然后清理自启实例
+# 产出:target/cef-smoke/ZapCEF.app
+```
+
+两点与开关有关：
+
+- `cef_webview` **不在 default features** —— 不带该 feature 的构建里**根本没有 CEF 代码**（自动走 wry）。
+- 带该 feature 的构建里 **CEF 后端默认启用**，不需要再设环境变量；`ZAP_CEF_WEBVIEW` 现在只是
+  "显式强制"的旁路（用于绕过 settings 里用户偏好对 flag 的覆盖）。`ZAP_CEF_OSR=1|0` 可强制
+  渲染模式（覆盖设置项 `general.webview.use_osr_rendering`）。
 
 ## 发布版打包
 
@@ -85,6 +112,34 @@ cp -R app/DockTilePlugin/ZapDockTilePlugin.docktileplugin target/release-lto/
 
 如需兼容 Intel Mac，去掉 `--nouniversal`。
 
+#### 带 CEF(Chromium)内核的发布包
+
+```bash
+export CEF_PATH="$HOME/.local/share/cef"   # 必须先 export:见下面第 2 条
+./script/macos/bundle --channel oss --selfsign --nouniversal --arch aarch64 --cef
+```
+
+`--cef` 做的事：把 `cef_webview` 追加进 features → 构建 `tools/cef-helper`（**独立 workspace**，
+与根 workspace 各自的 `Cargo.lock` 都要同步）→ 调 `script/macos/cef_embed` 把
+`Chromium Embedded Framework.framework` + 5 个 helper.app 装进 bundle 并**分层签名**。
+
+四条硬约束（都可在 `script/macos/bundle` 里溯源）：
+
+1. **前置检查**：`$CEF_PATH/Chromium Embedded Framework.framework` 不存在时脚本直接 `exit 1`
+   （提示"先准备 CEF 二进制"）。
+2. **必须由调用方 `export CEF_PATH`**：脚本只在 Step 1.5 的 helper 构建里传 `CEF_PATH`
+   （`bundle:782`），**主构建（`bundle:732`）不传**。
+   **已实测（2026-09-23，`env -u CEF_PATH cargo check -p warp --features cef_webview`）**：不传时
+   `cef-dll-sys` 会把 CEF **另下一份到 `target/debug/build/cef-dll-sys-*/out/cef_macos_aarch64/`**
+   （额外 132MB 下载 + 339MB 磁盘），而 Step 1.5 的 `${CEF_PATH:-~/.local/share/cef}` 仍取
+   `~/.local/share/cef` ⇒ **主二进制与嵌入的 framework 来自两份不同的副本**。构建**不会报错**
+   （静默不同源）：两份版本一致时无可见影响;一旦版本分叉（典型:升级后 `~/.local/share/cef`
+   还是旧的）就会出现 wrapper 与 framework 不匹配的风险。
+3. **`--cef` 不支持交叉架构**：`DEFAULT_TARGET != HOST_TARGET` 时直接报错
+   （"暂不支持交叉架构构建"）⇒ arm64 机器上要配 `--nouniversal --arch aarch64`。
+4. **版本必须同步**（两个 `Cargo.toml` + 两个 `Cargo.lock`；helper 的 lock 不随根更新）——升级流程见
+   [specs/cef-webview-minimal/CEF-UPGRADE.md](../specs/cef-webview-minimal/CEF-UPGRADE.md)。
+
 产出的 .app 和 .dmg（最终产物在 `target/release-lto/bundle/osx/`）：
 
 ```
@@ -106,6 +161,16 @@ ls -l target/release-lto/bundle/osx/Zap.app/Contents/Resources/Assets.car
 
 # 校验签名完整
 codesign --verify --deep --strict target/release-lto/bundle/osx/Zap.app
+```
+
+带 `--cef` 的包额外核对（`--verify --deep --strict` 已覆盖 framework 与 helper，这里确认版本与数量）：
+
+```bash
+APP=target/release-lto/bundle/osx/Zap.app
+# framework 版本应与 Cargo.lock 里 cef 的 "+" 后版本一致
+plutil -p "$APP/Contents/Frameworks/Chromium Embedded Framework.framework/Resources/Info.plist" | grep -i shortversion
+# 应为 5 个:zap-oss Helper{,(GPU),(Renderer),(Plugin),(Alerts)}.app
+ls "$APP/Contents/Frameworks/" | grep -c Helper
 ```
 
 ## 环境变量说明
@@ -217,3 +282,40 @@ BUNDLE=target/release-lto/bundle
 rm -f "$BUNDLE/osx/Zap.dmg"
 hdiutil create -volname "Zap" -srcfolder "$BUNDLE/osx/Zap.app" -ov -format UDZO "$BUNDLE/osx/Zap.dmg"
 ```
+
+### CEF 相关（`--cef` 打包 / `cef_smoke`）
+
+**`Error: 未找到 CEF framework($CEF_DIR)`**
+→ `export CEF_PATH=<直接含 Chromium Embedded Framework.framework 的那一层>`，或按前置条件准备 CEF 二进制。
+
+**`Error: --cef 暂不支持交叉架构构建`**
+→ 去掉 universal：`--nouniversal --arch aarch64`（在 arm64 机器上构建）。
+
+**升级 CEF 后仍然加载旧内核 / bundle 里 Info.plist 版本没变**
+→ 典型陷阱：`$CEF_PATH` 放的是**旧的平铺目录**，而 `cef-dll-sys` 的 `check_archive_json` 只在
+`archive > expected` 时报错（`archive <= expected` 视为通过）⇒ 升级 crate 版本后它仍用旧目录、
+**不下载也不告警**。按 [CEF-UPGRADE.md](../specs/cef-webview-minimal/CEF-UPGRADE.md) §3.4 先把旧目录挪走再构建。
+
+**启动即崩 / 日志出现 `Check failed: api_hash`**
+→ wrapper 与 framework 版本不一致（两个 `Cargo.toml` / 两个 lock 没同步，或 bundle 里嵌的是旧 framework）。
+CEF 的 `libcef_dll/wrapper/libcef_dll_wrapper.cc` 里有
+`CHECK(!strcmp(cef_api_hash(CEF_API_VERSION, 0), CEF_API_HASH_PLATFORM))`，不匹配直接 abort。
+改齐版本后重跑 `script/macos/cef_smoke`（或 `bundle --cef`）重嵌。
+
+**`cargo run --bin zap-oss` 里 CEF 没生效**
+→ 预期行为：裸二进制不是 `.app`，framework 加载不到，自动回退 wry（见「快速构建」）。用 `script/macos/cef_smoke`。
+
+**oss 渠道 `--cef` 后设置里没有 CEF 项、内核还是系统的**
+→ 症状：`render mode = ` 一类的 `[cef]` 特征串在二进制里搜不到（`strings` 计数 0），但 framework
+照嵌、签名全绿。根因曾是 `bundle` 的 oss 分支用**覆盖赋值**拼 `FEATURES`，把 `--cef` 追加的
+`cef_webview` 丢掉（2026-09-23 已修：oss 分支在 `CEF=true` 时补回）。快速判据：
+`strings <app>/Contents/MacOS/zap-oss | grep -c "render mode = "` —— 0 = 没编进 CEF。
+
+**dsh pane 打开即提示"已崩溃"，日志刷 `TS_PROCESS_CRASHED code=5`**
+→ renderer 子进程在 hardened runtime 下起 V8 即 `EXC_BREAKPOINT/SIGTRAP`（崩溃报告
+`faultingThread: CrRendererMain`）。根因：Step 3 的 `--deep` 整包重签会把 Step 1.5 给 helper
+做的分层签名（含 JIT entitlements）覆盖成主包 entitlements —— 主包没有
+`allow-jit`/`allow-unsigned-executable-memory`（2026-09-23 已修：Step 3.5 按
+`script/macos/cef-helper-entitlements.plist` 重签 5 个 helper）。判据：
+`codesign -d --entitlements - "<app>/Contents/Frameworks/zap-oss Helper (Renderer).app" | grep allow-jit`。
+参考：CEF 官方论坛 [macOS] Renderer Process Crash(SIGTRAP)（t=20345）。

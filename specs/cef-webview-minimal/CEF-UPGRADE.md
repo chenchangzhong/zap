@@ -81,13 +81,22 @@ cef-rs crate(含预生成 bindings)、我们的 5 个 helper.app 三者必须来
 再 `cargo update`;顺序反了会得到"`cargo update` 跑成功但版本没动"。
 (Cargo 的 caret 语义,**未在本仓实跑**。)
 
-**(b) `script/macos/bundle` 不会替你设 `CEF_PATH`。** **源码可溯·未实跑**
+**(b) `script/macos/bundle` 不会替你设 `CEF_PATH`。** **✅ 已实测(2026-09-23)**
 `script/macos/bundle:521` 只是本地变量 `CEF_DIR="${CEF_PATH:-$HOME/.local/share/cef}"`,全脚本无 `export CEF_PATH`。
 Step 1 的主构建(`bundle:732`)命令行里**不带** `CEF_PATH`;只有 Step 1.5 的 helper 构建(`bundle:782`)显式
 `CEF_PATH="$CEF_DIR" cargo build …`。
-⇒ 若调用方没有自己 `export CEF_PATH`,主构建会走 `build.rs` 的"无 `CEF_PATH`"分支,把 CEF 下到 `OUT_DIR`
-(`build.rs:109-111`),而 Step 1.5 仍从 `$HOME/.local/share/cef` 嵌 framework —— 两边可能不是同一份。
-**命令里必须显式带 `CEF_PATH=`。**
+
+实测方式:`env -u CEF_PATH cargo check -p warp --features cef_webview`(模拟调用方忘记 export),然后读
+`target/debug/build/cef-dll-sys-*/output` 的 `cargo::metadata=CEF_DIR=…`:
+
+| | 解析结果 |
+|---|---|
+| 主构建(CEF_PATH 未 export) | `target/debug/build/cef-dll-sys-<hash>/out/cef_macos_aarch64`(**新下一份**:132MB 下载 + 339MB 磁盘) |
+| Step 1.5(`${CEF_PATH:-~/.local/share/cef}`) | `~/.local/share/cef` |
+
+⇒ **两边确实不是同一份**(构建**不会报错**,是静默分叉);本次两份都是 154.0.23(sha1 相同)所以无可见影响,
+但版本一旦分叉(典型:升级后 `~/.local/share/cef` 还是旧的)就会出现 wrapper 与 framework 不匹配的风险。
+**命令里必须显式带 `CEF_PATH=`(并 `export`)。**
 
 ### 2.2 "取哪一层目录"的统一口径
 
@@ -164,7 +173,7 @@ crates.io 不存在,回到 3.1 决定是否走 git。
 
 ### 3.4 升级前处理"平铺旧目录"(最容易踩的一步)
 
-**这一条是升级期最危险的行为,先看依据。** **源码可溯·未实跑**
+**这一条是升级期最危险的行为,已实测(2026-09-23)。**
 
 - `build.rs:87-105`:若 `CEF_PATH/<cef_version>` 不存在,就 `check_archive_json(CEF_PATH)`;通过则
   **直接返回平铺目录、不下载**。
@@ -175,6 +184,17 @@ crates.io 不存在,回到 3.1 决定是否走 git。
 既不下载也不告警,构建继续用旧头文件与旧 `libcef_dll`。
 (即:"升级后不需要手工准备二进制、会自动落成版本化子目录"**只在平铺目录不存在时**成立;
 平铺旧目录存在时结论相反 —— 它会静默钉住旧版本。)
+
+#### 实测记录(2026-09-23:crate/锁定 154.0.23,把 `CEF_PATH` 指到 152.0.8 的旧平铺目录)
+
+| 阶段 | 实测结果 |
+|---|---|
+| `cargo check -p warp --features cef_webview` | **成功、0 warning、无下载、无告警**;`target/debug/build/cef-dll-sys-*/output` 里 `CEF_DIR=…/cef-152.0.8-flat`、**`CEF_API_VERSION=15200`**(期望 15400)⇒ 静默用了旧 CEF |
+| `script/macos/cef_smoke`(打包) | 同样**成功**;bundle 内 `CFBundleShortVersionString` = **152.0.8.0** |
+| **启动** | **立即崩溃**:stderr 只有一行<br>`[0923/154403.776588:ERROR:cef/libcef_dll/libcef_dll2.cc:105] Request for unsupported CEF API version 15400`<br>随后 `Trace/BPT trap: 5`(崩溃报告 `EXC_BREAKPOINT/SIGTRAP`),栈顶:<br>`cef_command_line_create` ← `cef::args::Args::as_cmd_line` ← `cef_backend::handle_subprocess_or_continue` ← `maybe_run_as_cef_subprocess` |
+
+⇒ **构建/打包全静默,代价在启动时一次性暴露**:框架侧报"unsupported CEF API version 15400"(Rust bindings 是
+154,面前这份 libcef 是 152)并直接 trap。**若不 launch 就发现不了**(CI 也不会拦,见 §6)。
 
 **处理(升级前二选一)**:
 
@@ -558,3 +578,21 @@ mv ~/.local/share/cef-152.0.8-flat ~/.local/share/cef
 # 3) 重打
 CEF_PATH=~/.local/share/cef ./script/macos/cef_smoke
 ```
+
+### 8.5 `--cef` release-lto 正式打包首跑(2026-09-23,`bundle --channel oss --selfsign … --cef`)
+
+> 本节是 §6 第 4 条("从未执行过")的闭环:**首次跑通**,踩了三个脚本级坑,均已修复并实机验证。
+
+| # | 坑 | 症状(实测) | 修法 |
+|---|----|-----------|------|
+| 1 | `--selfsign` 与 CEF 分层签名身份不兼容 | Step 1.5 写死 `APPLE_TEAM_ID=2BBY89MBSN`,本机无此身份 ⇒ `no identity found`,`set -e` 直接中断(且 shell 误报 exit 0) | `bundle` Step 1.5:`--selfsign` 时改用与 Step 3 同款本机 `Apple Development` 身份(无证书回退 adhoc) |
+| 2 | **oss 分支 `FEATURES` 覆盖赋值丢 `cef_webview`** | 打包全绿、framework 嵌入、签名 OK,但设置里无任何 CEF 项、内核仍是系统 webview;`strings` 查 `render mode = ` 为 **0**(好包为 1) | `bundle` oss 分支在 `CEF=true` 时把 `cef_webview` 补回;**其余渠道都是追加赋值,不受影响** |
+| 3 | **`--deep` 重签覆盖 helper 的 JIT entitlements** | dsh pane 打开即"已崩溃";日志每秒刷 `renderer 终止 TS_PROCESS_CRASHED code=5`;崩溃报告 `faultingThread: CrRendererMain`、`EXC_BREAKPOINT/SIGTRAP`,栈在 `cef_execute_process` → V8 init。smoke 包(adhoc、无 runtime)不复现 | 新增 `script/macos/cef-helper-entitlements.plist`(allow-jit + allow-unsigned-executable-memory + disable-library-validation),`cef_embed` 分层签 helper 时带上;`bundle` 在 Step 3 之后加 **Step 3.5** 按该 plist 重签 5 个 helper(只碰 helper,主包/framework 不动) |
+
+**验证(闭环)**:重签现包(不重编)→ 替换 `/Applications/Zap.app` → 用户实机 dsh 正常打开;
+`zap.log` 零条 `TS_PROCESS_CRASHED`、出现 `OSR surface … view_rect × scale`(retina 正确);
+`DiagnosticReports` 无新崩溃(最新仍是修复前 19:31 批次);`codesign --verify --deep --strict` 通过。
+坑 3 的外部依据:CEF 官方论坛 [macOS] Renderer Process Crash(SIGTRAP) (t=20345) 与
+Electron 同款案例(osx-sign#232)——hardened runtime 的 renderer helper 缺 JIT 权限即 SIGTRAP。
+**smoke 包(adhoc 签名)测不出坑 2/3**:`cef_smoke` 与正式包的差异(coverage 与 entitlements)
+正好是这两个 bug 的藏身处 ⇒ 正式打包首跑必须单独实机验证一次 dsh。

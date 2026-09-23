@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- CEF 5 个 helper.app 专用:主包的 entitlements 里没有这三个键,不能复用。
+	     renderer/GPU 进程起 V8 即申请可执行内存,缺了就在 hardened runtime 下
+	     EXC_BREAKPOINT/SIGTRAP(2026-09-23 实测,CEF 官方论坛 t=20345 同例)。
+	     只给 helper,不给主包/framework。 -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

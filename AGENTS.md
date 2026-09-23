@@ -351,6 +351,9 @@ cargo run --bin zap-oss
 #### 发布版打包（一键完成）
 ```bash
 ./script/macos/bundle --channel oss --selfsign --nouniversal --arch aarch64
+# 带 CEF(Chromium) 内核的包：必须先 export CEF_PATH，再加 --cef（CEF 不支持 universal 交叉架构）
+export CEF_PATH="$HOME/.local/share/cef"
+./script/macos/bundle --channel oss --selfsign --nouniversal --arch aarch64 --cef
 ```
 
 #### 前置依赖（构建前必须确认已安装）
@@ -359,6 +362,7 @@ cargo run --bin zap-oss
 cargo install cargo-about --features cli
 # DMG 打包必需
 brew install create-dmg
+# 仅 --cef 打包 / CEF 开发版需要：CEF 二进制放在 $CEF_PATH（默认 ~/.local/share/cef，须直接含 framework）
 ```
 
 #### 签名验证（打包后必须执行）

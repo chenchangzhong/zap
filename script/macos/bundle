@@ -446,6 +446,10 @@ elif [[ $RELEASE_CHANNEL = "oss" ]]; then
     WARP_SCHEME_NAME="zap"
     # autoupdate 走 GitHub Release(zerx-lab/warp),仅下载 DMG 到 Downloads,不自动覆盖 .app。
     FEATURES="release_bundle,extern_plist,autoupdate"
+    # oss 分支是覆盖赋值,会丢掉参数解析阶段追加的 cef_webview;补回(--cef)。
+    if [[ "$CEF" == true ]]; then
+      FEATURES="$FEATURES,cef_webview"
+    fi
 fi
 
 OUT_DIR="target/$TARGET_PROFILE_DIR/bundle/osx"
@@ -783,7 +787,19 @@ if [[ "$CEF" == true ]]; then
     --manifest-path "$WORKSPACE_ROOT_DIR/tools/cef-helper/Cargo.toml" \
     --release
   # 签名身份透传:正式签名时用同一 team id(否则 Step 3 的 --deep 也要重签一次)。
-  CEF_EMBED_SIGN_IDENTITY="${APPLE_TEAM_ID:--}" \
+  # --selfsign 时用与 Step 3 相同的本机 Apple Development 身份做分层签名,避免
+  # --deep 重签 317MB framework;无证书时回退 adhoc(再由 Step 3 统一 --deep 重签)。
+  CEF_SIGN_IDENTITY="$APPLE_TEAM_ID"
+  if [[ "$SELFSIGN" == true ]]; then
+    CEF_SIGN_IDENTITY="$(security find-identity -p codesigning -v | grep "Apple Development" | awk '{print $2}' | head -1)"
+    if [[ -z "$CEF_SIGN_IDENTITY" ]]; then
+      echo "No Apple Development cert found for CEF layered signing, falling back to ad-hoc."
+      CEF_SIGN_IDENTITY="-"
+    else
+      echo "CEF layered signing with Apple Development certificate $CEF_SIGN_IDENTITY"
+    fi
+  fi
+  CEF_EMBED_SIGN_IDENTITY="$CEF_SIGN_IDENTITY" \
     "$WORKSPACE_ROOT_DIR/script/macos/cef_embed" "$CEF_APP_PATH" \
       --cef-path "$CEF_DIR" \
       --helper-executable "$WORKSPACE_ROOT_DIR/tools/cef-helper/target/release/zap_cef_helper"
@@ -877,6 +893,32 @@ elif [[ $CODESIGN = true ]]; then
     # It's not possible to staple notarization tickets to standalone binaries:
     # https://developer.apple.com/documentation/security/customizing-the-notarization-workflow?language=objc#Staple-the-ticket-to-your-distribution
     STAPLE_TICKET=false
+  fi
+fi
+
+# Step 3.5:CEF helper 重签(--cef 构建专用)。
+# Step 3 的 `--deep` 整包重签会把 Step 1.5 做的 helper 分层签名覆盖掉(含 JIT
+# entitlements):--deep 对嵌套组件用的是主包 entitlements,而主包没有 allow-jit /
+# allow-unsigned-executable-memory ⇒ renderer 起 V8 即 EXC_BREAKPOINT/SIGTRAP
+# (2026-09-23 实测)。故在 DMG 打包前按 helper 专用 entitlements 重签 5 个 helper;
+# 主包/framework 的 Step 3 签名不受影响(只碰 helper)。
+if [[ "$CEF" == true && "$ARTIFACT" == app ]]; then
+  CEF_HELPER_ENTITLEMENTS="$WORKSPACE_ROOT_DIR/script/macos/cef-helper-entitlements.plist"
+  CEF_RESIGN_IDENTITY="$APPLE_TEAM_ID"
+  if [[ "$SELFSIGN" == true ]]; then
+    CEF_RESIGN_IDENTITY="$SIGNING_CERT"
+  elif [[ "$CODESIGN" != true ]]; then
+    CEF_RESIGN_IDENTITY=""
+  fi
+  if [[ -n "${CEF_RESIGN_IDENTITY:-}" && -f "$CEF_HELPER_ENTITLEMENTS" ]]; then
+    echo "Re-signing CEF helpers with JIT entitlements (identity=$CEF_RESIGN_IDENTITY)..."
+    CEF_APP_PATH="$BUNDLE_DIR/$WARP_APP_NAME.app"
+    MAIN_EXE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$CEF_APP_PATH/Contents/Info.plist")"
+    for helper in "Helper" "Helper (GPU)" "Helper (Renderer)" "Helper (Plugin)" "Helper (Alerts)"; do
+      codesign --force --options runtime --entitlements "$CEF_HELPER_ENTITLEMENTS" \
+        --sign "$CEF_RESIGN_IDENTITY" "$CEF_APP_PATH/Contents/Frameworks/${MAIN_EXE_NAME} ${helper}.app"
+    done
+    codesign --verify --deep --strict "$CEF_APP_PATH" && echo "CEF helper re-sign: OK"
   fi
 fi
 
