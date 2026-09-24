@@ -2348,24 +2348,86 @@ impl CodeReviewView {
         self.pending_reveal_file = Some(path);
     }
 
-    /// 滚动到文件头内 10px(`FILE_HEADER_HEIGHT` 为 41px)。
+    /// 选中一个文件:展开它、记为**活动文件**(双列高亮与内联编辑器都跟着它)、
+    /// 必要时补建双列编辑器,并把列表滚到它。
+    ///
+    /// 与 [`CodeReviewAction::FileSelected`] 同一语义。dsh 改动行入口单独滚列表是不够的:
+    /// 内容区跟的是 `active_file_index`,不设它会一直停在第一个文件。
+    fn select_file_index(&mut self, file_index: usize, ctx: &mut ViewContext<Self>) {
+        // Early-return when repo/state/file is missing to avoid calling
+        // invalidate_height_for_index or scroll_to with an invalid index.
+        let was_expanded = {
+            let Some(repo) = self.active_repo.as_mut() else {
+                return;
+            };
+            let CodeReviewViewState::Loaded(state) = &mut repo.state else {
+                return;
+            };
+            let Some((_, file)) = state.file_states.get_index_mut(file_index) else {
+                return;
+            };
+            let was_expanded = file.is_expanded;
+            file.is_expanded = true;
+            was_expanded
+        };
+        // Track the active file index for side-by-side mode
+        self.active_file_index = Some(file_index);
+
+        // Ensure the newly active file has its side-by-side editor pair.
+        // `create_side_by_side_editors_for_expanded_files` internally skips files
+        // that already have editors, so this is safe to call unconditionally.
+        if self.diff_layout.is_side_by_side() {
+            self.create_side_by_side_editors_for_expanded_files(ctx);
+        }
+
+        self.viewported_list_state
+            .invalidate_height_for_index(file_index);
+
+        if !was_expanded
+            && self.find_model.as_ref(ctx).is_find_bar_open()
+            && FeatureFlag::CodeReviewFind.is_enabled()
+        {
+            self.find_model.update(ctx, |model, model_ctx| {
+                model.run_search(self.editor_handles(), model_ctx);
+            });
+        }
+
+        ctx.notify();
+
+        self.viewported_list_state.scroll_to(file_index);
+        ctx.notify();
+    }
+
+    /// 把列表定位到某个文件:先按「选中文件」的语义展开并记为活动文件,再精确滚到
+    /// 文件头内 10px(`FILE_HEADER_HEIGHT` 为 41px)。
     /// 该文件有编辑器时顺带对齐滚动上下文;二进制/纯重命名等没有编辑器的文件
-    /// 仍按索引滚动(能定位,只是不做上下文对齐)。
+    /// 仍能定位,只是不做上下文对齐。
     fn scroll_to_file_index(
         &mut self,
         editor_index: usize,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
-        let CodeReviewViewState::Loaded(state) = self.state() else {
+        if !matches!(self.state(), CodeReviewViewState::Loaded(_)) {
             return false;
+        }
+
+        // 与点击面板里的文件头同一语义(否则内容区不会切到这个文件)。
+        self.select_file_index(editor_index, ctx);
+
+        // 取该文件的编辑器用于滚动上下文对齐(它在加载时即建好;这里重取只是为了避免
+        // 与 select 的借用区间重叠)。
+        let editor = match self.state() {
+            CodeReviewViewState::Loaded(state) => state
+                .file_states
+                .get_index(editor_index)
+                .and_then(|(_, file_state)| file_state.editor_state.as_ref())
+                .map(|editor_state| editor_state.editor().clone()),
+            CodeReviewViewState::None
+            | CodeReviewViewState::Error(_)
+            | CodeReviewViewState::NoRepoFound => None,
         };
 
-        let editor = state
-            .file_states
-            .get_index(editor_index)
-            .and_then(|(_, file_state)| file_state.editor_state.as_ref())
-            .map(|editor_state| editor_state.editor().clone());
-
+        // 比 select 里的纯 scroll_to 更精确:停在文件头内 10px。
         self.viewported_list_state
             .scroll_to_with_offset(editor_index, Pixels::new(10.0));
 
@@ -9419,48 +9481,7 @@ impl TypedActionView for CodeReviewView {
                 ctx.notify();
             }
             CodeReviewAction::FileSelected(file_index) => {
-                // Early-return when repo/state/file is missing to avoid calling
-                // invalidate_height_for_index or scroll_to with an invalid index.
-                let was_expanded = {
-                    let Some(repo) = self.active_repo.as_mut() else {
-                        return;
-                    };
-                    let CodeReviewViewState::Loaded(state) = &mut repo.state else {
-                        return;
-                    };
-                    let Some((_, file)) = state.file_states.get_index_mut(*file_index) else {
-                        return;
-                    };
-                    let was_expanded = file.is_expanded;
-                    file.is_expanded = true;
-                    was_expanded
-                };
-                // Track the active file index for side-by-side mode
-                self.active_file_index = Some(*file_index);
-
-                // Ensure the newly active file has its side-by-side editor pair.
-                // `create_side_by_side_editors_for_expanded_files` internally skips files
-                // that already have editors, so this is safe to call unconditionally.
-                if self.diff_layout.is_side_by_side() {
-                    self.create_side_by_side_editors_for_expanded_files(ctx);
-                }
-
-                self.viewported_list_state
-                    .invalidate_height_for_index(*file_index);
-
-                if !was_expanded
-                    && self.find_model.as_ref(ctx).is_find_bar_open()
-                    && FeatureFlag::CodeReviewFind.is_enabled()
-                {
-                    self.find_model.update(ctx, |model, model_ctx| {
-                        model.run_search(self.editor_handles(), model_ctx);
-                    });
-                }
-
-                ctx.notify();
-
-                self.viewported_list_state.scroll_to(*file_index);
-                ctx.notify();
+                self.select_file_index(*file_index, ctx);
             }
             CodeReviewAction::ToggleMaximize => {
                 // Determine if we're minimizing or maximizing

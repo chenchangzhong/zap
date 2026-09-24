@@ -1271,6 +1271,13 @@ fn test_scroll_to_file_index_without_editor_still_scrolls() {
                 view.scroll_to_file_index(0, view_ctx),
                 "无 editor 的文件也应能定位(修复前该分支返回 false)"
             );
+            // 关键:定位必须同时把该文件记为活动文件,否则内容区/双列高亮仍停在
+            // 第一个文件(dsh 改动行入口的实际症状:列表滚了但打开的是默认第一个)。
+            assert_eq!(
+                view.active_file_index,
+                Some(0),
+                "应把该文件记为活动文件(只滚列表内容区不会切换)"
+            );
             // 不能只断言返回值:`scroll_to` 会立即写入 scroll_top,顺带断言真的滚了
             // (评审 m-1:否则"返回 true 但不滚动"的回归不会被发现)。
             assert!(
@@ -1281,6 +1288,77 @@ fn test_scroll_to_file_index_without_editor_still_scrolls() {
                 view.viewported_list_state.get_scroll_offset(),
                 Pixels::new(10.0),
                 "应滚到文件头内 10px"
+            );
+        });
+    });
+}
+
+/// scroll_to_file_index:定位到索引 1 时必须让**面板的有效活动文件**跟着变成 1,
+/// 而不是回落到第一个展开文件(旧实现只滚列表 → `effective_active_index()` 仍是 0,
+/// 内容区就停在第一个文件——这正是 dsh 改动行入口的实际症状)。
+/// 用两文件场景,单文件下"永远选 0"的回归测不出来。
+#[test]
+fn test_scroll_to_file_index_selects_the_matched_file() {
+    App::test((), |mut app| async move {
+        initialize_test_app(&mut app);
+
+        let repo_path = PathBuf::from("/repo");
+        let first_path = PathBuf::from("a.rs");
+        let second_path = PathBuf::from("b.rs");
+        let (window_id, _) = app.add_window(WindowStyle::NotStealFocus, |_| TestView);
+        let first_editor = create_editor_with_content(&mut app, "first");
+        let second_editor = create_editor_with_content(&mut app, "second");
+        let state = create_loaded_state_with_editors(
+            &mut app,
+            window_id,
+            vec![(first_path, first_editor), (second_path, second_editor)],
+        );
+
+        let diff_state_model = app.add_model(|ctx| DiffStateModel::new(None, ctx));
+        let working_directories_model = app.add_model(|_| WorkingDirectoriesModel::new());
+        let code_review_comment_batch =
+            working_directories_model.update(&mut app, |working_directories, ctx| {
+                working_directories.get_or_create_code_review_comments(repo_path.as_path(), ctx)
+            });
+        let code_review_view = app.add_view(window_id, |ctx| {
+            CodeReviewView::new(
+                Some(repo_path.clone()),
+                diff_state_model,
+                code_review_comment_batch,
+                None,
+                false,
+                ctx,
+            )
+        });
+
+        code_review_view.update(&mut app, |view, view_ctx| {
+            view.active_repo
+                .as_mut()
+                .expect("CodeReviewView::new(Some(repo), ..) 应带 active_repo")
+                .state = CodeReviewViewState::Loaded(state);
+
+            // 面板默认会落在第一个展开文件上(有效活动文件 = 0)。
+            assert_eq!(
+                view.effective_active_index(),
+                Some(0),
+                "前置:未定位前有效活动文件应是第一个"
+            );
+
+            assert!(view.scroll_to_file_index(1, view_ctx));
+            assert_eq!(
+                view.active_file_index,
+                Some(1),
+                "应选中被定位的那个文件"
+            );
+            assert_eq!(
+                view.effective_active_index(),
+                Some(1),
+                "面板的有效活动文件(内容区跟着它)必须切到被定位的文件"
+            );
+            assert_eq!(
+                view.viewported_list_state.get_scroll_index(),
+                1,
+                "列表也应滚到该文件"
             );
         });
     });
