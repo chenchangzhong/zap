@@ -67,6 +67,8 @@ use crate::code_review::CodeReviewTelemetryEvent;
 use crate::code_review::GlobalCodeReviewModel;
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
 use crate::default_terminal::DefaultTerminal;
+#[cfg(feature = "local_fs")]
+use crate::notebooks::file::FileNotebookEvent;
 use crate::notebooks::NotebookObject;
 use crate::notification::NotificationContext;
 use crate::notifications::model::NotificationsModel;
@@ -941,8 +943,9 @@ const FLOATING_EDITOR_SCRIM_OPACITY: u8 = 40;
 ///
 /// 这些宿主都靠 Esc 收起,而键绑定匹配是**焦点优先**的:任何获得焦点的 `EditorView`
 /// (终端输入框、agent 输入框、宿主自己嵌的编辑器……)都会先吃掉 Esc,宿主的绑定或外层
-/// 元素树上的捕获层根本收不到。所以只能反过来让编辑器主动让位 —— `EditorView` 与
-/// `CodeEditorView` 的 `keymap_context` 会读这里,给自己的 `escape` 绑定补一个否定标识。
+/// 元素树上的捕获层根本收不到。所以只能反过来让编辑器主动让位 —— `EditorView`、
+/// `CodeEditorView` 与 `RichTextEditorView`(Markdown 预览器)的 `keymap_context` 会读这里,
+/// 给自己的 `escape` 绑定补一个否定标识。
 ///
 /// 悬浮工具面板不在此列:它用逐点 `escape_yields_to_host`(见面板里各 `EditorView` 的
 /// 构造点),不需要全局让位 —— 那会让面板打开期间终端与 agent 输入框的 Esc 行为整体改变。
@@ -5955,7 +5958,14 @@ impl Workspace {
 
         match target {
             FileTarget::MarkdownViewer(layout) => {
-                let session = self.get_active_session(ctx);
+                // 本分支的 `path` 来自本地文件树 / 全局搜索(本地路径),而活动会话可能是远端
+                // SSH —— `FilePane::new` 在 target session 非本地时什么都不做,会得到一个空
+                // notebook。过滤只设在这里:共享函数 `open_file_notebook` 不能过滤,终端右键的
+                // `OpenFileInWarp` 传的是真正的"远端路径 + 远端会话"(见
+                // `open_file_notebook_from_uri` 的注释)。
+                let session = self
+                    .get_active_session(ctx)
+                    .filter(|session| session.is_local());
 
                 self.open_file_notebook(path.clone(), session, layout, ctx);
             }
@@ -8708,27 +8718,10 @@ impl Workspace {
         ctx.notify();
     }
 
-    /// 销毁浮层 pane,并做 `PaneGroup` 本会替它做的清理。
-    ///
-    /// 浮层 pane 从不经过 `PaneGroup::attach`/`detach`,所以:
-    /// - 不走 `CodeView::cleanup_all_tabs`,会让 `GlobalBufferModel` 残留未保存的内存内容,
-    ///   下次打开同一文件会看到"看着已保存"的假象(见 `CodePane::detach` 的注释);
-    /// - 也不走 `PaneContent::detach` 的取消订阅。
+    /// 销毁浮层 pane,并做 `PaneGroup` 本会替它做的清理(见
+    /// [`Self::cleanup_floating_editor_pane`])。
     fn destroy_floating_editor(&mut self, ctx: &mut ViewContext<Self>) {
-        match self.floating_editor_pane.take() {
-            Some(FloatingEditorPane::Code(pane)) => {
-                ctx.unsubscribe_to_view(pane.pane_view());
-                let view = pane.file_view(ctx);
-                ctx.unsubscribe_to_view(&view);
-                view.update(ctx, |code_view, ctx| code_view.cleanup_all_tabs(ctx));
-            }
-            Some(FloatingEditorPane::Markdown(pane)) => {
-                ctx.unsubscribe_to_view(pane.pane_view());
-                let view = pane.file_view(ctx);
-                ctx.unsubscribe_to_view(&view);
-            }
-            None => {}
-        }
+        self.discard_floating_editor_pane(ctx);
 
         // 过渡状态到这里才清。`closing` 必须在装排队项之前清掉,否则 `show_floating_editor` 会
         // 把它当成"收起中"又塞回队列。
@@ -8962,6 +8955,25 @@ impl Workspace {
         self.install_floating_editor_pane(ctx);
     }
 
+    /// 把焦点交给浮层里的编辑器。
+    ///
+    /// 浮层是模态的:焦点一旦落回窗口级视图(见 `Self::on_focus`)或被活动 pane 抢走,
+    /// 键盘事件就离开浮层 —— 内嵌 CEF 的 pane 拿到焦点还会把 AppKit first responder
+    /// 交给 webview,此后该窗口所有按键都进页面,浮层连 Esc 都收不到。
+    fn focus_floating_editor_pane(&self, ctx: &mut ViewContext<Self>) {
+        match self.floating_editor_pane.as_ref() {
+            Some(FloatingEditorPane::Code(pane)) => {
+                let view = pane.file_view(ctx);
+                view.update(ctx, |view, ctx| view.focus(ctx));
+            }
+            Some(FloatingEditorPane::Markdown(pane)) => {
+                let view = pane.file_view(ctx);
+                view.update(ctx, |view, ctx| view.focus(ctx));
+            }
+            None => {}
+        }
+    }
+
     /// 把 `self.floating_editor_pane` 里已经就绪的编辑器装进浮层:告知 pane 关闭由宿主负责,
     /// 把 pane 头部与 overflow 菜单里的关闭意图接回收起流程,并把焦点交给编辑器。
     ///
@@ -8996,6 +9008,24 @@ impl Workspace {
                 // 而不是直接销毁 —— 用户此时可能还有未保存改动。
                 let code_view = pane.file_view(ctx);
                 ctx.subscribe_to_view(&code_view, |me, _, event, ctx| {
+                    // 浮层里的 pane 不属于任何 `PaneGroup`,「切回 Markdown 预览」发出的
+                    // `ReplaceWithFilePane`(见 `CodeViewAction::RenderMarkdown`)没有
+                    // `PaneGroup::handle_pane_event` 接住 —— 由宿主自己替换浮层内容。
+                    #[cfg(feature = "local_fs")]
+                    if let CodeViewEvent::Pane(PaneEvent::ReplaceWithFilePane {
+                        path,
+                        source,
+                        scroll_fraction,
+                    }) = event
+                    {
+                        me.replace_floating_editor_with_file_pane(
+                            path.clone(),
+                            source.clone(),
+                            scroll_fraction.map(|f| f.into_inner()),
+                            ctx,
+                        );
+                        return;
+                    }
                     if matches!(event, CodeViewEvent::Pane(PaneEvent::Close)) {
                         me.dismiss_floating_editor(ctx);
                     }
@@ -9016,6 +9046,25 @@ impl Workspace {
                         me.dismiss_floating_editor(ctx);
                     }
                 });
+                // 浮层里的 pane 不属于任何 `PaneGroup`,「切到源码」发出的 `ReplaceWithCodePane`
+                // (见 `FileNotebookAction::ToggleMarkdownDisplayMode`)没有
+                // `PaneGroup::handle_pane_event` 接住 —— 由宿主自己替换浮层内容。
+                #[cfg(feature = "local_fs")]
+                ctx.subscribe_to_view(&pane.file_view(ctx), |me, _, event, ctx| {
+                    if let FileNotebookEvent::Pane(PaneEvent::ReplaceWithCodePane {
+                        path,
+                        source,
+                        scroll_fraction,
+                    }) = event
+                    {
+                        me.replace_floating_editor_with_code_pane(
+                            path.clone(),
+                            source.clone(),
+                            scroll_fraction.map(|f| f.into_inner()),
+                            ctx,
+                        );
+                    }
+                });
             }
             None => {
                 ctx.notify();
@@ -9023,11 +9072,133 @@ impl Workspace {
             }
         }
 
-        if let Some(FloatingEditorPane::Code(pane)) = self.floating_editor_pane.as_ref() {
-            let view = pane.file_view(ctx);
-            view.update(ctx, |view, ctx| view.focus(ctx));
-        }
+        // 两类浮层都要把焦点收进来。让位只解决"编辑器不抢 Esc";按键要真能到浮层的捕获层,
+        // 前提是 AppKit first responder 还在 WarpUI 上 —— 焦点一旦被活动 pane 拿走,内嵌 CEF
+        // 的 pane 会把 responder 交给 webview,该窗口所有按键都进页面(实测:浮层完全无响应)。
+        // 见 [`Self::focus_floating_editor_pane`] 与 [`Self::on_focus`] 的同一道守卫。
+        self.focus_floating_editor_pane(ctx);
+        // 程序化聚焦只改 WarpUI 内部焦点,原生 first responder 不会动 —— 从 dsh 面板(CEF
+        // webview)里点文件链接打开浮层时,键盘焦点还在 CEF 上,该窗口里所有按键(含 Esc)都被
+        // CEF 吃掉,浮层的捕获层根本收不到(实测:不点浮层直接按 Esc 完全无反应)。这里补上
+        // `mouseDown` 路径做的同一件事(见 `host_view.m`),把 AppKit first responder 要回
+        // host view;不补则必须先点一下浮层才能用键盘。
+        #[cfg(target_os = "macos")]
+        warpui::platform::mac::Window::focus_host_view(self.window_id);
         ctx.notify();
+    }
+
+    /// 丢弃当前浮层 pane,并补做 `PaneContent::detach` 本会替它做的清理(见
+    /// [`Self::cleanup_floating_editor_pane`])。浮层内替换内容必须走这里 —— 直接给
+    /// `floating_editor_pane` 赋新值会把旧 pane 的 buffer 留在 `GlobalBufferModel` 里。
+    fn discard_floating_editor_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(pane) = self.floating_editor_pane.take() {
+            Self::cleanup_floating_editor_pane(&pane, ctx);
+        }
+    }
+
+    /// 浮层 pane 从不进入 `PaneGroup`,所以 `PaneContent::detach` 里的取消订阅与
+    /// `cleanup_all_tabs` 要由宿主补做:少了 `cleanup_all_tabs`,`GlobalBufferModel` 会残留
+    /// 未保存的内存内容,下次打开同一文件会看到"看着已保存"的假象(见 `CodePane::detach`)。
+    /// 只由 [`Self::discard_floating_editor_pane`] 调用(销毁路径也经由它)。
+    ///
+    /// **故意不补 `CodeManager::deregister_pane`**:`register_pane` 只在 `CodePane::attach`
+    /// 里调用,而浮层 pane 走 `set_detached_from_pane_group`、从不 attach;`deregister_pane`
+    /// 却是按 source 全局删除,补上会把真正 `PaneGroup` 里同一文件的登记一并删掉。
+    fn cleanup_floating_editor_pane(pane: &FloatingEditorPane, ctx: &mut ViewContext<Self>) {
+        match pane {
+            FloatingEditorPane::Code(pane) => {
+                ctx.unsubscribe_to_view(pane.pane_view());
+                let view = pane.file_view(ctx);
+                ctx.unsubscribe_to_view(&view);
+                view.update(ctx, |code_view, ctx| code_view.cleanup_all_tabs(ctx));
+            }
+            FloatingEditorPane::Markdown(pane) => {
+                ctx.unsubscribe_to_view(pane.pane_view());
+                let view = pane.file_view(ctx);
+                ctx.unsubscribe_to_view(&view);
+            }
+        }
+    }
+
+    /// 浮层里的 Markdown 预览切到源码:等价于 `PaneGroup::replace_file_pane_with_code_pane`,
+    /// 但浮层 pane 不属于任何 `PaneGroup`,替换只能由宿主自己做(订阅见
+    /// `install_floating_editor_pane`)。
+    #[cfg(feature = "local_fs")]
+    fn replace_floating_editor_with_code_pane(
+        &mut self,
+        path: PathBuf,
+        source: Option<CodeSource>,
+        scroll_fraction: Option<f32>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // 收起动画期间浮层仍可点,但此刻装入的任何 pane 都会被随后的
+        // `destroy_floating_editor` 丢掉(它 take 当前 pane)。与 `show_floating_editor` 一样
+        // 在这里拦;区别是直接忽略 —— 用户已经在关浮层,切换显示模式没有意义。
+        if self.floating_editor_closing {
+            return;
+        }
+        let source = source.unwrap_or(CodeSource::Link {
+            path,
+            range_start: None,
+            range_end: None,
+        });
+        // 旧 pane 先丢弃:清理它可能关掉同一文件的 buffer,不能让它落到新 pane 头上。
+        self.discard_floating_editor_pane(ctx);
+        let code_pane = CodePane::new(source, None, ctx);
+        if let Some(fraction) = scroll_fraction {
+            code_pane.file_view(ctx).update(ctx, |code_view, ctx| {
+                code_view.set_pending_scroll_fraction(fraction, ctx);
+            });
+        }
+        self.floating_editor_pane = Some(FloatingEditorPane::Code(code_pane));
+        self.install_floating_editor_pane(ctx);
+    }
+
+    /// 浮层里的源码切回 Markdown 预览,是 [`Self::replace_floating_editor_with_code_pane`]
+    /// 的反向操作。
+    #[cfg(feature = "local_fs")]
+    fn replace_floating_editor_with_file_pane(
+        &mut self,
+        path: PathBuf,
+        source: Option<CodeSource>,
+        scroll_fraction: Option<f32>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // 与 `PaneGroup::replace_code_pane_with_file_pane` 一致:活动会话是远端时不交给
+        // 本地 `FilePane`,否则这个本地文件会被挂上远端会话的链接与标题上下文。
+        // 收起动画期间直接忽略:此刻装入的 pane 会被随后的 `destroy_floating_editor` 丢掉
+        // (与 `replace_floating_editor_with_code_pane` 同一道闸)。
+        if self.floating_editor_closing {
+            return;
+        }
+        let session = self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .active_session_view(ctx)
+            .and_then(|view| {
+                let view_ref = view.as_ref(ctx);
+                if view_ref.active_session_is_local(ctx) == Some(true) {
+                    view_ref.active_block_session_id().and_then(|session_id| {
+                        view_ref.sessions_model().as_ref(ctx).get(session_id)
+                    })
+                } else {
+                    None
+                }
+            });
+        // TODO(floating): 走到这里时(`CodeViewAction::RenderMarkdown`)只保存了**活动** tab,
+        // 而下面的 `discard_floating_editor_pane` 会 `cleanup_all_tabs` 清掉整个 `tab_group`
+        // —— 其余 tab 的未保存内容会被静默丢弃。`dismiss_floating_editor` 正因此改用
+        // `close_all_tabs_with_callback` 逐个确认;替换路径还缺同样的确认(或先全部保存),
+        // 参考实现 `PaneGroup::replace_pane` 也有同一缺口。
+        // 旧 pane 先丢弃:清理它可能关掉同一文件的 buffer,不能让它落到新 pane 头上。
+        self.discard_floating_editor_pane(ctx);
+        let file_pane = FilePane::new(None, None, source, ctx);
+        file_pane.file_view(ctx).update(ctx, |view, ctx| {
+            view.set_pending_scroll_fraction(scroll_fraction);
+            view.open_local(path, session, ctx);
+        });
+        self.floating_editor_pane = Some(FloatingEditorPane::Markdown(file_pane));
+        self.install_floating_editor_pane(ctx);
     }
 
     /// 收起悬浮编辑器。有未保存修改时先弹确认,确认后才销毁;Markdown 预览器为只读,
@@ -12263,6 +12434,39 @@ impl Workspace {
             }),
         })));
         self.add_tab_with_pane_layout(panes_layout, Arc::new(HashMap::new()), None, ctx);
+    }
+
+    /// `file://` / dsh 文件链接入口的 Markdown 打开:悬浮布局交给浮层,其余保持既有的
+    /// 「新标签页里的文件笔记本」行为。
+    ///
+    /// 需要这个包装的原因:`uri::open_file` 对 Markdown 走独立分类(`OpenFileAction::Notebook`),
+    /// 落到 `add_tab_for_file_notebook` —— 它无条件新建标签页,不经过 `open_file_notebook` 的
+    /// `EditorLayout::Floating` 分流。结果同一入口下代码文件进浮层、Markdown 仍新开标签页。
+    #[cfg(feature = "local_fs")]
+    pub fn open_file_notebook_from_uri(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        let layout = *EditorSettings::as_ref(ctx).open_file_layout.value();
+        if matches!(layout, EditorLayout::Floating) {
+            // 远端会话不能带进 `FilePane`:`FilePane::new` 在 target session 非本地时**什么都不
+            // 做**(不加载文件、也不回退到本地 `ActiveSession`),浮层会停在永不加载的空
+            // notebook。这里传 `None` 让它走本地回退。
+            //
+            // **闸只设在本入口**:dsh / `file://` 的路径恒为本地(`url.to_file_path()`,dsh 侧也已
+            // 先做本地 canonicalize);而 `open_file_notebook` 是共享函数,其调用者的路径来源是
+            // 混合的 —— 既有"本地路径 + 远端会话",也有"远端路径 + 远端会话"(见终端 block 右键
+            // 的 `OpenFileInWarp`)。在共享函数里过滤会让后者回退到本地文件系统去读那串远端路径
+            // (通常报错,本地恰好同名时更会静默打开另一个文件)。
+            let session = self
+                .get_active_session(ctx)
+                .filter(|session| session.is_local());
+            self.open_file_notebook(path, session, layout, ctx);
+            return;
+        }
+        self.add_tab_for_file_notebook(Some(path), ctx);
+    }
+
+    #[cfg(not(feature = "local_fs"))]
+    pub fn open_file_notebook_from_uri(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        self.add_tab_for_file_notebook(Some(path), ctx);
     }
 
     pub fn add_tab_for_assisted_autoupdate<V: View>(
@@ -23533,8 +23737,8 @@ impl View for Workspace {
             )
             .finish();
             // 与悬浮工具面板同款:浮层捕获 Esc(编辑器自身的 escape 绑定已在
-            // `EditorView::keymap_context` 里让位),`Clipped` 新开一层避免点浮层内部
-            // 空白被 `Dismiss` 判成"点在外面"。
+            // `EditorView` / `CodeEditorView` / `RichTextEditorView` 的 `keymap_context` 里
+            // 让位),`Clipped` 新开一层避免点浮层内部空白被 `Dismiss` 判成"点在外面"。
             let panel_body = EventHandler::new(panel_body)
                 .with_always_handle()
                 .on_keydown(|ctx, _app, keystroke| {
@@ -24566,6 +24770,14 @@ impl View for Workspace {
 
     fn on_focus(&mut self, focus_ctx: &FocusContext, ctx: &mut ViewContext<Self>) {
         if focus_ctx.is_self_focused() {
+            // 浮层打开时焦点必须留在浮层里。切 Markdown 的源码/预览会先丢弃旧 pane,
+            // 焦点短暂悬空后回落到本视图 —— 若照常 `focus_active_tab`,焦点会被转给活动
+            // pane;内嵌 CEF 的 pane 拿到焦点就把 AppKit first responder 交给 webview,
+            // 此后该窗口所有按键都进页面,浮层连 Esc 都收不到(实测:卡片完全无响应)。
+            if self.floating_editor_visible() {
+                self.focus_floating_editor_pane(ctx);
+                return;
+            }
             self.focus_active_tab(ctx);
         }
     }
@@ -24591,6 +24803,19 @@ impl View for Workspace {
         WorkspaceRegistry::handle(ctx).update(ctx, |registry, _| {
             registry.unregister(window_id);
         });
+
+        // 收起/展开动画的定时器回调在窗口已关闭时会被静默跳过(见 `relay_task_output`),浮层
+        // 状态机就停在中途:恢复窗口后 `floating_editor_closing` 仍为 true,浮层一直渲染、且
+        // `dismiss_floating_editor` 直接早退 —— 全窗口的 Esc 被它吞掉。这里复位过渡态。
+        // 保留 `floating_editor_pane`:浮层内容随窗口一起恢复。
+        if let Some(task) = self.floating_editor_materialize_task.take() {
+            task.abort();
+        }
+        self.floating_editor_pending_open = None;
+        self.pending_floating_editor = None;
+        self.floating_editor_closing = false;
+        self.floating_editor_slide.set(None);
+        self.floating_editor_progress.set(0.);
 
         // 清掉本窗口的 Esc 归属登记,避免 map 随窗口开关无界增长。
         set_escape_owner(window_id, EscapeOwner::None);

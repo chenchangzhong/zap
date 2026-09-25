@@ -245,12 +245,16 @@ if escape_owner(self.window_id) != EscapeOwner::None {
 FixedBinding::new("escape", Action::Escape, ctx_id & !id!("...EscapeYieldsToHost"))
 ```
 
-**两个容易漏的点**:
+**三个容易漏的点**:
 
 1. **代码编辑器有自己的一套 escape 绑定**(`app/src/code/editor/view/actions.rs`
    的 `CodeEditorView`,上下文是 `CodeEditorView`),与 `EditorView` 是两套。
    只改一处会出现"终端里 Esc 生效、代码编辑器里不生效"。
-2. **这会让所有编辑器让位**,作用域是整个窗口 —— 是"浮层必须能用 Esc 收起"所必需的
+2. **Markdown 预览器渲染的是 `RichTextEditorView`**(`app/src/notebooks/editor/view.rs`),
+   它有第三套 escape 绑定(两条 `EditableBinding`:命令选择 / exit-command-selection,
+   加一条 `FixedBinding`)。三条都要挂上否定谓词 —— 只改前两处时,代码浮层与终端里
+   Esc 都正常,Markdown 浮层却收不掉。
+3. **这会让所有编辑器让位**,作用域是整个窗口 —— 是"浮层必须能用 Esc 收起"所必需的
    代价,但要有意识地接受它（参考 `refactor(tool-panel): 收敛 Esc 让位机制`
    那次提交曾专门删掉类似机制,理由是会改变终端 Esc 行为)。
 

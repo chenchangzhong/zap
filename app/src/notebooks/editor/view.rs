@@ -50,7 +50,7 @@ use warpui::{
     },
     units::Pixels,
     windowing, AppContext, BlurContext, CursorInfo, Element, Entity, FocusContext, ModelHandle,
-    SingletonEntity, TypedActionView, View, ViewContext, ViewHandle, WeakViewHandle,
+    SingletonEntity, TypedActionView, View, ViewContext, ViewHandle, WeakViewHandle, WindowId,
 };
 use warpui::{actions::StandardAction, elements::Hoverable};
 use warpui::{keymap::PerPlatformKeystroke, windowing::WindowManager};
@@ -101,6 +101,10 @@ const MAX_EDITOR_TIP_WIDTH: f32 = 300.;
 
 /// Width of the left gutter, which holds the block insertion menu.
 const GUTTER_WIDTH: f32 = ICON_DIMENSIONS + 4.;
+
+/// `escape` 让位标识:悬浮编辑器浮层打开期间插入,令本视图的三条 `escape` 绑定不匹配,
+/// 把该按键让给浮层的捕获层收起浮层(机制见 `workspace::view::EscapeOwner`)。
+pub(crate) const ESCAPE_YIELDS_TO_HOST: &str = "RichTextEditorView_EscapeYieldsToHost";
 
 pub fn init(app: &mut AppContext) {
     use warpui::keymap::macros::*;
@@ -317,7 +321,9 @@ pub fn init(app: &mut AppContext) {
             crate::t!("keybinding-desc-nbeditor-deselect-command"),
             EditorViewAction::ExitCommandSelection,
         )
-        .with_context_predicate(id!("RichTextEditorView") & id!("HasCommandSelection"))
+        .with_context_predicate(
+            id!("RichTextEditorView") & id!("HasCommandSelection") & !id!(ESCAPE_YIELDS_TO_HOST),
+        )
         .with_key_binding("escape"),
         EditableBinding::new(
             "editor_view:select_command",
@@ -327,7 +333,8 @@ pub fn init(app: &mut AppContext) {
         .with_context_predicate(
             id!("RichTextEditorView")
                 & !id!("HasCommandSelection")
-                & id!("CanExecuteShellCommands"),
+                & id!("CanExecuteShellCommands")
+                & !id!(ESCAPE_YIELDS_TO_HOST),
         )
         .with_key_binding("escape"),
         EditableBinding::new(
@@ -366,7 +373,10 @@ pub fn init(app: &mut AppContext) {
     app.register_fixed_bindings([FixedBinding::new(
         "escape",
         EditorViewAction::ExitCommandSelection,
-        id!("RichTextEditorView") & !id!("CanExecuteShellCommands") & !id!("HasCommandSelection"),
+        id!("RichTextEditorView")
+            & !id!("CanExecuteShellCommands")
+            & !id!("HasCommandSelection")
+            & !id!(ESCAPE_YIELDS_TO_HOST),
     )]);
 
     app.register_fixed_bindings([FixedBinding::new(
@@ -1022,6 +1032,7 @@ pub struct RichTextEditorView {
     display_state: DisplayStateHandle,
     scroll_state: ScrollStateHandle,
     self_handle: WeakViewHandle<Self>,
+    window_id: WindowId,
     ongoing_mouse_state: OngoingMouseEvent,
     hovered_block: Option<CharOffset>,
     links: ModelHandle<NotebookLinks>,
@@ -1145,6 +1156,7 @@ impl RichTextEditorView {
             display_state: Default::default(),
             scroll_state: Default::default(),
             self_handle: ctx.handle(),
+            window_id: ctx.window_id(),
             ongoing_mouse_state: OngoingMouseEvent::None,
             debug_mode: false,
             mouse_states: Default::default(),
@@ -2704,6 +2716,15 @@ impl View for RichTextEditorView {
 
         if self.can_execute_shell_commands {
             context.set.insert("CanExecuteShellCommands");
+        }
+
+        // 悬浮编辑器浮层打开时让出 Esc:键绑定匹配是焦点优先的,本视图的 escape 绑定
+        // (命令选择 / exit-command-selection)不退让,浮层的捕获层就收不到这个按键。
+        // 与 `EditorView` / `CodeEditorView` 同一机制,见 `workspace::view::EscapeOwner`。
+        if crate::workspace::view::escape_owner(self.window_id)
+            != crate::workspace::view::EscapeOwner::None
+        {
+            context.set.insert(ESCAPE_YIELDS_TO_HOST);
         }
 
         context
