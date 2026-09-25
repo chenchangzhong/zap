@@ -2119,7 +2119,7 @@ impl RootView {
     pub fn add_file_pane(&mut self, path: &PathBuf, ctx: &mut ViewContext<Self>) -> bool {
         if let AuthOnboardingState::Terminal(handle) = &self.auth_onboarding_state {
             handle.update(ctx, |workspace, ctx| {
-                workspace.add_tab_for_file_notebook(Some(path.to_owned()), ctx);
+                workspace.open_file_notebook_from_uri(path.to_owned(), ctx);
             });
             let window_id = ctx.window_id();
             // 仅在窗口尚未处于前台时才把它带到前台：dsh 文件打开发生在渲染帧

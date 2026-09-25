@@ -2178,6 +2178,281 @@ fn test_open_file_notebook_focuses_existing_markdown_pane() {
     });
 }
 
+/// `file://` / dsh 入口的 Markdown 打开必须遵守 `open_file_layout`:该入口在 `uri::open_file`
+/// 里被单独分类成 Notebook,落到 `add_tab_for_file_notebook` —— 它无条件新开标签页,不经过
+/// `open_file_notebook` 的 `Floating` 分流,于是同一入口下代码文件进浮层、Markdown 却新开标签页。
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_open_file_notebook_from_uri_respects_floating_layout() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let markdown_path = temp_dir.path().join("README.md");
+        std::fs::write(&markdown_path, "# Test\n").expect("failed to write markdown file");
+
+        // 对照:非悬浮布局仍走既有路径 —— 新开标签页,不出现浮层。
+        workspace.update(&mut app, |workspace, ctx| {
+            EditorSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings
+                    .open_file_layout
+                    .set_value(EditorLayout::SplitPane, ctx));
+            });
+            let tabs_before = workspace.tab_count();
+            workspace.open_file_notebook_from_uri(markdown_path.clone(), ctx);
+            assert!(workspace.floating_editor_pane.is_none());
+            assert!(workspace.tab_count() > tabs_before);
+        });
+
+        // 悬浮布局:不新增标签页,Markdown 装进浮层。
+        workspace.update(&mut app, |workspace, ctx| {
+            EditorSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings
+                    .open_file_layout
+                    .set_value(EditorLayout::Floating, ctx));
+            });
+            let tabs_before = workspace.tab_count();
+            workspace.open_file_notebook_from_uri(markdown_path.clone(), ctx);
+            assert_eq!(workspace.tab_count(), tabs_before);
+            assert!(matches!(
+                workspace.floating_editor_pane,
+                Some(FloatingEditorPane::Markdown(_))
+            ));
+            // 入口必须让 `FilePane` 真的走到 `open_local`(而不只是装一个空 pane):`local_path`
+            // 非空即证明加载被发起过(注意它不证明加载成功,`Loading`/`Error` 态同样非空)。
+            // (mock 环境拿不到远端活动会话 —— `get_active_session` 返回 `None`,`.filter` 的闭包
+            // 根本不会执行;那条分支的契约由
+            // `test_open_file_notebook_leaves_remote_session_to_file_pane` 锁定。)
+            let pane = match workspace.floating_editor_pane.as_ref() {
+                Some(FloatingEditorPane::Markdown(pane)) => pane,
+                Some(FloatingEditorPane::Code(_)) | None => {
+                    panic!("expected markdown floating pane")
+                }
+            };
+            assert_eq!(
+                pane.file_view(ctx).as_ref(ctx).local_path().as_deref(),
+                Some(markdown_path.as_path())
+            );
+            assert!(workspace.floating_editor_visible());
+        });
+    });
+}
+
+/// 浮层里的内容替换在原位完成(不收起再展开):`ReplaceWithCodePane` / `ReplaceWithFilePane`
+/// 由 Workspace 自己接住 —— 浮层 pane 不属于任何 `PaneGroup`,`PaneGroup::handle_pane_event`
+/// 接不到它们。替换前必须先丢弃旧 pane 并做 `PaneContent::detach` 的清理,直接覆盖会让旧
+/// pane 的 buffer 留在 `GlobalBufferModel` 里(见 `cleanup_floating_editor_pane`)。
+///
+/// 这里只覆盖 Markdown 方向的就地替换:CodePane 需要 `GlobalBufferModel` / `CodeManager` 等
+/// `open_file_notebook` 是共享函数,不能替调用者过滤会话。
+///
+/// 它的调用者路径来源是混合的:入口(`open_file_notebook_from_uri`)是"本地路径 + 可能远端
+/// 的活动会话",而终端 block 右键的 `OpenFileInWarp` 是"远端路径 + 远端会话"。在共享函数里
+/// 把远端会话过滤成 `None`,`FilePane::new` 就会回退到本地回退分支,拿**本地文件系统**去读
+/// 那串远端路径(通常报错;本地恰好同名时更会静默打开另一个文件)——所以闸只设在入口。
+///
+/// 这里直接把远端会话交给共享函数,锁定"原样透传"这条契约:一旦有人把过滤搬回
+/// `open_file_notebook`,它就会去 `open_local` 这个本地替身文件,断言立刻变红。
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_open_file_notebook_leaves_remote_session_to_file_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let markdown_path = temp_dir.path().join("README.md");
+        std::fs::write(&markdown_path, "# Test\n").expect("failed to write markdown file");
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.open_file_notebook(
+                markdown_path.clone(),
+                Some(Arc::new(Session::test_remote())),
+                EditorLayout::Floating,
+                ctx,
+            );
+            let pane = match workspace.floating_editor_pane.as_ref() {
+                Some(FloatingEditorPane::Markdown(pane)) => pane,
+                Some(FloatingEditorPane::Code(_)) | None => {
+                    panic!("expected markdown floating pane")
+                }
+            };
+            // 远端会话被原样交给 `FilePane`,它整段跳过 `open_local` —— 绝不会去读本地同名路径。
+            assert_eq!(pane.file_view(ctx).as_ref(ctx).local_path(), None);
+        });
+    });
+}
+
+/// 浮层里的内容替换在原位完成(不收起再展开):`ReplaceWithCodePane` / `ReplaceWithFilePane`
+/// 由 Workspace 自己接住 —— 浮层 pane 不属于任何 `PaneGroup`,`PaneGroup::handle_pane_event`
+/// 接不到它们。替换前必须先丢弃旧 pane 并做 `PaneContent::detach` 的清理,直接覆盖会让旧
+/// pane 的 buffer 留在 `GlobalBufferModel` 里(见 `cleanup_floating_editor_pane`)。
+///
+/// 这里只覆盖 Markdown 方向的就地替换:CodePane 需要 `GlobalBufferModel` / `CodeManager` 等
+/// 单例,当前 `initialize_app` 未注册,构造真实 CodePane 不在本测试基建范围内。
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_floating_editor_replaces_pane_in_place() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let markdown_path = temp_dir.path().join("README.md");
+        std::fs::write(&markdown_path, "# Test\n\nbody\n").expect("failed to write markdown file");
+
+        workspace.update(&mut app, |workspace, ctx| {
+            EditorSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings
+                    .open_file_layout
+                    .set_value(EditorLayout::Floating, ctx));
+            });
+            workspace.open_file_notebook_from_uri(markdown_path.clone(), ctx);
+            assert!(matches!(
+                workspace.floating_editor_pane,
+                Some(FloatingEditorPane::Markdown(_))
+            ));
+        });
+
+        // 「切回 Markdown 预览」的落地路径:丢弃旧 pane —— 走 `cleanup_floating_editor_pane`
+        // 的 Markdown 分支与 `active_session_view` 取会话 —— 再把新 pane 装回同一个浮层。
+        workspace.update(&mut app, |workspace, ctx| {
+            let tabs_before = workspace.tab_count();
+            workspace.replace_floating_editor_with_file_pane(
+                markdown_path.clone(),
+                None,
+                None,
+                ctx,
+            );
+            assert_eq!(workspace.tab_count(), tabs_before);
+            assert!(matches!(
+                workspace.floating_editor_pane,
+                Some(FloatingEditorPane::Markdown(_))
+            ));
+            assert!(workspace.floating_editor_visible());
+        });
+    });
+}
+
+/// 浮层可见时 `Workspace::on_focus` 必须把焦点留在浮层里,而不是转给活动 pane。
+///
+/// 切 Markdown 的源码/预览会先丢弃旧 pane,焦点短暂悬空后回落到 Workspace 自身并触发
+/// `on_focus`。若在那里照常 `focus_active_tab`,焦点会被转给活动 pane —— 内嵌 CEF 的 pane
+/// 拿到焦点就把 AppKit first responder 交给 webview,该窗口所有按键(含 Esc)都进页面,
+/// 浮层从此收不掉(实测:切换后卡片完全无响应)。
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_workspace_focus_keeps_floating_editor_focused() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let markdown_path = temp_dir.path().join("README.md");
+        std::fs::write(&markdown_path, "# Test\n").expect("failed to write markdown file");
+
+        workspace.update(&mut app, |workspace, ctx| {
+            EditorSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings
+                    .open_file_layout
+                    .set_value(EditorLayout::Floating, ctx));
+            });
+            workspace.open_file_notebook_from_uri(markdown_path.clone(), ctx);
+        });
+
+        // 浮层 install 设下的焦点(effects 已 flush)。
+        let focused_by_install = workspace.read(&app, |workspace, ctx| {
+            ctx.focused_view_id(workspace.window_id)
+        });
+        assert!(
+            focused_by_install.is_some(),
+            "打开浮层后应有一个视图持有焦点"
+        );
+
+        // 等价的"焦点悬空回落到 Workspace":让它自己获得焦点。
+        workspace.update(&mut app, |workspace, ctx| {
+            ctx.focus_self();
+            assert!(workspace.floating_editor_visible());
+        });
+
+        let focused_after = workspace.read(&app, |workspace, ctx| {
+            ctx.focused_view_id(workspace.window_id)
+        });
+        assert_eq!(
+            focused_after, focused_by_install,
+            "浮层可见时 on_focus 应把焦点收回浮层,而不是转给活动 pane"
+        );
+    });
+}
+
+/// 浮层里「切到源码」/「切回预览」的事件接线:浮层 pane 不属于任何 `PaneGroup`,
+/// `ReplaceWithCodePane` / `ReplaceWithFilePane` 只能由 Workspace 自己的订阅接住。
+/// 这里走真实事件派发(`ctx.emit`)而不是直接调私有的 `replace_floating_editor_with_*`,
+/// 覆盖那条接线,以及旧 `CodePane` 在替换时的 `cleanup_all_tabs` 清理。
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_floating_editor_event_driven_replace_round_trip() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        // `CodePane`/`CodeView` 需要 `GlobalBufferModel`;`initialize_app` 没注册它
+        // (它订阅的 `warp_files::FileModel` 已经注册过)。
+        app.add_singleton_model(crate::code::global_buffer_model::GlobalBufferModel::new);
+        let workspace = mock_workspace(&mut app);
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let markdown_path = temp_dir.path().join("README.md");
+        std::fs::write(&markdown_path, "# Test\n\nbody\n").expect("failed to write markdown file");
+
+        workspace.update(&mut app, |workspace, ctx| {
+            EditorSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings
+                    .open_file_layout
+                    .set_value(EditorLayout::Floating, ctx));
+            });
+            workspace.open_file_notebook_from_uri(markdown_path.clone(), ctx);
+        });
+
+        // 「切到源码」:Markdown pane 发出 `ReplaceWithCodePane`。
+        workspace.update(&mut app, |workspace, ctx| {
+            let file_view = match workspace.floating_editor_pane.as_ref() {
+                Some(FloatingEditorPane::Markdown(pane)) => pane.file_view(ctx),
+                _ => panic!("expected markdown floating pane"),
+            };
+            file_view.update(ctx, |_view, ctx| {
+                ctx.emit(FileNotebookEvent::Pane(PaneEvent::ReplaceWithCodePane {
+                    path: markdown_path.clone(),
+                    source: None,
+                    scroll_fraction: None,
+                }));
+            });
+        });
+        workspace.read(&app, |workspace, _ctx| {
+            assert!(matches!(
+                workspace.floating_editor_pane,
+                Some(FloatingEditorPane::Code(_))
+            ));
+        });
+
+        // 「切回预览」:CodePane 发出 `ReplaceWithFilePane`;旧 pane 的清理不得 panic。
+        workspace.update(&mut app, |workspace, ctx| {
+            let code_view = match workspace.floating_editor_pane.as_ref() {
+                Some(FloatingEditorPane::Code(pane)) => pane.file_view(ctx),
+                _ => panic!("expected code floating pane"),
+            };
+            code_view.update(ctx, |_view, ctx| {
+                ctx.emit(CodeViewEvent::Pane(PaneEvent::ReplaceWithFilePane {
+                    path: markdown_path.clone(),
+                    source: None,
+                    scroll_fraction: None,
+                }));
+            });
+        });
+        workspace.read(&app, |workspace, _ctx| {
+            assert!(matches!(
+                workspace.floating_editor_pane,
+                Some(FloatingEditorPane::Markdown(_))
+            ));
+            assert!(workspace.floating_editor_visible());
+        });
+    });
+}
+
 #[test]
 fn panel_revealed_only_while_animating_or_open() {
     // 收起终态必须落 false:否则面板子树与"展开态"探测层会永久留在渲染树里,鼠标再移到
