@@ -1193,12 +1193,19 @@ impl CodeReviewView {
     /// Subscribes to the diff state model and triggers diff loading.
     pub fn on_open(&mut self, repo_path: Option<PathBuf>, ctx: &mut ViewContext<Self>) {
         if self.is_open {
-            return;
+            // 已打开且 diff 已就绪:无需重来(原行为)。
+            // 已打开但状态还没到 Loaded(例如首次加载被中断):允许重发一次加载,
+            // 否则用户唯一的自救手段是切走项目再切回。
+            // 订阅只在首次建立,避免重复订阅累加。
+            if matches!(self.state(), CodeReviewViewState::Loaded(_)) {
+                return;
+            }
+        } else {
+            self.is_open = true;
+            ctx.subscribe_to_model(&self.diff_state_model, Self::handle_diff_state_model_event);
         }
-        self.is_open = true;
 
         self.update_current_repo(repo_path, ctx);
-        ctx.subscribe_to_model(&self.diff_state_model, Self::handle_diff_state_model_event);
         self.load_diffs_for_active_repo(false, ctx);
         if self.repo_path().is_some() {
             self.fetch_branches_and_setup_dropdown(ctx);

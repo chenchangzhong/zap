@@ -30,8 +30,8 @@ use crate::features::FeatureFlag;
 #[cfg(feature = "local_fs")]
 use crate::util::git::get_pr_for_branch;
 use crate::util::git::{
-    detect_current_branch, detect_main_branch, get_unpushed_commits, run_git_command, Commit,
-    PrInfo,
+    detect_current_branch, detect_main_branch, get_unpushed_commits, run_git_command,
+    run_git_network_command, Commit, PrInfo,
 };
 
 use super::diff_size_limits::compute_diff_size;
@@ -1385,7 +1385,8 @@ impl DiffStateModel {
         // Fetch the branch from origin. This creates / updates the remote-tracking
         // ref `origin/<branch>` without altering the working tree.
         log::warn!("Base branch '{branch}' not found locally, fetching from origin");
-        run_git_command(repo_path, &["fetch", "origin", branch]).await?;
+        // fetch 属网络类命令:可能合法地跑很久,故不设超时(见 util/git.rs)。
+        run_git_network_command(repo_path, &["fetch", "origin", branch], None).await?;
 
         // Retry with the now-available remote-tracking ref.
         Self::get_merge_base(repo_path, &origin_branch).await
