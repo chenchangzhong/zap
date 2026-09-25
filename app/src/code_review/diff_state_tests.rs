@@ -368,6 +368,159 @@ fn is_binary_file_content_matches_git_window() {
     ));
 }
 
+/// 解析 `cat-file --batch` 的分帧:正常 blob / 缺失 / **树(带内容段,必须跳过)** / 空 blob。
+#[test]
+fn parse_cat_file_batch_output_handles_missing_tree_and_empty_blob() {
+    let output = b"abc123 blob 5\nhello\nHEAD:gone missing\ndef456 tree 3\nxyz\nghi789 blob 0\n\n";
+    let parsed = DiffStateModel::parse_cat_file_batch_output(output, 4);
+    assert_eq!(
+        parsed,
+        vec![Some("hello".to_string()), None, None, Some(String::new())]
+    );
+}
+
+/// 截断的输出不能 panic,缺的条目补 None。
+#[test]
+fn parse_cat_file_batch_output_tolerates_truncated_stream() {
+    let output = b"abc123 blob 99\nhel";
+    let parsed = DiffStateModel::parse_cat_file_batch_output(output, 2);
+    assert_eq!(parsed, vec![None, None]);
+}
+
+/// 批量取 baseline 必须与逐个 `git show HEAD:<path>` **完全一致** —— 用原路径当 oracle。
+/// 覆盖:修改 / 删除 / 重命名(内容在旧路径) / 已 add 的新文件 / 未跟踪。
+#[tokio::test]
+async fn batched_baselines_match_per_file_git_show() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let run_git = |args: &[&str]| {
+        let output = command::blocking::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run_git(&["init", "-q"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    for (name, content) in [
+        ("modified.txt", "v1\n"),
+        ("deleted.txt", "bye\n"),
+        ("renamed.txt", "old\n"),
+    ] {
+        std::fs::write(dir.path().join(name), content).expect("write fixture");
+    }
+    run_git(&["add", "."]);
+    run_git(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"]);
+
+    // 制造各类改动;未跟踪文件要在 add 之后再建,否则会被变成已 add 的新文件。
+    std::fs::write(dir.path().join("modified.txt"), "v2\n").expect("write");
+    std::fs::remove_file(dir.path().join("deleted.txt")).expect("remove");
+    std::fs::rename(
+        dir.path().join("renamed.txt"),
+        dir.path().join("renamed-new.txt"),
+    )
+    .expect("rename");
+    std::fs::write(dir.path().join("added.txt"), "added\n").expect("write");
+    run_git(&["add", "-A"]);
+    std::fs::write(dir.path().join("untracked.txt"), "new\n").expect("write");
+
+    let statuses = DiffStateModel::file_statuses_against_head(dir.path())
+        .await
+        .expect("file_statuses_against_head");
+    assert!(
+        statuses.len() >= 5,
+        "fixture 应产生至少 5 条改动,实际 {statuses:?}"
+    );
+
+    let batched = DiffStateModel::baselines_for_files(dir.path(), "HEAD", &statuses).await;
+    assert_eq!(batched.len(), statuses.len());
+
+    for (index, (path, status)) in statuses.iter().enumerate() {
+        let oracle = DiffStateModel::get_file_content_at_head(dir.path(), path, status).await;
+        assert_eq!(
+            batched[index], oracle,
+            "baseline 与逐个 git show 不一致: {path:?} {status:?}"
+        );
+    }
+}
+
+/// 回归:路径含换行时**不能**走按行分隔的批量协议 —— 请求会被拆成两个、多出的响应让后续
+/// 请求整体错位。实测后果是该文件配到**别的文件的内容**(`we\nird.txt` 拿到 `we` 的内容)、
+/// 其后的文件丢掉 baseline。这类路径必须退回逐文件 `git show`。
+/// (Windows 不允许文件名含换行,故仅 unix。)
+#[cfg(unix)]
+#[tokio::test]
+async fn baselines_for_files_falls_back_for_newline_paths() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let run_git = |args: &[&str]| {
+        let output = command::blocking::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run_git(&["init", "-q"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    // "we" 与 "we\nird.txt" 的前缀关系,正是触发「配到别的文件内容」的条件。
+    let files = [
+        ("we", "I-AM-WE\n"),
+        ("we\nird.txt", "I-AM-WEIRD\n"),
+        ("after.txt", "I-AM-AFTER\n"),
+    ];
+    for (name, content) in files {
+        std::fs::write(dir.path().join(name), content).expect("write fixture");
+    }
+    run_git(&["add", "-A"]);
+    run_git(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"]);
+
+    // 改一遍内容,让三个文件都出现在 status 里(不改名、不新增)。
+    for (name, _) in files {
+        std::fs::write(dir.path().join(name), "v2\n").expect("write fixture");
+    }
+
+    let statuses = DiffStateModel::file_statuses_against_head(dir.path())
+        .await
+        .expect("file_statuses_against_head");
+    assert_eq!(statuses.len(), 3, "fixture 应有 3 个改动文件: {statuses:?}");
+
+    let batched = DiffStateModel::baselines_for_files(dir.path(), "HEAD", &statuses).await;
+
+    for (index, (path, status)) in statuses.iter().enumerate() {
+        let oracle = DiffStateModel::get_file_content_at_head(dir.path(), path, status).await;
+        assert_eq!(batched[index], oracle, "baseline 不一致: {path:?}");
+    }
+
+    let newline_index = statuses
+        .iter()
+        .position(|(path, _)| path.to_string_lossy().contains('\n'))
+        .expect("fixture 应包含含换行的路径");
+    assert_eq!(
+        batched[newline_index].as_deref(),
+        Some("I-AM-WEIRD\n"),
+        "含换行的路径必须取到自己的 baseline,不能串成 we 的内容"
+    );
+    // 排在它后面的文件也不能因为错位而丢掉 baseline。
+    assert!(
+        batched.iter().enumerate().any(
+            |(index, value)| index != newline_index && value.as_deref() == Some("I-AM-AFTER\n")
+        ),
+        "换行路径之后的文件必须仍有 baseline: {batched:?}"
+    );
+}
+
 /// 本地合成必须与 `git diff --no-index` 路径**整结构相同** —— 用 git 路径做 oracle。
 /// 覆盖:普通文本 / 无尾换行 / 空文件 / 单空行 / 连续空行 / CRLF / 超长行 / 二进制。
 #[tokio::test]
