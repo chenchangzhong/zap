@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
@@ -7,11 +8,73 @@ use anyhow::{anyhow, Result};
 #[path = "git_tests.rs"]
 mod tests;
 
+/// 本地 git 子命令的硬超时(定因见下方 [`run_command_with_timeout`])。
+///
+/// 取 30s:本地命令通常 <100ms,留足量余量;同时保证「完成事件丢失」时不会永久挂住。
+/// **网络类命令(push / fetch)不走它** —— 见 [`run_git_network_command`]。
+#[cfg(feature = "local_fs")]
+const GIT_LOCAL_COMMAND_TIMEOUT: Duration = std::time::Duration::from_secs(30);
+
+/// 运行子进程并收集输出;`timeout` 为 `None` 表示不设超时(网络类命令)。
+///
+/// 定因(2026-09-25,采样实证):原实现走 `command::async`(async-process 2.5),
+/// 在 macOS 上偶发**丢失「快速退出子进程」的完成事件** —— 采样可见 async_process 的
+/// reaper 驱动线程停在 `poll(2)`、git 子进程早已退出且系统无残留,而等待方永不恢复:
+/// `DiffStateModel` 永停 `Loading` ⇒ 代码审核面板永久骨架、徽标冻结(切项目才自愈)。
+/// 故改为「阻塞实现 + 独立线程读管道 + 轮询 try_wait(可带硬超时)」,
+/// 不再依赖任何退出通知机制。
+///
+/// stdout/stderr 各由一个独立线程读到 EOF:大输出(git diff)会写满管道缓冲,
+/// 若与轮询在同一线程会与子进程互相死锁。
+#[cfg(feature = "local_fs")]
+fn run_command_with_timeout(
+    command: &mut command::blocking::Command,
+    timeout: Option<Duration>,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            buf
+        })
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn command: {e}"))?;
+
+    let stdout_reader = child.stdout.take().map(drain);
+    let stderr_reader = child.stderr.take().map(drain);
+
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!("command timed out after {timeout:?}; killed"));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => return Err(anyhow!("Failed to wait for command: {e}")),
+        }
+    };
+
+    let join = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default()
+    };
+    Ok((status, join(stdout_reader), join(stderr_reader)))
+}
+
 /// Runs a git command and returns the output as a string.
-/// Thin wrapper over [`run_git_command_with_env`] with no `PATH` override.
+/// Thin wrapper over [`run_git_command_inner`] with no `PATH` override.
 #[cfg(feature = "local_fs")]
 pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String> {
-    run_git_command_with_env(repo_path, args, None).await
+    run_git_command_inner(repo_path, args, None, Some(GIT_LOCAL_COMMAND_TIMEOUT)).await
 }
 
 /// Like [`run_git_command`] but sets `PATH` on the child when `path_env` is
@@ -23,38 +86,71 @@ pub async fn run_git_command_with_env(
     args: &[&str],
     path_env: Option<&str>,
 ) -> Result<String> {
-    use command::r#async::Command;
-    use command::Stdio;
+    run_git_command_inner(repo_path, args, path_env, Some(GIT_LOCAL_COMMAND_TIMEOUT)).await
+}
 
+/// 网络类 git 子命令(push / fetch):**不设超时** —— LFS 推送 / 慢链路可以合法地跑很久,
+/// 设短超时会把它们误判成失败。仍走同一套「独立线程 + 阻塞实现」,因此同样不受
+/// async-process 完成事件丢失的影响(那才是真正的挂死来源)。
+#[cfg(feature = "local_fs")]
+pub async fn run_git_network_command(
+    repo_path: &Path,
+    args: &[&str],
+    path_env: Option<&str>,
+) -> Result<String> {
+    run_git_command_inner(repo_path, args, path_env, None).await
+}
+
+/// 公共实现:阻塞 git 调用放到独立线程,结果经 oneshot 回传;调用方只 await、
+/// 不阻塞执行器线程。`timeout` 语义见 [`run_command_with_timeout`]。
+#[cfg(feature = "local_fs")]
+async fn run_git_command_inner(
+    repo_path: &Path,
+    args: &[&str],
+    path_env: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<String> {
     log::debug!(
         "[GIT OPERATION] git.rs run_git_command git {}",
         args.join(" ")
     );
-    let mut cmd = Command::new("git");
-    cmd.arg("-c")
-        .arg("diff.autoRefreshIndex=false")
-        .args(args)
-        .current_dir(repo_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .kill_on_drop(true);
-    if let Some(path_env) = path_env {
-        cmd.env("PATH", path_env);
-    }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| anyhow!("Failed to execute git command: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let repo_path = repo_path.to_path_buf();
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let path_env = path_env.map(|path| path.to_string());
+
+    // 阻塞实现在独立线程里跑,结果经 oneshot 回传:调用方只 await、不阻塞执行器线程。
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::Builder::new()
+        .name("git-command".to_string())
+        .spawn(move || {
+            let mut cmd = command::blocking::Command::new("git");
+            cmd.arg("-c")
+                .arg("diff.autoRefreshIndex=false")
+                .args(&args)
+                .current_dir(&repo_path)
+                .stdout(command::Stdio::piped())
+                .stderr(command::Stdio::piped())
+                .env("GIT_OPTIONAL_LOCKS", "0");
+            if let Some(path_env) = path_env {
+                cmd.env("PATH", path_env);
+            }
+            let _ = tx.send(run_command_with_timeout(&mut cmd, timeout));
+        })
+        .map_err(|e| anyhow!("Failed to spawn git worker thread: {e}"))?;
+
+    let (status, stdout_bytes, stderr_bytes) = rx
+        .await
+        .map_err(|_| anyhow!("git worker thread exited without a result"))??;
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
 
     // Handle git diff specific behavior:
     // - Exit code 0: no differences
     // - Exit code 1: differences found (this is normal for diff commands)
     // - Exit code > 1: actual error
-    if output.status.success() || (output.status.code() == Some(1) && !stdout.is_empty()) {
+    if status.success() || (status.code() == Some(1) && !stdout.is_empty()) {
         Ok(stdout)
     } else {
         Err(anyhow!("Git command failed: {}, {}", stderr, stdout))
@@ -68,6 +164,15 @@ pub async fn run_git_command(_repo_path: &Path, _args: &[&str]) -> Result<String
 
 #[cfg(not(feature = "local_fs"))]
 pub async fn run_git_command_with_env(
+    _repo_path: &Path,
+    _args: &[&str],
+    _path_env: Option<&str>,
+) -> Result<String> {
+    Err(anyhow!("Not supported on wasm"))
+}
+
+#[cfg(not(feature = "local_fs"))]
+pub async fn run_git_network_command(
     _repo_path: &Path,
     _args: &[&str],
     _path_env: Option<&str>,
@@ -726,7 +831,8 @@ pub async fn get_branch_diff_entries(_repo_path: &Path) -> Result<Vec<FileChange
 /// `path_env` is forwarded so the LFS `pre-push` hook can find `git-lfs`.
 #[cfg(feature = "local_fs")]
 pub async fn run_push(repo_path: &Path, branch: &str, path_env: Option<&str>) -> Result<String> {
-    run_git_command_with_env(
+    // push 属网络类命令:可能合法地跑很久(LFS / 慢链路),故不设超时。
+    run_git_network_command(
         repo_path,
         &["push", "--set-upstream", "origin", branch],
         path_env,

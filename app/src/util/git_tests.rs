@@ -85,3 +85,59 @@ async fn detached_tag_display_returns_short_sha() {
         "expected {full_sha} to start with {result}"
     );
 }
+
+/// 正常路径:短命令在超时窗口内返回输出。
+#[cfg(all(feature = "local_fs", unix))]
+#[test]
+fn run_command_with_timeout_returns_output() {
+    let mut cmd = command::blocking::Command::new("echo");
+    cmd.arg("hi")
+        .stdout(command::Stdio::piped())
+        .stderr(command::Stdio::piped());
+
+    let (status, stdout, _stderr) =
+        super::run_command_with_timeout(&mut cmd, Some(std::time::Duration::from_secs(5)))
+            .expect("短命令应成功");
+
+    assert!(status.success());
+    assert_eq!(String::from_utf8_lossy(&stdout).trim(), "hi");
+}
+
+/// `timeout = None`(网络类命令 push/fetch)不做超时:命令照常返回。
+#[cfg(all(feature = "local_fs", unix))]
+#[test]
+fn run_command_without_timeout_returns_output() {
+    let mut cmd = command::blocking::Command::new("echo");
+    cmd.arg("no-timeout")
+        .stdout(command::Stdio::piped())
+        .stderr(command::Stdio::piped());
+
+    let (status, stdout, _stderr) =
+        super::run_command_with_timeout(&mut cmd, None).expect("应成功");
+
+    assert!(status.success());
+    assert_eq!(String::from_utf8_lossy(&stdout).trim(), "no-timeout");
+}
+
+/// 超时兜底:命令超时必须被 kill 并返回 Err,绝不能永久挂住。
+///
+/// 背景见 `GIT_LOCAL_COMMAND_TIMEOUT` 注释:`command::async`(async-process)会丢失
+/// 快速退出子进程的完成事件,导致 `output().await` 永久挂起(审核面板卡 Loading)。
+#[cfg(all(feature = "local_fs", unix))]
+#[test]
+fn run_command_with_timeout_kills_long_running_command() {
+    let started = std::time::Instant::now();
+    let mut cmd = command::blocking::Command::new("sleep");
+    cmd.arg("30")
+        .stdout(command::Stdio::piped())
+        .stderr(command::Stdio::piped());
+
+    let result =
+        super::run_command_with_timeout(&mut cmd, Some(std::time::Duration::from_millis(200)));
+
+    assert!(result.is_err(), "超时应返回 Err");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "超时后应很快返回,不能挂住"
+    );
+}
