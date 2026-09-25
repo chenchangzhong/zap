@@ -30,6 +30,7 @@ const GIT_LOCAL_COMMAND_TIMEOUT: Duration = std::time::Duration::from_secs(30);
 fn run_command_with_timeout(
     command: &mut command::blocking::Command,
     timeout: Option<Duration>,
+    stdin: Option<Vec<u8>>,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
@@ -39,12 +40,24 @@ fn run_command_with_timeout(
         })
     }
 
+    if stdin.is_some() {
+        command.stdin(command::Stdio::piped());
+    }
+
     let mut child = command
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn command: {e}"))?;
 
     let stdout_reader = child.stdout.take().map(drain);
     let stderr_reader = child.stderr.take().map(drain);
+
+    // stdin 必须在 stdout/stderr 已经由独立线程读取之后再写:否则子进程的大输出会写满
+    // 管道缓冲,与这里的写入互相死锁。写完即 drop,子进程才会读到 EOF。
+    if let Some(bytes) = stdin {
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = std::io::Write::write_all(&mut pipe, &bytes);
+        }
+    }
 
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let status = loop {
@@ -104,12 +117,13 @@ pub async fn run_git_network_command(
 /// 公共实现:阻塞 git 调用放到独立线程,结果经 oneshot 回传;调用方只 await、
 /// 不阻塞执行器线程。`timeout` 语义见 [`run_command_with_timeout`]。
 #[cfg(feature = "local_fs")]
-async fn run_git_command_inner(
+async fn run_git_command_raw(
     repo_path: &Path,
     args: &[&str],
     path_env: Option<&str>,
     timeout: Option<Duration>,
-) -> Result<String> {
+    stdin: Option<Vec<u8>>,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     log::debug!(
         "[GIT OPERATION] git.rs run_git_command git {}",
         args.join(" ")
@@ -135,13 +149,24 @@ async fn run_git_command_inner(
             if let Some(path_env) = path_env {
                 cmd.env("PATH", path_env);
             }
-            let _ = tx.send(run_command_with_timeout(&mut cmd, timeout));
+            let _ = tx.send(run_command_with_timeout(&mut cmd, timeout, stdin));
         })
         .map_err(|e| anyhow!("Failed to spawn git worker thread: {e}"))?;
 
-    let (status, stdout_bytes, stderr_bytes) = rx
-        .await
-        .map_err(|_| anyhow!("git worker thread exited without a result"))??;
+    rx.await
+        .map_err(|_| anyhow!("git worker thread exited without a result"))?
+}
+
+/// 字符串版:沿用 git 的退出码约定判定成败,并做 lossy 转换。
+#[cfg(feature = "local_fs")]
+async fn run_git_command_inner(
+    repo_path: &Path,
+    args: &[&str],
+    path_env: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<String> {
+    let (status, stdout_bytes, stderr_bytes) =
+        run_git_command_raw(repo_path, args, path_env, timeout, None).await?;
 
     let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
     let stderr = String::from_utf8_lossy(&stderr_bytes);
@@ -154,6 +179,34 @@ async fn run_git_command_inner(
         Ok(stdout)
     } else {
         Err(anyhow!("Git command failed: {}, {}", stderr, stdout))
+    }
+}
+
+/// 需要按字节精确分帧的 git 调用:`cat-file --batch` 的输出是
+/// `<oid> <type> <size>\n<内容>`,lossy 转换会改变长度、破坏分帧,所以必须返回原始字节。
+/// 请求列表经 stdin 传入,因此一次进程即可取回 N 个对象(替代 N 次 `git show`)。
+#[cfg(feature = "local_fs")]
+pub async fn run_git_command_bytes_with_stdin(
+    repo_path: &Path,
+    args: &[&str],
+    stdin: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let (status, stdout_bytes, stderr_bytes) = run_git_command_raw(
+        repo_path,
+        args,
+        None,
+        Some(GIT_LOCAL_COMMAND_TIMEOUT),
+        Some(stdin),
+    )
+    .await?;
+
+    if status.success() {
+        Ok(stdout_bytes)
+    } else {
+        Err(anyhow!(
+            "Git command failed: {}",
+            String::from_utf8_lossy(&stderr_bytes)
+        ))
     }
 }
 
@@ -177,6 +230,15 @@ pub async fn run_git_network_command(
     _args: &[&str],
     _path_env: Option<&str>,
 ) -> Result<String> {
+    Err(anyhow!("Not supported on wasm"))
+}
+
+#[cfg(not(feature = "local_fs"))]
+pub async fn run_git_command_bytes_with_stdin(
+    _repo_path: &Path,
+    _args: &[&str],
+    _stdin: Vec<u8>,
+) -> Result<Vec<u8>> {
     Err(anyhow!("Not supported on wasm"))
 }
 

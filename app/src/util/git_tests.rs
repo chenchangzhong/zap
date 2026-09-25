@@ -96,7 +96,7 @@ fn run_command_with_timeout_returns_output() {
         .stderr(command::Stdio::piped());
 
     let (status, stdout, _stderr) =
-        super::run_command_with_timeout(&mut cmd, Some(std::time::Duration::from_secs(5)))
+        super::run_command_with_timeout(&mut cmd, Some(std::time::Duration::from_secs(5)), None)
             .expect("短命令应成功");
 
     assert!(status.success());
@@ -113,7 +113,7 @@ fn run_command_without_timeout_returns_output() {
         .stderr(command::Stdio::piped());
 
     let (status, stdout, _stderr) =
-        super::run_command_with_timeout(&mut cmd, None).expect("应成功");
+        super::run_command_with_timeout(&mut cmd, None, None).expect("应成功");
 
     assert!(status.success());
     assert_eq!(String::from_utf8_lossy(&stdout).trim(), "no-timeout");
@@ -132,12 +132,38 @@ fn run_command_with_timeout_kills_long_running_command() {
         .stdout(command::Stdio::piped())
         .stderr(command::Stdio::piped());
 
-    let result =
-        super::run_command_with_timeout(&mut cmd, Some(std::time::Duration::from_millis(200)));
+    let result = super::run_command_with_timeout(
+        &mut cmd,
+        Some(std::time::Duration::from_millis(200)),
+        None,
+    );
 
     assert!(result.is_err(), "超时应返回 Err");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(5),
         "超时后应很快返回,不能挂住"
     );
+}
+
+/// stdin 通道:载荷远超管道缓冲(64KB)时也必须完整送达且不死锁 ——
+/// 这正是 `cat-file --batch` 的用法(请求列表经 stdin 传入)。
+/// 若把「写 stdin」放在启动 stdout/stderr 读取线程之前,这个测试会挂住。
+#[cfg(all(feature = "local_fs", unix))]
+#[test]
+fn run_command_with_timeout_delivers_large_stdin_without_deadlock() {
+    let payload = "x".repeat(1024 * 1024);
+
+    let mut cmd = command::blocking::Command::new("cat");
+    cmd.stdout(command::Stdio::piped())
+        .stderr(command::Stdio::piped());
+
+    let (status, stdout, _stderr) = super::run_command_with_timeout(
+        &mut cmd,
+        Some(std::time::Duration::from_secs(10)),
+        Some(payload.clone().into_bytes()),
+    )
+    .expect("cat 应成功");
+
+    assert!(status.success());
+    assert_eq!(String::from_utf8_lossy(&stdout), payload);
 }
