@@ -58,6 +58,11 @@ use crate::terminal::local_shell::LocalShellState;
 
 const UNCOMMITTED_CHANGES: &str = "Uncommitted changes";
 
+/// git 的二进制判据窗口(`FIRST_FEW_BYTES`):只看前 8000 字节内有无 NUL。
+/// 未跟踪文件的两处判据(`is_binary_file_content` 与 `synthesize_untracked_file_diff`)
+/// 共用它,避免两处漂移。
+const GIT_BINARY_CHECK_BYTES: usize = 8000;
+
 /// Represents a parsed unified diff header
 /// Format: @@ -old_start,old_count +new_start,new_count @@ [optional context]
 #[derive(Clone, Debug, PartialEq)]
@@ -1097,8 +1102,12 @@ impl DiffStateModel {
             handle.abort();
         }
 
-        // Always include base branch metadata since only code review uses this model now.
-        let include_base_branch = true;
+        // 只在当前模式真的需要「对比 main 分支」元数据时才计算它:那两条全树 diff 实测
+        // 每次约 545ms(`diff --name-status` 264ms + `diff --numstat` 281ms),而 Head
+        // 模式下 `against_base_branch` 没有任何消费方(`get_stats_for_mode(MainBranch)` 与
+        // `get_metadata()` 只在非 Head 模式下读取它)。切到分支模式时由视图补一次刷新,
+        // 见 `DiffStateModelEvent::DiffModeChanged` 的处理。
+        let include_base_branch = !matches!(self.mode, DiffMode::Head);
         let abort_handle = ctx.spawn(
             async move {
                 Self::load_metadata_for_repo(current_repository_path, include_base_branch).await
@@ -1145,8 +1154,12 @@ impl DiffStateModel {
             handle.abort();
         }
 
-        // Always include base branch metadata since only code review uses this model now.
-        let include_base_branch = true;
+        // 只在当前模式真的需要「对比 main 分支」元数据时才计算它:那两条全树 diff 实测
+        // 每次约 545ms(`diff --name-status` 264ms + `diff --numstat` 281ms),而 Head
+        // 模式下 `against_base_branch` 没有任何消费方(`get_stats_for_mode(MainBranch)` 与
+        // `get_metadata()` 只在非 Head 模式下读取它)。切到分支模式时由视图补一次刷新,
+        // 见 `DiffStateModelEvent::DiffModeChanged` 的处理。
+        let include_base_branch = !matches!(self.mode, DiffMode::Head);
         let abort_handle =
             ctx.spawn(
                 async move {
@@ -1730,8 +1743,19 @@ impl DiffStateModel {
 
         for (file_path, status) in changed_files {
             let is_binary = binary_files.contains(&file_path);
-            let mut file_diff =
-                Self::get_file_diff(repo_path, &file_path, &status, is_binary, None).await?;
+            // 未跟踪/新增文件:本地合成 diff,省掉一次 `git diff --no-index` spawn。
+            // numstat 已判为二进制的,走原路径(那条路径本来就不 spawn)。
+            let synthesized = if is_binary {
+                None
+            } else {
+                Self::synthesize_untracked_file_diff(repo_path, &file_path, &status)
+            };
+            let mut file_diff = match synthesized {
+                Some(diff) => diff,
+                None => {
+                    Self::get_file_diff(repo_path, &file_path, &status, is_binary, None).await?
+                }
+            };
             let content_at_head =
                 Self::get_file_content_at_head(repo_path, &file_path, &status).await;
 
@@ -1900,8 +1924,19 @@ impl DiffStateModel {
         status: &GitFileStatus,
         merge_base: Option<&str>,
     ) -> Result<Option<FileDiffAndContent>> {
-        let mut file_diff =
-            Self::get_file_diff(repo_path, file_path, status, is_binary, merge_base).await?;
+        // 未跟踪/新增文件:本地合成 diff,省掉一次 `git diff --no-index` spawn。
+        // numstat 已判为二进制的,走原路径(那条路径本来就不 spawn)。
+        let synthesized = if is_binary {
+            None
+        } else {
+            Self::synthesize_untracked_file_diff(repo_path, file_path, status)
+        };
+        let mut file_diff = match synthesized {
+            Some(diff) => diff,
+            None => {
+                Self::get_file_diff(repo_path, file_path, status, is_binary, merge_base).await?
+            }
+        };
 
         // Skip files that have no actual changes (empty hunks and not binary)
         // Also skip files with no additions or deletions (no real changes) except for renamed or new files.
@@ -2427,6 +2462,118 @@ impl DiffStateModel {
         }
     }
 
+    /// 按 git 自己的二进制判据(`buffer_is_binary`:前 8000 字节内出现 NUL 即二进制)
+    /// 判断工作树文件的内容。
+    ///
+    /// 角色:未跟踪/新增文件的常规路径已由 [`Self::synthesize_untracked_file_diff`] 用
+    /// 整份内容处理(含二进制);本函数只服务它之外的情形 —— 例如超大文件 `fs::read`
+    /// 失败但首块仍可读时,`get_file_diff` 靠它给出与 `git diff --no-index` 相同的固定
+    /// 二进制结构(hunks 为空、`is_binary=true`、size 为 `Normal`),省掉一次 spawn。
+    ///
+    /// 与 git 的一致性:窗口与判据都和 git 相同,因此返回 `true` 时 git 也会判为二进制
+    /// (除非 `.gitattributes` 强制指定,这类文件本来也渲染不出有效 diff)。读取失败
+    /// 一律返回 `false`,保守回退到 git 路径,不会把文本文件误判成二进制。
+    fn is_binary_file_content(file_path: &Path) -> bool {
+        let Ok(mut file) = File::open(file_path) else {
+            return false;
+        };
+        let mut buffer = vec![0; GIT_BINARY_CHECK_BYTES];
+        let Ok(bytes_read) = file.read(&mut buffer) else {
+            return false;
+        };
+        buffer.truncate(bytes_read);
+        buffer.contains(&0)
+    }
+
+    /// 未跟踪/新增文件的 diff 是「全部行新增」,完全由文件内容决定 —— 不需要 spawn
+    /// `git diff --no-index /dev/null <file>`(实测 ≈7ms/文件;未跟踪文件多的仓库里,
+    /// 这批 spawn 占打开面板关键路径的一半以上)。这里在本地合成与那条命令**逐字段相同**
+    /// 的 [`FileDiff`],由 `diff_state_tests.rs` 里以 git 路径为 oracle 的对照测试锁定。
+    ///
+    /// 返回 `None` 表示无法本地判定(非 New/Untracked 状态、或文件读不到),调用方**必须**
+    /// 回退到 git 路径。
+    ///
+    /// 两处刻意与 git 对齐的地方:
+    /// - 二进制判据同 git(前 8000 字节内出现 NUL),命中即返回固定的二进制结构;
+    /// - `size` 用「文件字节数 + 行数 + 头部估算」代理 `git diff` 的输出长度。分级阈值是
+    ///   2.19MB / 4.375MB 量级,代理值只差几十字节,不影响分级。
+    fn synthesize_untracked_file_diff(
+        repo_path: &Path,
+        file_path: &PathBuf,
+        status: &GitFileStatus,
+    ) -> Option<FileDiff> {
+        if !status.is_new_file() {
+            return None;
+        }
+
+        let bytes = std::fs::read(repo_path.join(file_path)).ok()?;
+
+        /// `git diff --no-index /dev/null <f>`(`--patch-with-raw -z`)的头部大致字节数:
+        /// raw 行 + new file mode / index / --- / +++ 四行 + hunk 头。
+        const GIT_NO_INDEX_HEADER_BYTES: usize = 160;
+
+        let check_len = bytes.len().min(GIT_BINARY_CHECK_BYTES);
+        if bytes[..check_len].contains(&0) {
+            return Some(FileDiff {
+                file_path: file_path.clone(),
+                status: status.clone(),
+                hunks: Arc::new(Vec::new()),
+                is_binary: true,
+                is_autogenerated: false,
+                max_line_number: 0,
+                has_hidden_bidi_chars: false,
+                size: DiffSize::Normal,
+            });
+        }
+
+        let content = String::from_utf8_lossy(&bytes);
+        // 与 git 路径的下游保持一致:`parse_diff_hunks` 用 `str::lines()`,它同时按 `\n`
+        // 与 `\r\n` 切行(CRLF 的 CR 被吃掉)、结尾换行不产生额外空行、空文件得到 0 行。
+        let lines: Vec<&str> = content.lines().collect();
+
+        let hunks = if lines.is_empty() {
+            Vec::new()
+        } else {
+            let hunk_lines = lines
+                .iter()
+                .enumerate()
+                .map(|(index, text)| DiffLine {
+                    line_type: DiffLineType::Add,
+                    old_line_number: None,
+                    new_line_number: Some(index + 1),
+                    text: (*text).to_string(),
+                    // git 路径经 `parse_diff_hunks` 后该字段恒为 false(标记行会被跳过)。
+                    no_trailing_newline: false,
+                })
+                .collect();
+            vec![DiffHunk {
+                old_start_line: 0,
+                old_line_count: 0,
+                new_start_line: 1,
+                new_line_count: lines.len(),
+                lines: hunk_lines,
+                unified_diff_start: 0,
+                unified_diff_end: 0,
+            }]
+        };
+
+        let approx_diff_len = bytes.len() + lines.len() + GIT_NO_INDEX_HEADER_BYTES;
+        let max_line_number = lines.len();
+        let size = compute_diff_size(&hunks, approx_diff_len);
+        let has_hidden_bidi_chars = Self::check_for_hidden_bidi_chars(&content);
+
+        Some(FileDiff {
+            file_path: file_path.clone(),
+            status: status.clone(),
+            hunks: Arc::new(hunks),
+            is_binary: false,
+            is_autogenerated: false,
+            max_line_number,
+            has_hidden_bidi_chars,
+            size,
+        })
+    }
+
     /// Gets the diff for a specific file
     /// This matches Git Desktop's getWorkingDirectoryDiff implementation
     /// If commit is provided, diffs against that commit; otherwise handles different statuses appropriately
@@ -2463,6 +2610,24 @@ impl DiffStateModel {
                 status: status.clone(),
                 hunks: Arc::new(Vec::new()),
                 is_binary: false,
+                is_autogenerated: false,
+                max_line_number: 0,
+                has_hidden_bidi_chars: false,
+                size: DiffSize::Normal,
+            });
+        }
+
+        // 未跟踪/新增文件的兜底层:`synthesize_untracked_file_diff` 已覆盖常规情形
+        // (含二进制),这里只兜住它拿不到整份内容的情况(例如超大文件 `fs::read` 失败、
+        // 但首块仍可读)——此时本地判为二进制即可省掉一次 `git diff --no-index`。
+        if matches!(status, GitFileStatus::New | GitFileStatus::Untracked)
+            && Self::is_binary_file_content(&repo_path.join(file_path))
+        {
+            return Ok(FileDiff {
+                file_path: file_path.clone(),
+                status: status.clone(),
+                hunks: Arc::new(Vec::new()),
+                is_binary: true,
                 is_autogenerated: false,
                 max_line_number: 0,
                 has_hidden_bidi_chars: false,

@@ -2890,6 +2890,22 @@ impl CodeReviewView {
                 self.load_diffs_for_active_repo(should_fetch_base, ctx);
                 self.invalidate_all(None, ctx);
                 ctx.notify();
+
+                // 「对比 main 分支」的元数据是按需计算的(Head 模式下不算,见
+                // `refresh_diff_metadata_for_current_repo`)。切进分支模式时必须补一次刷新,
+                // 否则 `against_base_branch` 为空,`update_aggregate_stats` 会直接早返回,
+                // 汇总数字会停在 Head 模式的值上。
+                if !matches!(
+                    self.diff_state_model.as_ref(ctx).diff_mode(),
+                    DiffMode::Head
+                ) {
+                    self.diff_state_model.update(ctx, |model, ctx| {
+                        model.refresh_diff_metadata_for_current_repo(
+                            InvalidationBehavior::PromptRefresh,
+                            ctx,
+                        );
+                    });
+                }
             }
             DiffStateModelEvent::NewDiffsComputed(diffs) => {
                 self.invalidate_all(diffs.as_ref(), ctx);
