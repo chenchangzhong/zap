@@ -79,8 +79,8 @@ impl RenderableBlock for RenderableTemporaryBlock {
         // rect over the whole reserved box covers every spacer row contiguously.
         if self.is_spacer {
             // 深色背景上 α=26(10%)的灰与底色几乎无差,肉眼等同于「空行
-            // 没渲染」;α=80 时叠加结果明显可见,又不盖过 diff 行高亮。
-            let background: Fill = ColorU::new(140, 140, 140, 80).into();
+            // 没渲染」;这里取 α=15,只留一层极淡的分界,不盖过 diff 行高亮。
+            let background: Fill = ColorU::new(140, 140, 140, 15).into();
             ctx.paint.scene.draw_rect_without_hit_recording(
                 self.viewport_item.reserved_bounds(ctx),
             )

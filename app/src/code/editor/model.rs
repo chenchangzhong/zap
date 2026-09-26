@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::{cmp, mem};
 use warp_core::platform::SessionPlatform;
 use warp_core::send_telemetry_from_ctx;
-use warp_core::ui::theme::Fill;
+use warp_core::ui::theme::{ColorScheme, Fill};
 use warp_editor::content::anchor::Anchor;
 use warp_editor::content::edit::EditDelta;
 use warp_editor::content::edit::TemporaryBlock;
@@ -23,12 +23,14 @@ use warp_editor::content::version::BufferVersion;
 use warp_editor::multiline::{AnyMultilineString, MultilineString, LF};
 use warp_editor::render::model::{AutoScrollMode, LineCount, StyleUpdateAction};
 use warp_editor::selection::TextDirection;
-use warpui::units::{IntoPixels, Pixels};
+use warpui::{
+    color::ColorU,
+    units::{IntoPixels, Pixels},
+};
 
 use crate::util::link_detection::get_word_range_at_offset;
 use crate::{
     appearance::Appearance, editor::InteractionState, notebooks::editor::model::word_unit,
-    themes::theme::AnsiColorIdentifier,
 };
 
 use ai::diff_validation::DiffDelta;
@@ -1368,36 +1370,24 @@ impl CodeEditorModel {
         }
     }
 
+    /// 代码语法高亮配色,对齐 VS Code 的 tokenColors:深色主题取 2026 Dark,浅色主题取 2026 Light。
+    /// 取值来源: VS Code 内置主题 theme-defaults/themes/2026-dark.json 与 2026-light.json。
+    /// 每个槽对应的 VS Code scope,按下方字段顺序:
+    /// keyword / entity.name.function / string / support·constant /
+    /// semanticTokenColors.numberLiteral / comment / meta.property-name / entity.name.tag。
     fn syntax_highlighting_color_map(ctx: &mut ModelContext<Self>) -> ColorMap {
-        let appearance = Appearance::as_ref(ctx);
-        let terminal_color = appearance.theme().terminal_colors().normal;
-
-        // TODO: This mapping is not finalized. We still need to double check with design.
+        let is_dark =
+            Appearance::as_ref(ctx).theme().inferred_color_scheme() == ColorScheme::LightOnDark;
+        let pick = |dark: u32, light: u32| ColorU::from_u32(if is_dark { dark } else { light });
         ColorMap {
-            keyword_color: AnsiColorIdentifier::Magenta
-                .to_ansi_color(&terminal_color)
-                .into(),
-            function_color: AnsiColorIdentifier::Blue
-                .to_ansi_color(&terminal_color)
-                .into(),
-            string_color: AnsiColorIdentifier::Green
-                .to_ansi_color(&terminal_color)
-                .into(),
-            type_color: AnsiColorIdentifier::Red
-                .to_ansi_color(&terminal_color)
-                .into(),
-            number_color: AnsiColorIdentifier::Green
-                .to_ansi_color(&terminal_color)
-                .into(),
-            comment_color: AnsiColorIdentifier::Yellow
-                .to_ansi_color(&terminal_color)
-                .into(),
-            property_color: AnsiColorIdentifier::Cyan
-                .to_ansi_color(&terminal_color)
-                .into(),
-            tag_color: AnsiColorIdentifier::Red
-                .to_ansi_color(&terminal_color)
-                .into(),
+            keyword_color: pick(0xff7b72ff, 0xcf222eff),
+            function_color: pick(0xd2a8ffff, 0x8250dfff),
+            string_color: pick(0xa5d6ffff, 0x0a3069ff),
+            type_color: pick(0x79c0ffff, 0x0550aeff),
+            number_color: pick(0xb5cea8ff, 0x098658ff),
+            comment_color: pick(0x8b949eff, 0x6e7781ff),
+            property_color: pick(0x79c0ffff, 0x0550aeff),
+            tag_color: pick(0x7ee787ff, 0x116329ff),
         }
     }
 
