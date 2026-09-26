@@ -23,10 +23,100 @@ use crate::{
     appearance::Appearance,
     code::editor::{line::EditorLineLocation, line_iterator::LineIterator},
 };
-use warp_core::ui::theme::AnsiColorIdentifier;
+use warp_core::ui::theme::{AnsiColorIdentifier, ColorScheme};
 
-const OVERLAY_ALPHA: u8 = 56;
-const INLINE_OVERLAY_ALPHA: u8 = 71;
+// diff 面板的增删配色对齐 VS Code,按主题明暗分别取 2026 Dark / 2026 Light 的值。
+// 取值来源: VS Code 内置主题 theme-defaults/themes/2026-dark.json 与 2026-light.json。
+
+/// `diffEditor.insertedLineBackground`
+const DARK_ADDED_LINE_BACKGROUND: ColorU = ColorU {
+    r: 0x34,
+    g: 0x7d,
+    b: 0x39,
+    a: 0x26,
+};
+/// `diffEditor.removedLineBackground`
+const DARK_REMOVED_LINE_BACKGROUND: ColorU = ColorU {
+    r: 0xc9,
+    g: 0x3c,
+    b: 0x37,
+    a: 0x26,
+};
+/// `diffEditor.insertedTextBackground`
+const DARK_ADDED_TEXT_BACKGROUND: ColorU = ColorU {
+    r: 0x57,
+    g: 0xab,
+    b: 0x5a,
+    a: 0x4d,
+};
+/// `diffEditor.removedTextBackground`
+const DARK_REMOVED_TEXT_BACKGROUND: ColorU = ColorU {
+    r: 0xf4,
+    g: 0x70,
+    b: 0x67,
+    a: 0x4d,
+};
+/// `editorGutter.addedBackground`
+const DARK_GUTTER_ADDED: ColorU = ColorU {
+    r: 0x72,
+    g: 0xc8,
+    b: 0x92,
+    a: 0xff,
+};
+/// `editorGutter.deletedBackground`
+const DARK_GUTTER_DELETED: ColorU = ColorU {
+    r: 0xf2,
+    g: 0x87,
+    b: 0x72,
+    a: 0xff,
+};
+/// 2026 Light 未定义 `diffEditor.*LineBackground`,故不绘制整行背景(透明)。
+const LIGHT_ADDED_LINE_BACKGROUND: ColorU = ColorU {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 0,
+};
+/// 2026 Light 未定义 `diffEditor.*LineBackground`,故不绘制整行背景(透明)。
+const LIGHT_REMOVED_LINE_BACKGROUND: ColorU = ColorU {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 0,
+};
+/// `diffEditor.insertedTextBackground`
+const LIGHT_ADDED_TEXT_BACKGROUND: ColorU = ColorU {
+    r: 0x58,
+    g: 0x7c,
+    b: 0x0c,
+    a: 0x26,
+};
+/// `diffEditor.removedTextBackground`
+const LIGHT_REMOVED_TEXT_BACKGROUND: ColorU = ColorU {
+    r: 0xad,
+    g: 0x07,
+    b: 0x07,
+    a: 0x26,
+};
+/// `editorGutter.addedBackground`
+const LIGHT_GUTTER_ADDED: ColorU = ColorU {
+    r: 0x58,
+    g: 0x7c,
+    b: 0x0c,
+    a: 0xff,
+};
+/// `editorGutter.deletedBackground`
+const LIGHT_GUTTER_DELETED: ColorU = ColorU {
+    r: 0xad,
+    g: 0x07,
+    b: 0x07,
+    a: 0xff,
+};
+
+/// 当前主题是否为深色(浅色前景画在深色背景上)。
+fn is_dark_theme(appearance: &Appearance) -> bool {
+    appearance.theme().inferred_color_scheme() == ColorScheme::LightOnDark
+}
 
 /// Get the theme-appropriate add color
 pub(crate) fn add_color(appearance: &Appearance) -> ColorU {
@@ -49,40 +139,60 @@ pub(crate) fn replace_color(appearance: &Appearance) -> ColorU {
         .into()
 }
 
-/// Get the theme-appropriate remove overlay color
+/// 删除行的整行背景色(对齐 VS Code `diffEditor.removedLineBackground`)
 pub(crate) fn remove_overlay_color(appearance: &Appearance) -> ColorU {
-    let ansi_color =
-        AnsiColorIdentifier::Red.to_ansi_color(&appearance.theme().terminal_colors().normal);
-    let mut color: ColorU = ansi_color.into();
-    color.a = OVERLAY_ALPHA;
-    color
+    if is_dark_theme(appearance) {
+        DARK_REMOVED_LINE_BACKGROUND
+    } else {
+        LIGHT_REMOVED_LINE_BACKGROUND
+    }
 }
 
-/// Get the theme-appropriate add overlay color
+/// 新增行的整行背景色(对齐 VS Code `diffEditor.insertedLineBackground`)
 pub(crate) fn add_overlay_color(appearance: &Appearance) -> ColorU {
-    let ansi_color =
-        AnsiColorIdentifier::Green.to_ansi_color(&appearance.theme().terminal_colors().normal);
-    let mut color: ColorU = ansi_color.into();
-    color.a = OVERLAY_ALPHA;
-    color
+    if is_dark_theme(appearance) {
+        DARK_ADDED_LINE_BACKGROUND
+    } else {
+        LIGHT_ADDED_LINE_BACKGROUND
+    }
 }
 
-/// Get the theme-appropriate add inline overlay color
+/// 新增侧的行内词级高亮色(对齐 VS Code `diffEditor.insertedTextBackground`)
 pub(crate) fn add_inline_overlay_color(appearance: &Appearance) -> ColorU {
-    let ansi_color =
-        AnsiColorIdentifier::Green.to_ansi_color(&appearance.theme().terminal_colors().normal);
-    let mut color: ColorU = ansi_color.into();
-    color.a = INLINE_OVERLAY_ALPHA;
-    color
+    if is_dark_theme(appearance) {
+        DARK_ADDED_TEXT_BACKGROUND
+    } else {
+        LIGHT_ADDED_TEXT_BACKGROUND
+    }
 }
 
-/// Get the theme-appropriate remove inline overlay color
+/// 删除侧的行内词级高亮色(对齐 VS Code `diffEditor.removedTextBackground`)
 pub(crate) fn remove_inline_overlay_color(appearance: &Appearance) -> ColorU {
-    let ansi_color =
-        AnsiColorIdentifier::Red.to_ansi_color(&appearance.theme().terminal_colors().normal);
-    let mut color: ColorU = ansi_color.into();
-    color.a = INLINE_OVERLAY_ALPHA;
-    color
+    if is_dark_theme(appearance) {
+        DARK_REMOVED_TEXT_BACKGROUND
+    } else {
+        LIGHT_REMOVED_TEXT_BACKGROUND
+    }
+}
+
+/// diff 面板 gutter 的新增指示条色(对齐 VS Code `editorGutter.addedBackground`)。
+/// 单独取名,避免影响其他复用 [`add_color`] / [`remove_color`] 的视图。
+fn diff_gutter_add_color(appearance: &Appearance) -> ColorU {
+    if is_dark_theme(appearance) {
+        DARK_GUTTER_ADDED
+    } else {
+        LIGHT_GUTTER_ADDED
+    }
+}
+
+/// diff 面板 gutter 的删除指示条色(对齐 VS Code `editorGutter.deletedBackground`)。
+/// 单独取名,避免影响其他复用 [`add_color`] / [`remove_color`] 的视图。
+fn diff_gutter_remove_color(appearance: &Appearance) -> ColorU {
+    if is_dark_theme(appearance) {
+        DARK_GUTTER_DELETED
+    } else {
+        LIGHT_GUTTER_DELETED
+    }
 }
 
 pub enum DiffModelEvent {
@@ -198,16 +308,20 @@ impl DiffStatus {
     ) -> Option<DiffHunkDisplay> {
         let line_num = line_num.as_usize();
         if self.deletion_mapping.contains_key(&line_num) {
-            return Some(DiffHunkDisplay::Remove(remove_color(appearance)));
+            return Some(DiffHunkDisplay::Remove(diff_gutter_remove_color(
+                appearance,
+            )));
         }
 
         match self.change_mapping.get(&line_num) {
             Some(ChangeType::Replacement { .. }) => Some(DiffHunkDisplay::Replacement {
                 collapsed_color: replace_color(appearance),
-                add_color: add_color(appearance),
-                remove_color: remove_color(appearance),
+                add_color: diff_gutter_add_color(appearance),
+                remove_color: diff_gutter_remove_color(appearance),
             }),
-            Some(ChangeType::Addition) => Some(DiffHunkDisplay::Add(add_color(appearance))),
+            Some(ChangeType::Addition) => {
+                Some(DiffHunkDisplay::Add(diff_gutter_add_color(appearance)))
+            }
             None => None,
         }
     }
