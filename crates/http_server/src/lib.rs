@@ -47,7 +47,15 @@ impl HttpServer {
 
         runtime.spawn(async move {
             let addr = SocketAddr::from(([127, 0, 0, 1], PORT));
-            let listener = tokio::net::TcpListener::bind(addr).await?;
+            // bind 失败原本只让这个 async 任务返回 Err(静默无监听,调用方以为成功);
+            // 显式记录,避免"端口被别的实例占用"这类问题被完全掩盖。
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    log::error!("Failed to bind local HTTP server on {addr}: {err:#}");
+                    return Err(err);
+                }
+            };
 
             axum::serve(listener, root.layer(TraceLayer::new_for_http())).await
         });
