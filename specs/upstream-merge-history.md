@@ -2507,3 +2507,81 @@ not 1) roughly halves build time versus codegen-units=1 for ~4% larger stripped/
    而实测数据是「186 个交换、2 个不同值、都不是 epoch（会话创建时间）」——两次都漏掉了真实形态。
    先量（P9/P11）再写判据，能省一轮构建 + 一次用户复现。
 3. **兼容回退要显式门控 + 注释标记**：本地 shim 只在退化时生效，避免污染上游路径；`history.md` 与本提交信息都写明「本地 shim」。
+
+## 44. §43 漏行补记（debug 切历史会话崩溃）+ 用户消息靠右的本地偏离（2026-10-09）
+
+> 触发：用户在 **debug 构建**里打开含命令块的历史智能体会话必闪退（SIGABRT，3 次实测）；修完后按要求把「靠右版式」这类**有意偏离上游**的实现登记在案。
+
+### 44.1 §43 移植漏了一行：`is_local: Some(true) → None`（提交 `8f5675176`）
+
+**现象**：debug 构建「打开历史会话」必崩，`~/Library/Logs/DiagnosticReports/zap-oss-*.ips` 三次同栈：
+
+```
+Block::set_restored_block_was_local   ← debug_assert! 失败
+BlockList::create_new_block ← restore_block ← insert_restored_block
+TerminalView::restore_conversation_after_view_creation ← enter_agent_view_for_conversations
+```
+
+**根因**：§43 采纳上游 `a2f586584`(#10423) 时只搬了「恢复时先插入会话持久化的命令块」这半条，
+**漏掉同一提交里 `conversation.rs::to_serialized_blocklist_items` 的 `is_local: Some(true) → None`**。
+`insert_restored_block` 硬编码以 `PostBootstrapPrecmd` 阶段插入，而 `Block::set_restored_block_was_local`
+的 `debug_assert!` 只允许 `RestoreBlocks` 阶段透传 `is_local` ⇒ 带 `Some` 的块必触发断言。
+release 构建因 `debug_assert!` 被编译掉而**不受影响**——这就是「正式版没问题、以前也没问题」的来源
+（正式版是日常入口，debug 只在开发时跑）。
+
+**走过的弯路（已回退）**：我第一轮在 `restore_block` 里加「只在 `RestoreBlocks` 阶段透传 `is_local`」的兜底。
+它确实能止崩，但那是**在上游函数里补症状**：把断言变成永不触发的死代码，还平白引入与上游的差异。
+按用户「先逐行对比参考实现」的要求回溯到 `a2f586584` 的 diff，才看到上游同批就是改这一行 ⇒ 改为补行，
+`restore_block` / `insert_restored_block` 回到与上游**逐字一致**（`git diff` 0 差异）。
+
+**可达性核查**（确认补行后没有别的路径还能把 `Some` 送进断言）：
+
+| `restore_block` 调用点 | 阶段 | 可达 | 传入 `is_local` |
+|---|---|---|---|
+| `blocks.rs` `initialize`（DB 恢复） | `RestoreBlocks` | 可达 | DB 的 `Some(bool)`——**合法路径，语义原样保留** |
+| `blocks.rs` `load_shared_session_scrollback` / `append_followup_shared_session_scrollback` | `PostBootstrapPrecmd` | **不可达**（本仓无调用者，见 §28.2 无共享会话 viewer） | — |
+| `blocks.rs` `insert_restored_block` ← AI 历史会话恢复 | `PostBootstrapPrecmd` | 可达（本次崩溃） | **改为 `None`** |
+| 同上 ← `restore_cli_agent_block_snapshot` | `PostBootstrapPrecmd` | **不可达**（`LoadedConversationData::CLIAgent` 在本仓从不构造，loader 只产出 `Oz`） | — |
+
+消费面确认（`None` 不改变可达行为）：唯一语义消费方 `TerminalView::contains_restored_remote_blocks`
+用 `restored_block_was_local().unwrap_or(true)` ⇒ `None ≡ Some(true)`；`BlockCompletedEvent.restored_block_was_local`
+全仓**无读取方**；持久化的 `is_local` 走独立入参（`persistence::block_list::create_block`），不读 `SerializedBlock.is_local`。
+
+**测试**（防回归成对）：`conversation_tests::serialized_command_blocks_do_not_carry_local_status`
+钉住序列化必须给 `None`；`blocks_test::test_set_restored_block_was_local_rejects_non_restore_stage`
+（`#[should_panic]`）钉住断言本身不被吞掉。
+
+**验证**：`cargo nextest -p warp -E 'test(ai::agent::conversation::tests) or test(terminal::model::blocks::tests)'`
+→ **73/73 过**；`cargo check --bin zap-oss` 绿；用户实机确认「切换历史会话正常」，此后无新增崩溃报告。
+
+**教训**：
+
+1. **移植要按「上游整个提交」对照，而不是照 PR 描述搬主逻辑**：`a2f586584` 的标题讲的是「恢复流程重构」，
+   但同一个提交里还带了数据字段的修正；只搬 PR 描述里的那半条，就会留下一颗只在 debug 构建引爆的雷。
+   落地做法：移植后对**同名函数**做一次 `diff <(git show upstream:<file>) <(cat 本文件)`，逐段确认差异都是**有意为之**。
+2. **断言是护栏，不要为了止崩把它改死**：让调用方永远不触发断言，等于删掉了未来发现同类错误的唯一手段；
+   正确做法是让**数据**符合上游契约（本次就是把 `Some` 改回 `None`）。
+3. **`debug_assert!` 类故障只在 debug 复现**：正式版根本不崩，会让人误判「以前没这问题」；
+   定位这类问题先确认构建类型与崩溃报告（`.ips`）里的栈，比在源码里猜快得多。
+
+### 44.2 本地偏离：智能体页用户消息靠右 + Oz 圆标头像（提交 `4378e2a84`）
+
+**上游行为**：`AIBlock` 的提问行是「头像在左 + 消息文字在其右」，无头像图时头像显示 display name 首字母。
+
+**本仓行为（有意偏离，产品要求）**：
+
+| 文件 | 偏离内容 |
+|---|---|
+| `app/src/ai/blocklist/block/view_impl/query.rs` | 消息列（文本 / context chips / 附件）交叉轴 `End`；头像移到消息**右侧**；头像左间距改用 `QUERY_AVATAR_GAP` |
+| `app/src/ai/blocklist/block/view_impl/common.rs` | `render_user_avatar`：**无头像图时画 Oz logo**（`bundled/svg/oz.svg`）——圆底与 logo 取色同纵向标签页的 Oz 圆标（`theme.background()` 圆底 + `main_text_color` 的 logo，logo 占圆直径一半）；有头像图时仍显示图片 |
+| `app/src/ai/blocklist/block/view_impl.rs` | 提问行与其右侧 `⋯` 溢出菜单：① 补半个 `OVERFLOW_BUTTON_SIZE - icon_size` 让消息中线与按钮图标中线齐平（底部补偿同步减半）；② 间距按**点的可见边缘**算（新增本地常量 `QUERY_AVATAR_GAP = 16` 与 `OVERFLOW_ICON_HORIZONTAL_INSET`，后者由 `overflow.svg` 的 24×24 viewBox 内 `x∈[10.667,13.333]` 推导） |
+
+**同步注意**：这三处是**产品性偏离，需保留本仓实现**。上游若改动同文件，不要整文件取上游；
+以「靠右版式 + `QUERY_AVATAR_GAP` / `OVERFLOW_ICON_HORIZONTAL_INSET` 两个本地常量」为基线做三方合并。
+另注：`⋯` 按钮本身（`header.rs::render_overflow_menu_button`）未改动，仍是上游实现。
+
+**已知取舍（用户 2026-10-09 决定先不处理）**：共享会话里「有头像色、无头像图」的参与者，
+圆底现在也统一是 `theme.background()`（原来会用其专属色），参与者配色在头像上不再体现。
+
+**验证**：用户实机验收通过（新会话 + 历史会话，靠右版式与间距均已确认）；`cargo check --bin zap-oss` 绿；
+本仓改动区域 `cargo fmt --check` 无差异（全仓仍有存量 fmt 差异，未越界改动）。
