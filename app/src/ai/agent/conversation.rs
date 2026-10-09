@@ -3923,7 +3923,13 @@ impl AIConversation {
                 is_background: false,
                 prompt_snapshot: None,
                 ai_metadata,
-                is_local: Some(true),
+                // 移植 a2f586584（#10423）时漏掉的一行：这些块会被
+                // `BlockList::insert_restored_block` 以 `PostBootstrapPrecmd` 阶段插入，
+                // 而 `Block::set_restored_block_was_local` 的 debug_assert 只允许
+                // `RestoreBlocks` 阶段透传 is_local——保持 None，否则 debug 构建打开历史
+                // 会话时必 panic。消费方按 `restored_block_was_local().unwrap_or(true)`
+                // 视这些块为本地块，语义不变。
+                is_local: None,
                 agent_view_visibility: Some(
                     AgentViewVisibility::new_from_conversation(self.id).into(),
                 ),

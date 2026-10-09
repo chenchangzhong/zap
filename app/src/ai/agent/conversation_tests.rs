@@ -679,6 +679,60 @@ fn test_cli_subagent_serialized_block_preserves_block_id_and_metadata() {
 
 #[allow(deprecated)]
 #[test]
+fn serialized_command_blocks_do_not_carry_local_status() {
+    // 回归（2026-10-09）：移植上游 a2f586584（#10423）时漏掉了「is_local: Some(true) → None」
+    // 这一行。这些块会被 `BlockList::insert_restored_block` 以 PostBootstrapPrecmd 阶段插入，
+    // 而 `Block::set_restored_block_was_local` 的 debug_assert 只允许 RestoreBlocks 阶段透传
+    // is_local —— 带 Some 的块会让 debug 构建在「打开历史会话」时 panic（该断言本身由
+    // terminal::model::blocks 的 test_set_restored_block_was_local_rejects_non_restore_stage
+    // 钉住）。消费方按 `restored_block_was_local().unwrap_or(true)` 视这些块为本地块，
+    // 因此 None 与原 Some(true) 语义等价。
+    let conversation = AIConversation::new_restored(
+        AIConversationId::new(),
+        vec![api::Task {
+            id: "root-task".to_string(),
+            messages: vec![
+                user_query_message("query-1", "request-1", "echo hi"),
+                tool_call_message_with_tool("tool-call-1", "call-1", run_shell_command_tool()),
+                tool_call_result_message_with_result(
+                    "tool-result-1",
+                    "call-1",
+                    api::message::tool_call_result::Result::RunShellCommand(
+                        api::RunShellCommandResult {
+                            command: "echo hi".to_string(),
+                            output: String::new(),
+                            exit_code: 0,
+                            result: Some(api::run_shell_command_result::Result::CommandFinished(
+                                api::ShellCommandFinished {
+                                    command_id: "block-1".to_string(),
+                                    output: "hi".to_string(),
+                                    exit_code: 0,
+                                },
+                            )),
+                        },
+                    ),
+                ),
+            ],
+            dependencies: None,
+            description: String::new(),
+            summary: String::new(),
+            server_data: String::new(),
+        }],
+        None,
+    )
+    .unwrap();
+
+    let blocks = conversation.to_serialized_blocklist_items();
+    assert_eq!(blocks.len(), 1, "普通命令块应被序列化出来");
+    let SerializedBlockListItem::Command { block } = &blocks[0];
+    assert_eq!(
+        block.is_local, None,
+        "insert_restored_block 以 PostBootstrapPrecmd 阶段插入这些块，is_local 必须为 None"
+    );
+}
+
+#[allow(deprecated)]
+#[test]
 fn test_cli_subagent_serialized_block_prefers_persisted_snapshot_output() {
     let conversation_id = AIConversationId::new();
     let cli_task_id = TaskId::new("cli-task-snapshot".to_string());

@@ -670,6 +670,25 @@ pub fn test_restore_blocks_with_local_status() {
 }
 
 #[test]
+#[should_panic(expected = "set_restored_block_was_local should only be called for restored blocks")]
+pub fn test_set_restored_block_was_local_rejects_non_restore_stage() {
+    // 钉住 Block::set_restored_block_was_local 的前置条件：只有 RestoreBlocks 阶段的块才
+    // 允许写 restored_block_was_local。非该阶段（例如 insert_restored_block 走的
+    // PostBootstrapPrecmd）必须由调用方保证不透传 is_local——这正是
+    // AIConversation::to_serialized_blocklist_items 必须给 None 的原因
+    // （见 conversation_tests::serialized_command_blocks_do_not_carry_local_status）。
+    let (events_tx, _events_rx) = async_channel::unbounded();
+    let channel_event_proxy = ChannelEventListener::builder_for_test()
+        .with_terminal_events_tx(events_tx)
+        .build();
+
+    let mut block_list = new_bootstrapped_block_list(None, None, channel_event_proxy);
+    block_list
+        .active_block_mut()
+        .set_restored_block_was_local(true);
+}
+
+#[test]
 pub fn test_restore_block_that_wasnt_started() {
     let (events_tx, events_rx) = async_channel::unbounded();
     let channel_event_proxy = ChannelEventListener::builder_for_test()
