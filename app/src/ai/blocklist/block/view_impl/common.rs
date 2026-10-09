@@ -3406,7 +3406,11 @@ pub struct FindContext<'a> {
     pub state: &'a FindState,
 }
 
-/// Renders a user avatar with profile image or display name.
+/// Renders the avatar shown next to a user query.
+///
+/// 有头像图时（共享会话参与者 / 已登录用户）显示图片；没有图时显示带圆形底色的 Oz logo：
+/// 本地/OSS 构建没有真实账号，display name 会退化成占位邮箱首字母（test_user@warp.dev
+/// →「T」），对用户没有意义。
 pub fn render_user_avatar(
     user_display_name: &str,
     profile_image_path: Option<&String>,
@@ -3415,17 +3419,39 @@ pub fn render_user_avatar(
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
+    let size = icon_size(app);
+
+    let Some(profile_image_path) = profile_image_path else {
+        // 圆底与 logo 取色同纵向标签页的 Oz 圆标（ui_components::icon_with_status 的
+        // `IconWithStatusVariant::OzAgent`）：theme.background() 圆底 + main_text_color 的
+        // logo。logo 占圆直径一半，与那里的 10/5 比例一致；总尺寸仍是 icon_size，提问行的
+        // 垂直对齐与左右间距不受影响。
+        let logo_size = size / 2.;
+        return Container::new(
+            ConstrainedBox::new(
+                Icon::Oz
+                    .to_warpui_icon(theme.main_text_color(theme.background()))
+                    .finish(),
+            )
+            .with_width(logo_size)
+            .with_height(logo_size)
+            .finish(),
+        )
+        .with_uniform_padding(logo_size / 2.)
+        .with_background(theme.background())
+        .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
+        .finish();
+    };
+
     let background = avatar_color.unwrap_or_else(|| blended_colors::accent(theme).into());
     let avatar = Avatar::new(
-        profile_image_path
-            .map(|url| AvatarContent::Image {
-                url: url.to_owned(),
-                display_name: user_display_name.to_owned(),
-            })
-            .unwrap_or(AvatarContent::DisplayName(user_display_name.to_owned())),
+        AvatarContent::Image {
+            url: profile_image_path.to_owned(),
+            display_name: user_display_name.to_owned(),
+        },
         UiComponentStyles {
-            width: Some(icon_size(app)),
-            height: Some(icon_size(app)),
+            width: Some(size),
+            height: Some(size),
             font_family_id: Some(appearance.ui_font_family()),
             font_size: Some(appearance.monospace_font_size() - 2.),
             background: Some(background.into()),

@@ -1054,14 +1054,33 @@ impl View for AIBlock {
                         contents.add_child(rendered_query.with_content_item_spacing().finish());
                     } else {
                         // The query element is designed to be exactly icon_size() height.
+                        // 三点菜单按钮是 OVERFLOW_BUTTON_SIZE 的方框、图标在框内垂直居中，
+                        // 而提问行高只有 icon_size：两者顶端对齐会让图标比消息文字低半个差值
+                        // （消息靠右并排在按钮旁边后尤其明显）。给提问补上半个差值，让消息
+                        // 中线与图标中线齐平；底部补偿相应从整个差值收到半个，消息下方间距不变。
                         let rendered_query_height = icon_size(app);
-                        let margin_bottom = (CONTENT_ITEM_VERTICAL_MARGIN
-                            - (OVERFLOW_BUTTON_SIZE - rendered_query_height).max(0.))
-                        .max(0.);
+                        let query_top_margin =
+                            (OVERFLOW_BUTTON_SIZE - rendered_query_height).max(0.) / 2.;
+                        let margin_bottom =
+                            (CONTENT_ITEM_VERTICAL_MARGIN - query_top_margin).max(0.);
+                        // 「⋯」按钮的方框比三个点的可见宽度宽得多（左右各留
+                        // OVERFLOW_ICON_HORIZONTAL_INSET），按方框对齐会显得比
+                        // 「头像↔消息文字」远，这里按点的可见边缘对齐。
+                        let overflow_menu_gap =
+                            (QUERY_AVATAR_GAP - OVERFLOW_ICON_HORIZONTAL_INSET).max(0.);
                         contents.add_child(
                             Flex::row()
+                                .with_spacing(overflow_menu_gap)
                                 .with_cross_axis_alignment(CrossAxisAlignment::Start)
-                                .with_child(Expanded::new(1., rendered_query).finish())
+                                .with_child(
+                                    Expanded::new(
+                                        1.,
+                                        Container::new(rendered_query)
+                                            .with_margin_top(query_top_margin)
+                                            .finish(),
+                                    )
+                                    .finish(),
+                                )
                                 .with_child(render_overflow_menu_button(
                                     self.state_handles.overflow_menu_handle.clone(),
                                     self.view_id,
@@ -1318,6 +1337,21 @@ impl View for AIBlock {
 /// Each sub-component of the AI block (header, query, output) is responsible for implementing its
 /// own padding and margin using these values.
 pub(crate) const CONTENT_HORIZONTAL_PADDING: f32 = 20.;
+
+/// 提问行里头像与消息文字之间的间距（视觉间距；无头部时「⋯」溢出菜单按钮与头像之间也
+/// 对齐到这个值——见 `OVERFLOW_ICON_HORIZONTAL_INSET`）。修改时两处一起生效：query.rs
+/// 里头像的左边距 + 本文件里提问行与溢出菜单之间的间距。
+pub(crate) const QUERY_AVATAR_GAP: f32 = 16.;
+
+/// `bundled/svg/overflow.svg` 是 24×24 viewBox，三个点只占 x∈[10.667, 13.333]（宽 8/3）。
+/// 图标以 `FitType::Contain` 缩放填满 `OVERFLOW_BUTTON_SIZE` 方框，所以点的可见宽度只有
+/// 方框的 `(8/3) / 24 ≈ 11%`，其余是方框内的空白。
+const OVERFLOW_DOTS_WIDTH_RATIO: f32 = (8. / 3.) / 24.;
+
+/// 「⋯」按钮方框内、三个点左侧（或右侧）的空白宽度：布局间距要按点的**可见边缘**算，
+/// 否则方框边距会显得比实际看到的大。
+const OVERFLOW_ICON_HORIZONTAL_INSET: f32 =
+    OVERFLOW_BUTTON_SIZE * (1. - OVERFLOW_DOTS_WIDTH_RATIO) / 2.;
 
 /// The vertical padding applied to the AIBlock's content.
 ///

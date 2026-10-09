@@ -5,8 +5,8 @@
 use warp_core::{features::FeatureFlag, ui::theme::color::internal_colors};
 use warpui::{
     elements::{
-        Border, ChildAnchor, Container, CornerRadius, Flex, MainAxisAlignment, MainAxisSize,
-        ParentAnchor, ParentElement, Radius, Shrinkable, Wrap,
+        Border, ChildAnchor, Container, CornerRadius, CrossAxisAlignment, Expanded, Flex,
+        MainAxisAlignment, MainAxisSize, ParentAnchor, ParentElement, Radius, Wrap,
     },
     fonts::{Properties, Style, Weight},
     ui_components::{
@@ -30,6 +30,7 @@ use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 
 use super::common::{render_query_text, render_user_avatar, FindContext, QueryContextReference};
+use super::QUERY_AVATAR_GAP;
 
 /// Width of the ring drawn around the user avatar while agent-view transcript
 /// navigation targets this query. The ring uses the ANSI magenta color the app
@@ -138,7 +139,9 @@ pub(crate) fn render_query(
     } else {
         avatar
     };
-    let avatar = Container::new(avatar).with_margin_right(16.).finish();
+    let avatar = Container::new(avatar)
+        .with_margin_left(QUERY_AVATAR_GAP)
+        .finish();
 
     let properties = Properties {
         style: Style::Normal,
@@ -160,7 +163,10 @@ pub(crate) fn render_query(
         app,
     );
 
-    let mut query = Flex::column().with_child(text_element.finish());
+    // 用户消息靠右显示：消息列（文本 / context chips / 附件）整体右对齐。
+    let mut query = Flex::column()
+        .with_cross_axis_alignment(CrossAxisAlignment::End)
+        .with_child(text_element.finish());
 
     if !context_references.is_empty() {
         query = query.with_child(render_context_references(context_references, appearance));
@@ -170,10 +176,12 @@ pub(crate) fn render_query(
         query = query.with_child(render_attachments(attachments, appearance));
     }
 
+    // 头像移到消息右侧；`⋯` 溢出菜单按钮渲染在块外层（view_impl.rs），位置与行为不变。
     Flex::row()
-        .with_cross_axis_alignment(warpui::elements::CrossAxisAlignment::Start)
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_child(Expanded::new(1., query.finish()).finish())
         .with_child(avatar)
-        .with_child(Shrinkable::new(1., query.finish()).finish())
         .finish()
 }
 
