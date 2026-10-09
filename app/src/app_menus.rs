@@ -111,6 +111,24 @@ fn updateable_custom_item_without_checkmark(action: CustomAction, ctx: &AppConte
     updateable_custom_item_with_checkmark(action, ctx, Box::new(|_| false))
 }
 
+/// dsh 的「重载界面 / 重启服务」菜单项。
+///
+/// 标题复用 keybinding 描述(`default_name`);两项刻意不绑默认键位(见
+/// `custom_tag_to_keystroke`),因此菜单不显示快捷键。派发走 [`CustomAction`]
+/// 通道;无 dsh pane 时置灰——这两项对没有 dsh pane 的窗口没有意义
+/// (重启服务还会白留一个常驻子进程)。
+fn dsh_menu_item(action: CustomAction, ctx: &AppContext) -> MenuItem {
+    MenuItem::Custom(CustomMenuItem::new(
+        &default_name(action, ctx),
+        custom_action_dispatcher(action),
+        move |_props, ctx| MenuItemPropertyChanges {
+            disabled: Some(!crate::dsh::runtime::has_reachable_dsh_pane(ctx)),
+            ..Default::default()
+        },
+        custom_shortcut(action),
+    ))
+}
+
 fn make_new_app_menu(ctx: &AppContext) -> Menu {
     let mut menu_items = vec![updateable_custom_item_without_checkmark(
         CustomAction::ShowAboutWarp,
@@ -418,6 +436,15 @@ fn make_new_view_menu(ctx: &AppContext) -> Menu {
             updateable_custom_item_without_checkmark(CustomAction::DecreaseFontSize, ctx),
             updateable_custom_item_without_checkmark(CustomAction::ResetFontSize, ctx),
             MenuItem::Separator,
+        ]);
+    }
+
+    // dsh 界面重载 / 服务重启:无 dsh pane 时置灰(见 `dsh_menu_item`)。
+    if FeatureFlag::DshPane.is_enabled() {
+        items.extend([
+            MenuItem::Separator,
+            dsh_menu_item(CustomAction::ReloadDshWebview, ctx),
+            dsh_menu_item(CustomAction::RestartDshRuntime, ctx),
         ]);
     }
 

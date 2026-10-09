@@ -395,12 +395,21 @@ impl DshPaneView {
         ctx.dispatch_typed_action_deferred(WorkspaceAction::AttachDshErrorAsContext { error });
     }
 
-    /// 重新启动 runtime:立刻切回「启动中」界面,再请求 workspace 启动。
+    /// 进入「重启中」界面:复位 webview 记账并置标志,渲染切到加载中界面。
+    ///
+    /// 只切界面、不派发启动请求,由调用方决定后续:
+    /// - 失败态「重新启动」按钮经 [`Self::restart_runtime`] 走 `OpenDshPane`
+    ///   (首次启动通道,就绪广播 `Ready`);
+    /// - 「重启 dsh 服务」菜单项由 workspace 在 `request_stop` 后调用,并走
+    ///   `Restarted` 通道(只导航已有 pane,不给其它窗口补建 pane)。
+    ///
+    /// webview 不重建:置标志把它换出显示加载中即可,就绪后由 workspace 按新
+    /// 实例 URL 导航(见 `navigate_existing_dsh_pane`)。
     ///
     /// 复位 webview 加载状态:旧 webview 指向的是已死实例,不重置会被判定
     /// 「已加载」而直接露出来(闪过僵尸页面)。就绪/失败分别由 Ready 与
     /// Failed 事件决定下一态。
-    fn restart_runtime(&mut self, ctx: &mut ViewContext<Self>) {
+    pub fn begin_runtime_restart(&mut self, ctx: &mut ViewContext<Self>) {
         self.runtime_failed = false;
         self.runtime_restarting = true;
         self.runtime_error = None;
@@ -410,9 +419,17 @@ impl DshPaneView {
         self.webview_crashed = false;
         self.webview_loaded = false;
         self.load_started_at = Some(Instant::now());
+        ctx.notify();
+    }
+
+    /// 失败态「重新启动」:切回加载中界面,再请求 workspace 启动 runtime。
+    ///
+    /// 健康态主动重启不走这里(见 [`Self::begin_runtime_restart`]):那条路径由
+    /// workspace 负责先停旧实例,并走 `Restarted` 通道。
+    fn restart_runtime(&mut self, ctx: &mut ViewContext<Self>) {
+        self.begin_runtime_restart(ctx);
         // 延迟派发:同步派发会在 DshPaneView 处于 update 中时重入 Workspace。
         ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenDshPane);
-        ctx.notify();
     }
 
     /// 进入 webview 崩溃态:WebContent 渲染进程已终止(runtime 仍健康)。
@@ -443,7 +460,9 @@ impl DshPaneView {
     /// layer/进程状态;收到 UrlChanged(加载完成)后从 spinner 切回,与初始
     /// 打开的揭示时机一致。仅重建页面,不重启 runtime(WebContent 崩溃是
     /// 渲染进程问题,dsh 服务本身仍健康)。
-    fn recreate_webview(&mut self, ctx: &mut ViewContext<Self>) {
+    ///
+    /// 亦由「重载 dsh 界面」菜单项在健康态直接调用(同样只重建页面)。
+    pub fn recreate_webview(&mut self, ctx: &mut ViewContext<Self>) {
         self.webview_crashed = false;
         if let Some(id) = self.webview_id {
             BrowserWebViewManager::as_ref(ctx).destroy(id);

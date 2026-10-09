@@ -1784,6 +1784,45 @@ mod tests {
         });
     }
 
+    /// 主动重启链路:request_stop 后 begin_start 清 stopping,新实例可被收养。
+    ///
+    /// 这是「重启 dsh 服务」的底层契约:workspace 先 `request_stop` 再启动。
+    /// 若 `begin_start` 不清 `stopping`,`adopt_child` 会把刚起的新进程当成
+    /// 「停止后才返回的 in-flight 启动」杀掉(见
+    /// `adopt_child_after_stop_kills_child`),重启就永远失败。
+    #[cfg(unix)]
+    #[test]
+    fn restart_after_request_stop_adopts_new_child() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let mut runtime = test_runtime();
+            // 先有一个健康实例(代次取 0,与新建 runtime 的初值一致)。
+            let mut cmd = command::r#async::Command::new("sleep");
+            cmd.arg("30");
+            let first = cmd.spawn().expect("spawn sleep");
+            assert!(runtime.adopt_child(first, "http://127.0.0.1:1".to_string(), 0));
+            assert_eq!(runtime.status(), DshRuntimeStatus::Ready);
+
+            // 主动重启:停旧实例 → 开新一轮。
+            runtime.request_stop();
+            assert_eq!(runtime.status(), DshRuntimeStatus::Stopped);
+            let generation = runtime.begin_start();
+
+            let mut cmd = command::r#async::Command::new("sleep");
+            cmd.arg("30");
+            let second = cmd.spawn().expect("spawn sleep");
+            assert!(
+                runtime.adopt_child(second, "http://127.0.0.1:2".to_string(), generation),
+                "begin_start must clear stopping so the new child is adopted"
+            );
+            assert_eq!(runtime.status(), DshRuntimeStatus::Ready);
+            assert_eq!(runtime.url(), Some("http://127.0.0.1:2"));
+
+            // 清理:杀掉测试子进程。
+            runtime.request_stop();
+        });
+    }
+
     /// 失败原因记录:set_failed 同时写入错误串与 Failed 状态;重新启动
     /// 或主动停止时清空,避免展示过期错误。
     #[test]

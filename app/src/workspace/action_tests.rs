@@ -30,6 +30,13 @@ fn settings_popup_toggle_does_not_save_workspace_state() {
     assert!(!WorkspaceAction::ToggleVerticalTabsSettingsPopup.should_save_app_state_on_action());
 }
 
+/// dsh 重载/重启只作用于运行时与 webview,不改变需要持久化的 workspace 状态。
+#[test]
+fn dsh_reload_and_restart_do_not_save_workspace_state() {
+    assert!(!WorkspaceAction::ReloadDshWebview.should_save_app_state_on_action());
+    assert!(!WorkspaceAction::RestartDshRuntime.should_save_app_state_on_action());
+}
+
 #[test]
 fn display_granularity_change_does_not_save_workspace_state() {
     assert!(!WorkspaceAction::SetVerticalTabsDisplayGranularity(

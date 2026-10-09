@@ -20706,7 +20706,6 @@ impl Workspace {
     /// - runtime 可用(启动中/就绪)且有 DshPane tab → 聚焦已有 tab
     /// - 否则 → 创建 Loading tab(若尚无),异步启动/重启 runtime
     fn open_dsh_pane(&mut self, ctx: &mut ViewContext<Self>) {
-        let window_id = ctx.window_id();
         // 非阻塞检查全局 dsh 更新(每次打开 pane 触发):有新版仅 toast 提示,
         // 不影响启动流程;离线/检查失败静默(下次打开 pane 会重查)。
         ctx.spawn(
@@ -20739,57 +20738,10 @@ impl Workspace {
             }
             return;
         }
-        // 2. 启动/重启 runtime(Starting 返回等就绪;Ready 无需动作——就绪
-        //    URL 同步由随后创建/恢复的 pane 在 attach 时完成;Stopped/Failed
-        //    重新 begin_start 以支持失败后重试)。先于建 tab:保证新建/恢复
-        //    的 DshPane 在 attach 时 runtime 已非停止态,不会被 DshPane::attach
-        //    的停止态检查误标为失败。
-        crate::dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
-            match runtime.status() {
-                crate::dsh::DshRuntimeStatus::Starting => return,
-                crate::dsh::DshRuntimeStatus::Ready => return,
-                crate::dsh::DshRuntimeStatus::Stopped | crate::dsh::DshRuntimeStatus::Failed => {}
-            }
-            // 注入最近打开的 Zap 项目目录作 dsh 工作目录(DSH_CWD),
-            // 使会话 cwd 跟随 Zap 项目(workspace 归组)。
-            let dir = crate::projects::ProjectManagementModel::handle(ctx)
-                .read(ctx, |model, _| {
-                    model
-                        .all_projects()
-                        .filter(|p| p.last_opened_ts.is_some())
-                        .max_by_key(|p| p.last_opened_ts.unwrap())
-                        .map(|p| std::path::PathBuf::from(&p.path))
-                })
-                .or_else(|| {
-                    // 无最近打开项目:fallback 到活动终端 cwd(更"当前"的工作目录)。
-                    crate::workspace::ActiveSession::handle(ctx).read(ctx, |active, _| {
-                        active
-                            .path_if_local(window_id)
-                            .map(std::path::PathBuf::from)
-                    })
-                });
-            if let Some(dir) = dir {
-                log::info!("[dsh] workspace dir set to {}", dir.display());
-                crate::dsh::runtime::set_workspace_dir(dir);
-            }
-            let gen = runtime.begin_start();
-            // 直接启动全局 dsh 命令(用户自装自升级,Zap 不做安装/版本管理)。
-            ctx.spawn(
-                crate::dsh::DshRuntime::start_future(),
-                move |runtime, result, ctx| match result {
-                    crate::dsh::DshStartResult::Ready { url, child } => {
-                        if runtime.adopt_child(child, url.clone(), gen) {
-                            ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
-                        }
-                    }
-                    crate::dsh::DshStartResult::Failed { error } => {
-                        log::error!("[dsh] start failed: {error}");
-                        runtime.set_failed(error.clone());
-                        ctx.emit(crate::dsh::bridge::BridgeEvent::Failed { error });
-                    }
-                },
-            );
-        });
+        // 2. 启动/重启 runtime:Starting/Ready 直接返回,由上面的聚焦分支处理;
+        //    Stopped/Failed 重新 begin_start 以支持失败后重试。详见
+        //    `start_dsh_runtime`。
+        self.start_dsh_runtime(false, ctx);
         // 3. 无可用 DshPane tab → 优先恢复宽限期内已关闭的 dsh tab,否则新建。
         if !self.has_dsh_pane(ctx) {
             // 已关闭的 dsh tab 仍在 undo 宽限期内时恢复它(等价于自动执行一次
@@ -21207,6 +21159,113 @@ impl Workspace {
             }
         }
         handled
+    }
+
+    /// 收集本 window 所有 tab 中的 dsh pane 句柄。
+    ///
+    /// 先收集再操作:调用方随后要 `update` 这些 pane(甚至先停 runtime),
+    /// 直接借 `pane_group` 遍历会与后续借用冲突。
+    fn dsh_pane_views(&self, ctx: &AppContext) -> Vec<ViewHandle<crate::dsh::pane::DshPaneView>> {
+        let mut views = Vec::new();
+        for tab in &self.tabs {
+            views.extend(
+                tab.pane_group
+                    .as_ref(ctx)
+                    .dsh_panes()
+                    .map(|pane| pane.dsh_view(ctx)),
+            );
+        }
+        views
+    }
+
+    /// 启动 dsh runtime(仅 `Stopped`/`Failed` 时真正启动)。
+    ///
+    /// `restarted` 决定就绪后广播的事件:
+    /// - `false` → `Ready`(全新启动;其它无 pane 的窗口会据此补建 pane);
+    /// - `true` → `Restarted`(重启;只导航已有 pane,不补建)。
+    ///
+    /// Starting/Ready 直接返回:就绪 URL 同步由随后创建/恢复的 pane 在 attach
+    /// 时完成。先于建 tab:保证新建/恢复的 DshPane 在 attach 时 runtime 已非
+    /// 停止态,不会被 `DshPane::attach` 的停止态检查误标为失败。
+    fn start_dsh_runtime(&mut self, restarted: bool, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
+        crate::dsh::DshRuntime::handle(ctx).update(ctx, |runtime, ctx| {
+            match runtime.status() {
+                crate::dsh::DshRuntimeStatus::Starting => return,
+                crate::dsh::DshRuntimeStatus::Ready => return,
+                crate::dsh::DshRuntimeStatus::Stopped | crate::dsh::DshRuntimeStatus::Failed => {}
+            }
+            // 注入最近打开的 Zap 项目目录作 dsh 工作目录(DSH_CWD),
+            // 使会话 cwd 跟随 Zap 项目(workspace 归组)。
+            let dir = crate::projects::ProjectManagementModel::handle(ctx)
+                .read(ctx, |model, _| {
+                    model
+                        .all_projects()
+                        .filter(|p| p.last_opened_ts.is_some())
+                        .max_by_key(|p| p.last_opened_ts.unwrap())
+                        .map(|p| std::path::PathBuf::from(&p.path))
+                })
+                .or_else(|| {
+                    // 无最近打开项目:fallback 到活动终端 cwd(更"当前"的工作目录)。
+                    crate::workspace::ActiveSession::handle(ctx).read(ctx, |active, _| {
+                        active
+                            .path_if_local(window_id)
+                            .map(std::path::PathBuf::from)
+                    })
+                });
+            if let Some(dir) = dir {
+                log::info!("[dsh] workspace dir set to {}", dir.display());
+                crate::dsh::runtime::set_workspace_dir(dir);
+            }
+            let gen = runtime.begin_start();
+            // 直接启动全局 dsh 命令(用户自装自升级,Zap 不做安装/版本管理)。
+            ctx.spawn(
+                crate::dsh::DshRuntime::start_future(),
+                move |runtime, result, ctx| match result {
+                    crate::dsh::DshStartResult::Ready { url, child } => {
+                        if runtime.adopt_child(child, url.clone(), gen) {
+                            if restarted {
+                                ctx.emit(crate::dsh::bridge::BridgeEvent::Restarted { url });
+                            } else {
+                                ctx.emit(crate::dsh::bridge::BridgeEvent::Ready { url });
+                            }
+                        }
+                    }
+                    crate::dsh::DshStartResult::Failed { error } => {
+                        log::error!("[dsh] start failed: {error}");
+                        runtime.set_failed(error.clone());
+                        ctx.emit(crate::dsh::bridge::BridgeEvent::Failed { error });
+                    }
+                },
+            );
+        });
+    }
+
+    /// 重载 dsh 界面:对每个 dsh pane 重建 webview(dsh 服务保持不动)。
+    fn reload_dsh_webview(&mut self, ctx: &mut ViewContext<Self>) {
+        for dsh_view in self.dsh_pane_views(ctx) {
+            dsh_view.update(ctx, |pane, ctx| pane.recreate_webview(ctx));
+        }
+    }
+
+    /// 重启 dsh 服务:停掉当前子进程 → 让每个 pane 切到加载中 → 启动新实例。
+    ///
+    /// 顺序不能反:`request_stop` 必须在启动前完成,否则 runtime 仍处于
+    /// `Ready`,`start_dsh_runtime` 会直接返回、重启不发生。
+    ///
+    /// 没有 dsh pane 时不做任何事:重启结果无处展示,还会白留一个常驻进程。
+    fn restart_dsh_runtime(&mut self, ctx: &mut ViewContext<Self>) {
+        let panes = self.dsh_pane_views(ctx);
+        if panes.is_empty() {
+            return;
+        }
+        // 先停。`request_stop` 置 `Stopped` 并终止子进程;随后 `begin_start`
+        // 会清 `stopping`/`stop_pending`,新实例才收养得进来(见 `begin_start`)。
+        crate::dsh::DshRuntime::handle(ctx).update(ctx, |runtime, _| runtime.request_stop());
+        for dsh_view in panes {
+            dsh_view.update(ctx, |pane, ctx| pane.begin_runtime_restart(ctx));
+        }
+        self.start_dsh_runtime(true, ctx);
     }
 }
 
@@ -22422,6 +22481,8 @@ impl TypedActionView for Workspace {
             AttachDshErrorAsContext { error } => {
                 self.attach_dsh_error_as_context(error, ctx);
             }
+            ReloadDshWebview => self.reload_dsh_webview(ctx),
+            RestartDshRuntime => self.restart_dsh_runtime(ctx),
             TabHoverWidthStart { width } => {
                 // Store the fixed width value for the tab to maintain consistent size during hover
                 self.tab_fixed_width = Some(*width);

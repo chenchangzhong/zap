@@ -1669,6 +1669,10 @@ keybinding-desc-pane-group-navigate-next = 激活下一个窗格
 
 # 鼠标 / 笔记本 / 工作流 / 文件夹
 keybinding-desc-workspace-toggle-mouse-reporting = 切换鼠标报告
+
+# DeepSeek Harness(dsh)
+keybinding-desc-workspace-reload-dsh-webview = 重载 DeepSeek Harness 界面
+keybinding-desc-workspace-restart-dsh-runtime = 重启 DeepSeek Harness 服务
 keybinding-desc-workspace-create-personal-notebook = 新建个人笔记本
 keybinding-desc-workspace-create-personal-notebook-menu = 新建个人笔记本
 keybinding-desc-workspace-create-personal-workflow = 新建个人工作流

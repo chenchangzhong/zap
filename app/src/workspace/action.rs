@@ -452,6 +452,11 @@ pub enum WorkspaceAction {
     AttachDshErrorAsContext {
         error: String,
     },
+    /// 重载 dsh 界面:仅重建 webview(WebContent 渲染进程),dsh 服务保持不动。
+    ReloadDshWebview,
+    /// 重启 dsh 服务:停止当前子进程并重新启动。webview 不重建,重启期间 pane
+    /// 显示加载中,就绪后导航到新实例 URL。
+    RestartDshRuntime,
     OpenNotebook {
         id: SyncId,
     },
@@ -903,6 +908,8 @@ impl WorkspaceAction {
             | TabConfigSidecarRemoveConfig { .. }
             | OpenSettingsFile
             | FixSettingsWithOz { .. } => false,
+            // dsh 重载/重启只作用于运行时与 webview,不改变需要持久化的 workspace 状态。
+            ReloadDshWebview | RestartDshRuntime => false,
             // 纯 UI 显隐(自动隐藏面板的钉住/解除),不改变需要持久化的状态。
             VerticalTabsAutoHideReveal | VerticalTabsAutoHideCollapse => false,
             #[cfg(debug_assertions)]

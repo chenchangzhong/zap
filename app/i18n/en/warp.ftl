@@ -1749,6 +1749,10 @@ keybinding-desc-pane-group-navigate-next = Activate next pane
 
 # Mouse / Notebooks / Workflows / Folders
 keybinding-desc-workspace-toggle-mouse-reporting = Toggle Mouse Reporting
+
+# DeepSeek Harness (dsh)
+keybinding-desc-workspace-reload-dsh-webview = Reload DeepSeek Harness UI
+keybinding-desc-workspace-restart-dsh-runtime = Restart DeepSeek Harness Service
 keybinding-desc-workspace-create-personal-notebook = Create a new personal notebook
 keybinding-desc-workspace-create-personal-notebook-menu = New Personal Notebook
 keybinding-desc-workspace-create-personal-workflow = Create a new personal workflow

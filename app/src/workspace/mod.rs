@@ -568,6 +568,22 @@ pub fn init(app: &mut AppContext) {
         .with_group(bindings::BindingGroup::Settings.as_str())
         .with_context_predicate(id!("Workspace")),
         EditableBinding::new(
+            "workspace:reload_dsh_webview",
+            crate::t!("keybinding-desc-workspace-reload-dsh-webview"),
+            WorkspaceAction::ReloadDshWebview,
+        )
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_context_predicate(id!("Workspace"))
+        .with_custom_action(CustomAction::ReloadDshWebview),
+        EditableBinding::new(
+            "workspace:restart_dsh_runtime",
+            crate::t!("keybinding-desc-workspace-restart-dsh-runtime"),
+            WorkspaceAction::RestartDshRuntime,
+        )
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_context_predicate(id!("Workspace"))
+        .with_custom_action(CustomAction::RestartDshRuntime),
+        EditableBinding::new(
             "workspace:create_personal_notebook",
             BindingDescription::new(crate::t!(
                 "keybinding-desc-workspace-create-personal-notebook"

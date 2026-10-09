@@ -134,6 +134,10 @@ pub enum CustomAction {
     ToggleConversationListView,
     FocusCLIAgentTerminal,
     FocusCLIAgentRichInput,
+    /// 重载 dsh 界面(仅重建 webview,不重启 dsh 服务)。
+    ReloadDshWebview,
+    /// 重启 dsh 服务(停止并重新启动 dsh 子进程;pane 显示加载中)。
+    RestartDshRuntime,
 }
 
 lazy_static! {
@@ -262,6 +266,11 @@ pub fn trigger_to_keystroke(trigger: &Trigger) -> Option<Keystroke> {
 /// Returns the corresponding [`Keystroke`], if any, of a [`CustomTag`].
 pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
     match custom.into() {
+        // 「重载 dsh 界面」/「重启 dsh 服务」刻意不绑默认快捷键:`⌘R` 要留给
+        // webview 自身的页面刷新(见 `app/src/browser/browser_pane_view.rs` 的
+        // `BrowserPaneAction::Reload`),两项都只从 View 菜单进入。这里必须是
+        // `None` —— 仍是默认键位的注册来源,返回键位会让 `⌘R` 被重新占用。
+        CustomAction::ReloadDshWebview | CustomAction::RestartDshRuntime => None,
         CustomAction::FocusInput => Keystroke::parse(cmd_or_ctrl_shift("l")).ok(),
         CustomAction::NewTab => Keystroke::parse(cmd_or_ctrl_shift("t")).ok(),
         CustomAction::Cut => Keystroke::parse("cmdorctrl-x").ok(),
