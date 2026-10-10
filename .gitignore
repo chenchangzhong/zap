@@ -84,3 +84,4 @@ docs/openwarp-cloud-removal-plan.md
 .codegraph/
 app/DockTilePlugin/ZapDockTilePlugin.docktileplugin/
 .agent-teams
+doc/
