@@ -6,6 +6,10 @@ mod controller;
 pub(crate) mod conversation_navigation_links;
 mod ephemeral_message_model;
 mod inline_agent_view_header;
+// 编排(阶段二):pill bar 三件套。见各文件头部对本地偏差的说明。
+pub(crate) mod orchestration_avatar;
+pub mod orchestration_pill_bar;
+pub mod orchestration_pill_bar_model;
 pub mod shortcuts;
 mod zero_state_block;
 
@@ -15,14 +19,15 @@ pub use agent_view_block::*;
 pub use controller::*;
 pub use ephemeral_message_model::*;
 pub use inline_agent_view_header::*;
+pub use orchestration_pill_bar::OrchestrationPillBar;
 use warpui::fonts::Properties;
 pub use zero_state_block::*;
 
 use std::sync::LazyLock;
 
 use pathfinder_color::ColorU;
-use warp_core::ui::theme::Fill;
 use warp_core::ui::appearance::Appearance;
+use warp_core::ui::theme::Fill;
 use warpui::keymap::Keystroke;
 
 use crate::view_components::action_button::ActionButtonTheme;

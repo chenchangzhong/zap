@@ -46,10 +46,9 @@ use warpui::{
 
 use crate::ai::agent::{AIAgentPtyWriteMode, CancellationReason};
 use crate::ai::blocklist::block::view_impl::common::{
-    render_query_text, UserQueryProps, BLOCKED_ACTION_MESSAGE_FOR_GREP_OR_FILE_GLOB,
-    BLOCKED_ACTION_MESSAGE_FOR_READING_FILES,
-    BLOCKED_ACTION_MESSAGE_FOR_WRITE_TO_LONG_RUNNING_SHELL_COMMAND,
-    LOAD_OUTPUT_MESSAGE_FOR_FILE_GLOB, LOAD_OUTPUT_MESSAGE_FOR_GREP,
+    blocked_action_message_for_grep_or_file_glob, blocked_action_message_for_reading_files,
+    blocked_action_message_for_write_to_long_running_shell_command, render_query_text,
+    UserQueryProps, LOAD_OUTPUT_MESSAGE_FOR_FILE_GLOB, LOAD_OUTPUT_MESSAGE_FOR_GREP,
     LOAD_OUTPUT_MESSAGE_FOR_READING_FILES, LOAD_OUTPUT_MESSAGE_FOR_WEB_SEARCH,
 };
 use crate::ai::blocklist::permissions::is_agent_mode_autonomy_allowed;
@@ -300,7 +299,9 @@ lazy_static! {
 const HAS_PENDING_CLI_ACTION_CONTEXT_KEY: &str = "HasPendingCLIAgentAction";
 const HAS_PENDING_NON_TRANSFER_CONTROL_ACTION_CONTEXT_KEY: &str =
     "HasPendingNonTransferControlCLIAgentAction";
-const BLOCKED_ACTION_MESSAGE_FOR_TRANSFER_CONTROL: &str = "Agent is asking you to take control.";
+fn blocked_action_message_for_transfer_control() -> String {
+    crate::t!("blocked-action-transfer-control")
+}
 
 pub fn init(app: &mut AppContext) {
     use warpui::keymap::{macros::*, FixedBinding};
@@ -1867,7 +1868,7 @@ impl View for CLISubagentView {
                         } => Some(render_blocked_action(
                             BlockedActionProps {
                                 header:
-                                    BLOCKED_ACTION_MESSAGE_FOR_WRITE_TO_LONG_RUNNING_SHELL_COMMAND
+                                    blocked_action_message_for_write_to_long_running_shell_command()
                                         .to_string(),
                                 description: Some(render_write_to_pty_input(
                                     WriteToPtyInputProps {
@@ -1901,7 +1902,7 @@ impl View for CLISubagentView {
                         AIAgentActionType::TransferShellCommandControlToUser { ref reason } => {
                             Some(render_blocked_action(
                                 BlockedActionProps {
-                                    header: BLOCKED_ACTION_MESSAGE_FOR_TRANSFER_CONTROL.to_string(),
+                                    header: blocked_action_message_for_transfer_control(),
                                     description: Some(render_transfer_control_reason(reason, app)),
                                     is_allow_menu_open: false,
                                     allow_menu: None,
@@ -2588,13 +2589,13 @@ fn render_transfer_control_reason(reason: &str, app: &AppContext) -> Box<dyn Ele
 fn get_blocked_action_header(action: AIAgentActionType) -> Option<String> {
     match action {
         AIAgentActionType::WriteToLongRunningShellCommand { .. } => {
-            Some(BLOCKED_ACTION_MESSAGE_FOR_WRITE_TO_LONG_RUNNING_SHELL_COMMAND.to_string())
+            Some(blocked_action_message_for_write_to_long_running_shell_command().to_string())
         }
         AIAgentActionType::ReadFiles(..) => {
-            Some(BLOCKED_ACTION_MESSAGE_FOR_READING_FILES.to_string())
+            Some(blocked_action_message_for_reading_files().to_string())
         }
         AIAgentActionType::Grep { .. } | AIAgentActionType::FileGlobV2 { .. } => {
-            Some(BLOCKED_ACTION_MESSAGE_FOR_GREP_OR_FILE_GLOB.to_string())
+            Some(blocked_action_message_for_grep_or_file_glob().to_string())
         }
         _ => None,
     }

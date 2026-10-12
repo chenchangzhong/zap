@@ -73,7 +73,8 @@ use crate::terminal::session_settings::{
     SessionSettingsChangedEvent,
 };
 use crate::terminal::settings::{
-    MaximumGridSize, ShowTerminalZeroStateBlock, TerminalSettings, UseAudibleBell,
+    MaximumGridSize, NotifyOnSubagentApproval, ShowTerminalZeroStateBlock, TerminalSettings,
+    UseAudibleBell,
 };
 use crate::terminal::{BlockListSettings, PreserveInputFocusOnBlockSelection, SnackbarEnabled};
 use crate::undo_close::UndoCloseSettings;
@@ -340,6 +341,19 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
         .is_supported_on_current_platform(
             TerminalSettings::as_ref(app)
                 .use_audible_bell
+                .is_supported_on_current_platform(),
+        ),
+        ToggleSettingActionPair::new(
+            &crate::t!("toggle-suffix-subagent-approval-bell"),
+            builder(SettingsAction::FeaturesPageToggle(
+                FeaturesPageAction::ToggleNotifyOnSubagentApproval,
+            )),
+            context,
+            flags::NOTIFY_ON_SUBAGENT_APPROVAL_CONTEXT_FLAG,
+        )
+        .is_supported_on_current_platform(
+            TerminalSettings::as_ref(app)
+                .notify_on_subagent_approval
                 .is_supported_on_current_platform(),
         ),
         ToggleSettingActionPair::new(
@@ -661,6 +675,7 @@ pub enum FeaturesPageAction {
     ToggleCodeAsDefaultEditor,
     ToggleShowInputHintText,
     ToggleUseAudibleBell,
+    ToggleNotifyOnSubagentApproval,
     ToggleShowTerminalZeroStateBlock,
     TogglePreferLowPowerGPU,
     ToggleVimMode,
@@ -1086,6 +1101,13 @@ impl FeaturesPageAction {
                 TelemetryEvent::FeaturesPageAction {
                     action: "ToggleUseAudibleBell".to_string(),
                     value: to_string(*terminal_settings.use_audible_bell),
+                }
+            }
+            Self::ToggleNotifyOnSubagentApproval => {
+                let terminal_settings = TerminalSettings::as_ref(ctx);
+                TelemetryEvent::FeaturesPageAction {
+                    action: "ToggleNotifyOnSubagentApproval".to_string(),
+                    value: to_string(*terminal_settings.notify_on_subagent_approval),
                 }
             }
             Self::ToggleVimMode => TelemetryEvent::FeaturesPageAction {
@@ -1800,6 +1822,13 @@ impl TypedActionView for FeaturesPageView {
                 TerminalSettings::handle(ctx).update(ctx, |terminal_settings, ctx| {
                     report_if_error!(terminal_settings
                         .use_audible_bell
+                        .toggle_and_save_value(ctx));
+                })
+            }
+            ToggleNotifyOnSubagentApproval => {
+                TerminalSettings::handle(ctx).update(ctx, |terminal_settings, ctx| {
+                    report_if_error!(terminal_settings
+                        .notify_on_subagent_approval
                         .toggle_and_save_value(ctx));
                 })
             }
@@ -2591,8 +2620,17 @@ impl FeaturesPageView {
 
         let app_editor_settings = AppEditorSettings::as_ref(ctx);
 
-        let notifications_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> =
+        let mut notifications_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> =
             vec![Box::new(DesktopNotificationsWidget::default())];
+        // 子代理等待审批的响铃放在通知组里(与「需要关注时通知」「播放通知声音」同组),
+        // 因为它的语义是**通知**,不是终端行为。用**自己**的设置项判定平台支持,
+        // 不借用其它设置项的支持范围。
+        if TerminalSettings::as_ref(ctx)
+            .notify_on_subagent_approval
+            .is_supported_on_current_platform()
+        {
+            notifications_widgets.push(Box::new(SubagentApprovalBellWidget::default()));
+        }
 
         let mut session_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![];
 
@@ -6697,6 +6735,55 @@ impl SettingsWidget for AudibleBellWidget {
                 .build()
                 .on_click(move |ctx, _, _| {
                     ctx.dispatch_typed_action(FeaturesPageAction::ToggleUseAudibleBell)
+                })
+                .finish(),
+            None,
+        )
+    }
+}
+
+/// Zap:子代理卡在等待审批时是否响铃。与 [`AudibleBellWidget`] 分开 —— 那条管的是
+/// 终端 BEL 事件(默认关),这条管的是子代理审批(默认开)。
+#[derive(Default)]
+struct SubagentApprovalBellWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for SubagentApprovalBellWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "subagent approval bell notification sound"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let ui_builder = appearance.ui_builder();
+        let terminal_settings = TerminalSettings::as_ref(app);
+        render_body_item::<FeaturesPageAction>(
+            crate::t!("settings-features-notify-subagent-approval"),
+            None,
+            LocalOnlyIconState::for_setting(
+                NotifyOnSubagentApproval::storage_key(),
+                NotifyOnSubagentApproval::sync_to_cloud(),
+                &mut view
+                    .button_mouse_states
+                    .local_only_icon_tooltip_states
+                    .borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            ui_builder
+                .switch(self.switch_state.clone())
+                .check(*terminal_settings.notify_on_subagent_approval)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(FeaturesPageAction::ToggleNotifyOnSubagentApproval)
                 })
                 .finish(),
             None,

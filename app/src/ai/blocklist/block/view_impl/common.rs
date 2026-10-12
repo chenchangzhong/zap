@@ -48,19 +48,7 @@ use super::{add_highlights_to_rich_text, add_highlights_to_text, output::LinkAct
 use crate::ai::agent::MessageId;
 use crate::terminal::grid_renderer::{FOCUSED_MATCH_COLOR, MATCH_COLOR};
 use crate::{
-    ai::{
-        agent::{conversation::AIConversation, icons, ShellCommandDelay},
-        blocklist::{
-            block::status_bar::BlocklistAIStatusBarAction, history_model::BlocklistAIHistoryModel,
-            BlocklistAIActionModel, ShellCommandExecutor,
-        },
-        loading::shimmering_warp_loading_text,
-    },
-    terminal::{self, TerminalModel},
-    util::link_detection::{add_link_detection_mouse_interactions, DetectedLinksState},
-    workspaces::{user_workspaces::UserWorkspaces, workspace::CustomerType},
-};
-use crate::{
+    ai::mcp::TemplatableMCPServerManager,
     ai::{
         agent::{
             icons::red_stop_icon, AIAgentAction, AIAgentActionType, AIAgentAttachment,
@@ -94,7 +82,6 @@ use crate::{
         },
     },
     code::{editor::view::CodeEditorView, editor_management::CodeSource},
-    ai::mcp::TemplatableMCPServerManager,
     notebooks::editor::{rich_text_styles, MarkdownTableAppearance},
     settings_view::SettingsSection,
     terminal::{
@@ -108,6 +95,19 @@ use crate::{
         icons::Icon,
     },
     workspace::WorkspaceAction,
+};
+use crate::{
+    ai::{
+        agent::{conversation::AIConversation, icons, ShellCommandDelay},
+        blocklist::{
+            block::status_bar::BlocklistAIStatusBarAction, history_model::BlocklistAIHistoryModel,
+            BlocklistAIActionModel, ShellCommandExecutor,
+        },
+        loading::shimmering_warp_loading_text,
+    },
+    terminal::{self, TerminalModel},
+    util::link_detection::{add_link_detection_mouse_interactions, DetectedLinksState},
+    workspaces::{user_workspaces::UserWorkspaces, workspace::CustomerType},
 };
 use crate::{
     search::slash_command_menu::static_commands::commands,
@@ -151,11 +151,18 @@ pub const LOAD_OUTPUT_MESSAGE_FOR_WEB_SEARCH: &str = "Searching the web...";
 #[cfg(feature = "local_fs")]
 pub(crate) type ResolvedBlocklistImageSources = HashMap<String, Option<AssetSource>>;
 
-pub const BLOCKED_ACTION_MESSAGE_FOR_WRITE_TO_LONG_RUNNING_SHELL_COMMAND: &str =
-    "Can I write the following to this running command?";
-pub const BLOCKED_ACTION_MESSAGE_FOR_READING_FILES: &str = "Grant access to the following files?";
-pub const BLOCKED_ACTION_MESSAGE_FOR_GREP_OR_FILE_GLOB: &str =
-    "OK if I search the files in this directory?";
+/// 审批卡的主文案。改成函数以走 i18n(原来是硬编码英文常量)。
+pub(crate) fn blocked_action_message_for_write_to_long_running_shell_command() -> String {
+    crate::t!("blocked-action-write-to-running-command")
+}
+
+pub(crate) fn blocked_action_message_for_reading_files() -> String {
+    crate::t!("blocked-action-grant-file-access")
+}
+
+pub(crate) fn blocked_action_message_for_grep_or_file_glob() -> String {
+    crate::t!("blocked-action-search-directory")
+}
 
 const BLOCKLIST_VISUAL_SECTION_HEIGHT_LINE_MULTIPLIER: f32 = 10.0;
 const INLINE_IMAGE_HEIGHT: f32 = 164.;
@@ -346,7 +353,7 @@ pub fn render_warping_indicator<V: View>(
             {
                 Some(server) => format!("Calling \"{name}\" MCP tool on {server}..."),
                 None => format!("Calling \"{name}\" MCP tool..."),
-            }
+            },
             Some(AIAgentActionType::ReadMCPResource { name, .. }) => {
                 format!("Reading \"{name}\" MCP resource...")
             }

@@ -843,6 +843,8 @@ impl AISettingsPageView {
                     Self::refresh_coding_model_menu(&me.coding_model_dropdown, ctx);
                     me.sync_context_window_editor(ctx, false);
                 }
+                // 父会话换模型不影响子代理模型的**选中项**(它是独立设置),
+                // 所以这里刻意不刷新子代理下拉。
                 LLMPreferencesEvent::UpdatedActiveAgentModeLLM => {
                     Self::refresh_base_model_menu(&me.base_model_dropdown, ctx);
                     me.sync_context_window_editor(ctx, false);

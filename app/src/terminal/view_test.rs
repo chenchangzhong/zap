@@ -5842,6 +5842,8 @@ fn cli_session_status_updates_active_child_conversation() {
                         view.view_id,
                         "Agent 2".to_string(),
                         parent_conversation_id,
+                        crate::ai::agent::conversation::AIConversationId::new(),
+                        true,
                         ctx,
                     )
                 });

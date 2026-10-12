@@ -5,8 +5,12 @@ pub mod block;
 pub mod code_block;
 mod context_model;
 mod controller;
+pub(crate) mod orchestration_topology;
 mod passive_suggestions;
 pub(crate) mod queued_query;
+// Oz 子代理(模型乙,D4):`PendingSubagentDispatch` 由 `PaneGroup` 在子会话/pane
+// 建好后构造,交给父 view 的 controller 登记。
+pub(crate) use controller::PendingSubagentDispatch;
 pub(super) use controller::RequestInput;
 pub mod history_model;
 pub mod inline_action;

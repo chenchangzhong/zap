@@ -1451,9 +1451,9 @@ fn emitted_deleted_conversation_ids(
         .borrow()
         .iter()
         .filter_map(|event| match event {
-            BlocklistAIHistoryEvent::DeletedConversation { conversation_id, .. } => {
-                Some(*conversation_id)
-            }
+            BlocklistAIHistoryEvent::DeletedConversation {
+                conversation_id, ..
+            } => Some(*conversation_id),
             _ => None,
         })
         .collect()
@@ -1474,7 +1474,8 @@ fn collect_model_events(
         );
     }
     match receiver.try_recv() {
-        Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected) => {}
+        Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected) => {
+        }
         Ok(extra) => panic!("unexpected extra model event: {extra:?}"),
     }
     events
@@ -1522,8 +1523,8 @@ fn test_delete_all_conversations_dedups_conversation_present_in_both_maps() {
             id
         });
 
-        let skipped = history_model
-            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        let skipped =
+            history_model.update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
         assert_eq!(skipped, 0, "no conversations should be skipped");
 
         // The overlapping conversation must be deleted exactly once: one
@@ -1534,7 +1535,11 @@ fn test_delete_all_conversations_dedups_conversation_present_in_both_maps() {
             .iter()
             .filter(|event| matches!(event, ModelEvent::DeleteAIConversation { .. }))
             .collect();
-        assert_eq!(delete_ai_events.len(), 1, "dedup failed: duplicate delete events");
+        assert_eq!(
+            delete_ai_events.len(),
+            1,
+            "dedup failed: duplicate delete events"
+        );
         assert!(matches!(
             delete_ai_events[0],
             ModelEvent::DeleteAIConversation {
@@ -1599,8 +1604,7 @@ fn test_delete_all_conversations_skips_ambient_conversations() {
 
         let regular_id = AIConversationId::new();
         let ambient_id = AIConversationId::new();
-        let ambient_task_id: AmbientAgentTaskId =
-            uuid::Uuid::new_v4().to_string().parse().unwrap();
+        let ambient_task_id: AmbientAgentTaskId = uuid::Uuid::new_v4().to_string().parse().unwrap();
 
         history_model.update(&mut app, |model, _| {
             model
@@ -1612,8 +1616,8 @@ fn test_delete_all_conversations_skips_ambient_conversations() {
             );
         });
 
-        let skipped = history_model
-            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        let skipped =
+            history_model.update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
         assert_eq!(skipped, 1, "the ambient conversation must count as skipped");
 
         // Only the regular conversation is deleted.
@@ -1656,8 +1660,7 @@ fn test_delete_all_conversations_skips_live_ambient_conversation_without_metadat
 
         let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
         let terminal_view_id = EntityId::new();
-        let ambient_task_id: AmbientAgentTaskId =
-            uuid::Uuid::new_v4().to_string().parse().unwrap();
+        let ambient_task_id: AmbientAgentTaskId = uuid::Uuid::new_v4().to_string().parse().unwrap();
 
         // A live, completed conversation owned by an ambient agent task.
         // `restore_conversations` never writes `all_conversations_metadata`, so
@@ -1682,14 +1685,19 @@ fn test_delete_all_conversations_skips_live_ambient_conversation_without_metadat
 
         history_model.read(&app, |model, _| {
             assert!(
-                !model.all_conversations_metadata.contains_key(&conversation_id),
+                !model
+                    .all_conversations_metadata
+                    .contains_key(&conversation_id),
                 "precondition: restore path must not write all_conversations_metadata"
             );
         });
 
-        let skipped = history_model
-            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
-        assert_eq!(skipped, 1, "the live ambient conversation must count as skipped");
+        let skipped =
+            history_model.update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(
+            skipped, 1,
+            "the live ambient conversation must count as skipped"
+        );
 
         // Nothing is deleted: no DeleteAIConversation event and no
         // DeleteMultiAgentConversations batch payload at all.
@@ -1722,15 +1730,15 @@ fn test_delete_all_conversations_skips_live_ambient_conversation_and_deletes_com
 
         let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
         let terminal_view_id = EntityId::new();
-        let ambient_task_id: AmbientAgentTaskId =
-            uuid::Uuid::new_v4().to_string().parse().unwrap();
+        let ambient_task_id: AmbientAgentTaskId = uuid::Uuid::new_v4().to_string().parse().unwrap();
 
         let companion_id = AIConversationId::new();
         let ambient_id = history_model.update(&mut app, |model, ctx| {
             // 1 deletable companion: historical-only, non-ambient metadata.
-            model
-                .all_conversations_metadata
-                .insert(companion_id, create_conversation_metadata(companion_id, None));
+            model.all_conversations_metadata.insert(
+                companion_id,
+                create_conversation_metadata(companion_id, None),
+            );
 
             // 1 live ambient conversation: restored (no metadata), completed,
             // owned by an ambient agent task.
@@ -1750,9 +1758,12 @@ fn test_delete_all_conversations_skips_live_ambient_conversation_and_deletes_com
             id
         });
 
-        let skipped = history_model
-            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
-        assert_eq!(skipped, 1, "only the live ambient conversation must be skipped");
+        let skipped =
+            history_model.update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(
+            skipped, 1,
+            "only the live ambient conversation must be skipped"
+        );
 
         // The companion is deleted: one DeleteAIConversation event and one
         // DeleteMultiAgentConversations batch containing ONLY the companion id.
@@ -1820,15 +1831,19 @@ fn test_delete_all_conversations_skips_in_progress_conversations() {
                 .get_mut(&completed_id)
                 .unwrap()
                 .update_status(ConversationStatus::Success, terminal_view_id, ctx);
-            model
-                .all_conversations_metadata
-                .insert(completed_id, create_conversation_metadata(completed_id, None));
+            model.all_conversations_metadata.insert(
+                completed_id,
+                create_conversation_metadata(completed_id, None),
+            );
             id
         });
 
-        let skipped = history_model
-            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
-        assert_eq!(skipped, 1, "the in-progress conversation must count as skipped");
+        let skipped =
+            history_model.update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(
+            skipped, 1,
+            "the in-progress conversation must count as skipped"
+        );
 
         let events = collect_model_events(&receiver, 2);
         let delete_ai_events: Vec<String> = events
@@ -1841,10 +1856,16 @@ fn test_delete_all_conversations_skips_in_progress_conversations() {
             })
             .collect();
         assert!(
-            !delete_ai_events.iter().any(|id| *id == in_progress_id.to_string()),
+            !delete_ai_events
+                .iter()
+                .any(|id| *id == in_progress_id.to_string()),
             "in-progress conversation must not be deleted"
         );
-        assert_eq!(delete_ai_events.len(), 1, "only the completed conversation is deleted");
+        assert_eq!(
+            delete_ai_events.len(),
+            1,
+            "only the completed conversation is deleted"
+        );
 
         history_model.read(&app, |model, _| {
             assert!(
@@ -1872,14 +1893,14 @@ fn test_delete_all_conversations_returns_skipped_count_for_mixed_state() {
 
         let deletable_id = AIConversationId::new();
         let ambient_id = AIConversationId::new();
-        let ambient_task_id: AmbientAgentTaskId =
-            uuid::Uuid::new_v4().to_string().parse().unwrap();
+        let ambient_task_id: AmbientAgentTaskId = uuid::Uuid::new_v4().to_string().parse().unwrap();
 
         let in_progress_id = history_model.update(&mut app, |model, ctx| {
             // 1 deletable: historical-only, non-ambient metadata.
-            model
-                .all_conversations_metadata
-                .insert(deletable_id, create_conversation_metadata(deletable_id, None));
+            model.all_conversations_metadata.insert(
+                deletable_id,
+                create_conversation_metadata(deletable_id, None),
+            );
             // 1 ambient: metadata owned by an ambient agent task.
             model.all_conversations_metadata.insert(
                 ambient_id,
@@ -1892,9 +1913,12 @@ fn test_delete_all_conversations_returns_skipped_count_for_mixed_state() {
             id
         });
 
-        let skipped = history_model
-            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
-        assert_eq!(skipped, 2, "ambient + in-progress conversations must be skipped");
+        let skipped =
+            history_model.update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        assert_eq!(
+            skipped, 2,
+            "ambient + in-progress conversations must be skipped"
+        );
 
         // Only the deletable conversation produces a DeleteAIConversation event.
         let events = collect_model_events(&receiver, 2);
@@ -1939,8 +1963,8 @@ fn test_delete_all_conversations_empty_model_returns_zero() {
             });
         }
 
-        let skipped = history_model
-            .update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
+        let skipped =
+            history_model.update(&mut app, |model, ctx| model.delete_all_conversations(ctx));
         assert_eq!(skipped, 0);
 
         // No persistence events and no emitted deletion events.
@@ -1949,5 +1973,847 @@ fn test_delete_all_conversations_empty_model_returns_zero() {
             Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected)
         ));
         assert!(emitted_deleted_conversation_ids(&emitted_events).is_empty());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Oz 子代理(模型乙):派发事件 + 启动收敛
+// ---------------------------------------------------------------------------
+
+/// 建一个父会话并挂上一个在飞的 response stream(否则 `AddMessagesToTask`
+/// 会因为 `added_exchanges_by_response` 里没有条目而报 `NoPendingRequest`)。
+/// 返回 `(parent_id, task_id, stream_id)`。
+fn prime_parent_conversation_for_subagent_test(
+    app: &mut App,
+    history_model: &warpui::ModelHandle<BlocklistAIHistoryModel>,
+    terminal_view_id: EntityId,
+) -> (
+    AIConversationId,
+    crate::ai::agent::task::TaskId,
+    ResponseStreamId,
+) {
+    let parent_id = history_model.update(app, |model, ctx| {
+        model.start_new_conversation(terminal_view_id, false, false, ctx)
+    });
+    let stream_id = ResponseStreamId::new_for_test();
+    let task_id = history_model.read(app, |model, _| {
+        model
+            .conversation(&parent_id)
+            .expect("parent exists")
+            .get_root_task_id()
+            .clone()
+    });
+    history_model.update(app, |model, ctx| {
+        let exchange = create_exchange_with_query("parent query", Local::now(), None);
+        let request_input = RequestInput {
+            conversation_id: parent_id,
+            input_messages: std::collections::HashMap::from([(task_id.clone(), exchange.input)]),
+            working_directory: exchange.working_directory,
+            model_id: exchange.model_id,
+            coding_model_id: exchange.coding_model_id,
+            cli_agent_model_id: exchange.cli_agent_model_id,
+            computer_use_model_id: exchange.computer_use_model_id,
+            shared_session_response_initiator: exchange.response_initiator,
+            request_start_ts: exchange.start_time,
+            supported_tools_override: None,
+        };
+        model
+            .update_conversation_for_new_request_input(
+                request_input,
+                stream_id.clone(),
+                terminal_view_id,
+                ctx,
+            )
+            .expect("request input registered");
+    });
+    // StreamInit 会把乐观 root task 升级成可写的 server task(`TaskNotInitialized`
+    // 在此之前会拒掉 `AddMessagesToTask`)。
+    history_model.update(app, |model, ctx| {
+        model.initialize_output_for_response_stream(
+            &stream_id,
+            parent_id,
+            terminal_view_id,
+            warp_multi_agent_api::response_event::StreamInit {
+                request_id: String::new(),
+                conversation_id: "subagent-test-server-token".to_owned(),
+                run_id: String::new(),
+            },
+            ctx,
+        );
+    });
+    // 乐观 root task 只有收到 `CreateTask` 才会变成 server task。
+    history_model.update(app, |model, ctx| {
+        model
+            .apply_client_actions(
+                &stream_id,
+                vec![api::ClientAction {
+                    action: Some(api::client_action::Action::CreateTask(
+                        api::client_action::CreateTask {
+                            task: Some(api::Task {
+                                id: task_id.to_string(),
+                                description: String::new(),
+                                dependencies: None,
+                                messages: vec![],
+                                summary: String::new(),
+                                server_data: String::new(),
+                            }),
+                        },
+                    )),
+                }],
+                parent_id,
+                terminal_view_id,
+                ctx,
+            )
+            .expect("root task upgraded to server task");
+    });
+    (parent_id, task_id, stream_id)
+}
+
+fn apply_messages_to_parent(
+    app: &mut App,
+    history_model: &warpui::ModelHandle<BlocklistAIHistoryModel>,
+    conversation_id: AIConversationId,
+    stream_id: &ResponseStreamId,
+    terminal_view_id: EntityId,
+    task_id: &crate::ai::agent::task::TaskId,
+    messages: Vec<api::Message>,
+) {
+    let stream_id = stream_id.clone();
+    let task_id = task_id.clone();
+    history_model.update(app, |model, ctx| {
+        model
+            .apply_client_actions(
+                &stream_id,
+                vec![api::ClientAction {
+                    action: Some(api::client_action::Action::AddMessagesToTask(
+                        api::client_action::AddMessagesToTask {
+                            task_id: task_id.to_string(),
+                            messages,
+                        },
+                    )),
+                }],
+                conversation_id,
+                terminal_view_id,
+                ctx,
+            )
+            .expect("client action applies");
+    });
+}
+
+fn subagent_carrier_message(
+    task_id: &crate::ai::agent::task::TaskId,
+    message_id: &str,
+    tool_call_id: &str,
+    args_json: &str,
+) -> api::Message {
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+    api::Message {
+        id: message_id.to_owned(),
+        task_id: task_id.to_string(),
+        server_message_data: format!("{}\n{}", subagent_tool::TOOL_NAME, args_json),
+        citations: vec![],
+        message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+            tool_call_id: tool_call_id.to_owned(),
+            tool: None,
+        })),
+        request_id: "req-1".to_owned(),
+        timestamp: None,
+    }
+}
+
+fn subagent_status_frame_message(
+    task_id: &crate::ai::agent::task::TaskId,
+    message_id: &str,
+    tool_call_id: &str,
+    payload: String,
+) -> api::Message {
+    api::Message {
+        id: message_id.to_owned(),
+        task_id: task_id.to_string(),
+        server_message_data: payload,
+        citations: vec![],
+        message: Some(api::message::Message::ToolCallResult(
+            api::message::ToolCallResult {
+                tool_call_id: tool_call_id.to_owned(),
+                context: None,
+                result: None,
+            },
+        )),
+        request_id: "req-1".to_owned(),
+        timestamp: None,
+    }
+}
+
+/// 父侧 `subagent` carrier + running 帧应用后,必须发出恰好一条
+/// `SubagentRequested`,且载荷与 running 帧里预生成的子会话 id 完全一致。
+#[test]
+fn subagent_dispatch_emits_requested_event_from_running_frame() {
+    use crate::ai::agent::task::TaskId;
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+    App::test((), |mut app| async move {
+        initialize_history_model_test_app(&mut app);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let (parent_id, task_id, stream_id) =
+            prime_parent_conversation_for_subagent_test(&mut app, &history_model, terminal_view_id);
+
+        let child_id = AIConversationId::new();
+        let messages = vec![
+            subagent_carrier_message(
+                &task_id,
+                "carrier-1",
+                "call-1",
+                r#"{"tasks":[{"prompt":"investigate A","name":"A"}]}"#,
+            ),
+            subagent_status_frame_message(
+                &task_id,
+                "running-frame-1",
+                "call-1",
+                subagent_tool::running_frame_json(&[subagent_tool::SubagentFrameChild::running(
+                    child_id.to_string(),
+                    "A".to_owned(),
+                )]),
+            ),
+        ];
+
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let emitted = emitted.clone();
+            app.update(|ctx| {
+                ctx.subscribe_to_model(&history_model, move |_, event, _| {
+                    emitted.borrow_mut().push(event.clone());
+                });
+            });
+        }
+
+        apply_messages_to_parent(
+            &mut app,
+            &history_model,
+            parent_id,
+            &stream_id,
+            terminal_view_id,
+            &task_id,
+            messages,
+        );
+
+        let requested: Vec<_> = emitted
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                BlocklistAIHistoryEvent::SubagentRequested {
+                    parent_conversation_id,
+                    parent_task_id,
+                    tool_call_id,
+                    result_message_id,
+                    children,
+                    ..
+                } => Some((
+                    *parent_conversation_id,
+                    parent_task_id.clone(),
+                    tool_call_id.clone(),
+                    result_message_id.clone(),
+                    children.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requested.len(), 1, "应恰好发出一次派发事件");
+        let (event_parent, event_task, tool_call_id, result_message_id, children) =
+            requested.into_iter().next().unwrap();
+        assert_eq!(event_parent, parent_id);
+        assert_eq!(event_task, TaskId::new(task_id.to_string()));
+        assert_eq!(tool_call_id, "call-1");
+        assert_eq!(result_message_id, "running-frame-1");
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].child_conversation_id, child_id,
+            "子会话 id 必须取自 running 帧,渲染层才能从消息体还原"
+        );
+        assert_eq!(children[0].prompt, "investigate A");
+        assert_eq!(children[0].name, "A");
+        assert_eq!(children[0].model, None);
+    });
+}
+
+/// 多子代理批量契约:一次调用派发 N 个子代理时,事件里必须带齐**全部**子代理
+/// (顺序与 args/frame 一致),且它们共享同一条 `result_message_id`。
+///
+/// 这是「一次派发完、卡片渲染 N 行」的数据前提:少带一个子代理就会漏建子会话;
+/// `result_message_id` 若被拆成 N 条,就会撞上 D3 的 `DuplicateToolResults`。
+#[test]
+fn subagent_dispatch_event_carries_every_child_of_one_call() {
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+    App::test((), |mut app| async move {
+        initialize_history_model_test_app(&mut app);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let (parent_id, task_id, stream_id) =
+            prime_parent_conversation_for_subagent_test(&mut app, &history_model, terminal_view_id);
+
+        let child_a = AIConversationId::new();
+        let child_b = AIConversationId::new();
+        let messages = vec![
+            subagent_carrier_message(
+                &task_id,
+                "carrier-1",
+                "call-1",
+                r#"{"tasks":[{"prompt":"A 的任务","name":"A"},{"prompt":"B 的任务","name":"B"}]}"#,
+            ),
+            subagent_status_frame_message(
+                &task_id,
+                "frame-1",
+                "call-1",
+                subagent_tool::running_frame_json(&[
+                    subagent_tool::SubagentFrameChild::running(child_a.to_string(), "A".to_owned()),
+                    subagent_tool::SubagentFrameChild::running(child_b.to_string(), "B".to_owned()),
+                ]),
+            ),
+        ];
+
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let emitted = emitted.clone();
+            app.update(|ctx| {
+                ctx.subscribe_to_model(&history_model, move |_, event, _| {
+                    emitted.borrow_mut().push(event.clone());
+                });
+            });
+        }
+
+        apply_messages_to_parent(
+            &mut app,
+            &history_model,
+            parent_id,
+            &stream_id,
+            terminal_view_id,
+            &task_id,
+            messages,
+        );
+
+        let requested: Vec<_> = emitted
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                BlocklistAIHistoryEvent::SubagentRequested {
+                    result_message_id,
+                    children,
+                    ..
+                } => Some((result_message_id.clone(), children.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requested.len(), 1, "一次调用只应发出一个派发事件");
+        let (result_message_id, children) = &requested[0];
+        assert_eq!(
+            result_message_id, "frame-1",
+            "N 个子代理共享同一条结果帧(否则会撞 DuplicateToolResults)"
+        );
+        assert_eq!(children.len(), 2, "必须带齐全部子代理,实际: {children:?}");
+        assert_eq!(children[0].child_conversation_id, child_a);
+        assert_eq!(children[0].prompt, "A 的任务");
+        assert_eq!(children[0].name, "A");
+        assert_eq!(children[1].child_conversation_id, child_b);
+        assert_eq!(children[1].prompt, "B 的任务");
+        assert_eq!(children[1].name, "B");
+    });
+}
+
+/// 多子代理的结果**逐个累积**进同一条帧:一个子代理结束时只改它自己那一项,
+/// 另一个的结果与状态必须原样保留。
+///
+/// 这是整条链路上最容易写错的一步(把「子代理粒度」误写成「工具调用粒度」会让
+/// 后完成的覆盖先完成的),而它只在真实并发下才暴露,所以在这里锁住。
+#[test]
+fn subagent_frame_accumulates_each_child_outcome_without_clobbering_siblings() {
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+    let child_a = AIConversationId::new();
+    let child_b = AIConversationId::new();
+    let running = subagent_tool::running_frame_json(&[
+        subagent_tool::SubagentFrameChild::running(child_a.to_string(), "A".to_owned()),
+        subagent_tool::SubagentFrameChild::running(child_b.to_string(), "B".to_owned()),
+    ]);
+
+    // A 先完成:帧里 A 变 completed,并带上 A 的结果;B 必须还是 running。
+    let after_a = subagent_tool::parse_status_frame(&running).expect("可解析");
+    let children = after_a
+        .children
+        .into_iter()
+        .map(|child| {
+            if child.child_conversation_id == child_a.to_string() {
+                subagent_tool::SubagentFrameChild::finished(
+                    child.child_conversation_id,
+                    child.name,
+                    subagent_tool::STATUS_COMPLETED,
+                    "A 的结论".to_owned(),
+                )
+            } else {
+                child
+            }
+        })
+        .collect::<Vec<_>>();
+    let payload_after_a = subagent_tool::completed_frame_json(
+        subagent_tool::aggregate_child_status(
+            &children
+                .iter()
+                .map(|c| c.status.clone())
+                .collect::<Vec<_>>(),
+        ),
+        &children,
+    );
+
+    let frame = subagent_tool::parse_status_frame(&payload_after_a).expect("可解析");
+    assert_eq!(frame.children[0].status, subagent_tool::STATUS_COMPLETED);
+    assert_eq!(frame.children[0].result.as_deref(), Some("A 的结论"));
+    assert_eq!(
+        frame.children[1].status,
+        subagent_tool::STATUS_RUNNING,
+        "B 还没结束,不得被顺手标成完成"
+    );
+    assert_eq!(frame.children[1].result, None);
+    assert_eq!(
+        frame.status,
+        subagent_tool::STATUS_RUNNING,
+        "还有子代理在跑,帧级状态必须是 running"
+    );
+
+    // B 随后完成:在 A 的结果之上累积,B 自己的结果也进来,A 的不被抹掉。
+    let children = frame
+        .children
+        .into_iter()
+        .map(|child| {
+            if child.child_conversation_id == child_b.to_string() {
+                subagent_tool::SubagentFrameChild::finished(
+                    child.child_conversation_id,
+                    child.name,
+                    subagent_tool::STATUS_COMPLETED,
+                    "B 的结论".to_owned(),
+                )
+            } else {
+                child
+            }
+        })
+        .collect::<Vec<_>>();
+    let payload_after_b = subagent_tool::completed_frame_json(
+        subagent_tool::aggregate_child_status(
+            &children
+                .iter()
+                .map(|c| c.status.clone())
+                .collect::<Vec<_>>(),
+        ),
+        &children,
+    );
+
+    let frame = subagent_tool::parse_status_frame(&payload_after_b).expect("可解析");
+    assert_eq!(
+        frame.children[0].result.as_deref(),
+        Some("A 的结论"),
+        "先完成的子代理结果不得被后完成的覆盖"
+    );
+    assert_eq!(frame.children[1].result.as_deref(), Some("B 的结论"));
+    assert_eq!(
+        frame.status,
+        subagent_tool::STATUS_COMPLETED,
+        "全部完成才是 completed"
+    );
+}
+
+/// 非 subagent 的 carrier(其它本地拦截工具 / 解析失败兜底)不得触发派发事件。
+#[test]
+fn subagent_dispatch_event_is_not_emitted_for_other_carriers() {
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+    App::test((), |mut app| async move {
+        initialize_history_model_test_app(&mut app);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let (parent_id, task_id, stream_id) =
+            prime_parent_conversation_for_subagent_test(&mut app, &history_model, terminal_view_id);
+
+        let child_id = AIConversationId::new();
+        // webfetch 风格的 carrier + 一条普通 running 帧:既不是 subagent 工具,
+        // 也没有可识别的子会话 id。
+        let messages = vec![
+            api::Message {
+                id: "carrier-web".to_owned(),
+                task_id: task_id.to_string(),
+                server_message_data: "webfetch\n{\"url\":\"https://example.com\"}".to_owned(),
+                citations: vec![],
+                message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+                    tool_call_id: "call-web".to_owned(),
+                    tool: None,
+                })),
+                request_id: "req-1".to_owned(),
+                timestamp: None,
+            },
+            subagent_status_frame_message(
+                &task_id,
+                "frame-web",
+                "call-web",
+                subagent_tool::running_frame_json(&[subagent_tool::SubagentFrameChild::running(
+                    child_id.to_string(),
+                    "A".to_owned(),
+                )]),
+            ),
+        ];
+
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let emitted = emitted.clone();
+            app.update(|ctx| {
+                ctx.subscribe_to_model(&history_model, move |_, event, _| {
+                    emitted.borrow_mut().push(event.clone());
+                });
+            });
+        }
+
+        apply_messages_to_parent(
+            &mut app,
+            &history_model,
+            parent_id,
+            &stream_id,
+            terminal_view_id,
+            &task_id,
+            messages,
+        );
+
+        assert!(
+            !emitted
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, BlocklistAIHistoryEvent::SubagentRequested { .. })),
+            "非 subagent carrier 不得触发派发"
+        );
+    });
+}
+
+/// 启动收敛:停在 running 的父侧帧被改成 error,子会话的 InProgress 也被收敛。
+#[test]
+fn reconcile_interrupted_subagent_dispatch_marks_frame_and_child_failed() {
+    use crate::ai::agent::conversation::ConversationStatus;
+    use crate::ai::agent::task::TaskId;
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+    App::test((), |mut app| async move {
+        initialize_history_model_test_app(&mut app);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let (parent_id, task_id, stream_id) =
+            prime_parent_conversation_for_subagent_test(&mut app, &history_model, terminal_view_id);
+
+        let child_conversation_id = AIConversationId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.start_new_child_conversation(
+                terminal_view_id,
+                "A".to_owned(),
+                parent_id,
+                child_conversation_id,
+                false,
+                ctx,
+            );
+        });
+
+        // 父侧落下一条仍停在 running 的结果帧。
+        let frame_message_id = "running-frame-1";
+        apply_messages_to_parent(
+            &mut app,
+            &history_model,
+            parent_id,
+            &stream_id,
+            terminal_view_id,
+            &task_id,
+            vec![subagent_status_frame_message(
+                &task_id,
+                frame_message_id,
+                "call-1",
+                subagent_tool::running_frame_json(&[subagent_tool::SubagentFrameChild::running(
+                    child_conversation_id.to_string(),
+                    "A".to_owned(),
+                )]),
+            )],
+        );
+
+        history_model.update(&mut app, |model, ctx| {
+            model.reconcile_interrupted_subagent_dispatches(terminal_view_id, ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            let parent = model.conversation(&parent_id).expect("parent exists");
+            let message = parent
+                .get_task(&TaskId::new(task_id.to_string()))
+                .expect("task exists")
+                .messages()
+                .find(|message| message.id == frame_message_id)
+                .expect("frame still present");
+            let frame = subagent_tool::parse_status_frame(&message.server_message_data)
+                .expect("frame still parses");
+            assert_eq!(
+                frame.status,
+                subagent_tool::STATUS_ERROR,
+                "重启后仍在 running 的派发必须被收敛成失败"
+            );
+            assert_eq!(
+                model
+                    .conversation(&child_conversation_id)
+                    .expect("child exists")
+                    .status(),
+                &ConversationStatus::Error,
+                "子会话不能一直停在 InProgress"
+            );
+        });
+    });
+}
+
+/// 收敛必须幂等:已终态的帧再跑一次不会被改写。
+#[test]
+fn reconcile_interrupted_subagent_dispatch_is_idempotent_for_terminal_frames() {
+    use crate::ai::agent::task::TaskId;
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+    App::test((), |mut app| async move {
+        initialize_history_model_test_app(&mut app);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let (parent_id, task_id, stream_id) =
+            prime_parent_conversation_for_subagent_test(&mut app, &history_model, terminal_view_id);
+
+        let child_id = AIConversationId::new();
+        let done_payload = subagent_tool::completed_frame_json(
+            subagent_tool::STATUS_COMPLETED,
+            &[subagent_tool::SubagentFrameChild::finished(
+                child_id.to_string(),
+                "A".to_owned(),
+                subagent_tool::STATUS_COMPLETED,
+                "done".to_owned(),
+            )],
+        );
+        apply_messages_to_parent(
+            &mut app,
+            &history_model,
+            parent_id,
+            &stream_id,
+            terminal_view_id,
+            &task_id,
+            vec![subagent_status_frame_message(
+                &task_id,
+                "done-frame",
+                "call-1",
+                done_payload.clone(),
+            )],
+        );
+
+        history_model.update(&mut app, |model, ctx| {
+            model.reconcile_interrupted_subagent_dispatches(terminal_view_id, ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            let message = model
+                .conversation(&parent_id)
+                .unwrap()
+                .get_task(&TaskId::new(task_id.to_string()))
+                .unwrap()
+                .messages()
+                .find(|message| message.id == "done-frame")
+                .unwrap();
+            assert_eq!(
+                message.server_message_data, done_payload,
+                "已完成的帧不得被收敛改写"
+            );
+        });
+    });
+}
+
+/// Oz 子代理(模型乙)回归:父侧「carrier ToolCall + 状态帧 ToolCallResult」在
+/// **从持久化恢复**之后,必须仍然产出 `AIAgentOutputMessageType::SubagentRun`
+/// (子代理派发记录,供 SDK/导出消费;底部状态卡另从子会话索引取数据)。
+///
+/// 这条用例来自实测故障:恢复路径里 `ToolCallResult` 原本被无条件当成 exchange
+/// 输入消费(`convert_conversation.rs` 对该 arm 恒返回 `true`),于是表示层根本
+/// 不跑 ⇒ 重启后卡片消失、还会被兜底合成为一条假的「已取消」结果。
+#[test]
+fn restored_subagent_status_frame_yields_subagent_run_output() {
+    use crate::ai::agent::AIAgentOutputMessageType;
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+    let child_conversation_id = AIConversationId::new();
+
+    let messages = vec![
+        byop_user_query_message("msg-user", "req-1", "用子代理查 A", None),
+        api::Message {
+            id: "msg-carrier".to_owned(),
+            task_id: "root-task".to_owned(),
+            server_message_data: format!(
+                "{}\n{}",
+                subagent_tool::TOOL_NAME,
+                r#"{"tasks":[{"prompt":"查 A","name":"A"}]}"#
+            ),
+            citations: vec![],
+            message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+                tool_call_id: "call-1".to_owned(),
+                tool: None,
+            })),
+            request_id: "req-1".to_owned(),
+            timestamp: None,
+        },
+        api::Message {
+            id: "msg-frame".to_owned(),
+            task_id: "root-task".to_owned(),
+            server_message_data: subagent_tool::running_frame_json(&[
+                subagent_tool::SubagentFrameChild::running(
+                    child_conversation_id.to_string(),
+                    "A".to_owned(),
+                ),
+            ]),
+            citations: vec![],
+            message: Some(api::message::Message::ToolCallResult(
+                api::message::ToolCallResult {
+                    tool_call_id: "call-1".to_owned(),
+                    context: None,
+                    result: None,
+                },
+            )),
+            request_id: "req-1".to_owned(),
+            timestamp: None,
+        },
+    ];
+
+    let persisted = persisted_agent_conversation_for_test(
+        AIConversationId::new(),
+        chrono::NaiveDateTime::default(),
+        messages,
+    );
+
+    let restored = convert_persisted_conversation_to_ai_conversation_with_metadata(persisted)
+        .expect("persisted conversation should restore");
+
+    let runs: Vec<(String, String)> = restored
+        .all_exchanges()
+        .into_iter()
+        .filter_map(|exchange| exchange.output_status.output())
+        .flat_map(|output| output.get().messages.clone())
+        .filter_map(|message| match message.message {
+            AIAgentOutputMessageType::SubagentRun(call) => Some((
+                call.runs[0].name.clone(),
+                call.runs[0].conversation_id.to_string(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        runs.len(),
+        1,
+        "恢复后必须恰好有一条子代理派发记录,实际: {runs:?}"
+    );
+    assert_eq!(runs[0].0, "A");
+    assert_eq!(
+        runs[0].1,
+        child_conversation_id.to_string(),
+        "派发记录必须指回 running 帧里预生成的子会话 id"
+    );
+}
+
+/// Oz 子代理回归:**会话被激活时**必须收敛它名下过期的派发。
+///
+/// 实测故障:启动收敛只覆盖「启动时已 live」的父会话,用户**事后从历史打开**的
+/// 会话走不到那里 ⇒ 卡片一直显示「运行中」,直到点开子会话才被按需修正。
+/// 因此收敛挂在 `set_active_conversation_id` 上。
+#[test]
+fn activating_conversation_reconciles_its_stale_subagent_dispatches() {
+    use crate::ai::agent::conversation::ConversationStatus;
+    use crate::ai::agent::task::TaskId;
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+    App::test((), |mut app| async move {
+        initialize_history_model_test_app(&mut app);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+        let (parent_id, task_id, stream_id) =
+            prime_parent_conversation_for_subagent_test(&mut app, &history_model, terminal_view_id);
+
+        let child_id = AIConversationId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.start_new_child_conversation(
+                terminal_view_id,
+                "A".to_owned(),
+                parent_id,
+                child_id,
+                false,
+                ctx,
+            );
+        });
+
+        // 父侧一条仍停在 running 的帧(模拟上次退出前没跑完)。
+        apply_messages_to_parent(
+            &mut app,
+            &history_model,
+            parent_id,
+            &stream_id,
+            terminal_view_id,
+            &task_id,
+            vec![subagent_status_frame_message(
+                &task_id,
+                "frame-running",
+                "call-1",
+                subagent_tool::running_frame_json(&[subagent_tool::SubagentFrameChild::running(
+                    child_id.to_string(),
+                    "A".to_owned(),
+                )]),
+            )],
+        );
+
+        // 激活会话 —— 收敛应当在这里发生,而不是等用户点开子会话。
+        history_model.update(&mut app, |model, ctx| {
+            model.set_active_conversation_id(parent_id, terminal_view_id, ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            let frame = model
+                .conversation(&parent_id)
+                .expect("parent exists")
+                .get_task(&TaskId::new(task_id.to_string()))
+                .expect("task exists")
+                .messages()
+                .find(|message| message.id == "frame-running")
+                .expect("frame present");
+            let parsed = subagent_tool::parse_status_frame(&frame.server_message_data)
+                .expect("frame still parses");
+            assert_eq!(
+                parsed.status,
+                subagent_tool::STATUS_ERROR,
+                "激活会话后仍停在 running 的派发必须被收敛成失败"
+            );
+            assert_eq!(
+                model
+                    .conversation(&child_id)
+                    .expect("child exists")
+                    .status(),
+                &ConversationStatus::Error,
+                "子会话不能一直停在 InProgress"
+            );
+
+            // 关键:卡片读的是 exchange 里的 **output 表示**,不是 source message。
+            // 若 output 没跟着刷新,UI 就会继续显示「运行中」(实测故障)。
+            let parent = model.conversation(&parent_id).expect("parent exists");
+            let run_statuses: Vec<ConversationStatus> = parent
+                .all_exchanges()
+                .into_iter()
+                .filter_map(|exchange| exchange.output_status.output())
+                .flat_map(|output| output.get().messages.clone())
+                .filter_map(|message| match message.message {
+                    crate::ai::agent::AIAgentOutputMessageType::SubagentRun(call) => {
+                        Some(call.runs[0].fallback_status.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                run_statuses,
+                vec![ConversationStatus::Error],
+                "父侧卡片的 output 表示必须同步为失败,否则 UI 会一直显示运行中"
+            );
+        });
     });
 }

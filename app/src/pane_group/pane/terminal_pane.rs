@@ -13,10 +13,12 @@ use warpui::{
 use crate::{
     ai::{blocklist::BlocklistAIHistoryModel, llms::LLMPreferences, skills::SkillManager},
     app_state::{AmbientAgentPaneSnapshot, LeafContents, TerminalPaneSnapshot},
+    pane_group::pane::view::PaneHeaderAction,
     pane_group::{self, Direction, Event::OpenConversationHistory, PaneGroup},
     persistence::{BlockCompleted, ModelEvent},
     session_management::SessionNavigationData,
     terminal::cli_agent_sessions::CLIAgentSessionsModel,
+    terminal::view::TerminalAction,
     terminal::{
         general_settings::GeneralSettings, shared_session::SharedSessionStatus, view::Event,
         TerminalManager, TerminalView,
@@ -247,6 +249,7 @@ impl PaneContent for TerminalPane {
                         .unwrap_or(false);
 
                     handle_ai_history_event(
+                        group,
                         event,
                         terminal_view_id,
                         terminal_pane_id,
@@ -943,12 +946,93 @@ fn handle_terminal_view_event(
                 });
             }
             Event::RevealChildAgent { conversation_id } => {
-                if let Some(&child_pane_id) = group.child_agent_panes.get(conversation_id) {
-                    group.panes.show_pane_for_child_agent(child_pane_id);
-                    group.handle_pane_count_change(ctx);
-                    group.focus_pane(child_pane_id, true, ctx);
+                let parent_pane_id = terminal_pane_id.into();
+                // 事后从历史打开的父会话没有预先物化的隐藏 pane,这里按需补建,
+                // 否则点击子代理卡会「无反应」(实测故障)。
+                let materialized = group.ensure_hidden_child_agent_pane_for_conversation(
+                    *conversation_id,
+                    parent_pane_id,
+                    ctx,
+                );
+                if materialized {
+                    if let Some(&child_pane_id) = group.child_agent_panes.get(conversation_id) {
+                        group.panes.show_pane_for_child_agent(child_pane_id);
+                        group.handle_pane_count_change(ctx);
+                        group.focus_pane(child_pane_id, true, ctx);
+                    }
                 } else {
-                    log::warn!("No hidden pane found for child conversation {conversation_id:?}");
+                    // 兜底:连会话都取不到时,至少把本 pane 的 agent view 切过去,
+                    // 不要给出一个「点了没反应」的入口。
+                    log::warn!(
+                        "RevealChildAgent: could not materialize a pane for child conversation \
+                         {conversation_id:?}; falling back to switching this pane's agent view"
+                    );
+                    ctx.dispatch_typed_action(
+                        &PaneHeaderAction::<TerminalAction, TerminalAction>::CustomAction(
+                            TerminalAction::SwitchAgentViewToConversation {
+                                conversation_id: *conversation_id,
+                            },
+                        ),
+                    );
+                }
+            }
+            // Oz 子代理(模型乙,步骤 7):在**子 pane 自己的** controller 上取消该
+            // 会话。父对话的取消按钮不会连带取消子代理(两条独立通道),所以这里
+            // 是用户在父对话里停掉子代理的唯一入口。
+            Event::StopChildAgentConversation { conversation_id } => {
+                let parent_pane_id = terminal_pane_id.into();
+                if !group.ensure_hidden_child_agent_pane_for_conversation(
+                    *conversation_id,
+                    parent_pane_id,
+                    ctx,
+                ) {
+                    log::warn!(
+                        "StopChildAgentConversation: could not materialize a pane for child \
+                         conversation {conversation_id:?}"
+                    );
+                    return;
+                }
+                let Some(&child_pane_id) = group.child_agent_panes.get(conversation_id) else {
+                    return;
+                };
+                let Some(child_view) = group.terminal_view_from_pane_id(child_pane_id, ctx) else {
+                    log::warn!(
+                        "StopChildAgentConversation: child pane {child_pane_id:?} has no \
+                         terminal view"
+                    );
+                    return;
+                };
+                let controller = child_view.as_ref(ctx).ai_controller().clone();
+                controller.update(ctx, |controller, ctx| {
+                    controller.cancel_conversation_progress(
+                        *conversation_id,
+                        crate::ai::agent::CancellationReason::ManuallyCancelled,
+                        ctx,
+                    );
+                });
+            }
+            // 编排 pill bar 的「在独立 pane / tab 中打开」:本地没有 pane 分割/重建
+            // 能力(上游 `pane_group/child_agent/` 不存在),降级为显示并聚焦既有
+            // 隐藏 pane —— 与 `RevealChildAgent` 同路径,见 `action.rs` 的偏差说明。
+            Event::OpenChildAgentInNewPane { conversation_id }
+            | Event::OpenChildAgentInNewTab { conversation_id } => {
+                let parent_pane_id = terminal_pane_id.into();
+                let materialized = group.ensure_hidden_child_agent_pane_for_conversation(
+                    *conversation_id,
+                    parent_pane_id,
+                    ctx,
+                );
+                if materialized {
+                    if let Some(&child_pane_id) = group.child_agent_panes.get(conversation_id) {
+                        group.panes.show_pane_for_child_agent(child_pane_id);
+                        group.handle_pane_count_change(ctx);
+                        group.focus_pane(child_pane_id, true, ctx);
+                    }
+                } else {
+                    log::warn!(
+                        "Could not materialize a pane for child conversation {conversation_id:?}; \
+                         opening it in a separate pane/tab is not supported in this build"
+                    );
                 }
             }
             _ => {}
@@ -960,6 +1044,7 @@ fn handle_terminal_view_event(
 
 #[cfg(feature = "local_fs")]
 fn handle_ai_history_event(
+    group: &mut PaneGroup,
     event: &BlocklistAIHistoryEvent,
     terminal_view_id: EntityId,
     terminal_pane_id: TerminalPaneId,
@@ -1079,6 +1164,37 @@ fn handle_ai_history_event(
                     }
                 },
             );
+        }
+        // Oz 子代理(模型乙,步骤 3+4):父会话这一轮派发了 `subagent`,在这里
+        // 建独立子会话 + 隐藏 pane,并用子 pane 自己的 controller 提交首轮 query。
+        // 放在 PaneGroup 侧是因为它拥有隐藏 pane 与 `child_agent_panes` 索引;
+        // 结果回填与 resume 由父 view 的 controller 负责(D4)。
+        //
+        // 一次调用可以带多个子代理:逐个派发。它们共享同一对父侧消息
+        // (`result_message_id` 只有一条),各自结束后由控制层写进同一帧的
+        // `children` 数组。
+        BlocklistAIHistoryEvent::SubagentRequested {
+            parent_conversation_id,
+            parent_task_id,
+            result_message_id,
+            tool_call_id,
+            children,
+            ..
+        } => {
+            for child in children {
+                group.dispatch_subagent_request(
+                    terminal_pane_id.into(),
+                    *parent_conversation_id,
+                    parent_task_id.clone(),
+                    child.child_conversation_id,
+                    result_message_id.clone(),
+                    tool_call_id.clone(),
+                    child.prompt.clone(),
+                    child.name.clone(),
+                    child.model.clone(),
+                    ctx,
+                );
+            }
         }
         // DeletedConversation SQL cleanup is handled directly in delete_conversation().
         BlocklistAIHistoryEvent::DeletedConversation { .. }

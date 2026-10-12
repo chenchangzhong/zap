@@ -387,6 +387,8 @@ pub mod flags {
     pub const SYNC_ALL_TABS_FLAG: &str = "Sync_All_Tabs_Enabled";
     pub const SYNC_ALL_PANES_IN_CURRENT_TAB: &str = "Sync_All_Panes_In_Current_Tab";
     pub const USE_AUDIBLE_BELL_CONTEXT_FLAG: &str = "Use_Audible_Terminal_Bell";
+    /// Zap:子代理等待审批时响铃(与终端响铃分开,默认开启)。
+    pub const NOTIFY_ON_SUBAGENT_APPROVAL_CONTEXT_FLAG: &str = "Notify_On_Subagent_Approval";
     pub const SHOW_INPUT_HINT_TEXT_CONTEXT_FLAG: &str = "Show_Input_Hint_text";
     pub const SHOW_AGENT_TIPS_FLAG: &str = "Show_Agent_Tips";
     pub const USE_AGENT_FOOTER_FLAG: &str = "Use_Agent_Footer";

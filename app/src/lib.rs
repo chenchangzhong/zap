@@ -1663,6 +1663,16 @@ fn initialize_app(
         let conversations = &multi_agent_conversations;
         ctx.add_singleton_model(move |_| BlocklistAIHistoryModel::new(ai_queries, conversations));
     }
+    // 编排 pill bar 的跨 pane UI 状态(阶段二)。
+    // **必须在 `BlocklistAIHistoryModel` 之后注册** —— 它构造时会 `handle(ctx)`
+    // 订阅该模型,提前注册会在启动时 panic("never registered")。
+    // 置顶集合本期仅内存(无持久化列),故种子恒为空集。
+    ctx.add_singleton_model(|ctx| {
+        ai::blocklist::agent_view::orchestration_pill_bar_model::OrchestrationPillBarModel::new(
+            std::collections::HashSet::new(),
+            ctx,
+        )
+    });
     {
         let (restored, failed_to_restore) =
             RestoredAgentConversations::new(multi_agent_conversations);

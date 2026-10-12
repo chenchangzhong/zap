@@ -52,7 +52,7 @@ use crate::ai::blocklist::agent_view::{
     AgentViewController, AgentViewControllerEvent, AgentViewDisplayMode, AgentViewEntryBlockParams,
     AgentViewEntryOrigin, AgentViewHeaderDisabledTheme, AgentViewHeaderTheme,
     AgentViewZeroStateBlock, AgentViewZeroStateEvent, EphemeralMessageModel, ExitAgentViewError,
-    ExitConfirmationTrigger, InlineAgentViewHeader,
+    ExitConfirmationTrigger, InlineAgentViewHeader, OrchestrationPillBar,
 };
 use crate::ai::conversation_utils;
 use crate::ai::predict::prompt_suggestions::{
@@ -1882,6 +1882,21 @@ pub enum Event {
     RevealChildAgent {
         conversation_id: AIConversationId,
     },
+    /// Oz 子代理(模型乙,步骤 7):用户要求停止一个正在运行的子代理。
+    StopChildAgentConversation {
+        conversation_id: AIConversationId,
+    },
+    /// 编排 pill bar 的 3-dot 菜单:「在独立 pane 中打开」子代理会话。
+    ///
+    /// 本地降级为复用既有隐藏 pane(见 `TerminalAction::OpenChildAgentInNewPane`)。
+    OpenChildAgentInNewPane {
+        conversation_id: AIConversationId,
+    },
+    /// 编排 pill bar 的 3-dot 菜单:「在独立 tab 中打开」子代理会话。
+    /// 本地与 [`Self::OpenChildAgentInNewPane`] 同路径。
+    OpenChildAgentInNewTab {
+        conversation_id: AIConversationId,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2713,6 +2728,9 @@ pub struct TerminalView {
 
     agent_view_controller: ModelHandle<AgentViewController>,
     agent_view_back_button: ViewHandle<ActionButton>,
+    /// 编排 pill bar(阶段二)。总是构造;它自己在没有子会话时渲染成 `Empty`,
+    /// 是否绘制由渲染层的 agent view 全屏判定控制。
+    orchestration_pill_bar: ViewHandle<OrchestrationPillBar>,
     is_using_conversation_for_pane_header_title: bool,
 
     ambient_agent_view_model: ModelHandle<ambient_agent::AmbientAgentViewModel>,
@@ -3936,6 +3954,13 @@ impl TerminalView {
             })
         });
 
+        // 编排 pill bar:与 agent view controller 共享同一份会话状态,并在其
+        // 变化时重画。
+        let orchestration_pill_bar = ctx.add_typed_action_view(|ctx| {
+            OrchestrationPillBar::new(agent_view_controller.clone(), ctx)
+        });
+        ctx.subscribe_to_view(&orchestration_pill_bar, |_, _, _, ctx| ctx.notify());
+
         let window_id = ctx.window_id();
         let mut terminal_view = Self {
             model,
@@ -4079,6 +4104,7 @@ impl TerminalView {
             use_agent_footer: use_agent_button_bar,
             agent_view_controller,
             agent_view_back_button,
+            orchestration_pill_bar,
             is_using_conversation_for_pane_header_title: false,
             ambient_agent_view_model,
             ambient_agent_cancel_mouse_state: Default::default(),
@@ -4447,9 +4473,17 @@ impl TerminalView {
     ) {
         // 命令完成可能早于 CLI subagent 把结果交回主 agent。这种情况下行留在队列里,
         // 等 history 显示 subagent 消失后再发(见 maybe_send_lrc_queued_prompts_after_subagent_handoff)。
+        //
+        // Oz 子代理(D4.1):**并列**加上「本会话还有在飞子代理」的判定 ——
+        // 子代理跑完前父回合不算完成,期间不该把 LRC 排队行发出去。
+        // 注意这里是新增 OR 判定,`has_active_subagent()` 本体(LRC 语义)未改。
         let has_active_subagent = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)
-            .is_some_and(|conversation| conversation.has_active_subagent());
+            .is_some_and(|conversation| conversation.has_active_subagent())
+            || self
+                .ai_controller
+                .as_ref(ctx)
+                .has_pending_subagent_for(conversation_id);
         if has_active_subagent {
             self.last_observed_active_subagent
                 .insert(conversation_id, true);
@@ -4511,7 +4545,11 @@ impl TerminalView {
         }
         let has_active_subagent = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)
-            .is_some_and(|conversation| conversation.has_active_subagent());
+            .is_some_and(|conversation| conversation.has_active_subagent())
+            || self
+                .ai_controller
+                .as_ref(ctx)
+                .has_pending_subagent_for(conversation_id);
         let previously_had_active_subagent = self
             .last_observed_active_subagent
             .insert(conversation_id, has_active_subagent)
@@ -4822,6 +4860,25 @@ impl TerminalView {
         if let BlocklistAIControllerEvent::SentRequest { model_id, .. } = event {
             self.maybe_insert_aws_bedrock_login_banner(model_id, ctx);
         }
+        // Oz 子代理(模型乙):子代理结果已写回本会话历史。子会话挂在另一个 terminal
+        // view 上,本 view 收不到它的 `UpdatedConversationStatus`,所以在这里重画一次,
+        // 让子代理卡片从 running 切到终态。
+        if matches!(
+            event,
+            BlocklistAIControllerEvent::SubagentResultDelivered { .. }
+        ) {
+            ctx.notify();
+        }
+        // Oz 子代理(模型乙):有子代理卡在等待审批。子代理的审批按钮在它自己的会话
+        // 里,父界面结构上看不到,所以这里额外把窗口/标签标记为需要注意。
+        // 声音已在 controller 里响过(`request_user_attention` 只在 ViewContext 上可用)。
+        if matches!(
+            event,
+            BlocklistAIControllerEvent::SubagentAwaitingApproval { .. }
+        ) {
+            ctx.notify();
+            ctx.request_user_attention();
+        }
         if let BlocklistAIControllerEvent::FinishedReceivingOutput {
             conversation_id, ..
         } = event
@@ -4832,10 +4889,19 @@ impl TerminalView {
             // handing off to it — not the end of the overall turn. Defer
             // conversation-finished side effects (e.g. firing a queued `/queue`
             // prompt) until the entire turn is actually done.
+            //
+            // Oz 子代理(D4.1):同样把「本会话还有在飞子代理」并列进来 —— 乙模型下
+            // 父回合会先结束,子代理跑完后才 resume,若不门控就会「父看似说完、
+            // 稍后又冒出一段总结」。`has_active_subagent()` 本体未改。
+            let has_pending_subagent = self
+                .ai_controller
+                .as_ref(ctx)
+                .has_pending_subagent_for(*conversation_id);
             let has_active_subagent = || {
-                BlocklistAIHistoryModel::as_ref(ctx)
-                    .conversation(conversation_id)
-                    .is_some_and(|c| c.has_active_subagent())
+                has_pending_subagent
+                    || BlocklistAIHistoryModel::as_ref(ctx)
+                        .conversation(conversation_id)
+                        .is_some_and(|c| c.has_active_subagent())
             };
 
             let mut finish_reason: Option<FinishReason> = None;
@@ -5236,7 +5302,10 @@ impl TerminalView {
             | BlocklistAIHistoryEvent::DeletedConversation { .. }
             | BlocklistAIHistoryEvent::RestoredConversations { .. }
             | BlocklistAIHistoryEvent::ConversationAgentIdAssigned { .. }
-            | BlocklistAIHistoryEvent::ConversationOwnershipTransferred { .. } => None,
+            | BlocklistAIHistoryEvent::ConversationOwnershipTransferred { .. }
+            // 子代理派发不改本 view 渲染的内容:父侧卡片由 AI block 渲染,
+            // 子会话隐藏 pane 由 pane group 侧的订阅创建。
+            | BlocklistAIHistoryEvent::SubagentRequested { .. } => None,
         }
     }
 
@@ -5644,7 +5713,10 @@ impl TerminalView {
             | BlocklistAIHistoryEvent::RestoredConversations { .. }
             | BlocklistAIHistoryEvent::UpgradedTask { .. }
             | BlocklistAIHistoryEvent::UpdatedConversationArtifacts { .. }
-            | BlocklistAIHistoryEvent::ConversationAgentIdAssigned { .. } => {}
+            | BlocklistAIHistoryEvent::ConversationAgentIdAssigned { .. }
+            // 子代理派发由 pane group 侧订阅处理(建子会话 + 隐藏 pane + 首轮 query),
+            // 本 view 只需跟随 `StartedNewConversation` 刷新。
+            | BlocklistAIHistoryEvent::SubagentRequested { .. } => {}
         }
         ctx.notify();
     }
@@ -24521,6 +24593,10 @@ impl TypedActionView for TerminalView {
             | ExecuteRewindFromInlineMenu { .. }
             | ToggleUsageFooter
             | RevealChildAgent { .. }
+            | StopChildAgentConversation { .. }
+            | SwitchAgentViewToConversation { .. }
+            | OpenChildAgentInNewPane { .. }
+            | OpenChildAgentInNewTab { .. }
             | ToggleCLIAgentRichInput
             | FocusCLIAgentTerminal
             | FocusCLIAgentRichInput
@@ -25477,6 +25553,33 @@ impl TypedActionView for TerminalView {
             }
             RevealChildAgent { conversation_id } => {
                 ctx.emit(Event::RevealChildAgent {
+                    conversation_id: *conversation_id,
+                });
+            }
+            StopChildAgentConversation { conversation_id } => {
+                ctx.emit(Event::StopChildAgentConversation {
+                    conversation_id: *conversation_id,
+                });
+            }
+            // 编排 pill bar:原地把本 pane 的 agent view 切到目标会话。
+            SwitchAgentViewToConversation { conversation_id } => {
+                let conversation_id = *conversation_id;
+                self.enter_agent_view(
+                    None,
+                    Some(conversation_id),
+                    AgentViewEntryOrigin::ConversationSelector,
+                    ctx,
+                );
+            }
+            // 编排 pill bar 的两个「打开」动作:本地没有 pane 重建/分割能力,
+            // 统一走 reveal 既有隐藏 pane(见 action.rs 上的偏差说明)。
+            OpenChildAgentInNewPane { conversation_id } => {
+                ctx.emit(Event::OpenChildAgentInNewPane {
+                    conversation_id: *conversation_id,
+                });
+            }
+            OpenChildAgentInNewTab { conversation_id } => {
+                ctx.emit(Event::OpenChildAgentInNewTab {
                     conversation_id: *conversation_id,
                 });
             }

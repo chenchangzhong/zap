@@ -85,6 +85,14 @@ pub fn initialize_app_for_terminal_view(app: &mut App) {
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
     app.add_singleton_model(BlocklistAIPermissions::new);
     app.add_singleton_model(UndoCloseStack::new);
+    // 阶段二:编排 pill bar 的跨 pane UI 状态。`TerminalView` 构造时会读取它,
+    // 未注册会让所有构造 terminal view 的测试 panic。置顶集合仅内存,种子为空集。
+    app.add_singleton_model(|ctx| {
+        crate::ai::blocklist::agent_view::orchestration_pill_bar_model::OrchestrationPillBarModel::new(
+            std::collections::HashSet::new(),
+            ctx,
+        )
+    });
 
     app.add_singleton_model(AIRequestUsageModel::new_for_test);
     app.add_singleton_model(|_| KeybindingChangedNotifier::new());

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use warpui::elements::{Element, Empty, Flex, MouseStateHandle, ParentElement};
 use warpui::platform::Cursor;
@@ -15,26 +15,27 @@ use crate::ai::blocklist::agent_view::{AgentViewController, AgentViewControllerE
 use crate::ai::blocklist::BlocklistAIHistoryEvent;
 use crate::appearance::Appearance;
 use crate::terminal::view::TerminalAction;
-use crate::ui_components::buttons::close_button;
+use crate::ui_components::buttons::icon_button;
+use crate::ui_components::icons::Icon;
 use crate::BlocklistAIHistoryModel;
 
 #[derive(Debug, Clone)]
 pub enum ChildAgentStatusCardAction {
-    Dismiss(AIConversationId),
+    /// 停止该子代理。子代理跑在独立会话里,父对话的取消不会连带取消它,所以这是
+    /// 用户在父界面里停掉跑偏子代理的入口。
+    StopAgent(AIConversationId),
 }
 
 /// Renders a list of child agent statuses above the agent message bar.
 ///
 /// Each row shows a status icon, agent name, and conversation title.
 /// Clicking a row reveals the child agent's hidden pane.
-/// Cards can be dismissed via an X button and automatically reappear
-/// when the child agent starts or restarts (transitions to InProgress).
+/// While the child is still running, the row offers a **stop** button; finished
+/// rows show no action (there is nothing left to stop).
 pub struct ChildAgentStatusCard {
     agent_view_controller: ModelHandle<AgentViewController>,
     mouse_states: HashMap<AIConversationId, MouseStateHandle>,
-    dismiss_mouse_states: HashMap<AIConversationId, MouseStateHandle>,
-    dismissed: HashSet<AIConversationId>,
-    previous_statuses: HashMap<AIConversationId, ConversationStatus>,
+    stop_mouse_states: HashMap<AIConversationId, MouseStateHandle>,
 }
 
 impl Entity for ChildAgentStatusCard {
@@ -50,10 +51,7 @@ impl ChildAgentStatusCard {
         // updates for child conversations (which have a different terminal_view_id).
         let history_model = BlocklistAIHistoryModel::handle(ctx);
         ctx.subscribe_to_model(&history_model, |this, _, event, ctx| match event {
-            BlocklistAIHistoryEvent::UpdatedConversationStatus {
-                conversation_id, ..
-            } => {
-                this.on_conversation_status_updated(*conversation_id, ctx);
+            BlocklistAIHistoryEvent::UpdatedConversationStatus { .. } => {
                 this.ensure_mouse_states(ctx);
                 ctx.notify();
             }
@@ -77,10 +75,8 @@ impl ChildAgentStatusCard {
             // Reset all per-child state when entering a conversation so stale
             // entries from a previous conversation's children don't accumulate.
             if matches!(event, AgentViewControllerEvent::EnteredAgentView { .. }) {
-                this.dismissed.clear();
-                this.previous_statuses.clear();
                 this.mouse_states.clear();
-                this.dismiss_mouse_states.clear();
+                this.stop_mouse_states.clear();
             }
             this.ensure_mouse_states(ctx);
             ctx.notify();
@@ -89,9 +85,7 @@ impl ChildAgentStatusCard {
         Self {
             agent_view_controller,
             mouse_states: HashMap::new(),
-            dismiss_mouse_states: HashMap::new(),
-            dismissed: HashSet::new(),
-            previous_statuses: HashMap::new(),
+            stop_mouse_states: HashMap::new(),
         }
     }
 
@@ -107,44 +101,13 @@ impl ChildAgentStatusCard {
         for child in history_model.child_conversations_of(active_conversation_id) {
             let child_id = child.id();
             self.mouse_states.entry(child_id).or_default();
-            self.dismiss_mouse_states.entry(child_id).or_default();
-            self.previous_statuses
-                .entry(child_id)
-                .or_insert_with(|| child.status().clone());
+            self.stop_mouse_states.entry(child_id).or_default();
         }
     }
 
     fn remove_state_for_conversation(&mut self, conversation_id: AIConversationId) {
-        self.dismissed.remove(&conversation_id);
-        self.previous_statuses.remove(&conversation_id);
         self.mouse_states.remove(&conversation_id);
-        self.dismiss_mouse_states.remove(&conversation_id);
-    }
-
-    /// Checks whether a child conversation transitioned to `InProgress` from a
-    /// non-`InProgress` state. If so, restores any dismissed card for that conversation.
-    fn on_conversation_status_updated(
-        &mut self,
-        conversation_id: AIConversationId,
-        ctx: &AppContext,
-    ) {
-        let Some(conversation) =
-            BlocklistAIHistoryModel::as_ref(ctx).conversation(&conversation_id)
-        else {
-            return;
-        };
-        if !conversation.is_child_agent_conversation() {
-            return;
-        }
-        let current_status = conversation.status().clone();
-        if should_restore_dismissed_card(
-            &current_status,
-            self.previous_statuses.get(&conversation_id),
-        ) {
-            self.dismissed.remove(&conversation_id);
-        }
-        self.previous_statuses
-            .insert(conversation_id, current_status);
+        self.stop_mouse_states.remove(&conversation_id);
     }
 }
 
@@ -153,9 +116,10 @@ impl TypedActionView for ChildAgentStatusCard {
 
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
-            ChildAgentStatusCardAction::Dismiss(conversation_id) => {
-                self.dismissed.insert(*conversation_id);
-                ctx.notify();
+            ChildAgentStatusCardAction::StopAgent(conversation_id) => {
+                ctx.dispatch_typed_action(&TerminalAction::StopChildAgentConversation {
+                    conversation_id: *conversation_id,
+                });
             }
         }
     }
@@ -189,9 +153,6 @@ impl View for ChildAgentStatusCard {
 
         for child in &children {
             let conversation_id = child.id();
-            if self.dismissed.contains(&conversation_id) {
-                continue;
-            }
 
             let agent_name = child
                 .agent_name()
@@ -205,14 +166,37 @@ impl View for ChildAgentStatusCard {
             // T3-7:in_progress 子代理在 title 里 surface 当前 action,
             // "Untitled · ↳ Searching codebase..." / "Refactor X · ↳ Reading files..."。
             // finished 子代理仍显示原 title 不变。
-            let title = if child.status().is_in_progress() {
-                if let Some(presence) = latest_action_presence(child) {
-                    format!("{raw_title} · ↳ {presence}...")
-                } else {
-                    raw_title
+            //
+            // Zap:子代理**等待审批**时必须单独说清楚。子代理的审批按钮渲染在它
+            // 自己的会话里(`AIBlock::conversation_id` 把 block 绑定到唯一会话,
+            // `blocked_action` 也只读该会话的 output),父界面结构上看不到那个按钮,
+            // 所以这里必须明确告诉用户「在等确认」以及「点这一行可以进去处理」,
+            // 否则用户只看到一个黄点而不知道该做什么。
+            //
+            // 注意 `Blocked` **不是** `is_in_progress()`(见 `ConversationStatus`
+            // 的两个独立判定),所以它需要单独一个分支。
+            let title = match child.status() {
+                ConversationStatus::Blocked { blocked_action } => {
+                    let action = blocked_action.trim();
+                    if action.is_empty() {
+                        format!(
+                            "{raw_title} · {}",
+                            crate::t!("child-agent-awaiting-approval")
+                        )
+                    } else {
+                        // `blocked_action` 已由 `localized_action_name` 生成为本地化
+                        // 纯文本(源不再包调试引号),这里直接展示。
+                        format!("{raw_title} · ↳ {action}")
+                    }
                 }
-            } else {
-                raw_title
+                _ if child.status().is_in_progress() => {
+                    if let Some(presence) = latest_action_presence(child) {
+                        format!("{raw_title} · ↳ {presence}...")
+                    } else {
+                        raw_title
+                    }
+                }
+                _ => raw_title,
             };
 
             let Some(mouse_state) = self.mouse_states.get(&conversation_id).cloned() else {
@@ -223,23 +207,44 @@ impl View for ChildAgentStatusCard {
                 continue;
             };
 
-            let Some(dismiss_mouse_state) =
-                self.dismiss_mouse_states.get(&conversation_id).cloned()
-            else {
-                log::error!(
-                    "Missing dismiss mouse state handle for child agent card {:?}",
-                    conversation_id
-                );
-                continue;
+            // 「停止」入口只在子代理**还活着**时提供:已结束的会话没有可停的东西,
+            // 而且 `cancel_conversation_progress` 在无 in-flight stream 时会走
+            // `cancel_all_pending_actions` 分支 —— 对已完成的会话调用语义不对。
+            //
+            // 未运行时仍然放一个空占位:渲染器只在 `extra_trailing` 为 `Some` 时才
+            // 插入 `Expanded` 占位(`conversation_navigation_card_with_icon`),少了它
+            // 各行的 chevron 位置会不一致。
+            let trailing: Box<dyn Element> = if matches!(
+                child.status(),
+                ConversationStatus::InProgress | ConversationStatus::Blocked { .. }
+            ) {
+                let Some(stop_mouse_state) = self.stop_mouse_states.get(&conversation_id).cloned()
+                else {
+                    log::error!(
+                        "Missing stop mouse state handle for child agent card {:?}",
+                        conversation_id
+                    );
+                    continue;
+                };
+                let stop_tooltip = appearance.ui_builder().clone();
+                icon_button(appearance, Icon::StopFilled, false, stop_mouse_state)
+                    .with_tooltip(move || {
+                        stop_tooltip
+                            .tool_tip(crate::t!("child-agent-stop"))
+                            .build()
+                            .finish()
+                    })
+                    .build()
+                    .on_click(move |ctx: &mut warpui::EventContext<'_>, _, _| {
+                        ctx.dispatch_typed_action(ChildAgentStatusCardAction::StopAgent(
+                            conversation_id,
+                        ));
+                    })
+                    .with_cursor(Cursor::PointingHand)
+                    .finish()
+            } else {
+                Empty::new().finish()
             };
-
-            let dismiss_button = close_button(appearance, dismiss_mouse_state)
-                .build()
-                .on_click(move |ctx: &mut warpui::EventContext<'_>, _, _| {
-                    ctx.dispatch_typed_action(ChildAgentStatusCardAction::Dismiss(conversation_id));
-                })
-                .with_cursor(Cursor::PointingHand)
-                .finish();
 
             let card = conversation_navigation_card_with_icon(
                 Some(status_icon),
@@ -250,7 +255,7 @@ impl View for ChildAgentStatusCard {
                 },
                 mouse_state,
                 true,
-                Some(dismiss_button),
+                Some(trailing),
                 app,
             );
             column.add_child(Container::new(card).with_margin_top(4.).finish());
@@ -258,17 +263,6 @@ impl View for ChildAgentStatusCard {
 
         column.finish()
     }
-}
-
-/// Returns true when a dismissed card should be restored: the conversation
-/// transitioned to `InProgress` from a non-`InProgress` state, matching the
-/// Started/Restarted lifecycle event semantics.
-fn should_restore_dismissed_card(
-    current_status: &ConversationStatus,
-    previous_status: Option<&ConversationStatus>,
-) -> bool {
-    let was_in_progress = previous_status.is_some_and(|s| s.is_in_progress());
-    current_status.is_in_progress() && !was_in_progress
 }
 
 /// T3-7: 提取子代理 conversation 当前/最近的 action presence summary,

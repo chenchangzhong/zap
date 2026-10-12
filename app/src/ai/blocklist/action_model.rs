@@ -758,12 +758,11 @@ impl BlocklistAIActionModel {
                 action.id.clone(),
             ));
             BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
-                let blocked_action_user_friendly_str = action.action.user_friendly_name();
                 history_model.update_conversation_status(
                     self.terminal_view_id,
                     conversation_id,
                     ConversationStatus::Blocked {
-                        blocked_action: format!("{blocked_action_user_friendly_str:?}"),
+                        blocked_action: localized_action_name(&action.action),
                     },
                     ctx,
                 );
@@ -1479,6 +1478,62 @@ impl BlocklistAIActionEvent {
             BlocklistAIActionEvent::ToggleCodeReview(action_id) => action_id,
             BlocklistAIActionEvent::InsertCodeReviewComments { action_id, .. } => action_id,
         }
+    }
+}
+
+/// 把动作类型翻成**本地化**的用户可读名称。
+///
+/// 为什么不直接用 `AIAgentActionType::user_friendly_name()`:那个方法在
+/// `crates/ai` 里,该 crate 不依赖本仓的 i18n 层(`crate::t!` 只在 `app` 里可用),
+/// 所以它只能返回硬编码英文。这里按同样的语义做一次本地化映射,键为
+/// `agent-action-name-*`。
+///
+/// 返回的是纯文本,不带调试引号 —— 之前调用点写成 `format!("{...:?}")`,会把
+/// 文案包成 `"Run command: ls"` 显示到界面上。
+pub(crate) fn localized_action_name(action: &AIAgentActionType) -> String {
+    match action {
+        AIAgentActionType::RequestCommandOutput { command, .. } => {
+            crate::t!("agent-action-name-run-command", command = command)
+        }
+        AIAgentActionType::WriteToLongRunningShellCommand { .. } => {
+            crate::t!("agent-action-name-write-long-running-command")
+        }
+        AIAgentActionType::ReadFiles(_) => crate::t!("agent-action-name-read-files"),
+        AIAgentActionType::RequestFileEdits { file_edits, .. } => {
+            let file_names = file_edits.iter().filter_map(|edit| edit.file()).join(", ");
+            crate::t!("agent-action-name-edit-files", files = file_names)
+        }
+        AIAgentActionType::Grep { .. } => crate::t!("agent-action-name-grep"),
+        AIAgentActionType::FileGlob { .. } | AIAgentActionType::FileGlobV2 { .. } => {
+            crate::t!("agent-action-name-file-glob")
+        }
+        AIAgentActionType::ReadMCPResource { .. } => {
+            crate::t!("agent-action-name-read-mcp-resource")
+        }
+        AIAgentActionType::CallMCPTool { .. } => crate::t!("agent-action-name-call-mcp-tool"),
+        AIAgentActionType::SuggestNewConversation { .. } => {
+            crate::t!("agent-action-name-suggest-new-conversation")
+        }
+        AIAgentActionType::SuggestPrompt { .. } => crate::t!("agent-action-name-suggest-prompt"),
+        AIAgentActionType::OpenCodeReview => crate::t!("agent-action-name-open-code-review"),
+        AIAgentActionType::ReadDocuments(_) => crate::t!("agent-action-name-read-documents"),
+        AIAgentActionType::EditDocuments(_) => crate::t!("agent-action-name-edit-documents"),
+        AIAgentActionType::CreateDocuments(_) => crate::t!("agent-action-name-create-documents"),
+        AIAgentActionType::ReadShellCommandOutput { .. } => {
+            crate::t!("agent-action-name-read-shell-command-output")
+        }
+        AIAgentActionType::InsertCodeReviewComments { comments, .. } => crate::t!(
+            "agent-action-name-insert-code-review-comments",
+            count = comments.len()
+        ),
+        AIAgentActionType::ReadSkill(_) => crate::t!("agent-action-name-read-skill"),
+        AIAgentActionType::TransferShellCommandControlToUser { .. } => {
+            crate::t!("agent-action-name-transfer-shell-command-control")
+        }
+        AIAgentActionType::AskUserQuestion { questions } => crate::t!(
+            "agent-action-name-ask-user-question",
+            count = questions.len()
+        ),
     }
 }
 

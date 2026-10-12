@@ -206,6 +206,10 @@ pub struct AIExecutionProfile {
     /// Next Command(灰色补全/zero-state 建议)使用的模型。
     /// `None` 时回退到 `base_model`。低延迟敏感,建议选最便宜/最快的 BYOP 模型。
     pub next_command_model: Option<LLMId>,
+    /// Zap 子代理(Oz 模型乙)使用的模型。`None` 时**跟随父会话**——
+    /// 语义与其它 `*_model` 字段的「回退到 base_model」不同:子代理跑在独立子会话里,
+    /// 它的默认值取父会话当时的模型,而不是本 profile 的 base_model。
+    pub subagent_model: Option<LLMId>,
 
     pub context_window_limit: Option<u32>,
 
@@ -240,6 +244,7 @@ impl Default for AIExecutionProfile {
             title_model: None,
             active_ai_model: None,
             next_command_model: None,
+            subagent_model: None,
             context_window_limit: None,
             autosync_plans_to_warp_drive: false,
             web_search_enabled: true,
@@ -295,6 +300,7 @@ impl AIExecutionProfile {
             title_model: None,
             active_ai_model: None,
             next_command_model: None,
+            subagent_model: None,
             context_window_limit: None,
             autosync_plans_to_warp_drive: false,
             web_search_enabled: true,
@@ -353,6 +359,7 @@ impl AIExecutionProfile {
             title_model: None,
             active_ai_model: None,
             next_command_model: None,
+            subagent_model: None,
             context_window_limit: None,
             autosync_plans_to_warp_drive: FeatureFlag::SyncAmbientPlans.is_enabled(),
             web_search_enabled: true,

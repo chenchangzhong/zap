@@ -58,6 +58,7 @@ use genai::{Client, ModelIden, ServiceTarget, WebConfig};
 use http_client::current_proxy_config;
 
 use crate::ai::agent::api::{RequestParams, ResponseStream};
+use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::{AIAgentActionResult, AIAgentInput, RunningCommand, UserQueryMode};
 use crate::ai::api_error::AIApiError;
 use crate::ai::byop_compaction;
@@ -2671,6 +2672,9 @@ const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &[
     "open_code_review",
     "transfer_shell_command_control_to_user",
     "suggest_prompt",
+    // plan mode 的硬护栏是「把写/执行类工具从列表里拿掉」。子代理会自带一套
+    // 写/执行工具(它不继承 plan mode),留在列表里等于给护栏开后门。
+    tools::subagent::TOOL_NAME,
 ];
 
 /// 列出本轮真正会喂给上游模型的 tool name(内置 REGISTRY + 当前 MCP 工具),
@@ -4298,6 +4302,99 @@ pub async fn generate_byop_output(
                             e.to_string(),
                             &args_str,
                         );
+                        let error_content = serde_json::to_string(&error_payload)
+                            .unwrap_or_else(|_| r#"{"error":"invalid_arguments"}"#.to_owned());
+                        final_messages.push(make_tool_call_carrier_message(
+                            &current_task_id,
+                            &request_id,
+                            &call.call_id,
+                            &call.fn_name,
+                            &args_str,
+                        ));
+                        final_messages.push(make_tool_call_result_message(
+                            &current_task_id,
+                            &request_id,
+                            call.call_id.clone(),
+                            error_content,
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            // Oz 子代理(模型乙)拦截:不映射到 protobuf executor,就地合成
+            // (carrier ToolCall, running ToolCallResult) 一对消息。真正的派发
+            // (建子会话 + 隐藏 pane + 提交首轮 query)由控制层在应用这批消息时
+            // 按 carrier 识别后完成(见 `tools::subagent::SubagentDispatch`)。
+            //
+            // 子会话 id 在这里**预生成**:running 帧的 `server_message_data`
+            // 随 conversation 落库,重启恢复时渲染层直接从消息体拿到子会话 id,
+            // 无需额外持久化状态;控制层也用它作为 `AIConversation` 的 id,
+            // 保证消息与真实子会话一一对应。
+            if call.fn_name == tools::subagent::TOOL_NAME {
+                let args_str = if call.fn_arguments.is_string() {
+                    call.fn_arguments.as_str().unwrap_or("").to_owned()
+                } else {
+                    call.fn_arguments.to_string()
+                };
+                match tools::subagent::SubagentArgs::parse(&args_str) {
+                    Ok(args) => {
+                        // 每个任务预生成一个子会话 id。帧里必须带满 N 个:控制层
+                        // 按 id 建子会话,渲染层按 id 找实时状态,重启恢复后也只
+                        // 能从这个消息体里拿到它们(见 subagent.rs 模块文档)。
+                        let children = args
+                            .tasks
+                            .iter()
+                            .map(|task| {
+                                tools::subagent::SubagentFrameChild::running(
+                                    AIConversationId::new().to_string(),
+                                    task.display_name(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        log::info!(
+                            "[byop][subagent] dispatch requested: call_id={} task_count={} \
+                             children={:?}",
+                            call.call_id,
+                            children.len(),
+                            children
+                                .iter()
+                                .map(|child| child.child_conversation_id.as_str())
+                                .collect::<Vec<_>>()
+                        );
+                        final_messages.push(make_tool_call_carrier_message(
+                            &current_task_id,
+                            &request_id,
+                            &call.call_id,
+                            &call.fn_name,
+                            &args_str,
+                        ));
+                        // running 帧:合法 JSON + 不含两个保留子串(D3 硬约束 1/2),
+                        // 因此不会触发 auto-resume、也不会把请求 blocking 成
+                        // UnreadableLocalInterception。
+                        final_messages.push(make_tool_call_result_message(
+                            &current_task_id,
+                            &request_id,
+                            call.call_id.clone(),
+                            tools::subagent::running_frame_json(&children),
+                        ));
+                    }
+                    Err(e) => {
+                        // 与其它 BYOP tool 一致:参数不合 schema 时 emit
+                        // carrier + synthetic error tool_result,让模型下一轮
+                        // 看到标准 tool_result error 后改参数重试。
+                        log::warn!(
+                            "[byop][subagent] args parse failed: call_id={} err={e:#}",
+                            call.call_id
+                        );
+                        let error_payload = json!({
+                            "error": "invalid_arguments",
+                            "detail": e.to_string(),
+                            "received_args": &args_str,
+                            "hint": "`tasks` is required: a non-empty array of \
+                                {prompt, name?, model?} objects. Put every independent \
+                                subagent in the same call.",
+                        });
                         let error_content = serde_json::to_string(&error_payload)
                             .unwrap_or_else(|_| r#"{"error":"invalid_arguments"}"#.to_owned());
                         final_messages.push(make_tool_call_carrier_message(
@@ -6507,6 +6604,126 @@ mod serializer_readiness_tests {
         let report = classify_byop_controller_readiness(&params);
 
         assert!(matches!(report.state, ReadinessState::Ready));
+    }
+
+    /// Oz 子代理(D3 硬约束 1/2):父侧的「carrier ToolCall + running 帧」这一对
+    /// 必须被判定为 **Ready 且能正常序列化发出**,而不是被 blocking。
+    ///
+    /// 这是计划里风险最高的两条的回归防线:running 帧若不是合法 JSON,或含
+    /// `"_byop_intercepted":true` / `"error":"invalid_arguments"` 字节级子串,
+    /// 就分别会被打成 `UnreadableLocalInterception`(阻塞请求)或被误判成
+    /// 「本地拦截结果」而触发多余的 auto-resume。
+    #[test]
+    fn subagent_running_frame_is_ready_and_replays_as_tool_call() {
+        use crate::ai::agent::conversation::AIConversationId;
+        use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+        let child_id = AIConversationId::new().to_string();
+        let carrier = make_tool_call_carrier_message(
+            "task-1",
+            "req-1",
+            "call-1",
+            subagent_tool::TOOL_NAME,
+            r#"{"tasks":[{"prompt":"investigate A","name":"A"}]}"#,
+        );
+        let running = make_tool_call_result_message(
+            "task-1",
+            "req-1",
+            "call-1".to_owned(),
+            subagent_tool::running_frame_json(&[subagent_tool::SubagentFrameChild::running(
+                child_id.clone(),
+                "A".to_owned(),
+            )]),
+        );
+        let params = request_params(vec![carrier, running], vec![]);
+
+        let report = classify_byop_controller_readiness(&params);
+        assert!(
+            matches!(report.state, ReadinessState::Ready),
+            "running 帧必须满足就绪性(合法 JSON 且不含保留子串),实际: {:?}",
+            report.state
+        );
+
+        let request = build_openai_request(&params)
+            .expect("子代理 carrier + running 帧必须能序列化发出,不得被 blocking");
+
+        // 回放:上游必须看到 fn_name = subagent 的工具调用,以及 running 帧内容。
+        let tool_call = request
+            .messages
+            .iter()
+            .flat_map(|message| message.content.tool_calls())
+            .find(|call| call.call_id == "call-1")
+            .expect("carrier 必须回放成上游可见的 tool call");
+        assert_eq!(tool_call.fn_name, subagent_tool::TOOL_NAME);
+        let contents = tool_response_contents(&request, "call-1");
+        assert_eq!(contents.len(), 1, "每个 tool_call 只能有一条结果");
+        assert!(
+            contents[0].contains("running"),
+            "running 帧内容应被原样回放,实际: {}",
+            contents[0]
+        );
+        assert!(
+            contents[0].contains(&child_id),
+            "running 帧必须带上预生成的子会话 id,渲染层与结果回填都依赖它"
+        );
+        assert!(
+            contents[0].contains("\"children\""),
+            "一次调用可以派发多个子代理,帧必须是 children 数组而不是扁平的单个 id"
+        );
+    }
+
+    /// Oz 子代理(D3 硬约束 3):结果只走「原地改写同一条 message」。改写后
+    /// 上游看到的是终态内容,且请求仍然 Ready、仍然只有一条结果。
+    #[test]
+    fn subagent_result_frame_replaces_running_frame_in_place() {
+        use crate::ai::agent::conversation::AIConversationId;
+        use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+        let child_id = AIConversationId::new().to_string();
+        let carrier = make_tool_call_carrier_message(
+            "task-1",
+            "req-1",
+            "call-1",
+            subagent_tool::TOOL_NAME,
+            r#"{"tasks":[{"prompt":"investigate A","name":"A"}]}"#,
+        );
+        // 先落 running 帧,再按消息 id **原地**替换成终态帧 —— 与
+        // `AIConversation::update_byop_task_message_payload` 的效果一致。
+        let mut frame = make_tool_call_result_message(
+            "task-1",
+            "req-1",
+            "call-1".to_owned(),
+            subagent_tool::running_frame_json(&[subagent_tool::SubagentFrameChild::running(
+                child_id.clone(),
+                "A".to_owned(),
+            )]),
+        );
+        frame.server_message_data = subagent_tool::completed_frame_json(
+            subagent_tool::STATUS_COMPLETED,
+            &[subagent_tool::SubagentFrameChild::finished(
+                child_id.clone(),
+                "A".to_owned(),
+                subagent_tool::STATUS_COMPLETED,
+                "A 的结论".to_owned(),
+            )],
+        );
+        let params = request_params(vec![carrier, frame], vec![]);
+
+        let report = classify_byop_controller_readiness(&params);
+        assert!(matches!(report.state, ReadinessState::Ready));
+
+        let request = build_openai_request(&params).expect("终态帧必须能序列化发出");
+        let contents = tool_response_contents(&request, "call-1");
+        assert_eq!(
+            contents.len(),
+            1,
+            "原地改写后仍只能有一条结果;多一条会被就绪性判成 DuplicateToolResults"
+        );
+        assert!(
+            contents[0].contains("A 的结论"),
+            "父会话下一轮必须看到子代理的最终结果,实际: {}",
+            contents[0]
+        );
     }
 
     #[test]

@@ -877,6 +877,8 @@ impl AgentConversationsModel {
             | BlocklistAIHistoryEvent::UpdatedStreamingExchange { .. }
             | BlocklistAIHistoryEvent::ConversationAgentIdAssigned { .. }
             | BlocklistAIHistoryEvent::ConversationOwnershipTransferred { .. }
+            // 子代理派发不改导航数据;子会话创建会另发 StartedNewConversation。
+            | BlocklistAIHistoryEvent::SubagentRequested { .. }
             => {}
         }
     }

@@ -209,6 +209,7 @@ impl BlocklistAIPermissions {
             title_model: profile_data.title_model.clone(),
             active_ai_model: profile_data.active_ai_model.clone(),
             next_command_model: profile_data.next_command_model.clone(),
+            subagent_model: profile_data.subagent_model.clone(),
             context_window_limit: profile_data.context_window_limit,
             autosync_plans_to_warp_drive: profile_data.autosync_plans_to_warp_drive,
             web_search_enabled: profile_data.web_search_enabled,
@@ -862,8 +863,8 @@ impl BlocklistAIPermissions {
         let auto_approve_enabled = BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(conversation_id)
             .is_some_and(|convo| convo.autoexecute_any_action());
-        let bypass_user_denylist = auto_approve_enabled
-            && *AISettings::as_ref(ctx).auto_approve_bypasses_command_denylist;
+        let bypass_user_denylist =
+            auto_approve_enabled && *AISettings::as_ref(ctx).auto_approve_bypasses_command_denylist;
         let denylist = if bypass_user_denylist {
             Vec::new()
         } else {

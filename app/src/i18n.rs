@@ -268,6 +268,106 @@ mod tests {
         assert!(loader().is_some());
     }
 
+    /// Zap:子代理等待审批时状态卡的副标题。键名写错时 fluent 会把 key 本身
+    /// 当文本返回,UI 上就会出现字面的 `child-agent-awaiting-approval`,所以
+    /// 这里锁一次真正的翻译值。
+    #[test]
+    fn child_agent_awaiting_approval_key_is_translated() {
+        init(Some("zh-CN"));
+        let zh = loader().unwrap().get("child-agent-awaiting-approval");
+        assert!(zh.contains("确认"), "zh-CN 译文缺失,实际: {zh}");
+        assert!(
+            !zh.contains("child-agent-awaiting-approval"),
+            "键名未解析成译文,实际: {zh}"
+        );
+
+        init(Some("en"));
+        let en = loader().unwrap().get("child-agent-awaiting-approval");
+        assert!(
+            !en.contains("child-agent-awaiting-approval"),
+            "en 译文缺失,实际: {en}"
+        );
+    }
+
+    /// Zap:动作名与审批卡文案都改成走 i18n。任何一个键名写错,fluent 会把 key
+    /// 本身当文本返回,界面上就会出现字面的 `agent-action-name-...`,所以这里把
+    /// 新增键锁一遍。
+    ///
+    /// 例外:`child-agent-awaiting-approval` 由上面的
+    /// [`child_agent_awaiting_approval_key_is_translated`] 单独校验(那里还断言了
+    /// 具体译文内容),不在此列。
+    #[test]
+    fn action_and_approval_keys_are_translated() {
+        const KEYS: [&str; 36] = [
+            "agent-action-name-run-command",
+            "agent-action-name-write-long-running-command",
+            "agent-action-name-read-files",
+            "agent-action-name-edit-files",
+            "agent-action-name-grep",
+            "agent-action-name-file-glob",
+            "agent-action-name-read-mcp-resource",
+            "agent-action-name-call-mcp-tool",
+            "agent-action-name-suggest-new-conversation",
+            "agent-action-name-suggest-prompt",
+            "agent-action-name-open-code-review",
+            "agent-action-name-read-documents",
+            "agent-action-name-edit-documents",
+            "agent-action-name-create-documents",
+            "agent-action-name-read-shell-command-output",
+            "agent-action-name-insert-code-review-comments",
+            "agent-action-name-read-skill",
+            "agent-action-name-transfer-shell-command-control",
+            "agent-action-name-ask-user-question",
+            "blocked-action-grant-file-access",
+            "blocked-action-search-directory",
+            "blocked-action-write-to-running-command",
+            "blocked-action-transfer-control",
+            "blocked-action-run-command",
+            "blocked-action-call-mcp-tool",
+            "blocked-action-call-mcp-tool-named",
+            "blocked-action-call-mcp-tool-on-server",
+            "blocked-action-read-mcp-resource",
+            "toggle-suffix-subagent-approval-bell",
+            "settings-features-notify-subagent-approval",
+            "child-agent-stop",
+            "settings-exec-profile-editor-subagent-model",
+            "settings-exec-profile-editor-subagent-model-desc",
+            "settings-exec-profile-editor-subagent-model-follow-parent",
+            "settings-exec-profile-subagent-model",
+            "settings-exec-profile-subagent-model-follow-parent",
+        ];
+        for locale in ["zh-CN", "en"] {
+            init(Some(locale));
+            for key in KEYS {
+                let value = loader().unwrap().get(key);
+                assert!(
+                    !value.contains(key),
+                    "[{locale}] 键 {key} 未解析成译文,实际: {value}"
+                );
+                assert!(!value.trim().is_empty(), "[{locale}] 键 {key} 译文为空");
+            }
+        }
+    }
+
+    /// 带参数的键必须真的把参数插进去(否则界面上会显示 `{ $command }`)。
+    #[test]
+    fn parameterized_action_keys_interpolate() {
+        init(Some("zh-CN"));
+        let loader = loader().unwrap();
+        let run = loader.get_args(
+            "agent-action-name-run-command",
+            std::collections::HashMap::from([("command", "ls -la")]),
+        );
+        assert!(run.contains("ls -la"), "command 参数未插入,实际: {run}");
+        assert!(!run.contains("$command"), "参数占位符残留: {run}");
+
+        let edits = loader.get_args(
+            "agent-action-name-edit-files",
+            std::collections::HashMap::from([("files", "a.rs")]),
+        );
+        assert!(edits.contains("a.rs"), "files 参数未插入,实际: {edits}");
+    }
+
     #[test]
     fn fallback_chain_works() {
         init(Some("zh-CN"));

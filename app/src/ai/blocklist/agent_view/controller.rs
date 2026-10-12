@@ -387,6 +387,12 @@ impl AgentViewController {
         self.pane_group_id
     }
 
+    /// 本 controller 所属的 terminal view id。pill bar 需要它来判断「这个
+    /// 会话是不是就在当前 pane 里」,上游同名 accessor。
+    pub(crate) fn terminal_view_id(&self) -> EntityId {
+        self.terminal_view_id
+    }
+
     pub fn set_pane_group_id(&mut self, pane_group_id: EntityId) {
         self.pane_group_id = Some(pane_group_id);
     }

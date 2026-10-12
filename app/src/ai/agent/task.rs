@@ -584,6 +584,14 @@ impl Task {
         self.exchanges.iter()
     }
 
+    /// 可变版本的 [`Self::exchanges`]。
+    ///
+    /// BYOP 子代理结果回填需要它:父侧状态帧被原地改写后,同一条 message 在
+    /// exchange 里的 **output 表示**也必须同步刷新,否则卡片(读 output)不会更新。
+    pub(super) fn exchanges_mut(&mut self) -> impl Iterator<Item = &mut AIAgentExchange> {
+        self.exchanges.iter_mut()
+    }
+
     pub fn exchange(&self, exchange_id: AIAgentExchangeId) -> Option<&AIAgentExchange> {
         self.exchanges
             .iter()
@@ -723,6 +731,35 @@ impl Task {
             .messages
             .retain(|message| !message_ids.contains(&message.id));
         Ok(())
+    }
+
+    /// BYOP:按 id 原地改写一条 source message 的 `server_message_data`。
+    ///
+    /// 只替换这一个自由字符串字段(返回是否命中),其余字段保持原样:BYOP 的
+    /// ToolCall / ToolCallResult 载体把「给模型看的内容」全放在 `server_message_data`
+    /// 里,原地改写它既不会破坏 message 结构,也不需要重建整条消息。
+    ///
+    /// 与 [`Self::upsert_message`] 的区别是它**不经过 exchange**:子代理在父回合
+    /// 结束之后才完成,此时父会话的 `added_exchanges_by_response` 已被
+    /// `cleanup_completed_response_stream` 清掉,走 `Action::UpdateTaskMessage`
+    /// 会直接 `NoPendingRequest`;但模型可见的 `task.messages` 仍然必须被改写 ——
+    /// 否则父侧要么永远停在 running 帧,要么出现两条同 `tool_call_id` 的结果
+    /// 而被就绪性检查判成 `DuplicateToolResults`。
+    pub(super) fn update_source_message_payload(
+        &mut self,
+        message_id: &str,
+        payload: String,
+    ) -> Result<bool, UpdateTaskError> {
+        let source = self.try_get_source_mut()?;
+        let Some(message) = source
+            .messages
+            .iter_mut()
+            .find(|existing| existing.id == message_id)
+        else {
+            return Ok(false);
+        };
+        message.server_message_data = payload;
+        Ok(true)
     }
 
     pub(super) fn upsert_message(

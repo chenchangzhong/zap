@@ -1046,6 +1046,8 @@ impl AgentDriver {
                 BlocklistAIHistoryEvent::UpdatedTodoList { .. } => {
                     // TODO: Log TODO list updates.
                 }
+                // Oz 子代理派发由 pane group 侧的订阅处理,SDK driver 无需介入。
+                BlocklistAIHistoryEvent::SubagentRequested { .. } => {}
                 BlocklistAIHistoryEvent::AppendedExchange {
                     exchange_id,
                     conversation_id,

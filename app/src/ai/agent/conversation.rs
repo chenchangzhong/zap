@@ -300,6 +300,9 @@ pub struct AIConversation {
     /// reporting. TaskStatusSyncModel skips status updates for these.
     is_remote_child: bool,
 
+    /// 用户是否在编排 pill bar 里置顶了该会话(仅内存,见 [`Self::is_pinned`])。
+    pinned: bool,
+
     /// Legacy cloud event cursor retained only for deserializing older conversations.
     last_event_sequence: Option<i64>,
 
@@ -333,9 +336,18 @@ pub(crate) fn artifact_from_fork_proto(
 
 impl AIConversation {
     pub fn new(is_viewing_shared_session: bool) -> Self {
+        Self::new_with_id(AIConversationId::new(), is_viewing_shared_session)
+    }
+
+    /// 用调用方指定的 id 新建会话。
+    ///
+    /// Oz 子代理(模型乙)需要它:子会话 id 由 chat_stream 在合成父侧 running 帧
+    /// 时**预生成**并写进消息体(消息体随 conversation 落库),等控制层真正创建
+    /// 子会话时再把这个 id 用回来,消息与真实子会话才能一一对应。
+    pub fn new_with_id(id: AIConversationId, is_viewing_shared_session: bool) -> Self {
         let root_task = Task::new_optimistic_root();
         Self {
-            id: AIConversationId::new(),
+            id,
             task_store: TaskStore::with_root_task(root_task),
             optimistic_cli_subagent_subtask_id: None,
             code_review: None,
@@ -363,6 +375,7 @@ impl AIConversation {
             agent_name: None,
             parent_conversation_id: None,
             is_remote_child: false,
+            pinned: false,
             last_event_sequence: None,
             compaction_state: Default::default(),
             byop_repair_state: RepairStateStatus::default(),
@@ -665,6 +678,7 @@ impl AIConversation {
             agent_name,
             parent_conversation_id,
             is_remote_child: false,
+            pinned: false,
             last_event_sequence,
             compaction_state,
             byop_repair_state,
@@ -1030,6 +1044,28 @@ impl AIConversation {
 
     pub fn forked_from_server_conversation_token(&self) -> Option<&ServerConversationToken> {
         self.forked_from_server_conversation_token.as_ref()
+    }
+
+    /// 该会话在编排(orchestration)里的服务端 agent 标识。
+    ///
+    /// 与上游一致:就是 `run_id`。抽成具名方法是为了让编排拓扑代码读起来是
+    /// 「编排身份」而不是「运行 id」。
+    pub fn orchestration_agent_id(&self) -> Option<String> {
+        self.run_id()
+    }
+
+    /// 用户是否在编排 pill bar 里置顶了该会话。
+    ///
+    /// **本地偏差(阶段二方案 A)**:置顶状态**仅内存**,`AIConversationData`
+    /// 与 SQLite 都没有对应列,重启后回到未置顶。上游把 `pinned` 持久化在本仓
+    /// 没有的列上,补齐需要 schema migration,不在本期范围。
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// 见 [`Self::is_pinned`](仅内存,不落库)。
+    pub fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
     }
 
     /// Clears the forked_from token after the first Init event has been sent to viewers.
@@ -1626,6 +1662,110 @@ impl AIConversation {
         // turn 启动即落盘:user query 提交时先写一次,stream 中途强退也能保留提问记录。
         self.write_updated_conversation_state(ctx);
         Ok(())
+    }
+
+    /// BYOP 子代理(Zap 模型乙)结果回填:把 `task_id` 下 id 为 `message_id` 的
+    /// source message 的 `server_message_data` **原地**改写为 `payload`。
+    ///
+    /// 返回值表示是否命中该 message(未命中不算错误,但调用方应当据此判断结果
+    /// 没送到)。
+    ///
+    /// 为什么不复用 `Action::UpdateTaskMessage`:那条路径要求存在 in-flight
+    /// response stream(`AIConversation::apply_client_action` 按 `response_stream_id`
+    /// 查 `added_exchanges_by_response`,查不到即 `NoPendingRequest`)。子代理是在
+    /// 父回合**结束之后**才完成的,那时父会话的条目已被
+    /// `cleanup_completed_response_stream` 清掉 ⇒ 客户端 action 走不通。
+    ///
+    /// exchange 层的 output message 通过 [`Self::refresh_byop_output_message`] 重建,
+    /// 让表示层(`SubagentRun`)与 source message 保持一致(见上面的说明)。
+    pub fn update_byop_task_message_payload(
+        &mut self,
+        task_id: TaskId,
+        message_id: &str,
+        payload: String,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<bool, UpdateConversationError> {
+        let found = self
+            .task_store
+            .modify_task(&task_id, |task| {
+                task.update_source_message_payload(message_id, payload)
+            })
+            .ok_or(UpdateConversationError::TaskNotFound)??;
+        if !found {
+            return Ok(false);
+        }
+        // 同一条 message 在 exchange 里的 **output 表示**必须一起刷新:表示层
+        // (`to_client_output_message` → `SubagentRun`)读的是 output 而不是 source
+        // message,只改 source 的话恢复/导出拿到的仍是旧状态。
+        self.refresh_byop_output_message(&task_id, message_id);
+        // 内存已改;持久化失败只降级为 warn —— 父侧已经拿到结果并会继续,
+        // 为了「写盘失败」把结果回填整个丢掉会让父永久停在 running 帧。
+        if let Err(e) = self.send_updated_conversation_state_for_byop_preflight(ctx) {
+            log::warn!(
+                "[byop][subagent] in-place task message update ({message_id}) applied in memory \
+                 but not persisted: {e:?}"
+            );
+        }
+        Ok(true)
+    }
+
+
+    /// 读出 `task_id` 下 id 为 `message_id` 的 source message 的 `server_message_data`。
+    ///
+    /// 与 [`Self::update_byop_task_message_payload`] 配对:BYOP 子代理的一次派发可以
+    /// 带 N 个子代理,它们共享同一条结果帧,每个结束时都必须在**当前帧内容**上做
+    /// 增量改写(而不是用只知道自己那一份的信息覆盖整帧),所以要先读回来。
+    pub fn byop_task_message_payload(&self, task_id: &TaskId, message_id: &str) -> Option<String> {
+        self.task_store
+            .get(task_id)?
+            .messages()
+            .find(|message| message.id == message_id)
+            .map(|message| message.server_message_data.clone())
+    }
+
+    /// 把 `message_id` 对应的 **exchange output 表示**按最新的 source message 重建。
+    ///
+    /// 仅用于 BYOP 子代理的原地回填:父回合早已 `Finished`,`upsert_output_for_message`
+    /// 那条路径不会跑,所以必须手动同步 output,卡片才会立刻反映新状态。
+    fn refresh_byop_output_message(&mut self, task_id: &TaskId, message_id: &str) {
+        use crate::ai::agent::api::{
+            ConversionParams, ConvertAPIMessageToClientOutputMessage, MaybeAIAgentOutputMessage,
+        };
+
+        let current_todo_list = self.todo_lists.last().cloned();
+        let current_comment_state = self.code_review.as_ref().cloned();
+        self.task_store.modify_task(task_id, |task| {
+            let Some(source_message) = task
+                .messages()
+                .find(|message| message.id == message_id)
+                .cloned()
+            else {
+                return;
+            };
+            let Ok(MaybeAIAgentOutputMessage::Message(refreshed)) = source_message
+                .to_client_output_message(ConversionParams {
+                    task_id,
+                    current_todo_list: current_todo_list.as_ref(),
+                    active_code_review: current_comment_state.as_ref(),
+                })
+            else {
+                return;
+            };
+            for exchange in task.exchanges_mut() {
+                let Some(output) = exchange.output_status.output() else {
+                    continue;
+                };
+                let mut output = output.get_mut();
+                if let Some(slot) = output
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id.0 == message_id)
+                {
+                    *slot = refreshed;
+                    return;
+                }
+            }
+        });
     }
 
     pub fn append_byop_preflight_messages_to_task(

@@ -8,11 +8,13 @@ use crate::ai::llms::{LLMId, LLMInfo, LLMPreferences, LLMPreferencesEvent};
 use crate::ai::paths::host_native_absolute_path;
 use crate::editor::InteractionState;
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions};
+use crate::menu::{MenuItem, MenuItemFields};
 use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::settings::{AISettings, AgentModeCommandExecutionPredicate};
 use crate::ui_components::icons::Icon;
 use crate::view_components::{
     action_button::{ActionButton, DangerSecondaryTheme},
+    dropdown::DropdownAction,
     Dropdown, DropdownItem, FilterableDropdown, SubmittableTextInput, SubmittableTextInputEvent,
 };
 use crate::workspaces::user_workspaces::UserWorkspacesEvent;
@@ -94,6 +96,10 @@ pub enum ExecutionProfileEditorViewAction {
     SetNextCommandModel {
         id: LLMId,
     },
+    /// Zap:设置子代理默认模型。`None` = 跟随父会话。
+    SetSubagentModel {
+        id: Option<LLMId>,
+    },
     SetComputerUseModel {
         id: LLMId,
     },
@@ -168,6 +174,7 @@ pub struct ExecutionProfileEditorView {
     title_model_dropdown: ViewHandle<FilterableDropdown<ExecutionProfileEditorViewAction>>,
     active_ai_model_dropdown: ViewHandle<FilterableDropdown<ExecutionProfileEditorViewAction>>,
     next_command_model_dropdown: ViewHandle<FilterableDropdown<ExecutionProfileEditorViewAction>>,
+    subagent_model_dropdown: ViewHandle<FilterableDropdown<ExecutionProfileEditorViewAction>>,
     computer_use_model_dropdown: ViewHandle<FilterableDropdown<ExecutionProfileEditorViewAction>>,
     apply_code_diffs_dropdown: ViewHandle<Dropdown<ExecutionProfileEditorViewAction>>,
     read_files_dropdown: ViewHandle<Dropdown<ExecutionProfileEditorViewAction>>,
@@ -455,6 +462,11 @@ impl ExecutionProfileEditorView {
             dropdown.set_menu_width(MODEL_MENU_WIDTH, ctx);
             dropdown
         });
+        let subagent_model_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = FilterableDropdown::new(ctx);
+            dropdown.set_menu_width(MODEL_MENU_WIDTH, ctx);
+            dropdown
+        });
         let command_allowlist_editor = ctx.add_typed_action_view(|ctx| {
             let mut input =
                 SubmittableTextInput::new(ctx).validate_on_edit(|s| Regex::new(s).is_ok());
@@ -539,6 +551,7 @@ impl ExecutionProfileEditorView {
             title_model_dropdown,
             active_ai_model_dropdown,
             next_command_model_dropdown,
+            subagent_model_dropdown,
             computer_use_model_dropdown,
             apply_code_diffs_dropdown,
             read_files_dropdown,
@@ -676,6 +689,11 @@ impl ExecutionProfileEditorView {
                         &me.upgrade_footer_mouse_state,
                         ctx,
                     );
+                    Self::refresh_subagent_model_dropdown(
+                        &me.subagent_model_dropdown,
+                        current_permissions.subagent_model.clone(),
+                        ctx,
+                    );
                     Self::refresh_filterable_model_dropdown(
                         &me.computer_use_model_dropdown,
                         current_permissions.computer_use_model.clone(),
@@ -722,6 +740,11 @@ impl ExecutionProfileEditorView {
                         |id| ExecutionProfileEditorViewAction::SetNextCommandModel { id },
                         |prefs| prefs.get_default_base_model().id.clone(),
                         &me.upgrade_footer_mouse_state,
+                        ctx,
+                    );
+                    Self::refresh_subagent_model_dropdown(
+                        &me.subagent_model_dropdown,
+                        current_permissions.subagent_model.clone(),
                         ctx,
                     );
                 }
@@ -777,6 +800,11 @@ impl ExecutionProfileEditorView {
                     |id| ExecutionProfileEditorViewAction::SetNextCommandModel { id },
                     |prefs| prefs.get_default_base_model().id.clone(),
                     &me.upgrade_footer_mouse_state,
+                    ctx,
+                );
+                Self::refresh_subagent_model_dropdown(
+                    &me.subagent_model_dropdown,
+                    current_permissions.subagent_model.clone(),
                     ctx,
                 );
                 Self::refresh_coding_model_dropdown(
@@ -917,6 +945,11 @@ impl ExecutionProfileEditorView {
             |id| ExecutionProfileEditorViewAction::SetNextCommandModel { id },
             |prefs| prefs.get_default_base_model().id.clone(),
             &self.upgrade_footer_mouse_state,
+            ctx,
+        );
+        Self::refresh_subagent_model_dropdown(
+            &self.subagent_model_dropdown,
+            current_permissions.subagent_model.clone(),
             ctx,
         );
         Self::refresh_filterable_model_dropdown(
@@ -1134,6 +1167,61 @@ impl ExecutionProfileEditorView {
             let llm_prefs = llm_prefs.as_ref(ctx);
             let model_to_select = profile_model.unwrap_or_else(|| get_default_id(llm_prefs));
             dropdown.set_selected_by_action(create_action(model_to_select), ctx);
+            ctx.notify();
+        });
+        ctx.notify();
+    }
+
+    /// Zap:子代理模型下拉。与其它模型下拉的区别是**首项为「跟随父会话」**
+    /// (值为 `None`),因为子代理的默认语义就是跟随父会话,用户必须能改回去 ——
+    /// 通用的 `refresh_filterable_model_dropdown` 只会把 `None` 显示成默认模型,
+    /// 没有回退入口。
+    fn refresh_subagent_model_dropdown(
+        menu: &ViewHandle<FilterableDropdown<ExecutionProfileEditorViewAction>>,
+        profile_model: Option<LLMId>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        menu.update(ctx, |dropdown, ctx| {
+            if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+                dropdown.set_disabled(ctx);
+            } else {
+                dropdown.set_enabled(ctx);
+            }
+
+            let choices = LLMPreferences::as_ref(ctx)
+                .get_base_llm_choices_for_agent_mode()
+                .collect_vec();
+
+            let mut items: Vec<MenuItem<DropdownAction<ExecutionProfileEditorViewAction>>> =
+                vec![MenuItem::Item(
+                    MenuItemFields::new(crate::t!(
+                        "settings-exec-profile-editor-subagent-model-follow-parent"
+                    ))
+                    .with_on_select_action(
+                        ExecutionProfileEditorViewAction::SetSubagentModel { id: None }.into(),
+                    ),
+                )];
+            items.extend(available_model_menu_items(
+                choices,
+                |llm| {
+                    ExecutionProfileEditorViewAction::SetSubagentModel {
+                        id: Some(llm.id.clone()),
+                    }
+                    .into()
+                },
+                None,
+                None,
+                false,
+                false,
+                ctx,
+            ));
+            dropdown.set_rich_items(items, ctx);
+            dropdown.clear_footer(ctx);
+
+            let selected = ExecutionProfileEditorViewAction::SetSubagentModel {
+                id: profile_model.clone(),
+            };
+            dropdown.set_selected_by_action(selected, ctx);
             ctx.notify();
         });
         ctx.notify();
@@ -1413,6 +1501,12 @@ impl TypedActionView for ExecutionProfileEditorView {
             ExecutionProfileEditorViewAction::SetNextCommandModel { id } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
                     profiles_model.set_next_command_model(self.profile_id, Some(id.clone()), ctx);
+                });
+                ctx.notify();
+            }
+            ExecutionProfileEditorViewAction::SetSubagentModel { id } => {
+                AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
+                    profiles_model.set_subagent_model(self.profile_id, id.clone(), ctx);
                 });
                 ctx.notify();
             }

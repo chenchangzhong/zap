@@ -146,6 +146,19 @@ define_settings_group!(TerminalSettings, settings: [
         toml_path: "experimental.async_find_enabled",
         description: "Use an improved implementation of find to keep the UI responsive while searching for matches on large outputs.",
     },
+    // 子代理卡在「等待用户审批」时是否响铃。**默认开启** —— 子代理的审批按钮渲染在
+    // 它自己的会话里,父界面看不到,不提醒的话用户不会知道有子代理正等他确认,
+    // 父会话会一直干等。与 `use_audible_bell`(终端响铃,默认关)刻意分开:那条设置
+    // 管的是终端 BEL 事件,这里管的是子代理审批。
+    notify_on_subagent_approval: NotifyOnSubagentApproval {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "notifications.notify_on_subagent_approval",
+        description: "Whether to play a bell when a subagent is waiting for your approval.",
+    },
 ]);
 
 impl TerminalSettings {

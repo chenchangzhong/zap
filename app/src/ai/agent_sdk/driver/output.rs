@@ -355,6 +355,9 @@ pub mod text {
                 AIAgentOutputMessageType::Subagent(subagent) => {
                     writeln!(w, "{subagent}")?;
                 }
+                AIAgentOutputMessageType::SubagentRun(call) => {
+                    writeln!(w, "{call}")?;
+                }
                 AIAgentOutputMessageType::WebSearch(status) => match status {
                     WebSearchStatus::Searching { query } => match query {
                         Some(q) => writeln!(w, "Searching web for: {q}")?,
@@ -958,6 +961,8 @@ pub mod json {
                 AIAgentOutputMessageType::Subagent(SubagentCall { task_id, .. }) => {
                     Some(JsonMessage::Subagent { task_id })
                 }
+                // Oz 子代理(模型乙)是独立子会话,不属于 SDK driver 的 task 级输出协议。
+                AIAgentOutputMessageType::SubagentRun(_) => None,
                 AIAgentOutputMessageType::WebSearch(_) => None,
                 AIAgentOutputMessageType::WebFetch(_) => None,
                 AIAgentOutputMessageType::DebugOutput { .. } => None,

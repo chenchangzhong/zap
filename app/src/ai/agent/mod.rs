@@ -1,5 +1,7 @@
 pub(crate) mod conversation;
 pub(crate) mod conversation_yaml;
+
+use conversation::{AIConversationId, ConversationStatus};
 pub(crate) mod todos;
 
 pub(crate) mod api;
@@ -620,6 +622,10 @@ impl AIAgentOutput {
                 }
                 AIAgentOutputMessageType::Subagent(subagent) => {
                     result.push(format!("{subagent}"));
+                    last_was_action = false;
+                }
+                AIAgentOutputMessageType::SubagentRun(call) => {
+                    result.push(format!("{call}"));
                     last_was_action = false;
                 }
                 AIAgentOutputMessageType::CommentsAddressed {
@@ -1702,6 +1708,42 @@ pub struct InvokedSkill {
     pub name: String,
 }
 
+/// Oz 子代理(模型乙):父会话里一次 `subagent` 工具调用的展示数据。
+///
+/// **一次调用可以是 N 个子代理**(见 `tools::subagent` 的批量契约):父侧只有一条
+/// `ToolCallResult` 消息,所以一张卡片承载 [`Self::runs`] 里的所有子代理,每个
+/// 子代理一行(名称 + 各自状态 + 各自打开入口)。
+///
+/// **状态不单独持久化**:父侧那条 ToolCallResult 只在子代理跑完时被原地改写,
+/// 每条 `SubagentRun` 的 `Status` 取自其所属帧 —— 一个子代理结束时整帧被重写,
+/// 所以同一帧里其它子代理的状态也随之更新(它们本来就是从同一条消息里读出来的)。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubagentRunCall {
+    /// 帧级聚合状态,作为整个卡片的兜底(例如子会话尚未加载时)。
+    pub fallback_status: ConversationStatus,
+    pub runs: Vec<SubagentRun>,
+}
+
+/// 一次派发里的单个子代理。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubagentRun {
+    pub conversation_id: AIConversationId,
+    pub name: String,
+    /// 该子代理在父侧状态帧里记的状态,作为**兜底**:渲染层优先读子会话的实时
+    /// 状态,读不到(子会话未加载/已被清理)时用它,避免把「未知」谎报成「运行中」。
+    pub fallback_status: ConversationStatus,
+}
+
+impl Display for SubagentRunCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Subagent run ({} subagent(s))", self.runs.len())?;
+        for run in &self.runs {
+            write!(f, " [{}({})]", run.name, run.conversation_id)?;
+        }
+        Ok(())
+    }
+}
+
 /// Data for a single received message, used for rendering in the UI.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReceivedMessageDisplay {
@@ -1740,6 +1782,9 @@ pub enum AIAgentOutputMessageType {
         token_count: Option<u32>,
     },
     Subagent(SubagentCall),
+    /// Oz 子代理(模型乙):父会话里派发出去、跑在**独立子会话**里的子代理。
+    /// 与 [`Self::Subagent`](甲模型的 task 内子代理)是两条不同的通道。
+    SubagentRun(SubagentRunCall),
     Action(AIAgentAction),
     TodoOperation(TodoOperation),
     WebSearch(WebSearchStatus),
@@ -1909,6 +1954,7 @@ impl Display for AIAgentOutputMessage {
             AIAgentOutputMessageType::Action(action) => write!(f, "Action: {action}")?,
             AIAgentOutputMessageType::TodoOperation(todo) => write!(f, "Todo: {todo}")?,
             AIAgentOutputMessageType::Subagent(subagent) => write!(f, "Subagent: {subagent}")?,
+            AIAgentOutputMessageType::SubagentRun(call) => write!(f, "Subagent run: {call}")?,
             AIAgentOutputMessageType::WebSearch(status) => match status {
                 WebSearchStatus::Searching { query } => match query {
                     Some(q) => write!(f, "Searching web for: {q}")?,
@@ -1991,6 +2037,14 @@ impl AIAgentOutputMessage {
         Self {
             id,
             message: AIAgentOutputMessageType::Subagent(subagent),
+            citations: vec![],
+        }
+    }
+
+    pub fn subagent_run(id: MessageId, call: SubagentRunCall) -> Self {
+        Self {
+            id,
+            message: AIAgentOutputMessageType::SubagentRun(call),
             citations: vec![],
         }
     }

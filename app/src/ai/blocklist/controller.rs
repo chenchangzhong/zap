@@ -65,8 +65,9 @@ use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionType;
 use crate::terminal::{
     model::session::{active_session::ActiveSession, SessionType},
     model::terminal_model::TerminalModel,
+    settings::TerminalSettings,
     shared_session::ParticipantId,
-    ShellLaunchData,
+    AudibleBell, ShellLaunchData,
 };
 use crate::{send_telemetry_from_ctx, server::telemetry::TelemetryEvent};
 use anyhow::anyhow;
@@ -195,6 +196,19 @@ pub enum BlocklistAIControllerEvent {
 
     /// Emitted when the export-to-file slash command is executed.
     ExportConversationToFile { filename: Option<String> },
+
+    /// Zap BYOP 子代理(模型乙):某个子代理的结果已经写回父侧历史。
+    ///
+    /// 父 view 需要它来重画底部子代理状态卡 —— 它按子会话实时状态渲染,而子
+    /// 会话挂在另一个 terminal view 上,父 view 收不到它的 `UpdatedConversationStatus`。
+    SubagentResultDelivered { conversation_id: AIConversationId },
+
+    /// Zap BYOP 子代理(模型乙):某个子代理卡在**等待用户审批**上。
+    ///
+    /// 铃在 controller(模型)里已经响过;这个事件是给 **view** 的 ——
+    /// `request_user_attention` 只在 `ViewContext` 上可用(模型层拿不到),所以由
+    /// 父 view 负责把窗口/标签标记为需要注意。
+    SubagentAwaitingApproval { conversation_id: AIConversationId },
 }
 
 #[derive(Debug, Clone)]
@@ -389,6 +403,99 @@ pub struct BlocklistAIController {
     /// 避免用户提交的 prompt 被静默丢弃。
     /// 每个 conversation 最多保留 1 条;用户后续直接提交新请求会覆盖。
     pending_byop_requests: HashMap<AIConversationId, PendingByopRequest>,
+
+    /// Oz 子代理(模型乙,D4):本会话派发出去、尚未回到终态的子会话。
+    ///
+    /// 键是**子会话** id。父会话的一个回合可能同时派发多个子代理,全部回到终态
+    /// 之后才 resume 父会话(默认取「总结」语义,见 A1)。
+    pending_subagent_dispatches: HashMap<AIConversationId, PendingSubagentDispatch>,
+
+    /// 已经为「等待审批」响过铃的子会话(见
+    /// [`Self::notify_subagent_awaiting_approval`])。避免同一次 Blocked 重复响铃。
+    awaiting_approval_notified: HashSet<AIConversationId>,
+}
+
+/// Oz 子代理(模型乙,D4)的一条待办。
+///
+/// 由 `PaneGroup` 在隐藏子会话 + pane 建好之后登记;子会话进入终态时由
+/// [`BlocklistAIController::on_subagent_conversation_status_changed`] 消费。
+///
+/// **粒度是一个子代理,不是一个工具调用**:一次 `subagent` 调用可以派发 N 个
+/// 子代理,它们共享同一条父侧结果帧(`result_message_id`),各自结束时就地改写
+/// 帧里属于自己的那一项。全部子代理都结束后才 resume 父会话。
+#[derive(Debug, Clone)]
+pub struct PendingSubagentDispatch {
+    pub parent_conversation_id: AIConversationId,
+    pub parent_task_id: TaskId,
+    /// 父侧 running 帧的消息 id;结果回填要**原地**改写这一条。
+    pub result_message_id: String,
+    pub child_conversation_id: AIConversationId,
+    /// 父侧 `ToolCallResult.tool_call_id`,落库判重与卡片 join key 都用它。
+    pub tool_call_id: String,
+    /// 展示用子代理名(与 running 帧里的 `subagent` 字段一致)。
+    pub name: String,
+}
+
+/// 子会话状态 → 父侧结果帧的 `status`。返回 `None` 表示「还没结束,继续等」。
+///
+/// `InProgress` 与 `Blocked`(等待用户审批)**都不算终态**:子代理还活着,父必须
+/// 继续等 —— 子代理阻塞在审批上时父若提前 resume,会拿到一个「还没做完」的结果。
+fn subagent_terminal_frame_status(status: &ConversationStatus) -> Option<&'static str> {
+    use crate::ai::agent_providers::tools::subagent;
+    match status {
+        ConversationStatus::InProgress => None,
+        ConversationStatus::Blocked { .. } => None,
+        ConversationStatus::Success => Some(subagent::STATUS_COMPLETED),
+        ConversationStatus::Error => Some(subagent::STATUS_ERROR),
+        ConversationStatus::Cancelled => Some(subagent::STATUS_CANCELLED),
+    }
+}
+
+/// 子代理超时(步骤 7)。
+///
+/// 本仓库此前**没有任何 subagent 超时**。Oz 子代理允许写文件(D5),一个卡在
+/// 网络/审批/死循环上的子代理会让父会话一直等下去(「父永久等待」是计划里
+/// 明列的停线条件)。超时后把父侧结果帧标成 error 并让父继续,子会话本身不动
+/// (用户仍可点进去看它到底卡在哪)。
+///
+/// 取值偏保守:正常子代理任务(研究/改文件)几分钟内会结束,30 分钟足够覆盖
+/// 慢任务,又不至于让用户觉得父会话永远不动。
+const SUBAGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// 取子会话最后一次带输出的 exchange 的 agent 输出,拼成回传给父会话的纯文本。
+///
+/// 只回最后一条:子代理可能有多轮(被用户/父追问),父要的是「最终结论」。
+fn subagent_result_text(conversation: &AIConversation) -> String {
+    use crate::ai::agent::AIAgentTextSection;
+
+    for exchange in conversation.exchanges_reversed() {
+        let Some(output) = exchange.output_status.output() else {
+            continue;
+        };
+        let output = output.get();
+        let mut parts: Vec<String> = Vec::new();
+        for text in output.text_from_agent_output() {
+            for section in &text.sections {
+                match section {
+                    AIAgentTextSection::PlainText { text } => parts.push(text.text().to_owned()),
+                    AIAgentTextSection::Code { code, .. } => parts.push(code.clone()),
+                    AIAgentTextSection::Table { table } => {
+                        parts.push(table.markdown_source.clone());
+                    }
+                    AIAgentTextSection::Image { image } => {
+                        parts.push(image.markdown_source.clone());
+                    }
+                    AIAgentTextSection::MermaidDiagram { diagram } => {
+                        parts.push(diagram.markdown_source.clone());
+                    }
+                }
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n").trim().to_owned();
+        }
+    }
+    String::new()
 }
 
 /// 见 `pending_byop_requests`。
@@ -613,6 +720,23 @@ impl BlocklistAIController {
             });
         });
 
+        // Oz 子代理(模型乙,D4):订阅子会话的终态,把结果回填到父侧并择机 resume。
+        ctx.subscribe_to_model(
+            &BlocklistAIHistoryModel::handle(ctx),
+            |me, _, event, ctx| {
+                let BlocklistAIHistoryEvent::UpdatedConversationStatus {
+                    conversation_id, ..
+                } = event
+                else {
+                    return;
+                };
+                if !me.pending_subagent_dispatches.contains_key(conversation_id) {
+                    return;
+                }
+                me.on_subagent_conversation_status_changed(*conversation_id, ctx);
+            },
+        );
+
         ctx.subscribe_to_model(&agent_view_controller, |me, _, event, ctx| {
             let AgentViewControllerEvent::ExitedAgentView {
                 conversation_id,
@@ -663,6 +787,8 @@ impl BlocklistAIController {
             pending_passive_follow_ups: HashSet::new(),
             pending_passive_suggestion_results: HashMap::new(),
             pending_byop_requests: HashMap::new(),
+            pending_subagent_dispatches: HashMap::new(),
+            awaiting_approval_notified: HashSet::new(),
         }
     }
 
@@ -1731,6 +1857,390 @@ impl BlocklistAIController {
             /*is_queued_prompt*/ false,
             ctx,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Oz 子代理(模型乙):pending 编排(D4)
+    // -----------------------------------------------------------------------
+
+    /// 登记一个已经建好隐藏子会话/pane 的子代理派发。
+    ///
+    /// 由 `PaneGroup::dispatch_subagent_request` 在**成功建好**子会话后调用 ——
+    /// 失败路径走 [`Self::fail_subagent_dispatch`],不会留下永远等不到结果的
+    /// pending 条目。
+    pub fn register_pending_subagent(
+        &mut self,
+        dispatch: PendingSubagentDispatch,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let child_conversation_id = dispatch.child_conversation_id;
+        log::info!(
+            "[byop][subagent] registered pending dispatch: child={child_conversation_id:?} \
+             parent={:?} tool_call_id={}",
+            dispatch.parent_conversation_id,
+            dispatch.tool_call_id
+        );
+        // 子会话可能在登记之前就已经进入终态(极短任务或立即失败),那时状态事件
+        // 早于登记到达。登记时补一次现状检查,避免这类顺序竞态把父挂死。
+        let already_terminal = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&child_conversation_id)
+            .is_some_and(|conversation| {
+                subagent_terminal_frame_status(conversation.status()).is_some()
+            });
+        self.pending_subagent_dispatches
+            .insert(child_conversation_id, dispatch);
+        // 超时兜底:万一子代理永远不到终态,父会话不能一直等。
+        // 用 `warpui::r#async::Timer`(跨平台 timer)而**不是** `tokio::time::sleep`:
+        // 后者是急求值构造的 future,在这里(UI 线程的 model update 内、不在 Tokio
+        // runtime 上下文)会直接 panic `TryCurrentError`。本仓既有延时任务都用这个
+        // 写法,见 `terminal/shared_session/participant_avatar_view.rs`。
+        ctx.spawn(
+            warpui::r#async::Timer::after(SUBAGENT_TIMEOUT),
+            move |me, _, ctx| me.on_subagent_timeout(child_conversation_id, ctx),
+        );
+        if already_terminal {
+            self.on_subagent_conversation_status_changed(child_conversation_id, ctx);
+        }
+    }
+
+    /// 子代理超时:仍在 pending 就按 error 收尾并让父继续。
+    fn on_subagent_timeout(
+        &mut self,
+        child_conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(dispatch) = self
+            .pending_subagent_dispatches
+            .get(&child_conversation_id)
+            .cloned()
+        else {
+            // 已经正常回填(或已被停止),定时器是空转。
+            return;
+        };
+        log::warn!(
+            "[byop][subagent] timed out after {}s: child={child_conversation_id:?} parent={:?}",
+            SUBAGENT_TIMEOUT.as_secs(),
+            dispatch.parent_conversation_id
+        );
+        self.pending_subagent_dispatches
+            .remove(&child_conversation_id);
+        self.awaiting_approval_notified
+            .remove(&child_conversation_id);
+        self.write_subagent_child_outcome(
+            dispatch.parent_conversation_id,
+            dispatch.parent_task_id.clone(),
+            dispatch.result_message_id.clone(),
+            &child_conversation_id,
+            crate::ai::agent_providers::tools::subagent::STATUS_ERROR,
+            &format!(
+                "Subagent did not finish within {} minutes and was abandoned. \
+                 Open its conversation to see what it was doing.",
+                SUBAGENT_TIMEOUT.as_secs() / 60
+            ),
+            ctx,
+        );
+        let parent_still_waiting = self
+            .pending_subagent_dispatches
+            .values()
+            .any(|pending| pending.parent_conversation_id == dispatch.parent_conversation_id);
+        if !parent_still_waiting {
+            self.resume_conversation_after_subagents(dispatch.parent_conversation_id, ctx);
+        }
+    }
+
+    /// 全部子代理结束后让父会话继续。
+    ///
+    /// **只在父会话处于「回合已正常结束、正在等子代理」时 resume**。若父会话已被
+    /// 用户取消(或出错),自动 resume 会把用户刚取消的回合重新跑起来 —— 那种
+    /// 情况下只回填结果帧,让历史完整、由用户自己决定是否继续。
+    fn resume_conversation_after_subagents(
+        &mut self,
+        parent_conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let parent_status = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&parent_conversation_id)
+            .map(|conversation| conversation.status().clone());
+        if !matches!(parent_status, Some(ConversationStatus::Success)) {
+            log::info!(
+                "[byop][subagent] parent {parent_conversation_id:?} is not waiting \
+                 (status={parent_status:?}); delivering results without resuming"
+            );
+            return;
+        }
+        if self
+            .in_flight_response_streams
+            .has_active_stream_for_conversation(parent_conversation_id, ctx)
+        {
+            log::info!(
+                "[byop][subagent] parent {parent_conversation_id:?} already has an in-flight \
+                 stream; skipping resume"
+            );
+            return;
+        }
+        self.resume_conversation(
+            parent_conversation_id,
+            /*can_attempt_resume_on_error*/ true,
+            /*is_auto_resume_after_error*/ false,
+            vec![],
+            ctx,
+        );
+    }
+
+    /// 派发失败(子 pane 建不出来等):立刻把父侧 running 帧改成 error 并让父继续,
+    /// 否则父会话会因为「等一个永远不会跑完的子代理」而永久挂起。
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail_subagent_dispatch(
+        &mut self,
+        parent_conversation_id: AIConversationId,
+        parent_task_id: TaskId,
+        result_message_id: String,
+        child_conversation_id: AIConversationId,
+        reason: &str,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        log::error!(
+            "[byop][subagent] dispatch failed for child={child_conversation_id:?} \
+             parent={parent_conversation_id:?}: {reason}"
+        );
+        self.write_subagent_child_outcome(
+            parent_conversation_id,
+            parent_task_id,
+            result_message_id,
+            &child_conversation_id,
+            crate::ai::agent_providers::tools::subagent::STATUS_ERROR,
+            &format!("Subagent could not be started: {reason}"),
+            ctx,
+        );
+        // 走与正常收尾同一条 resume 路径:父会话若已被取消/出错就不自动继续。
+        self.resume_conversation_after_subagents(parent_conversation_id, ctx);
+    }
+
+    /// 子代理在等审批:响铃 + 提示用户(见调用点的说明)。
+    ///
+    /// **每个子代理只提醒一次**:`UpdatedConversationStatus` 在子会话每次状态变化时
+    /// 都会到达,而 `Blocked` 可能因为重绘被重复广播 —— 不设闸的话会连续响铃。
+    /// 用 `awaiting_approval_notified` 记已提醒过的子会话,子会话离开 `Blocked`
+    /// (重新开跑或进入终态)时清掉,允许它下次再卡住时再提醒一次。
+    fn notify_subagent_awaiting_approval(
+        &mut self,
+        child_conversation_id: &AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        // 铃只在子代理**新进** Blocked 时响一次。
+        if !self
+            .awaiting_approval_notified
+            .insert(*child_conversation_id)
+        {
+            return;
+        }
+        log::info!(
+            "[byop][subagent] child={child_conversation_id:?} is blocked on user confirmation; \
+             ringing the bell so the user notices"
+        );
+        // 与终端 bell 同一条播声路径(`terminal/view.rs` 的 `ModelEvent::Bell`),但用
+        // **独立**的设置项:终端响铃默认关,而子代理审批提醒默认开(见
+        // `NotifyOnSubagentApproval` 的说明)。
+        if *TerminalSettings::as_ref(ctx).notify_on_subagent_approval {
+            if let Err(e) = AudibleBell::as_ref(ctx).ring() {
+                log::warn!("Unable to play subagent approval bell: {e:#}");
+            }
+        }
+        // 无论声音开关如何,都要把窗口/标签标记为需要注意 —— 这是无声用户的唯一提示。
+        // `request_user_attention` 只在 `ViewContext` 上可用,所以交给父 view 做。
+        ctx.emit(BlocklistAIControllerEvent::SubagentAwaitingApproval {
+            conversation_id: *child_conversation_id,
+        });
+    }
+
+    /// 子会话状态变化:若已是终态(Success / Error / Cancelled),把结果回填到父侧
+    /// running 帧,并在父会话已无待办子代理时 resume 父会话。
+    ///
+    /// `Blocked`(等待用户审批)**不算终态**:子代理还活着,父必须继续等(见步骤 7
+    /// 的父侧「等待确认」标注与超时兜底)。
+    fn on_subagent_conversation_status_changed(
+        &mut self,
+        child_conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(dispatch) = self
+            .pending_subagent_dispatches
+            .get(&child_conversation_id)
+            .cloned()
+        else {
+            return;
+        };
+        let status = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&child_conversation_id)
+            .map(|conversation| conversation.status().clone());
+        let Some(status) = status else {
+            return;
+        };
+        // Oz 子代理:子代理**卡在审批上**时要提醒用户。
+        //
+        // 为什么必须在这里做:子代理的审批按钮渲染在它自己的会话里
+        // (`AIBlock::conversation_id` 把 block 绑定到唯一会话),父界面结构上看不到
+        // 那个按钮 —— 用户不主动点进子代理页面,就不知道有个子代理正等他确认,
+        // 父会话会一直等下去。所以这里响一声铃 + 请求用户注意。
+        //
+        // 位置放在终态判断**之前**:`Blocked` 不是终态(见
+        // `subagent_terminal_frame_status`),放到后面就永远走不到。
+        if matches!(status, ConversationStatus::Blocked { .. }) {
+            self.notify_subagent_awaiting_approval(&child_conversation_id, ctx);
+            return;
+        }
+        let Some(frame_status) = subagent_terminal_frame_status(&status) else {
+            return;
+        };
+        self.pending_subagent_dispatches
+            .remove(&child_conversation_id);
+        // 该子代理已经收尾,解除「已提醒」标记(它若被重新派发/重启再卡住,还能再提醒)。
+        self.awaiting_approval_notified
+            .remove(&child_conversation_id);
+
+        let result_text = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&child_conversation_id)
+            .map(subagent_result_text)
+            .unwrap_or_default();
+        self.write_subagent_child_outcome(
+            dispatch.parent_conversation_id,
+            dispatch.parent_task_id.clone(),
+            dispatch.result_message_id.clone(),
+            &child_conversation_id,
+            frame_status,
+            &result_text,
+            ctx,
+        );
+
+        // 父会话在本控制器里没有其它在飞子代理 ⇒ 让父继续(默认「全部完成才 resume」)。
+        let parent_still_waiting = self
+            .pending_subagent_dispatches
+            .values()
+            .any(|pending| pending.parent_conversation_id == dispatch.parent_conversation_id);
+        if parent_still_waiting {
+            log::info!(
+                "[byop][subagent] child={child_conversation_id:?} finished; parent \
+                 {:?} still has {} pending subagent(s)",
+                dispatch.parent_conversation_id,
+                self.pending_subagent_dispatches.len()
+            );
+            return;
+        }
+        log::info!(
+            "[byop][subagent] all subagents finished for parent {:?}; resuming",
+            dispatch.parent_conversation_id
+        );
+        self.resume_conversation_after_subagents(dispatch.parent_conversation_id, ctx);
+    }
+
+    /// 本会话是否还有在飞子代理(D4.1 回合门控用)。
+    ///
+    /// 这是「父回合还不能收尾」最精确的判据:它只覆盖**本进程内真正派发过、
+    /// 尚未回填**的子代理,因此重启恢复出来的历史子会话不会把父永久卡住
+    /// (pending 是内存态,重启即空)。
+    pub fn has_pending_subagent_for(&self, parent_conversation_id: AIConversationId) -> bool {
+        self.pending_subagent_dispatches
+            .values()
+            .any(|pending| pending.parent_conversation_id == parent_conversation_id)
+    }
+
+    /// 把父侧 running 帧里**某一个子代理**原地改成它的结局。
+    ///
+    /// 一个 `subagent` 调用可以派发 N 个子代理,而父侧一个 call 只能有一条
+    /// `ToolCallResult`(D3:同一 `(task_id, tool_call_id)` 的第二条结果会被就绪性
+    /// 检查判成 `DuplicateToolResults`)。所以结果是**逐个写进同一帧**的 `children`
+    /// 数组:读出现有帧 → 替换目标子代理那一项 → 整帧写回同一条消息。
+    ///
+    /// 读改写必须在同一次 `history_model.update` 之内完成,否则 N 个子代理几乎同时
+    /// 结束时会出现「后写的覆盖先写的」(丢结果)。因此这里一次 update 里做完全部
+    /// 三件事:读帧、替换、写回。
+    #[allow(clippy::too_many_arguments)]
+    fn write_subagent_child_outcome(
+        &mut self,
+        parent_conversation_id: AIConversationId,
+        parent_task_id: TaskId,
+        result_message_id: String,
+        child_conversation_id: &AIConversationId,
+        child_status: &str,
+        result: &str,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+        let child_id = child_conversation_id.to_string();
+        let updated = BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+            let Some(conversation) = history_model.conversation_mut(&parent_conversation_id) else {
+                log::warn!(
+                    "[byop][subagent] parent conversation {parent_conversation_id:?} not found; \
+                     cannot deliver subagent result"
+                );
+                return false;
+            };
+            let Some(current) =
+                conversation.byop_task_message_payload(&parent_task_id, &result_message_id)
+            else {
+                log::warn!(
+                    "[byop][subagent] running frame {result_message_id} not found in parent \
+                     {parent_conversation_id:?}; cannot deliver subagent result"
+                );
+                return false;
+            };
+            let Some(frame) = subagent_tool::parse_status_frame(&current) else {
+                log::warn!(
+                    "[byop][subagent] message {result_message_id} is not a subagent status frame; \
+                     refusing to overwrite it"
+                );
+                return false;
+            };
+            let children = frame
+                .children
+                .into_iter()
+                .map(|child| {
+                    if child.child_conversation_id != child_id {
+                        return child;
+                    }
+                    subagent_tool::SubagentFrameChild::finished(
+                        child.child_conversation_id,
+                        child.name,
+                        child_status,
+                        result.to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            // 帧级状态由全体子代理聚合 —— 一个 call 只有一条结果帧,父模型看到的是
+            // 「这轮派发整体怎么样」。
+            let aggregate = subagent_tool::aggregate_child_status(
+                &children
+                    .iter()
+                    .map(|child| child.status.clone())
+                    .collect::<Vec<_>>(),
+            );
+            let payload = subagent_tool::completed_frame_json(aggregate, &children);
+            match conversation.update_byop_task_message_payload(
+                parent_task_id,
+                &result_message_id,
+                payload,
+                ctx,
+            ) {
+                Ok(found) => found,
+                Err(e) => {
+                    log::warn!(
+                        "[byop][subagent] failed to write result frame for \
+                         {parent_conversation_id:?}: {e:?}"
+                    );
+                    false
+                }
+            }
+        });
+        if !updated {
+            return;
+        }
+        // 父侧状态卡要重画;帧属于**父会话**,而写帧的地方可能是在子
+        // view 的 controller 里(子代理超时),父 view 不一定收到更新事件。
+        // 所以这里显式通知父 view 重画一次。
+        ctx.emit(BlocklistAIControllerEvent::SubagentResultDelivered {
+            conversation_id: parent_conversation_id,
+        });
     }
 
     pub fn send_passive_code_diff_request(

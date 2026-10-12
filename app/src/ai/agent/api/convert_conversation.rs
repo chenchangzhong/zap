@@ -346,18 +346,36 @@ impl ConvertToExchanges for &api::Task {
                     }
                 }
                 api::message::Message::ToolCallResult(tool_call_result) => {
-                    // Try to convert tool call result - returns None for ServerToolCalls
-                    if let Some(input) = convert_tool_call_result_to_input(
-                        &task_id,
-                        tool_call_result,
-                        &tool_call_map,
-                        &mut document_versions,
-                    ) {
-                        // Add tool call result as input
-                        current_inputs.push(input);
-                    }
+                    // Oz 子代理(模型乙):父侧的「子代理状态帧」(`result: None` +
+                    // `server_message_data` 是本工具的 JSON)不是真正的工具结果,
+                    // 而是这次派发的记录载体(子代理列表与各自的结局都在帧里)。
+                    //
+                    // 必须返回 `false` 把它交给表示层
+                    // (`to_client_output_message` → `SubagentRun`),否则**重启恢复后
+                    // 这条派发记录会整条消失**;同时避免落到
+                    // `convert_tool_call_result_to_input` 的 `None` 兜底
+                    // (`create_cancelled_result_for_tool_call`),那会为它凭空合成一条
+                    // 假的「已取消」action 输入。
+                    if crate::ai::agent_providers::tools::subagent::parse_status_frame(
+                        &api_message.server_message_data,
+                    )
+                    .is_some()
+                    {
+                        false
+                    } else {
+                        // Try to convert tool call result - returns None for ServerToolCalls
+                        if let Some(input) = convert_tool_call_result_to_input(
+                            &task_id,
+                            tool_call_result,
+                            &tool_call_map,
+                            &mut document_versions,
+                        ) {
+                            // Add tool call result as input
+                            current_inputs.push(input);
+                        }
 
-                    true
+                        true
+                    }
                 }
                 api::message::Message::UpdateTodos(update) => {
                     if let Some(operation) = &update.operation {

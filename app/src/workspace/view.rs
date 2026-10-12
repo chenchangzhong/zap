@@ -20410,6 +20410,9 @@ impl Workspace {
         if *terminal_settings.use_audible_bell {
             context.set.insert(flags::USE_AUDIBLE_BELL_CONTEXT_FLAG);
         }
+        if *terminal_settings.notify_on_subagent_approval {
+            context.set.insert(flags::NOTIFY_ON_SUBAGENT_APPROVAL_CONTEXT_FLAG);
+        }
 
         let gpu_settings = GPUSettings::as_ref(app);
         if *gpu_settings.prefer_low_power_gpu {

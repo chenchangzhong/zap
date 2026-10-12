@@ -2,6 +2,7 @@ use crate::browser::BrowserPane;
 use crate::dsh::DshPane;
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::{AIAgentHarness, AIConversation, AIConversationId};
+use crate::ai::agent::task::TaskId;
 use crate::ai::agent_conversations_model::{
     AgentConversationsModel, AgentConversationsModelEvent, ConversationOrTask,
 };
@@ -15,7 +16,7 @@ use crate::ai::blocklist::suggested_rule_modal::SuggestedRuleAndId;
 use crate::ai::blocklist::{BlocklistAIHistoryModel, InputConfig};
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentModel, AIDocumentVersion};
 use crate::ai::execution_profiles::profiles::{AIExecutionProfilesModel, ClientProfileId};
-use crate::ai::llms::LLMId;
+use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::ai::restored_conversations::RestoredAgentConversations;
 #[cfg(target_family = "wasm")]
 use crate::cloud_object::model::persistence::ObjectStoreModel;
@@ -973,6 +974,23 @@ enum AIDocumentPaneVisibilityAction {
     ///
     /// If the requested pane is open, this will close it. Otherwise it will open it.
     Toggle,
+}
+
+/// 解析子代理该用哪个模型(纯函数,便于单测)。
+///
+/// 优先级:工具调用显式 `model` > profile 里的「子代理模型」 > 父会话模型。
+/// profile 里为 `None`(未配置)时直接落到父会话模型 —— 这就是「默认与父一样」。
+fn resolve_subagent_model(
+    explicit: Option<String>,
+    configured_default: Option<LLMId>,
+    parent_model: Option<LLMId>,
+) -> Option<LLMId> {
+    explicit
+        .map(|model| model.trim().to_owned())
+        .filter(|model| !model.is_empty())
+        .map(LLMId::from)
+        .or(configured_default)
+        .or(parent_model)
 }
 
 impl PaneGroup {
@@ -2557,6 +2575,12 @@ impl PaneGroup {
         };
         let terminal_view_id = terminal_pane.terminal_view(ctx).id();
 
+        // Oz 子代理(模型乙,步骤 8):先把上次退出前没跑完的派发收敛成失败,
+        // 否则父对话会永远显示「运行中」,模型下一轮也会等一个不会来的结果。
+        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+            history_model.reconcile_interrupted_subagent_dispatches(terminal_view_id, ctx);
+        });
+
         // Collect child IDs from both in-memory conversations and the startup
         // index.  The index covers children that haven't been loaded into
         // conversations_by_id yet (because their pane was not snapshotted).
@@ -2609,6 +2633,62 @@ impl PaneGroup {
         }
     }
 
+    /// 按需为一个子会话物化隐藏 pane,返回最终是否有可用 pane。
+    ///
+    /// **为什么需要**:`create_missing_child_agent_panes` 只在 PaneGroup 构造期处理
+    /// 「当时已 live」的父会话。**事后从历史打开**的父会话不会走那条路,于是子会话
+    /// 没有 pane,点击子代理卡/编排 pill 会只打一行 warn 然后什么都不做(实测:
+    /// `No hidden pane found for child conversation ...`)。
+    ///
+    /// 上游用 `pane_group/child_agent/restoration.rs::ensure_hidden_child_agent_pane_for_conversation`
+    /// 覆盖这一场景,本地没有那个模块(阶段二偏差 C),这里用既有
+    /// [`Self::create_hidden_child_agent_pane`] 补一个最小等价物。
+    ///
+    /// **过期收敛**:物化出来的子会话若还停在 `InProgress`,说明它是上次退出前没跑完
+    /// 的残留(本进程没有 pending 派发),就地标失败 —— 否则卡片会一直显示「运行中」。
+    fn ensure_hidden_child_agent_pane_for_conversation(
+        &mut self,
+        conversation_id: AIConversationId,
+        parent_pane_id: PaneId,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        if self.child_agent_panes.contains_key(&conversation_id) {
+            return true;
+        }
+
+        // 内存优先;未加载的历史子会话从恢复暂存区取(与启动急建同一来源)。
+        let child_conversation = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .cloned()
+            .or_else(|| {
+                RestoredAgentConversations::handle(ctx)
+                    .update(ctx, |store, _| store.take_conversation(&conversation_id))
+            });
+        let Some(child_conversation) = child_conversation else {
+            log::warn!(
+                "ensure_hidden_child_agent_pane_for_conversation: child conversation \
+                 {conversation_id:?} not found in memory or restored store"
+            );
+            return false;
+        };
+
+        self.create_hidden_child_agent_pane(child_conversation, parent_pane_id, ctx);
+        let Some(&child_pane_id) = self.child_agent_panes.get(&conversation_id) else {
+            return false;
+        };
+
+        // 用子 pane 自己的 view id 发状态更新事件(与 controller/状态卡的订阅口径一致)。
+        if let Some(child_view_id) = self
+            .terminal_view_from_pane_id(child_pane_id, ctx)
+            .map(|view| view.id())
+        {
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                history.mark_stale_child_conversation_failed(conversation_id, child_view_id, ctx);
+            });
+        }
+        true
+    }
+
     /// Creates a hidden child agent pane for an existing child conversation,
     /// restoring the conversation and tracking it in `child_agent_panes`.
     fn create_hidden_child_agent_pane(
@@ -2642,6 +2722,207 @@ impl PaneGroup {
             log::error!("Failed to get terminal view for child agent pane {child_id:?}");
             self.discard_pane(new_pane_id.into(), ctx);
         }
+    }
+
+    /// Oz 子代理(模型乙,步骤 3+4):为一次 `subagent` 派发建独立子会话 + 隐藏
+    /// pane、对齐权限(D5/D6),并用**子 pane 自己的** controller 提交首轮 query。
+    ///
+    /// ## 为什么必须用子 controller
+    ///
+    /// `BlocklistAIController` 是**每 TerminalView 一份**(字段 `terminal_view_id`
+    /// 与其 `terminal_model` 都属于该 view)。若误用父 controller,子会话会按父的
+    /// `terminal_view_id` 注册进父 view,并锁定父的 `TerminalModel`;本仓库在持锁
+    /// 期间跨层 emit 曾有死锁先例。
+    ///
+    /// ## 权限对齐(D5/D6)
+    ///
+    /// - profile:复制父 view 的 active profile。
+    /// - base model:复制父 view 的 preferred agent mode LLM;`model` 显式给出时覆盖。
+    /// - autoexecute:**按父会话的实际 `autoexecute_any_action()` 复制**,不得无条件
+    ///   打开(见 `start_new_child_conversation` 的文档)。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_subagent_request(
+        &mut self,
+        parent_pane_id: PaneId,
+        parent_conversation_id: AIConversationId,
+        parent_task_id: TaskId,
+        child_conversation_id: AIConversationId,
+        result_message_id: String,
+        tool_call_id: String,
+        prompt: String,
+        name: String,
+        model: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let parent_view_id = self
+            .terminal_view_from_pane_id(parent_pane_id, ctx)
+            .map(|view| view.id());
+        // D6:先读父会话的真实 override 状态,再决定子会话的创建参数。
+        let parent_autoexecute = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&parent_conversation_id)
+            .is_some_and(|conversation| conversation.autoexecute_any_action());
+
+        let new_pane_id =
+            self.insert_terminal_pane_hidden_for_child_agent(parent_pane_id, HashMap::new(), ctx);
+        let Some(child_terminal_view) = self.terminal_view_from_pane_id(new_pane_id, ctx) else {
+            log::error!(
+                "[byop][subagent] failed to get terminal view for new child agent pane; \
+                 failing the dispatch so the parent is not left waiting"
+            );
+            self.discard_pane(new_pane_id.into(), ctx);
+            self.fail_subagent_dispatch(
+                parent_pane_id,
+                parent_conversation_id,
+                parent_task_id,
+                child_conversation_id,
+                result_message_id,
+                "failed to create the subagent pane",
+                ctx,
+            );
+            return;
+        };
+        let child_terminal_view_id = child_terminal_view.id();
+        let child_controller = child_terminal_view.as_ref(ctx).ai_controller().clone();
+
+        // D5:权限与父一致 —— profile 与 base model 都从父 view 复制;
+        // `model` 显式给出时才覆盖父的模型选择。
+        if let Some(parent_view_id) = parent_view_id {
+            let parent_profile_id = *AIExecutionProfilesModel::as_ref(ctx)
+                .active_profile(Some(parent_view_id), ctx)
+                .id();
+            AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
+                profiles.set_active_profile(child_terminal_view_id, parent_profile_id, ctx);
+            });
+        }
+        // 模型优先级(高 → 低):
+        //   1. 工具调用里显式给的 `model`(模型自己决定某个子任务用别的模型)
+        //   2. 当前 execution profile 里配的「子代理模型」(`profile.subagent_model`)
+        //   3. 父会话当前的模型 —— **默认行为**,保证开箱即「与父一样」
+        //
+        // 第 2 项用 `Option<LLMId>`,与 profile 里其它模型字段同构;`None` 即「跟随父会话」。
+        let configured_default = parent_view_id
+            .and_then(|parent_view_id| {
+                AIExecutionProfilesModel::as_ref(ctx).active_profile(Some(parent_view_id), ctx)
+                    .data()
+                    .subagent_model
+                    .clone()
+            });
+        let parent_model = parent_view_id.map(|parent_view_id| {
+            LLMPreferences::as_ref(ctx)
+                .get_active_base_model(ctx, Some(parent_view_id))
+                .id
+                .clone()
+        });
+        let child_model_id = resolve_subagent_model(model.clone(), configured_default, parent_model);
+        if let Some(model_id) = child_model_id {
+            LLMPreferences::handle(ctx).update(ctx, |llm_preferences, ctx| {
+                llm_preferences.update_preferred_agent_mode_llm(
+                    &model_id,
+                    child_terminal_view_id,
+                    ctx,
+                );
+            });
+        }
+
+        let created_conversation_id =
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+                history_model.start_new_child_conversation(
+                    child_terminal_view_id,
+                    name.clone(),
+                    parent_conversation_id,
+                    child_conversation_id,
+                    parent_autoexecute,
+                    ctx,
+                )
+            });
+        debug_assert_eq!(
+            created_conversation_id, child_conversation_id,
+            "child conversation must use the id pre-generated in the parent running frame"
+        );
+        self.child_agent_panes
+            .insert(created_conversation_id, new_pane_id.into());
+
+        // 让子 pane 进入 agent view,与恢复路径(`create_hidden_child_agent_pane`)
+        // 保持一致;pane 本身是 `HiddenForChildAgent`,不会被展示出来。
+        child_terminal_view.update(ctx, |terminal_view, ctx| {
+            terminal_view.enter_agent_view(
+                None,
+                Some(created_conversation_id),
+                AgentViewEntryOrigin::ChildAgent,
+                ctx,
+            );
+        });
+
+        // 步骤 4:用子 pane 自己的 controller 提交首轮 query。
+        // `send_user_query_in_conversation_no_lrc_subagent` 会跳过 running command
+        // 探测,所以这条 query 不会被送进 CLI subagent(LRC)通道。
+        child_controller.update(ctx, |controller, ctx| {
+            controller.send_user_query_in_conversation_no_lrc_subagent(
+                prompt,
+                created_conversation_id,
+                None,
+                ctx,
+            );
+        });
+
+        // D4:登记 pending。子会话进入终态后由父 view 的 controller 回填结果并 resume。
+        let Some(parent_controller) = self
+            .terminal_view_from_pane_id(parent_pane_id, ctx)
+            .map(|view| view.as_ref(ctx).ai_controller().clone())
+        else {
+            log::error!(
+                "[byop][subagent] could not resolve the parent controller for \
+                 {parent_conversation_id:?}; the subagent result will not be delivered"
+            );
+            return;
+        };
+        parent_controller.update(ctx, |controller, ctx| {
+            controller.register_pending_subagent(
+                crate::ai::blocklist::PendingSubagentDispatch {
+                    parent_conversation_id,
+                    parent_task_id,
+                    result_message_id,
+                    child_conversation_id: created_conversation_id,
+                    tool_call_id,
+                    name,
+                },
+                ctx,
+            );
+        });
+    }
+
+    /// 子代理派发失败时,把错误写回父侧结果帧并让父继续,避免父会话永久挂起。
+    #[allow(clippy::too_many_arguments)]
+    fn fail_subagent_dispatch(
+        &mut self,
+        parent_pane_id: PaneId,
+        parent_conversation_id: AIConversationId,
+        parent_task_id: TaskId,
+        child_conversation_id: AIConversationId,
+        result_message_id: String,
+        reason: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(parent_controller) = self
+            .terminal_view_from_pane_id(parent_pane_id, ctx)
+            .map(|view| view.as_ref(ctx).ai_controller().clone())
+        else {
+            log::error!(
+                "[byop][subagent] could not resolve the parent controller for \
+                 {parent_conversation_id:?}; cannot report the dispatch failure"
+            );
+            return;
+        };
+        parent_controller.update(ctx, |controller, ctx| {
+            controller.fail_subagent_dispatch(
+                parent_conversation_id,
+                parent_task_id,
+                result_message_id,
+                child_conversation_id,
+                reason,
+                ctx,
+            );
+        });
     }
 
     /// Helper that creates the initial [`PaneData`] and [`InitialFocus`] given a terminal view.
@@ -6314,3 +6595,7 @@ impl View for PaneGroup {
     ) {
     }
 }
+
+#[cfg(test)]
+#[path = "subagent_model_tests.rs"]
+mod subagent_model_tests;

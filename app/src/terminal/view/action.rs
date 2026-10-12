@@ -393,6 +393,39 @@ pub enum TerminalAction {
     RevealChildAgent {
         conversation_id: AIConversationId,
     },
+    /// Oz 子代理(模型乙,步骤 7):停止一个正在运行的子代理。
+    ///
+    /// 父对话取消**不会**连带取消子代理(两者是独立的子会话与 view),所以父侧
+    /// 卡片必须自带一个「停止」入口,否则用户在父对话里没有办法停掉跑偏的子代理。
+    StopChildAgentConversation {
+        conversation_id: AIConversationId,
+    },
+    /// 把本 pane 的 agent view **原地**切换到指定会话(编排 pill bar 里点编排者
+    /// pill、或无法跨 pane 聚焦时的回落路径)。
+    ///
+    /// 与 `RevealChildAgent`(显示那个子会话自己的隐藏 pane)不同:这里不动 pane
+    /// 布局,只切换本 view 正在展示的会话 —— 与上游同名动作语义一致。
+    SwitchAgentViewToConversation {
+        conversation_id: AIConversationId,
+    },
+    /// 在独立 pane 中打开一个子代理会话(编排 pill bar 的 3-dot 菜单)。
+    ///
+    /// **本地偏差(阶段二方案 A)**:上游该动作会把隐藏子 pane 「分割出来」成为
+    /// 可见 pane(`unhide_child_agent_pane_for_split_off`),但本地没有
+    /// `app/src/pane_group/child_agent/` 那一套(上游 2200 行)。本期降级为
+    /// **复用既有隐藏 pane**:显示并聚焦它,等价于 `RevealChildAgent`。
+    OpenChildAgentInNewPane {
+        conversation_id: AIConversationId,
+    },
+    /// 在独立 tab 中打开一个子代理会话(编排 pill bar 的 3-dot 菜单)。
+    ///
+    /// **本地偏差(阶段二方案 A)**:上游这个变体本身也是 stub(注释明写"暂时
+    /// 回落到与 `OpenChildAgentInNewPane` 相同的路径,直到 tab 级路由接上"),
+    /// 且其 handler 依赖本地不存在的 pane 重建能力。本期与
+    /// [`Self::OpenChildAgentInNewPane`] 完全同路径。
+    OpenChildAgentInNewTab {
+        conversation_id: AIConversationId,
+    },
     /// Toggle PTY recording for this session.
     ToggleSessionRecording,
     /// Toggle the rich input editor for composing a prompt to send to a CLI agent.
@@ -648,6 +681,10 @@ impl fmt::Debug for TerminalAction {
             AwsCliNotInstalledBanner(action) => write!(f, "AwsCliNotInstalledBanner({action:?})"),
             ToggleUsageFooter => write!(f, "ToggleUsageFooter"),
             RevealChildAgent { .. } => write!(f, "RevealChildAgent"),
+            StopChildAgentConversation { .. } => write!(f, "StopChildAgentConversation"),
+            SwitchAgentViewToConversation { .. } => write!(f, "SwitchAgentViewToConversation"),
+            OpenChildAgentInNewPane { .. } => write!(f, "OpenChildAgentInNewPane"),
+            OpenChildAgentInNewTab { .. } => write!(f, "OpenChildAgentInNewTab"),
             ToggleSessionRecording => write!(f, "ToggleSessionRecording"),
             ToggleCLIAgentRichInput => write!(f, "ToggleCLIAgentRichInput"),
             FocusCLIAgentTerminal => write!(f, "FocusCLIAgentTerminal"),

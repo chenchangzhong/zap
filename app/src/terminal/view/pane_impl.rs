@@ -13,6 +13,7 @@ use crate::pane_group::pane::view::header::components::{
     header_edge_min_width, render_pane_header_buttons, render_pane_header_title_text,
     render_three_column_header, CenteredHeaderEdgeWidth,
 };
+use crate::pane_group::pane::view::header::PANE_HEADER_HEIGHT;
 use crate::pane_group::pane::PaneStack;
 use crate::pane_group::{
     pane::view, pane::view::PaneHeaderAction, BackingView, SplitPaneState,
@@ -378,7 +379,46 @@ impl TerminalView {
             header_ctx.draggable_state.is_dragging(),
         );
 
-        header
+        self.maybe_add_orchestration_pill_bar(header, is_fullscreen_agent_view)
+    }
+
+    /// 编排 pill bar(阶段二):在全屏 agent view 下,把标题行下面接一行 pill bar。
+    ///
+    /// 结构对齐上游 `maybe_add_parent_navigation_card`:
+    /// - 标题行用 `ConstrainedBox::with_height(PANE_HEADER_HEIGHT)` 钉住 —— 外层
+    ///   `Flex::column` 否则会把无限的竖直约束传下去,标题的垂直居中会塌成自身行高。
+    /// - 次级行放 pill bar;它自己在没有子会话时渲染成 `Empty`。
+    ///
+    /// **本地偏差(阶段二方案 A)**:上游这里还有 split-off 分支(渲染
+    /// `render_orchestration_breadcrumbs`),依赖本仓不存在的
+    /// `is_orchestration_split_off` 与 `mouse_states.breadcrumbs_horizontal_scroll`,
+    /// 故本期不提供 breadcrumb 行。
+    ///
+    /// ⚠️ **未跑 UI 验证的一处细节**:`PaneHeader` 对 `HeaderContent::Custom` 还会再包
+    /// 一层 `Clipped::new(ConstrainedBox::with_height(PANE_HEADER_HEIGHT))`
+    /// (`pane_group/pane/view/header/mod.rs`)。上游是**同一个结构**,且上游此处注释
+    /// 明确写了这层钉高是为了「让 pill bar / breadcrumb 行**按自身高度**紧接着排在下面」;
+    /// 本地实现上 `ConstrainedBox::layout` 只收窄约束、**不夹紧子元素的返回值**
+    /// (`crates/warpui_core/src/elements/constrained_box.rs`),而 `Clipped::size()` 取
+    /// 子元素报告的尺寸(`crates/warpui_core/src/elements/clipped.rs`),所以静态推导与
+    /// 上游意图一致。但「pill bar 行在全屏 agent view 里确实可见」仍需手工跑一次确认。
+    fn maybe_add_orchestration_pill_bar(
+        &self,
+        header: Box<dyn Element>,
+        is_fullscreen_agent_view: bool,
+    ) -> Box<dyn Element> {
+        if !is_fullscreen_agent_view {
+            return header;
+        }
+        let pinned_header = ConstrainedBox::new(header)
+            .with_height(PANE_HEADER_HEIGHT)
+            .finish();
+        let pill_bar_row = ChildView::new(&self.orchestration_pill_bar).finish();
+        Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(pinned_header)
+            .with_child(pill_bar_row)
+            .finish()
     }
 }
 

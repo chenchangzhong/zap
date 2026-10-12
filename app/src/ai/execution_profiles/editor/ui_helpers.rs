@@ -233,6 +233,8 @@ pub fn render_models_section(
     let active_desc = crate::t!("settings-exec-profile-editor-active-ai-model-desc");
     let next_label = crate::t!("settings-exec-profile-editor-next-command-model");
     let next_desc = crate::t!("settings-exec-profile-editor-next-command-model-desc");
+    let subagent_label = crate::t!("settings-exec-profile-editor-subagent-model");
+    let subagent_desc = crate::t!("settings-exec-profile-editor-subagent-model-desc");
 
     let mut column = Flex::column()
         .with_child(render_separator(appearance))
@@ -266,6 +268,12 @@ pub fn render_models_section(
             &next_label,
             &next_desc,
             &view.next_command_model_dropdown,
+        ))
+        .with_child(render_filterable_dropdown_row(
+            appearance,
+            &subagent_label,
+            &subagent_desc,
+            &view.subagent_model_dropdown,
         ));
 
     if FeatureFlag::LocalComputerUse.is_enabled() {

@@ -6,13 +6,14 @@ use crate::ai::agent::api::convert_conversation::{
     convert_input_context, convert_tool_call_result_to_input,
 };
 use crate::ai::agent::comment::CodeReview;
+use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::todos::AIAgentTodoList;
 use crate::ai::agent::{
     util::parse_markdown_into_text_and_code_sections, AIAgentAction, AIAgentActionType,
     AIAgentCitation, AIAgentInput, AIAgentOutputMessage, AIAgentText, AIAgentTodo,
-    ArtifactCreatedData, MessageId, SuggestedAgentModeWorkflow, SuggestedRule, Suggestions,
-    TodoOperation,
+    ArtifactCreatedData, MessageId, SubagentRunCall, SuggestedAgentModeWorkflow, SuggestedRule,
+    Suggestions, TodoOperation,
 };
 use crate::ai::agent::{
     CloneRepositoryURL, SubagentCall, SubagentType, SummarizationType, WebFetchStatus,
@@ -495,15 +496,85 @@ impl ConvertAPIMessageToClientOutputMessage for api::Message {
             // These messages don't indicate an error but they don't translate to a client-side output message.
             api::message::Message::UserQuery(_)
             | api::message::Message::SystemQuery(_)
-            | api::message::Message::ToolCallResult(_)
             | api::message::Message::CodeReview(_)
             | api::message::Message::ServerEvent(_)
             | api::message::Message::InvokeSkill(_)
             | api::message::Message::PassiveSuggestionResult(_) => {
                 Ok(MaybeAIAgentOutputMessage::NoClientRepresentation)
             }
+            // Oz 子代理(模型乙):父侧状态帧是 `ToolCallResult{result:None}`
+            // + 合法 JSON 的 `server_message_data`。这里把它翻成 `SubagentRun`
+            // 表示(子代理列表与各自状态),供 SDK/导出等消费者使用。
+            // **只有**本工具的状态帧会命中(其余
+            // `result:None` 的 ToolCallResult —— 例如本地拦截/解析失败的兜底 ——
+            // 仍然走 `NoClientRepresentation`),所以不会改变既有渲染。
+            api::message::Message::ToolCallResult(tool_call_result) => {
+                match subagent_run_call(&tool_call_result, &self.server_message_data) {
+                    Some(call) => Ok(MaybeAIAgentOutputMessage::Message(
+                        AIAgentOutputMessage::subagent_run(MessageId::new(self.id), call)
+                            .with_citations(citations),
+                    )),
+                    None => Ok(MaybeAIAgentOutputMessage::NoClientRepresentation),
+                }
+            }
         }
     }
+}
+
+/// 从一条父侧 `ToolCallResult` 里读出「子代理派发」的展示数据。
+///
+/// 判定条件(任一不满足即返回 `None`):
+/// 1. `result` oneof 为空(我们只写 `server_message_data`);
+/// 2. `server_message_data` 是合法 JSON,且 `tool == "subagent"`;
+/// 3. 带得出合法的 `child_conversation_id`(`AIConversationId` 是 uuid,
+///    解析失败说明这不是我们的帧或者是脏数据)。
+/// 父侧状态帧的 `status` → `ConversationStatus`,只用于渲染层的兜底。
+///
+/// 帧里的状态是**子代理派发**的状态(由我们的帧编码定义),与子会话自身的
+/// `ConversationStatus` 是两套东西;这里做一次收敛,让卡片在拿不到子会话时
+/// 仍能说真话。
+fn subagent_frame_status_to_conversation_status(frame_status: &str) -> ConversationStatus {
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+    match frame_status {
+        subagent_tool::STATUS_COMPLETED => ConversationStatus::Success,
+        subagent_tool::STATUS_ERROR => ConversationStatus::Error,
+        subagent_tool::STATUS_CANCELLED => ConversationStatus::Cancelled,
+        _ => ConversationStatus::InProgress,
+    }
+}
+
+fn subagent_run_call(
+    tool_call_result: &api::message::ToolCallResult,
+    server_message_data: &str,
+) -> Option<SubagentRunCall> {
+    use crate::ai::agent::SubagentRun;
+    use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+    if tool_call_result.result.is_some() {
+        return None;
+    }
+    let frame = subagent_tool::parse_status_frame(server_message_data)?;
+    let runs = frame
+        .children
+        .into_iter()
+        .filter_map(|child| {
+            // 帧里的子会话 id 由我们预生成,解析失败说明是脏数据:跳过这一项而不是
+            // 丢掉整张卡片 —— 同一次派发里其余子代理仍然值得展示。
+            let conversation_id = AIConversationId::try_from(child.child_conversation_id).ok()?;
+            Some(SubagentRun {
+                conversation_id,
+                name: child.name,
+                fallback_status: subagent_frame_status_to_conversation_status(&child.status),
+            })
+        })
+        .collect::<Vec<_>>();
+    if runs.is_empty() {
+        return None;
+    }
+    Some(SubagentRunCall {
+        fallback_status: subagent_frame_status_to_conversation_status(&frame.status),
+        runs,
+    })
 }
 
 impl From<api::message::AgentOutput> for AIAgentText {

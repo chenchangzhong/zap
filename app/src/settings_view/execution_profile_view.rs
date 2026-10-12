@@ -162,6 +162,15 @@ impl View for ExecutionProfileView {
                     .clone()
             });
 
+        // 子代理模型:未设置时语义是**跟随父会话**(不是回退到 base),所以显式
+        // 显示成「跟随父会话」,避免与「已设为 base 同名模型」混淆。
+        let subagent_model = profile
+            .subagent_model
+            .as_ref()
+            .and_then(|id| llm_preferences.get_llm_info(id))
+            .map(|info| info.display_name.clone())
+            .unwrap_or_else(|| crate::t!("settings-exec-profile-subagent-model-follow-parent"));
+
         let computer_use_model = profile
             .computer_use_model
             .as_ref()
@@ -245,6 +254,15 @@ impl View for ExecutionProfileView {
                             Icon::Lightning,
                             crate::t!("settings-exec-profile-next-command-model"),
                             next_command_model,
+                            appearance,
+                            is_any_ai_enabled,
+                        ),
+                    ));
+                    model_flex.add_child(with_standard_vertical_margin(
+                        render_model_line_with_icon(
+                            Icon::Workflow,
+                            crate::t!("settings-exec-profile-subagent-model"),
+                            subagent_model,
                             appearance,
                             is_any_ai_enabled,
                         ),

@@ -668,6 +668,36 @@ impl AIExecutionProfilesModel {
         }
     }
 
+    /// Zap:设置该 profile 的子代理默认模型。`None` = 跟随父会话。
+    pub fn set_subagent_model(
+        &mut self,
+        profile_id: ClientProfileId,
+        model_id: Option<LLMId>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.edit_profile_internal(
+            profile_id,
+            |profile| {
+                if profile.subagent_model != model_id {
+                    profile.subagent_model = model_id.clone();
+                    return true;
+                }
+                false
+            },
+            ctx,
+        );
+
+        if let Some(model_id) = &model_id {
+            send_telemetry_from_ctx!(
+                TelemetryEvent::AIExecutionProfileModelSelected {
+                    model_type: "subagent".to_string(),
+                    model_value: model_id.to_string(),
+                },
+                ctx
+            );
+        }
+    }
+
     pub fn set_computer_use_model(
         &mut self,
         profile_id: ClientProfileId,

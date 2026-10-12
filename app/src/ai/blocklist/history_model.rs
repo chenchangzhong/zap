@@ -42,7 +42,7 @@ use crate::{
     ai::agent::{
         conversation::{AIConversation, AIConversationId},
         AIAgentActionId, AIAgentExchange, AIAgentInput, AIAgentOutputStatus, FinishedAIAgentOutput,
-        MessageId, RenderableAIError, RequestCost, Suggestions,
+        MessageId, RenderableAIError, RequestCost, Suggestions, TransientNetworkErrorKind,
     },
     persistence::model::AgentConversation,
     ui_components::icons::Icon,
@@ -345,12 +345,24 @@ impl BlocklistAIHistoryModel {
             .collect()
     }
 
-    /// Creates a new child agent conversation.
+    /// 子会话 id 由调用方给定,见 [`AIConversation::new_with_id`]。
+    ///
+    /// ## `auto_execute` 必须显式对齐父会话(D6)
+    ///
+    /// 该参数会走 `toggle_autoexecute_override` ⇒ 把会话置为
+    /// [`AIConversationAutoexecuteMode::RunToCompletion`],而该状态**直接进权限判定**:
+    /// `permissions.rs` 共 8 处消费 `autoexecute_any_action()`,其中写 PTY 会直接
+    /// 返回 `AlwaysAllow`,还会与 `auto_approve_bypasses_command_denylist` 组合
+    /// **绕过用户命令 denylist**。所以调用方**不得**无条件传 `true`
+    /// (参考实现 `fa1063715^:app/src/pane_group/child_agent.rs` 就是无条件 true,
+    /// 那会让子代理权限高于父),必须复制父会话当时的 `autoexecute_any_action()`。
     pub fn start_new_child_conversation(
         &mut self,
         terminal_view_id: EntityId,
         name: String,
         parent_conversation_id: AIConversationId,
+        conversation_id: AIConversationId,
+        auto_execute: bool,
         ctx: &mut ModelContext<Self>,
     ) -> AIConversationId {
         let parent_agent_id = self
@@ -363,9 +375,13 @@ impl BlocklistAIHistoryModel {
             );
         }
 
-        let auto_execute = true; // Child auto-executes by default.
-        let conversation_id =
-            self.start_new_conversation(terminal_view_id, auto_execute, false, ctx);
+        let conversation_id = self.start_new_conversation_with_id(
+            terminal_view_id,
+            auto_execute,
+            false,
+            conversation_id,
+            ctx,
+        );
         {
             let conversation = self
                 .conversation_mut(&conversation_id)
@@ -481,6 +497,49 @@ impl BlocklistAIHistoryModel {
             .iter()
             .find(|(_, conversation_ids)| conversation_ids.contains(conversation_id))
             .map(|(terminal_view_id, _)| *terminal_view_id)
+    }
+
+    /// 设置会话在编排 pill bar 里的置顶状态。
+    ///
+    /// **本地偏差(阶段二方案 A)**:置顶**仅内存**(`AIConversation::pinned` 没有
+    /// 对应的持久化列,见 `AIConversation::is_pinned` 的文档),所以这里不写库,
+    /// 只改内存并广播一次元数据更新让订阅者重绘。上游会因为「写盘」顺带 emit,
+    /// 本地的 emit 是唯一作用,保留它是为了让 pill bar 立刻反映新状态。
+    pub fn set_conversation_pinned(
+        &mut self,
+        conversation_id: AIConversationId,
+        pinned: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(conversation) = self.conversations_by_id.get_mut(&conversation_id) else {
+            log::warn!("Tried to set pin state on unknown conversation: {conversation_id:?}");
+            return;
+        };
+        if conversation.is_pinned() == pinned {
+            return;
+        }
+        conversation.set_pinned(pinned);
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedConversationMetadata {
+            terminal_view_id: self.terminal_view_id_for_conversation(&conversation_id),
+            conversation_id,
+        });
+    }
+
+    /// 会话的「规范父会话 id」:优先取显式的 `parent_conversation_id`,缺失时回落到
+    /// 由 `parent_agent_id` 反查。
+    ///
+    /// 从上游 `orchestration_conversation_links.rs` 的 `parent_conversation_id` 包装
+    /// 收敛到这里,让 breadcrumb / 子会话导航 / 编排根节点遍历共用同一个口径
+    /// (上游注释原话:UI 层不得与子会话索引漂移)。
+    pub fn resolved_parent_conversation_id_for_conversation(
+        &self,
+        conversation: &AIConversation,
+    ) -> Option<AIConversationId> {
+        resolved_parent_conversation_id_from_refs(
+            conversation.parent_conversation_id(),
+            conversation.parent_agent_id(),
+            |agent_id| self.conversation_id_for_agent_id(agent_id),
+        )
     }
 
     /// Returns the conversation ID from the terminal view's history corresponding to the action,
@@ -694,6 +753,15 @@ impl BlocklistAIHistoryModel {
         self.active_conversation_for_terminal_view
             .insert(terminal_view_id, conversation_id);
 
+        // Oz 子代理(模型乙):会话被激活时,顺手收敛它名下「上次退出前没跑完」的
+        // 派发。启动收敛只覆盖启动时已 live 的父会话;**事后从历史打开**的会话只能
+        // 靠这里,否则卡片会一直显示「运行中」直到用户点开子会话才被按需修正(实测)。
+        self.reconcile_interrupted_subagent_dispatches_for_parent(
+            conversation_id,
+            terminal_view_id,
+            ctx,
+        );
+
         ctx.emit(BlocklistAIHistoryEvent::SetActiveConversation {
             conversation_id,
             terminal_view_id,
@@ -748,7 +816,29 @@ impl BlocklistAIHistoryModel {
         is_viewing_shared_session: bool,
         ctx: &mut ModelContext<Self>,
     ) -> AIConversationId {
-        let mut new_conversation = AIConversation::new(is_viewing_shared_session);
+        self.start_new_conversation_with_id(
+            terminal_view_id,
+            is_autoexecute_override,
+            is_viewing_shared_session,
+            AIConversationId::new(),
+            ctx,
+        )
+    }
+
+    /// 用调用方指定的 id 新建会话(其余语义同 [`Self::start_new_conversation`])。
+    ///
+    /// Oz 子代理需要它:id 在父侧 running 帧里已经写进消息体并落库,创建时必须
+    /// 用回同一个 id。
+    pub fn start_new_conversation_with_id(
+        &mut self,
+        terminal_view_id: EntityId,
+        is_autoexecute_override: bool,
+        is_viewing_shared_session: bool,
+        conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) -> AIConversationId {
+        let mut new_conversation =
+            AIConversation::new_with_id(conversation_id, is_viewing_shared_session);
         if is_autoexecute_override {
             new_conversation.toggle_autoexecute_override();
         }
@@ -1283,6 +1373,183 @@ impl BlocklistAIHistoryModel {
         Ok(forked_conversation)
     }
 
+    /// Oz 子代理(模型乙,步骤 8):启动时收敛「上次退出前没跑完」的子代理派发。
+    ///
+    /// ## 为什么必须在启动时收敛
+    ///
+    /// pending 表是**内存态**(`BlocklistAIController::pending_subagent_dispatches`),
+    /// 重启后必然为空,所以父会话在门控上不会永久挂起。但父侧历史里那条
+    /// running 帧会**原样落库**:渲染层按子会话实时状态显示,而子会话在库里仍是
+    /// `InProgress`(子代理进程随上次退出一起没了),于是父对话永远显示「运行中」,
+    /// 模型下一轮也会看到一个永远不会有结果的 tool result。
+    ///
+    /// 收敛规则:**凡是仍停在 running 的派发,重启后一律不可能再完成** ——
+    /// 把父侧结果帧改写为 error(保留子会话,用户仍可点进去看它停在哪),并把
+    /// 子会话自身的 `InProgress` 也标成 `Error`,否则状态卡会一直显示转圈。
+    ///
+    /// 幂等:只处理 `status == running` 的帧,重复调用无副作用。
+    pub fn reconcile_interrupted_subagent_dispatches(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let parent_ids: Vec<AIConversationId> = self
+            .all_live_conversations_for_terminal_view(terminal_view_id)
+            .filter(|conversation| !conversation.is_child_agent_conversation())
+            .map(|conversation| conversation.id())
+            .collect();
+
+        for parent_id in parent_ids {
+            self.reconcile_interrupted_subagent_dispatches_for_parent(
+                parent_id,
+                terminal_view_id,
+                ctx,
+            );
+        }
+    }
+
+    /// 单个父会话的过期派发收敛。见
+    /// [`Self::reconcile_interrupted_subagent_dispatches`]。
+    ///
+    /// **为什么单独暴露**:启动收敛只覆盖「启动时已 live」的父会话,而用户**事后
+    /// 从历史打开**的父会话永远走不到那里 —— 实测表现为卡片一直显示「运行中」,
+    /// 直到用户点开子会话才被按需收敛修正。因此「会话被激活」时也要对它的子会话
+    /// 跑一遍(见 [`Self::set_active_conversation_id`])。
+    pub fn reconcile_interrupted_subagent_dispatches_for_parent(
+        &mut self,
+        parent_id: AIConversationId,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        use crate::ai::agent_providers::tools::subagent as subagent_tool;
+
+        {
+            // 先只读扫描,再逐个短借用改写:父会话与子会话都在
+            // `conversations_by_id` 里,同时持有两把可变借用是行不通的。
+            //
+            // 一个父侧结果帧可能带 N 个子代理,收敛是**逐个子代理**的:只把还停在
+            // `running` 的那些改成 error,已经成功的子代理必须原样保留结果 ——
+            // 整帧覆盖会把「重启前跑完的那个」的成功结果一起抹掉。
+            let mut stale_frames: Vec<(TaskId, String, Vec<AIConversationId>)> = Vec::new();
+            let Some(parent) = self.conversations_by_id.get(&parent_id) else {
+                return;
+            };
+            for task in parent.all_tasks() {
+                for message in task.messages() {
+                    let Some(inner) = message.message.as_ref() else {
+                        continue;
+                    };
+                    if !matches!(
+                        inner,
+                        warp_multi_agent_api::message::Message::ToolCallResult(_)
+                    ) {
+                        continue;
+                    }
+                    let Some(frame) =
+                        subagent_tool::parse_status_frame(&message.server_message_data)
+                    else {
+                        continue;
+                    };
+                    let stale_children = frame
+                        .children
+                        .iter()
+                        .filter(|child| child.status == subagent_tool::STATUS_RUNNING)
+                        .filter_map(|child| {
+                            AIConversationId::try_from(child.child_conversation_id.clone()).ok()
+                        })
+                        .collect::<Vec<_>>();
+                    if stale_children.is_empty() {
+                        continue;
+                    }
+                    stale_frames.push((task.id().clone(), message.id.clone(), stale_children));
+                }
+            }
+            if stale_frames.is_empty() {
+                return;
+            }
+            log::warn!(
+                "[byop][subagent] found {} interrupted subagent dispatch(es) in parent \
+                 {parent_id:?}; marking them as failed",
+                stale_frames.len()
+            );
+            for (task_id, message_id, stale_children) in stale_frames {
+                // 逐个改写:按当前帧内容重算这一整帧的 children,只把 stale 的
+                // 那些换成 error,其余原样带回去(包括它们的 result 文本)。
+                let payload = self
+                    .conversations_by_id
+                    .get(&parent_id)
+                    .and_then(|parent| {
+                        parent
+                            .all_tasks()
+                            .find(|task| task.id() == &task_id)
+                            .and_then(|task| {
+                                task.messages().find(|message| message.id == message_id)
+                            })
+                    })
+                    .and_then(|message| {
+                        subagent_tool::rewrite_running_children_as_error(
+                            &message.server_message_data,
+                            "This subagent was interrupted by a restart and never finished.",
+                        )
+                    });
+                let Some(payload) = payload else {
+                    continue;
+                };
+                let write_result = self.conversations_by_id.get_mut(&parent_id).map(|parent| {
+                    parent.update_byop_task_message_payload(task_id, &message_id, payload, ctx)
+                });
+                if let Some(Err(e)) = write_result {
+                    log::warn!(
+                        "[byop][subagent] failed to mark interrupted dispatch {message_id} as \
+                         failed: {e:?}"
+                    );
+                }
+                // 子会话自身若还停在 InProgress,也收敛掉,否则状态卡会一直转圈。
+                for child_id in stale_children {
+                    self.mark_stale_child_conversation_failed(child_id, terminal_view_id, ctx);
+                }
+            }
+        }
+    }
+
+    /// 把一个「还停在 `InProgress` 但本进程已经没人在跑它」的子会话标成失败。
+    ///
+    /// 判据是**没有 pending 派发**(内存态),所以只应在两种时机调用:
+    /// 启动收敛,以及按需物化一个历史子会话时(见
+    /// `PaneGroup::ensure_hidden_child_agent_pane_for_conversation`)。
+    /// `Blocked`(等待审批)不会被误伤 —— 它本来就不满足 `is_in_progress`。
+    pub fn mark_stale_child_conversation_failed(
+        &mut self,
+        child_id: AIConversationId,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(child) = self.conversations_by_id.get_mut(&child_id) else {
+            return;
+        };
+        if !child.status().is_in_progress() {
+            return;
+        }
+        log::warn!(
+            "[byop][subagent] child conversation {child_id:?} is still InProgress but has no \
+             pending dispatch in this process; marking it failed so the parent's card stops \
+             showing a spinner"
+        );
+        child.update_status_with_error(
+            ConversationStatus::Error,
+            Some(RenderableAIError::transient_network_error(
+                false,
+                false,
+                TransientNetworkErrorKind::UnfinishedExchange,
+            )),
+            terminal_view_id,
+            ctx,
+        );
+        // `update_status_with_error` 只改内存 + emit 事件,不落库;不写库的话下次启动
+        // 子会话又变回 InProgress(实测:卡片重启后继续显示「运行中」)。
+        child.write_updated_conversation_state(ctx);
+    }
+
     pub fn apply_client_actions(
         &mut self,
         response_stream_id: &ResponseStreamId,
@@ -1293,6 +1560,22 @@ impl BlocklistAIHistoryModel {
     ) -> Result<(), UpdateHistoryError> {
         let mut current_conversation_id = conversation_id;
         for client_action in client_actions {
+            // Oz 子代理(模型乙):本批 `AddMessagesToTask` 里若含 `subagent`
+            // carrier,就记下派发请求,等消息真正落盘后再发事件 —— 建子会话/建 pane
+            // 是 View 层的事,不能在模型可变借用期间直接做。
+            let subagent_dispatches = match client_action.action.as_ref() {
+                Some(Action::AddMessagesToTask(add_messages_to_task)) => {
+                    let parent_task_id = TaskId::new(add_messages_to_task.task_id.clone());
+                    crate::ai::agent_providers::tools::subagent::dispatch_requests_in_batch(
+                        &add_messages_to_task.messages,
+                    )
+                    .into_iter()
+                    .map(|dispatch| (parent_task_id.clone(), dispatch))
+                    .collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            };
+
             match client_action.action {
                 Some(Action::StartNewConversation(StartNewConversation {
                     start_from_message_id,
@@ -1323,6 +1606,39 @@ impl BlocklistAIHistoryModel {
                 None => {
                     log::warn!("Received empty client action");
                 }
+            }
+
+            for (parent_task_id, dispatch) in subagent_dispatches {
+                let mut children = Vec::with_capacity(dispatch.children.len());
+                for child in dispatch.children {
+                    match AIConversationId::try_from(child.child_conversation_id.clone()) {
+                        Ok(child_conversation_id) => children.push(SubagentRequestedChild {
+                            child_conversation_id,
+                            prompt: child.prompt,
+                            name: child.name,
+                            model: child.model,
+                        }),
+                        Err(e) => {
+                            log::warn!(
+                                "[byop][subagent] invalid child conversation id {:?} in running \
+                                 frame of tool_call_id={}: {e:#}",
+                                child.child_conversation_id,
+                                dispatch.tool_call_id
+                            );
+                        }
+                    }
+                }
+                if children.is_empty() {
+                    continue;
+                }
+                ctx.emit(BlocklistAIHistoryEvent::SubagentRequested {
+                    parent_conversation_id: current_conversation_id,
+                    parent_task_id,
+                    terminal_view_id,
+                    tool_call_id: dispatch.tool_call_id,
+                    result_message_id: dispatch.result_message_id,
+                    children,
+                });
             }
         }
         Ok(())
@@ -1518,12 +1834,12 @@ impl BlocklistAIHistoryModel {
             // 反查对话的 owner view,避免 per-terminal-view 索引残留。
             let resolved_terminal_view_id = terminal_view_id
                 .or_else(|| self.terminal_view_id_for_conversation(&conversation_id));
-            self.remove_conversation_from_memory(
+            self.remove_conversation_from_memory(conversation_id, resolved_terminal_view_id, ctx);
+            conversations.push((
                 conversation_id,
+                conversation_title,
                 resolved_terminal_view_id,
-                ctx,
-            );
-            conversations.push((conversation_id, conversation_title, resolved_terminal_view_id));
+            ));
         }
 
         // Delete persisted conversations from sqlite.
@@ -2051,6 +2367,18 @@ fn agent_id_key(conversation: &AIConversation) -> Option<String> {
     conversation.agent_link_id()
 }
 
+/// 见 [`BlocklistAIHistoryModel::resolved_parent_conversation_id_for_conversation`]。
+///
+/// `lookup_agent` 由调用方注入(而不是直接读 `self.conversations_by_id`),这样
+/// 该判定既能用于已加载的内存会话,也能复用到只有持久化数据的恢复路径。
+fn resolved_parent_conversation_id_from_refs(
+    parent_conversation_id: Option<AIConversationId>,
+    parent_agent_id: Option<&str>,
+    lookup_agent: impl FnOnce(&str) -> Option<AIConversationId>,
+) -> Option<AIConversationId> {
+    parent_conversation_id.or_else(|| parent_agent_id.and_then(lookup_agent))
+}
+
 #[derive(Clone, Debug)]
 pub enum BlocklistAIHistoryEvent {
     /// A new conversation was started.
@@ -2199,6 +2527,38 @@ pub enum BlocklistAIHistoryEvent {
         previous_terminal_view_id: EntityId,
         new_terminal_view_id: EntityId,
     },
+
+    /// Oz 子代理(模型乙):父会话这一轮里出现了一次 `subagent` 工具调用,
+    /// 需要为它建独立子会话 + 隐藏 pane,并把各自的 `prompt` 作为该子会话的首轮
+    /// query 提交。
+    ///
+    /// 只在 **新应用** 的 `AddMessagesToTask` 上触发(恢复历史时不会再派发),
+    /// 因此这里带齐了派发所需的一切:
+    /// - `children`:`tasks` 数组里的每个任务一项,顺序即派发顺序。每项带
+    ///   chat_stream 在合成 running 帧时预生成的子会话 id —— 与消息体里记录的
+    ///   完全一致(重启恢复时渲染层可直接从消息里取到)。
+    /// - `result_message_id`:父侧 running 帧的消息 id,**一次调用只有一条**。
+    ///   N 个子代理共享它,谁结束都按此 id 原地改写同一条 `ToolCallResult`
+    ///   (另追加一条会被判重而丢弃真结果,见 D3)。
+    /// - `tool_call_id`:父侧 `has_persisted_tool_result` 的判重键,也是父侧卡片
+    ///   与子会话之间的 join key。
+    SubagentRequested {
+        parent_conversation_id: AIConversationId,
+        parent_task_id: TaskId,
+        terminal_view_id: EntityId,
+        tool_call_id: String,
+        result_message_id: String,
+        children: Vec<SubagentRequestedChild>,
+    },
+}
+
+/// [`BlocklistAIHistoryEvent::SubagentRequested`] 里的一个子代理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentRequestedChild {
+    pub child_conversation_id: AIConversationId,
+    pub prompt: String,
+    pub name: String,
+    pub model: Option<String>,
 }
 
 impl BlocklistAIHistoryEvent {
@@ -2257,9 +2617,13 @@ impl BlocklistAIHistoryEvent {
             }
             | BlocklistAIHistoryEvent::ConversationAgentIdAssigned {
                 terminal_view_id, ..
+            }
+            | BlocklistAIHistoryEvent::SubagentRequested {
+                terminal_view_id, ..
             } => Some(*terminal_view_id),
-            | BlocklistAIHistoryEvent::ConversationOwnershipTransferred {
-                previous_terminal_view_id, ..
+            BlocklistAIHistoryEvent::ConversationOwnershipTransferred {
+                previous_terminal_view_id,
+                ..
             } => Some(*previous_terminal_view_id),
             // UpdatedConversationMetadata can have None when updating historical-only conversations
             BlocklistAIHistoryEvent::UpdatedConversationMetadata {

@@ -115,6 +115,7 @@ use crate::{GlobalResourceHandles, GlobalResourceHandlesProvider};
 pub fn initialize_app(app: &mut App) {
     initialize_settings_for_tests(app);
 
+
     // Make sure we set up all necessary custom action bindings.
     app.update(init);
 
@@ -144,6 +145,15 @@ pub fn initialize_app(app: &mut App) {
     app.add_singleton_model(|_| ActiveSession::default());
     app.add_singleton_model(AIRequestUsageModel::new_for_test);
     app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+    // 阶段二:编排 pill bar 的跨 pane UI 状态。`TerminalView` 构造时会读取它,
+    // 未注册会 panic。必须在 `BlocklistAIHistoryModel` 之后注册 —— 它构造时会订阅
+    // 该模型。置顶集合仅内存,种子为空集。
+    app.add_singleton_model(|ctx| {
+        crate::ai::blocklist::agent_view::orchestration_pill_bar_model::OrchestrationPillBarModel::new(
+            std::collections::HashSet::new(),
+            ctx,
+        )
+    });
     app.add_singleton_model(crate::ai::blocklist::QueuedQueryModel::new);
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
     app.add_singleton_model(BlocklistAIPermissions::new);

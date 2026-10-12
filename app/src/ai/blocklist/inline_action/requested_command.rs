@@ -4,10 +4,10 @@ use pathfinder_geometry::vector::vec2f;
 use settings::Setting as _;
 use std::borrow::Cow;
 use std::cmp::{Ordering, PartialEq};
-use uuid::Uuid;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use uuid::Uuid;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::Icon;
 use warp_editor::render::element::VerticalExpansionBehavior;
@@ -39,6 +39,7 @@ use crate::ai::blocklist::model::{AIBlockModel, AIBlockModelHelper};
 use crate::ai::blocklist::{
     AIBlock, BlocklistAIActionEvent, BlocklistAIHistoryModel, ClientIdentifiers,
 };
+use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::ai::{
     agent::{AIAgentActionId, AIAgentCitation, AIAgentOutputMessageType, CallMCPToolResult},
     blocklist::{
@@ -57,7 +58,6 @@ use crate::ai::{
         BlocklistAIActionModel,
     },
 };
-use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::code::editor::view::{CodeEditorEvent, CodeEditorRenderOptions, CodeEditorView};
 use crate::editor::InteractionState;
 use crate::menu::{Event as MenuEvent, Menu, MenuItemFields, MenuVariant};
@@ -87,8 +87,13 @@ const REQUESTED_COMMAND_ACCEPT_LABEL: &str = "Run";
 const REQUESTED_COMMAND_MINIMIZE_LABEL: &str = "Done";
 
 const LOADING_MESSAGE: &str = "Generating command...";
-const COMMAND_WAITING_FOR_USER_MESSAGE: &str = "OK if I run this command and read the output?";
-const MCP_TOOL_WAITING_FOR_USER_MESSAGE: &str = "OK if I call this MCP tool?";
+fn command_waiting_for_user_message() -> String {
+    crate::t!("blocked-action-run-command")
+}
+
+fn mcp_tool_waiting_for_user_message() -> String {
+    crate::t!("blocked-action-call-mcp-tool")
+}
 const MONITORING_COMMAND_MESSAGE: &str = "Agent is monitoring command...";
 const AGENT_NEEDS_INPUT_MESSAGE: &str = "Agent needs your input to continue";
 const USER_TOOK_CONTROL_COMMAND_MESSAGE: &str = "User is in control.";
@@ -1113,7 +1118,7 @@ impl RequestedCommandView {
             }
             Some(AIActionStatus::Blocked) => {
                 title = match &self.action_type {
-                    RequestedActionViewType::Command => COMMAND_WAITING_FOR_USER_MESSAGE.into(),
+                    RequestedActionViewType::Command => command_waiting_for_user_message().into(),
                     RequestedActionViewType::McpTool => self.mcp_blocked_title(app).into(),
                 };
             }
@@ -1427,11 +1432,15 @@ pub(crate) fn header_message_for_user_take_over_reason(
 /// waiting message when the tool name is also unavailable.
 pub(crate) fn mcp_blocked_title_text(tool_name: &str, server_name: Option<&str>) -> String {
     if tool_name.is_empty() {
-        return MCP_TOOL_WAITING_FOR_USER_MESSAGE.to_owned();
+        return mcp_tool_waiting_for_user_message();
     }
     match server_name {
-        Some(server) => format!("OK if I call MCP tool {tool_name} on server {server}"),
-        None => format!("OK if I call MCP tool {tool_name}"),
+        Some(server) => crate::t!(
+            "blocked-action-call-mcp-tool-on-server",
+            tool = tool_name,
+            server = server
+        ),
+        None => crate::t!("blocked-action-call-mcp-tool-named", tool = tool_name),
     }
 }
 

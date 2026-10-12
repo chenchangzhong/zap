@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod search;
 pub mod shell;
 pub mod skill;
+pub mod subagent;
 pub mod suggest;
 pub mod todowrite;
 pub mod web_runtime;
@@ -95,6 +96,10 @@ pub const REGISTRY: &[&OpenAiTool] = &[
     &markers::TRANSFER_SHELL_CONTROL,
     // 本地 todo list(BYOP 自合成 Message::UpdateTodos,不走 protobuf executor)
     &todowrite::TODOWRITE,
+    // Oz 子代理(模型乙):每个子代理是一个独立 AIConversation + 隐藏 pane,
+    // 父侧只留 carrier ToolCall + running ToolCallResult 两条消息。同样由
+    // chat_stream 在 parse_incoming_tool_call 之前按 name 拦截。
+    &subagent::SUBAGENT,
     // BYOP-only 网络工具:不映射到 protobuf executor variant,由 chat_stream
     // 在 parse_incoming_tool_call 之前按 name 拦截,直接调 web_runtime 跑 HTTP。
     // gating:profile.web_search_enabled=false 时,build_tools_array 会过滤掉。

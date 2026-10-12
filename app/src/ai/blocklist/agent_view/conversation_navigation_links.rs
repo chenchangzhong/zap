@@ -15,6 +15,104 @@ use warpui::{
 
 use crate::ui_components::{blended_colors, icons::Icon};
 
+use crate::ai::agent::conversation::{AIConversation, AIConversationId};
+use crate::ai::blocklist::BlocklistAIHistoryModel;
+use crate::terminal::view::TerminalAction;
+use crate::workspace::{WorkspaceAction, WorkspaceRegistry};
+use warpui::EntityId;
+
+// ---------------------------------------------------------------------------
+// 会话导航判定(自上游 `orchestration_conversation_links.rs` 合并)
+// ---------------------------------------------------------------------------
+
+/// 该会话是否已在**其它可见** pane 中打开。隐藏的 child-agent pane 会被排除,
+/// 否则「还没点开过的子代理」会被误判成「已经打开」。
+pub(crate) fn is_conversation_open_in_other_visible_view(
+    conversation_id: AIConversationId,
+    self_terminal_view_id: EntityId,
+    app: &AppContext,
+) -> bool {
+    let Some(owner) =
+        BlocklistAIHistoryModel::as_ref(app).terminal_view_id_for_conversation(&conversation_id)
+    else {
+        return false;
+    };
+    if owner == self_terminal_view_id {
+        return false;
+    }
+    pane_group_id_containing_terminal_view(owner, app).is_some()
+}
+
+/// 在所有可见 pane / tab 中查找承载该 terminal view 的 pane group。
+/// 用于区分「同 tab 聚焦」与「跨 tab 激活」。
+pub(crate) fn pane_group_id_containing_terminal_view(
+    terminal_view_id: EntityId,
+    app: &AppContext,
+) -> Option<EntityId> {
+    let registry = WorkspaceRegistry::as_ref(app);
+    for (_, workspace_handle) in registry.all_workspaces(app) {
+        let workspace = workspace_handle.as_ref(app);
+        for pane_group_handle in workspace.tab_views() {
+            let pane_group = pane_group_handle.as_ref(app);
+            for pane_id in pane_group.visible_pane_ids() {
+                if let Some(terminal_view) = pane_group.terminal_view_from_pane_id(pane_id, app) {
+                    if terminal_view.id() == terminal_view_id {
+                        return Some(pane_group_handle.id());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 导航到子代理的 pane:同 pane group 内复用已有隐藏 pane,跨 pane group 时激活
+/// 其所属 tab,都没有才新开一个 pane。
+///
+/// **本地偏差(阶段二方案 A)**:上游在没有所属 view 时 dispatch
+/// `TerminalAction::OpenChildAgentInNewPane`,该动作的 handler 依赖上游
+/// `pane_group/child_agent/`(本地不存在)。这里改为
+/// `TerminalAction::RevealChildAgent` —— 复用本仓既有的隐藏 pane reveal 链路,
+/// 效果是「显示并聚焦该子会话」。新开 tab 的语义(上游 `InNewTab` 同样是 stub)
+/// 本期不交付。
+pub(crate) fn dispatch_focus_or_open_child_agent_pane(
+    conversation_id: AIConversationId,
+    self_terminal_view_id: EntityId,
+    ctx: &mut EventContext,
+    app: &AppContext,
+) {
+    let owner_view_id =
+        BlocklistAIHistoryModel::as_ref(app).terminal_view_id_for_conversation(&conversation_id);
+    if let Some(owner_view_id) = owner_view_id {
+        if owner_view_id != self_terminal_view_id {
+            if let Some(owner_pane_group_id) =
+                pane_group_id_containing_terminal_view(owner_view_id, app)
+            {
+                let self_pane_group_id =
+                    pane_group_id_containing_terminal_view(self_terminal_view_id, app);
+                if Some(owner_pane_group_id) == self_pane_group_id {
+                    ctx.dispatch_typed_action(TerminalAction::RevealChildAgent { conversation_id });
+                } else {
+                    ctx.dispatch_typed_action(WorkspaceAction::FocusTerminalViewInWorkspace {
+                        terminal_view_id: owner_view_id,
+                    });
+                }
+                return;
+            }
+        }
+    }
+    ctx.dispatch_typed_action(TerminalAction::RevealChildAgent { conversation_id });
+}
+
+/// 会话的规范父会话 id(薄包装,判定收敛在 history model)。
+pub(crate) fn parent_conversation_id(
+    active_conversation: &AIConversation,
+    app: &AppContext,
+) -> Option<AIConversationId> {
+    BlocklistAIHistoryModel::as_ref(app)
+        .resolved_parent_conversation_id_for_conversation(active_conversation)
+}
+
 /// Renders a clickable card with an optional leading icon, title/subtitle,
 /// a trailing chevron, and an optional extra trailing element (e.g. a dismiss
 /// button). When `extra_trailing` is provided, the card's Hoverable uses

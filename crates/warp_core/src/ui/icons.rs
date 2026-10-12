@@ -132,6 +132,10 @@ pub enum Icon {
     InlineCode,
     Strikethrough,
     Stars,
+    /// 编排 pill bar 的置顶切换(复用已有的 bookmark 资源)。
+    Bookmark,
+    /// 已置顶状态(复用已有的 bookmark 填充版资源)。
+    BookmarkFilled,
     AgentMode,
     AmbientAgentMode,
     Github,
@@ -447,6 +451,8 @@ impl From<Icon> for &'static str {
             Icon::InlineCode => "bundled/svg/edit-code.svg",
             Icon::Strikethrough => "bundled/svg/edit-strikethrough.svg",
             Icon::Stars => "bundled/svg/stars-01.svg",
+            Icon::Bookmark => "bundled/svg/bookmark.svg",
+            Icon::BookmarkFilled => "bundled/svg/bookmark_filled.svg",
             Icon::AgentMode => "bundled/svg/agentmode.svg",
             Icon::AmbientAgentMode => "bundled/svg/ambient-agent-mode.svg",
             Icon::Github => "bundled/svg/github.svg",
