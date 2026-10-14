@@ -140,9 +140,52 @@
 - 在 Zap 智能体页让助手流式输出一个 3 列表格,确认不再闪。
 - 同时确认: 流结束后表格行列数、单元格文本、对齐 与改动前一致。
 
-### Task 6 — 独立 follow-up(不在本计划范围)
+### Task 6 — 独立 follow-up(不在本次范围;**已评估,决定推迟**)
 
-- 流式期间表格 UI 状态句柄每帧新建(`app/src/ai/blocklist/block.rs:2242` 只在 `handle_complete_output` 赋值;`app/src/ai/blocklist/block/view_impl/common.rs:1250-1254` 每帧 `unwrap_or_default()`)。会带来每帧全量测量与宽表格横向滚动归零,**与本次闪烁无关**,单独一次提交处理。
+**现象**(代码级已核实): 流式期间表格 UI 状态句柄每帧新建 —— 唯一赋值点是
+`app/src/ai/blocklist/block.rs:2242`(在 `handle_complete_output` 内,只有回复**结束**时才跑),
+而渲染侧 `app/src/ai/blocklist/block/view_impl/common.rs:1250-1254` 每帧 `.unwrap_or_default()`,
+于是每次重排都拿到全新的 `TableStateHandle` / `ClippedScrollStateHandle`。与本次闪烁无关。
+
+**纠正(2026-10-14 复核,推翻本文档最初的"每帧全量测量"说法)**:
+
+- `docs/warpui-transition-animation.md:280` 确认:重绘期间**每帧都会重新 layout + paint 整棵树**;
+  我最初据此推断"每秒 60 次重测"——**推断错了**。
+- 实测 `app/src/ai` 下 `repaint_after` / `notify_after` **数量为 0**:流式纯文本回复**没有重绘心跳**。
+- 因此重测实际发生在**每次重排事件**时(新增量、滚动、鼠标移动、resize、主题变更),
+  而不是每秒 60 次。收益比最初描述小一档。
+
+**收益**:
+
+| 收益 | 确定度 | 说明 |
+|---|---|---|
+| 流式期间宽表格横向滚动位置不再归零 | 确定(代码级) | 每帧新建 `ClippedScrollStateHandle` |
+| 流式期间重排不必重测全部单元格 | 中等,有前提 | 需"流式 + 大表格 + 高频重排"三者叠加才可感知 |
+| 代码一致性 | 确定 | `block.rs:352-356` 声明此类句柄"必须跨帧持久",表格在流式期不满足 |
+
+性能量级(**未实测,仅估算**): 4×6 表每次重排约 48 次文本 layout(无约束测量 + 约束布局各一遍),
+20×6 约 240 次;按单次短文本 layout 十几微秒量级估,约 1–5ms/次重排,滚动/拖拽时才会叠加成可感知掉帧。
+
+**成本**:
+
+1. **必须连带做缓存失效,否则是净回归**: `invalidate_intrinsic_width*` 在**生产代码里 0 个调用点**
+   (只有 `crates/warpui_core/src/elements/table/mod.rs` 的定义与测试)。句柄一旦持久化,intrinsic
+   列宽会永远停在第一帧的值 → 流式内容变长后列宽不跟着长,表格宽带/换行都会错。
+   所以本任务不是"两行提前创建句柄",而是"提前创建 **+** 内容变更时失效"。
+2. **与并行工作线撞同一文件**: `block.rs` 正被另一条线反复修改,冲突概率高。
+3. **无判据测试**: 现有判据只覆盖"不翻转",覆盖不了"列宽随内容增长"。
+
+**决定: 推迟(优先级低)**。唯一确定的用户可见症状是"流式那几秒里宽表滚不动",至今无人反馈。
+**满足任一条件再做**: ① 有人反馈流式期宽表滚动跳回/滚不动;② 要做单元格级交互(hover/选择/tooltip),
+句柄必须跨帧;③ 出现"大表格流式期间卡顿"的实际采样;④ 并行线稳定后整体重做表格渲染时顺带。
+
+**真要做时的正确做法**(防止只加句柄就上):
+
+1. 在**流式更新路径**按 section 数**增量补齐**句柄(保留已有、只 append),而不是 `handle_complete_output`
+   里整体替换;
+2. 内容变化后调 `invalidate_all_intrinsic_widths()`(或按内容签名判断)—— **硬前提**;
+3. 判据三条: ① 列宽随流式内容增长;② 内容未变的重排之间不重测(可用列宽不变或 `render_fn`
+   调用计数断言);③ 流式期横向滚动位置保持。
 
 ## 8. 验证矩阵(判据)
 
@@ -230,4 +273,6 @@ rustfmt --check(.rustfmt.toml)                                   5 个改动文�
 
 共享面收口: `parse_markdown_with_gfm_tables` 的生产调用点只有两处 —— `app/src/ai/agent/util.rs:186`(本次路径)与 `crates/editor/src/content/buffer.rs:840`(编辑器,受 `FeatureFlag::MarkdownTables` 门控),后者已有 54 条表格用例覆盖。
 
-未做: Task 5 用户可见验收;Task 6 句柄 follow-up。
+任务状态: Task 0-5 全部完成(Task 5 用户已在 debug 实例确认流式表格不再闪);Task 6 已评估并**推迟**,依据见第 7 节。
+
+提交: `cc850ddcb`(修复 + 判据测试 + 本文件)。
