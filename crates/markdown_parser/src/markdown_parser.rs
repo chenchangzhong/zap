@@ -4,7 +4,8 @@ use anyhow::Result;
 use itertools::Itertools;
 use nom::branch::alt;
 use nom::bytes::complete::{
-    is_a, tag, tag_no_case, take, take_till1, take_until, take_while, take_while_m_n, take_while1,
+    is_a, tag, tag_no_case, take, take_till, take_till1, take_until, take_while, take_while_m_n,
+    take_while1,
 };
 use nom::character::complete::{char, one_of, satisfy, space0, space1};
 use nom::character::is_digit;
@@ -541,6 +542,9 @@ fn parse_image_title<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
 /// - Separator row: `| --- | :---: |` (determines alignment)
 /// - Data rows: `| Cell 1 | Cell 2 |`
 ///
+/// Per GFM, the leading and trailing pipe of each row is optional (`| a | b` parses the same as
+/// `| a | b |`).
+///
 fn parse_table<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     markdown: &'a str,
 ) -> IResult<&'a str, FormattedTable, E> {
@@ -574,6 +578,16 @@ fn parse_table<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     })(markdown)
 }
 
+/// 取当前行剩余的内容,**不消费**换行符;已到行尾或输入末尾时返回空串。
+///
+/// 用于 GFM 允许省略行尾竖线的场景:此时同一行的剩余内容就是最后一个单元格。
+fn take_until_markdown_line_end(input: &str) -> (&str, &str) {
+    let end = input
+        .find(|c| c == '\n' || c == '\r')
+        .unwrap_or(input.len());
+    (&input[end..], &input[..end])
+}
+
 /// Parse a single table row, returning each cell's content as parsed inline markdown
 fn parse_table_row<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     input: &'a str,
@@ -581,7 +595,16 @@ fn parse_table_row<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     let (input, _) = space0(input)?;
     let (input, _) = tag("|")(input)?;
 
-    let (input, cells) = many0(parse_table_cell)(input)?;
+    let (input, mut cells) = many0(parse_table_cell)(input)?;
+
+    // Per GFM, a leading and trailing pipe is optional. When the row ends without one, the rest
+    // of the line is the final cell. Leaving it unconsumed would end the table here and drop the
+    // cell out of the rendered table entirely.
+    let (input, cell) = take_until_markdown_line_end(input);
+    let cell = cell.trim();
+    if !cell.is_empty() {
+        cells.push(cell.to_owned());
+    }
 
     let (input, _) = alt((value((), parse_line_ending), value((), eof)))(input)?;
 
@@ -634,7 +657,22 @@ fn parse_table_separator<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     let (input, _) = space0(input)?;
     let (input, _) = tag("|")(input)?;
 
-    let (input, alignments) = many0(parse_separator_cell)(input)?;
+    let (input, mut alignments) = many0(parse_separator_cell)(input)?;
+
+    // Same optional trailing pipe rule as data rows: the rest of the line is the final alignment
+    // cell.
+    let separator_tail = input;
+    let (input, cell) = take_until_markdown_line_end(separator_tail);
+    let cell = cell.trim();
+    if !cell.is_empty() {
+        let Some(alignment) = separator_alignment(cell) else {
+            return Err(nom::Err::Error(make_error(
+                separator_tail,
+                ErrorKind::Verify,
+            )));
+        };
+        alignments.push(alignment);
+    }
 
     // Must have at least one column
     if alignments.is_empty() {
@@ -646,13 +684,8 @@ fn parse_table_separator<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     Ok((input, alignments))
 }
 
-/// Parse a single separator cell to determine alignment
-fn parse_separator_cell<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
-    input: &'a str,
-) -> IResult<&'a str, TableAlignment, E> {
-    let (input, content) = take_until("|")(input)?;
-    let (input, _) = tag("|")(input)?;
-
+/// 解析一个分隔格的对齐方式;内容非法时返回 `None`。
+fn separator_alignment(content: &str) -> Option<TableAlignment> {
     let trimmed = content.trim();
 
     // Verify it's a valid separator (contains only :, -, and whitespace)
@@ -660,15 +693,29 @@ fn parse_separator_cell<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
         .chars()
         .all(|c: char| c == '-' || c == ':' || c.is_whitespace());
     if !is_valid || trimmed.is_empty() {
-        return Err(nom::Err::Error(make_error(input, ErrorKind::Verify)));
+        return None;
     }
 
-    let alignment = if trimmed.starts_with(':') && trimmed.ends_with(':') {
+    Some(if trimmed.starts_with(':') && trimmed.ends_with(':') {
         TableAlignment::Center
     } else if trimmed.ends_with(':') {
         TableAlignment::Right
     } else {
         TableAlignment::Left
+    })
+}
+
+/// Parse a single separator cell to determine alignment
+fn parse_separator_cell<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
+    input: &'a str,
+) -> IResult<&'a str, TableAlignment, E> {
+    // 分隔格必须落在同一行内:不能跨过行尾去匹配下一行的 `|`,否则会把下一行
+    // 误当成同一行剩余的分隔格。
+    let (input, content) = take_till(|c| c == '|' || c == '\n' || c == '\r')(input)?;
+    let (input, _) = tag("|")(input)?;
+
+    let Some(alignment) = separator_alignment(content) else {
+        return Err(nom::Err::Error(make_error(input, ErrorKind::Verify)));
     };
 
     Ok((input, alignment))

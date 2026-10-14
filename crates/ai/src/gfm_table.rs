@@ -62,7 +62,9 @@ fn is_gfm_table_separator_row(row: &str) -> bool {
 /// Attempts to parse a GFM table starting from `header_line`.
 ///
 /// If the next line in `lines` is a valid GFM separator row, this consumes all
-/// subsequent table rows and returns the raw table lines.
+/// subsequent table rows and returns the raw table lines. A row may have fewer or more cells than
+/// the header (GFM pads with empty cells / ignores the excess), so only a line without any `|`
+/// ends the table.
 /// The `should_stop` predicate is called on each candidate row to allow the caller
 /// to halt parsing early (e.g., when encountering a fenced code block).
 ///
@@ -98,9 +100,12 @@ where
     while let Some(next_line) = lines.peek() {
         let is_blank = next_line.trim().is_empty();
         let is_end_of_section = should_stop(next_line);
-        let row_column_count = split_cells_escaped(next_line).len();
-        let has_wrong_column_count = row_column_count != header_column_count;
-        if is_blank || is_end_of_section || has_wrong_column_count {
+        // GFM 允许数据行的单元格数少于或多于表头(渲染时补空单元格 / 忽略多余的),
+        // 因此列数不参与"这张表是否继续"的判定 —— 否则正在流式写入的那一行会因为
+        // 列数暂时不足而被踢出表格,下一帧又被吸回来,表现为闪烁。
+        // 只有不含竖线的行才说明表格到此结束。
+        let continues_table = next_line.contains('|');
+        if is_blank || is_end_of_section || !continues_table {
             break;
         }
         table_lines.push(lines.next().expect("peeked line must exist").to_owned());

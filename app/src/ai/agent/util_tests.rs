@@ -241,6 +241,64 @@ fn block_image_with_unclosed_title_falls_back_to_plain_text() {
     assert!(matches!(sections[0], AIAgentTextSection::PlainText { .. }));
 }
 
+/// 助手回复流式到达时,表格内容会逐 token 变化。判据:无论处于哪个中间态,
+/// 都必须渲染成表格 —— 既不能回落到原始 markdown 文本,也不能让未写完的
+/// 尾行掉到表格外面(那会造成"一闪一闪")。
+#[test]
+fn streaming_table_frames_never_fall_back_or_flip() {
+    let _flag = FeatureFlag::BlocklistMarkdownTableRendering.override_enabled(true);
+
+    let header = "| A | B |\n| --- | --- |\n";
+    let frames = [
+        ("header+separator", format!("{header}")),
+        ("row-lone-pipe", format!("{header}|")),
+        ("row-cell1-start", format!("{header}| 1")),
+        ("row-cell1-closed", format!("{header}| 1 |")),
+        ("row-cell2-start", format!("{header}| 1 | 2")),
+        ("row-cell2-closed", format!("{header}| 1 | 2 |")),
+        ("row-newline", format!("{header}| 1 | 2 |\n")),
+        ("row2-cell1-closed", format!("{header}| 1 | 2 |\n| 3 |")),
+    ];
+
+    let mut violations = Vec::new();
+
+    for (name, input) in frames {
+        let sections = parse_markdown_into_text_and_code_sections(&input);
+        let shape = sections
+            .iter()
+            .map(|section| match section {
+                AIAgentTextSection::PlainText { text } => {
+                    format!("PlainText({:?})", text.text())
+                }
+                AIAgentTextSection::Table { table } => {
+                    let structured = table.structured_table();
+                    format!(
+                        "Table(cols={}, rows={})",
+                        structured.map_or(0, |t| t.headers.len()),
+                        structured.map_or(0, |t| t.rows.len())
+                    )
+                }
+                AIAgentTextSection::Code { .. } => "Code".to_owned(),
+                AIAgentTextSection::Image { .. } => "Image".to_owned(),
+                AIAgentTextSection::MermaidDiagram { .. } => "Mermaid".to_owned(),
+            })
+            .collect::<Vec<_>>();
+
+        // 一次跑出全部坏帧,而不是停在第一个 —— 这个矩阵本身就是验收判据。
+        let is_single_table =
+            sections.len() == 1 && matches!(sections[0], AIAgentTextSection::Table { .. });
+        if !is_single_table {
+            violations.push(format!("帧 `{name}` 输入 {input:?} 渲染成 {shape:?}"));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "流式表格的中间态不应改变 section 结构,但以下帧发生了回落或翻转:\n{}",
+        violations.join("\n")
+    );
+}
+
 #[test]
 fn extracts_mermaid_code_block_into_mermaid_section() {
     let input = "```mermaid\ngraph TD\nA[Start] --> B[Finish]\n```";

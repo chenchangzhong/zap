@@ -2816,3 +2816,95 @@ fn test_parse_table_with_strikethrough() {
         panic!("Expected table");
     }
 }
+
+// GFM 允许省略行尾竖线(如 `| a | b`)。助手回复流式到达时,正在输入的单元格
+// 一定会先经过"没有尾竖线"的中间态,若此时不认它是表格行,整张表会退回原始
+// markdown 文本再变回来,表现为闪烁。
+#[test]
+fn test_parse_table_row_without_trailing_pipe() {
+    let source = "| A | B |\n| --- | --- |\n| 1 | 2\n";
+    let result = test_parse_markdown_with_gfm_tables(source);
+    assert_eq!(result.len(), 1);
+
+    if let FormattedTextLine::Table(table) = &result[0] {
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].len(), 2);
+        assert_eq!(table.rows[0][0][0].text, "1");
+        assert_eq!(table.rows[0][1][0].text, "2");
+    } else {
+        panic!("Expected table, got {:?}", result[0]);
+    }
+}
+
+#[test]
+fn test_parse_table_row_without_trailing_pipe_at_eof_without_newline() {
+    // 与上一条的差别:输入末尾没有换行符,即流式过程中最常见的最后一帧。
+    let result = test_parse_markdown_with_gfm_tables("| A | B |\n| --- | --- |\n| 1 | 2");
+    assert_eq!(result.len(), 1);
+    assert!(matches!(result[0], FormattedTextLine::Table(_)));
+}
+
+#[test]
+fn test_parse_table_header_and_separator_without_trailing_pipe() {
+    // 表头与分隔行也允许省略尾竖线。
+    let source = "| A | B\n| --- | ---\n| 1 | 2";
+    let result = test_parse_markdown_with_gfm_tables(source);
+    assert_eq!(result.len(), 1);
+
+    if let FormattedTextLine::Table(table) = &result[0] {
+        assert_eq!(table.headers.len(), 2);
+        assert_eq!(table.alignments.len(), 2);
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].len(), 2);
+    } else {
+        panic!("Expected table, got {:?}", result[0]);
+    }
+}
+
+#[test]
+fn test_parse_table_row_with_short_cell_count_is_kept_in_table() {
+    // GFM:数据行列数少于表头时补空单元格,因此短行仍属表格,不能把表截断在这里。
+    let source = "| A | B |\n| --- | --- |\n| 1 |";
+    let result = test_parse_markdown_with_gfm_tables(source);
+    assert_eq!(result.len(), 1);
+
+    if let FormattedTextLine::Table(table) = &result[0] {
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].len(), 1);
+        assert_eq!(table.rows[0][0][0].text, "1");
+    } else {
+        panic!("Expected table, got {:?}", result[0]);
+    }
+}
+
+// 尾竖线之后跟空格也是常见形态(模型常输出 `| 1 | 2 | `)。GFM 里这属于同一行
+// 的尾随空白,必须仍然算表格行,否则该行连同其后内容会掉出表格。
+#[test]
+fn test_parse_table_row_with_trailing_spaces_after_final_pipe() {
+    let source = "| A | B |\n| --- | --- |\n| 1 | 2 | \n| 3 | 4 |\n";
+    let result = test_parse_markdown_with_gfm_tables(source);
+    assert_eq!(result.len(), 1);
+
+    if let FormattedTextLine::Table(table) = &result[0] {
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0][1][0].text, "2");
+        assert_eq!(table.rows[1][0][0].text, "3");
+    } else {
+        panic!("Expected table, got {:?}", result[0]);
+    }
+}
+
+#[test]
+fn test_parse_table_row_without_leading_pipe_still_ends_the_table() {
+    // 边界:不以竖线开头的行仍然结束表格(不能因为放宽尾竖线而把正文吞进表格)。
+    let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\nSome trailing prose\n";
+    let result = test_parse_markdown_with_gfm_tables(source);
+    assert_eq!(result.len(), 2);
+    assert!(matches!(result[0], FormattedTextLine::Table(_)));
+
+    if let FormattedTextLine::Line(fragments) = &result[1] {
+        assert_eq!(fragments[0].text, "Some trailing prose");
+    } else {
+        panic!("Expected Line, got {:?}", result[1]);
+    }
+}
