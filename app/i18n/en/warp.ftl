@@ -2266,6 +2266,11 @@ agent-message-bar-enabling = Enabling...
 child-agent-default-name = Agent
 child-agent-awaiting-approval = Waiting for your approval — click to review
 child-agent-stop = Stop this subagent
+subagent-status-running = Running
+subagent-status-completed = Done
+subagent-status-waiting-approval = Waiting for your approval
+subagent-status-cancelled = Cancelled
+subagent-status-error = Failed
 
 agent-action-name-run-command = Run command: { $command }
 agent-action-name-write-long-running-command = Write to long running shell command

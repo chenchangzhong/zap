@@ -1126,6 +1126,7 @@ impl View for AIBlock {
                 unit_test_suggestions: &self.unit_tests_suggestions,
                 todo_list_states: &self.todo_list_states,
                 collapsible_block_states: &self.collapsible_block_states,
+                subagent_card_mouse_states: &self.subagent_card_mouse_states,
                 is_selecting_text: self.state_handles.selection_handle.is_selecting(),
                 is_ai_input_enabled: self
                     .context_model

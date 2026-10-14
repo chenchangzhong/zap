@@ -632,6 +632,29 @@ pub enum CollapsibleExpansionState {
     Collapsed,
 }
 
+/// Oz 子代理(模型乙)父侧「子代理卡」的跨帧鼠标状态。
+///
+/// **一卡多行**:一次 `subagent` 调用可以派发 N 个子代理,它们在卡片里各占一行,
+/// 所以整卡一个 handle、每个子代理的「停止」按钮各一个 handle(按子会话 id 索引)。
+/// 必须跨帧保持,否则每帧重建的 handle 会让 hover 状态在每次重绘时被重置。
+#[derive(Default, Clone)]
+pub struct SubagentCardMouseStates {
+    pub card: MouseStateHandle,
+    pub stop: HashMap<AIConversationId, MouseStateHandle>,
+}
+
+impl SubagentCardMouseStates {
+    /// 取某个子代理那一行的停止按钮 handle。
+    ///
+    /// **只读**:条目由 block 的逐消息预分配创建(见 `block.rs` 里遍历
+    /// `output.messages` 的 `SubagentRun` 分支)。这里**不做**「miss 时补建」——
+    /// `&self` 也补不了;返回 `default()` 只是兜底,真出现 miss 说明预分配漏跑,
+    /// 表现是该行 hover 失效(静默降级)。
+    pub fn stop_handle(&self, conversation_id: AIConversationId) -> MouseStateHandle {
+        self.stop.get(&conversation_id).cloned().unwrap_or_default()
+    }
+}
+
 /// State for collapsible elements with scroll support.
 pub struct CollapsibleElementState {
     pub expansion_toggle_mouse_state: MouseStateHandle,
@@ -794,6 +817,9 @@ pub struct AIBlock {
 
     /// Map from collapsible block message IDs (reasoning or summarization) to their states.
     collapsible_block_states: HashMap<MessageId, CollapsibleElementState>,
+
+    /// Oz 子代理卡(消息流内)的鼠标状态,按输出消息 id 存。
+    subagent_card_mouse_states: HashMap<MessageId, SubagentCardMouseStates>,
 
     /// Map from suggested prompt action ID to its view handle and status.
     unit_tests_suggestions: HashMap<AIAgentActionId, ViewHandle<SuggestedUnitTestsView>>,
@@ -1243,6 +1269,7 @@ impl AIBlock {
             todo_list_states: Default::default(),
             comment_states,
             collapsible_block_states: Default::default(),
+            subagent_card_mouse_states: Default::default(),
             unit_tests_suggestions: Default::default(),
             secret_redaction_state,
             find_state: FindState::default(),
@@ -1957,6 +1984,18 @@ impl AIBlock {
                 self.collapsible_block_states
                     .entry(message.id.clone())
                     .or_default();
+            }
+
+            // Oz 子代理:为消息流里的子代理卡预分配跨帧 hover 状态,并给它每一行
+            // 备好「停止」按钮的 handle。
+            if let AIAgentOutputMessageType::SubagentRun(call) = &message.message {
+                let states = self
+                    .subagent_card_mouse_states
+                    .entry(message.id.clone())
+                    .or_default();
+                for run in &call.runs {
+                    states.stop.entry(run.conversation_id).or_default();
+                }
             }
         }
 

@@ -440,6 +440,18 @@ impl BlocklistAIStatusBar {
         self.agent_message_bar.update(ctx, |_, ctx| ctx.notify());
     }
 
+    /// Oz 子代理:父侧块列表滚动后,让「子代理状态卡」重算可见性。
+    ///
+    /// 状态卡是**独立 view**,父视图重绘不会带动它(`ChildView::layout` 只从缓存
+    /// 取子视图元素,见 `presenter.rs`),而它需要按位置缓存判断「消息流里那一行
+    /// 是否在可视区」,所以滚动后必须显式通知它。不复用
+    /// [`Self::notify_and_notify_children`]:那个方法服务于别的语义(只带
+    /// `agent_message_bar`),改它会影响既有调用点。
+    pub fn notify_child_agent_status_card(&mut self, ctx: &mut ViewContext<Self>) {
+        self.child_agent_status_card
+            .update(ctx, |_, ctx| ctx.notify());
+    }
+
     fn reset_model_for_exchange(
         &mut self,
         exchange_id: AIAgentExchangeId,

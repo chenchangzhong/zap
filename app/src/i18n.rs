@@ -298,7 +298,7 @@ mod tests {
     /// 具体译文内容),不在此列。
     #[test]
     fn action_and_approval_keys_are_translated() {
-        const KEYS: [&str; 36] = [
+        const KEYS: [&str; 41] = [
             "agent-action-name-run-command",
             "agent-action-name-write-long-running-command",
             "agent-action-name-read-files",
@@ -330,6 +330,11 @@ mod tests {
             "toggle-suffix-subagent-approval-bell",
             "settings-features-notify-subagent-approval",
             "child-agent-stop",
+            "subagent-status-running",
+            "subagent-status-completed",
+            "subagent-status-waiting-approval",
+            "subagent-status-cancelled",
+            "subagent-status-error",
             "settings-exec-profile-editor-subagent-model",
             "settings-exec-profile-editor-subagent-model-desc",
             "settings-exec-profile-editor-subagent-model-follow-parent",

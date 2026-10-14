@@ -6,7 +6,7 @@ use crate::ai::agent::comment::ReviewComment;
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
     AIAgentInput, CancellationOutcome, CreateDocumentsResult, EditDocumentsResult, ReadFilesResult,
-    SubagentCall, SubagentType, TodoOperation,
+    SubagentCall, SubagentRun, SubagentRunCall, SubagentType, TodoOperation,
 };
 use crate::util::truncation::truncate_from_end;
 use ai::agent::file_locations::group_file_contexts_for_display;
@@ -47,9 +47,13 @@ use warpui::elements::{
 };
 use warpui::EntityId;
 
+use crate::ai::agent::conversation::ConversationStatus;
+use crate::ai::blocklist::agent_view::conversation_navigation_links::conversation_navigation_card_with_icon;
 use crate::ai::blocklist::block::{
     CollapsibleElementState, CollapsibleExpansionState, FinishReason, ImportedCommentGroup,
+    SubagentCardMouseStates,
 };
+use crate::terminal::view::TerminalAction;
 use indexmap::IndexMap;
 use std::{cmp::Ordering, collections::HashMap, rc::Rc, sync::Arc};
 
@@ -125,7 +129,8 @@ use warpui::{
     elements::{
         Align, Border, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
         Empty, Expanded, Fill, Flex, FormattedTextElement, Hoverable, MainAxisAlignment,
-        MainAxisSize, ParentElement, Radius, Shrinkable, Text, Wrap,
+        MainAxisSize, MouseStateHandle, ParentElement, Radius, SavePosition, Shrinkable, Text,
+        Wrap,
     },
     keymap::Keystroke,
     platform::{Cursor, OperatingSystem},
@@ -152,6 +157,8 @@ pub(crate) struct Props<'a> {
         &'a HashMap<AIAgentActionId, ViewHandle<SuggestedUnitTestsView>>,
     pub(super) todo_list_states: &'a HashMap<MessageId, TodoListElementState>,
     pub(super) collapsible_block_states: &'a HashMap<MessageId, CollapsibleElementState>,
+    /// Oz 子代理卡(消息流内)按输出消息 id 存的跨帧 hover 状态。
+    pub(super) subagent_card_mouse_states: &'a HashMap<MessageId, SubagentCardMouseStates>,
     pub(crate) is_selecting_text: bool,
     pub(super) is_ai_input_enabled: bool,
     pub(crate) find_context: Option<FindContext<'a>>,
@@ -828,6 +835,13 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                                 );
                             }
                         }
+                        AIAgentOutputMessageType::SubagentRun(call) => {
+                            if let Some(element) =
+                                render_subagent_run_card(output_message, call, props, app)
+                            {
+                                output_items.add_child(element);
+                            }
+                        }
                         AIAgentOutputMessageType::DebugOutput { text } => {
                             if ChannelState::enable_debug_features() {
                                 if let Some(element) = render_collapsible_debug_output(
@@ -1340,6 +1354,140 @@ pub fn render_read_files_text<A: Action>(
         app,
     );
     formatted_files
+}
+
+/// Oz 子代理(模型乙):父会话里一次 `subagent` 派发的卡片(渲染在**消息流内**,
+/// 位置就是派发它的那个 exchange)。
+///
+/// **一次调用渲染 N 行**:一次 `subagent` 调用可以派发多个子代理,它们共享同一条
+/// 父侧 `ToolCallResult`,所以这里为 `call.runs` 里的每个子代理各渲染一行。
+///
+/// 每行都套一层 [`SavePosition`] 并标记 `.for_single_frame()`:单帧位置在**每帧起始**
+/// 被清除(`presenter::PositionCache::clear_single_frame_positions`),而块列表按可视
+/// 范围虚拟化 —— 于是「底部状态卡能查到这一行的位置」就等价于「这一行此刻在可视
+/// 区」。底部卡据此避免和这里重复显示(见 `child_agent_status_card.rs`)。
+fn render_subagent_run_card(
+    output_message: &AIAgentOutputMessage,
+    call: &SubagentRunCall,
+    props: Props,
+    app: &AppContext,
+) -> Option<Box<dyn Element>> {
+    let appearance = Appearance::as_ref(app);
+    let card_mouse_states = props
+        .subagent_card_mouse_states
+        .get(&output_message.id)
+        .cloned()
+        .unwrap_or_default();
+    if call.runs.is_empty() {
+        return None;
+    }
+
+    let rows = call
+        .runs
+        .iter()
+        .map(|run| {
+            let row = render_subagent_run_row(
+                run,
+                card_mouse_states.card.clone(),
+                card_mouse_states.stop_handle(run.conversation_id),
+                appearance,
+                app,
+            );
+            SavePosition::new(
+                row,
+                &crate::ai::agent_providers::tools::subagent::row_position_id(
+                    &run.conversation_id.to_string(),
+                ),
+            )
+            .for_single_frame()
+            // 只在**真的可见**时才发布位置:块列表会为可视区外预留渲染边距,只按
+            // 「有没有被渲染」判断,会让刚滚出屏幕的行仍被算作可见 —— 实测表现为
+            // 「要再滚一段距离底部卡才出现」。开这个开关后,被裁剪层完全裁掉的行不
+            // 发布位置,读方据此判定不可见。
+            .only_when_visible()
+            .finish()
+        })
+        .collect::<Vec<_>>();
+
+    Some(
+        Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(4.)
+            .with_children(rows)
+            .finish(),
+    )
+}
+
+/// 卡片里单个子代理那一行(名称 + 该子代理的状态 + 打开/停止入口)。
+fn render_subagent_run_row(
+    run: &SubagentRun,
+    row_mouse_state: MouseStateHandle,
+    stop_mouse_state: MouseStateHandle,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    // 状态以**父侧状态帧**为准:帧在每条终态路径(子代理完成 / 超时 / 重启收敛)上
+    // 都会被改写,是这次派发的权威结局。子会话的实时状态只在一种情况下更有价值 ——
+    // `Blocked`(正等你审批),这时必须显式标注,否则用户会漏掉审批。
+    let live_status = BlocklistAIHistoryModel::as_ref(app)
+        .conversation(&run.conversation_id)
+        .map(|c| c.status().clone());
+    let status = match live_status {
+        Some(ConversationStatus::Blocked { .. }) => live_status.unwrap(),
+        _ => run.fallback_status.clone(),
+    };
+    // 图标与配色直接复用会话状态自己的口径,避免在渲染层重新发明一套颜色语义。
+    let (icon, status_color) = status.status_icon_and_color(appearance.theme());
+    let status_label = match &status {
+        ConversationStatus::InProgress => crate::t!("subagent-status-running"),
+        ConversationStatus::Success => crate::t!("subagent-status-completed"),
+        ConversationStatus::Blocked { .. } => crate::t!("subagent-status-waiting-approval"),
+        ConversationStatus::Cancelled => crate::t!("subagent-status-cancelled"),
+        ConversationStatus::Error => crate::t!("subagent-status-error"),
+    };
+
+    // 「停止」入口只在子代理还活着时提供 —— 父对话的取消不会连带取消子代理,没有
+    // 这个按钮用户在父对话里就无法停掉跑偏的子代理。已结束的行仍然占住 trailing
+    // 槽位:渲染器只在 `extra_trailing` 为 `Some` 时才插入 `Expanded` 占位,少了它
+    // 各行 chevron 位置会不一致。
+    let conversation_id = run.conversation_id;
+    let extra_trailing = if matches!(
+        status,
+        ConversationStatus::InProgress | ConversationStatus::Blocked { .. }
+    ) {
+        let stop_tooltip = appearance.ui_builder().clone();
+        Some(
+            icon_button(appearance, Icon::StopFilled, false, stop_mouse_state)
+                .with_tooltip(move || {
+                    stop_tooltip
+                        .tool_tip(crate::t!("child-agent-stop"))
+                        .build()
+                        .finish()
+                })
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(TerminalAction::StopChildAgentConversation {
+                        conversation_id,
+                    });
+                })
+                .finish(),
+        )
+    } else {
+        Some(Empty::new().finish())
+    };
+
+    conversation_navigation_card_with_icon(
+        Some((icon, status_color)),
+        run.name.clone(),
+        Some(status_label),
+        move |ctx, _, _| {
+            ctx.dispatch_typed_action(TerminalAction::RevealChildAgent { conversation_id });
+        },
+        row_mouse_state,
+        true,
+        extra_trailing,
+        app,
+    )
 }
 
 fn render_read_skill(

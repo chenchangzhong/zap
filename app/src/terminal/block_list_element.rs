@@ -1447,6 +1447,17 @@ impl BlockListElement {
                 }
             }
             ctx.dispatch_typed_action(TerminalAction::Scroll { delta: delta_lines });
+            // Oz 子代理:滚动会改变「消息流内子代理行」是否在可视区。底部状态卡要按
+            // 位置缓存判断可见性,但它是**独立 view**,父视图(终端视图)的重绘不会带动
+            // 它(`ChildView::layout` 只从缓存取子视图元素),所以这里显式发信号,由
+            // `TerminalView::handle_action` 在下一帧通知它重算。
+            //
+            // **这里只是「低延迟快路径」,不是唯一入口**:可滚动区域外面包的是框架的
+            // `NewScrollable` 且用 Manual 句柄,拖滚动条时偏移由框架元素直接改、根本
+            // 不经过本函数;PageUp/Down、键盘、自动滚动同理。那些来源由状态卡自己的
+            // 定期复评覆盖(`child_agent_status_card.rs` 的 `VISIBILITY_POLL_INTERVAL`)。
+            // 保留本路径是为了让最常见的滚轮交互**当帧**响应,而不必等一个轮询间隔。
+            ctx.dispatch_typed_action(TerminalAction::SubagentCardVisibilityMayHaveChanged);
             true
         } else {
             false

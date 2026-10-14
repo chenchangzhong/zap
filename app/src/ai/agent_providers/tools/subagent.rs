@@ -76,6 +76,20 @@ pub const STATUS_COMPLETED: &str = "completed";
 pub const STATUS_ERROR: &str = "error";
 pub const STATUS_CANCELLED: &str = "cancelled";
 
+/// 消息流里「某个子代理那一行」的 `SavePosition` id。
+///
+/// **写入方**(消息流卡片,`block/view_impl/output.rs`)与**读取方**(底部状态卡,
+/// 判断该行是否在可视区)必须用同一套规则生成,所以放在这里共用一份,避免两处
+/// 各写一遍字符串拼接而悄悄不一致。
+///
+/// 为什么用 id 而不是坐标判断可见性:`SavePosition::for_single_frame` 的位置在每帧
+/// 起始被清除(`presenter::PositionCache::clear_single_frame_positions`),而块列表按
+/// 可视范围虚拟化 —— 因此「查不到位置」就等于「这一帧没有被渲染」,也就是滚出了
+/// 可视区。
+pub fn row_position_id(child_conversation_id: &str) -> String {
+    format!("subagent_row:{child_conversation_id}")
+}
+
 /// 一次调用最多派发的子代理数。
 ///
 /// 上限存在的理由是**资源**:每个子代理会建一个隐藏 pane + 一条独立会话(各自

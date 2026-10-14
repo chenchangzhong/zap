@@ -609,3 +609,30 @@ fn description_requires_batching_independent_subagents_in_one_call() {
     );
     assert!(description.contains("subagent"), "描述必须点名 subagent");
 }
+
+/// 描述必须明确告诉模型:**不需要用户点名**就能派发,并且**优先派发**而不是串行自己
+/// 做。
+///
+/// 这两句决定了「不明确要求子代理时它会不会用」:只有条件句(「可以并发时使用」)时
+/// 模型倾向自己串行做完;必须显式写出「你自己决定」与「优先派发」才会主动触发。
+#[test]
+fn description_tells_model_to_dispatch_without_being_asked() {
+    let tool = crate::ai::agent_providers::tools::lookup(TOOL_NAME).expect("subagent 已注册");
+    let description = tool.description.to_ascii_lowercase();
+    assert!(
+        description.contains("does not need to ask"),
+        "描述必须写明不需要用户主动要求: {}",
+        tool.description
+    );
+    assert!(
+        description.contains("prefer dispatching"),
+        "描述必须给出「优先派发而非串行」的正向指引: {}",
+        tool.description
+    );
+    // 判据要可操作:给出「两项以上、彼此不需要对方结果」这个自测问句。
+    assert!(
+        description.contains("do not need each other's results"),
+        "描述必须给出可操作的自测判据: {}",
+        tool.description
+    );
+}

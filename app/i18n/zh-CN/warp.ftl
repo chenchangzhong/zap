@@ -2186,6 +2186,11 @@ agent-message-bar-enabling = 正在启用...
 child-agent-default-name = 智能体
 child-agent-awaiting-approval = 等待你确认——点击进入处理
 child-agent-stop = 停止该子代理
+subagent-status-running = 运行中
+subagent-status-completed = 已完成
+subagent-status-waiting-approval = 等待你确认
+subagent-status-cancelled = 已取消
+subagent-status-error = 已失败
 
 agent-action-name-run-command = 运行命令：{ $command }
 agent-action-name-write-long-running-command = 写入长时间运行的命令

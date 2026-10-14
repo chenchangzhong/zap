@@ -2366,6 +2366,9 @@ pub struct TerminalView {
     alt_screen_vertical_scroll_state: ScrollStateHandle,
     /// Lines from the top of the content we are scrolled in the alt screen.
     alt_screen_scroll_top: Lines,
+    /// Oz 子代理:是否已经排了一次「滚动后重算子代理卡可见性」。用于合并连续滚轮
+    /// 事件,避免每个事件都排一个定时器。
+    subagent_visibility_refresh_pending: bool,
 
     /// Scroll state for scrolling horizontally.
     horizontal_clipped_scroll_state: ClippedScrollStateHandle,
@@ -3975,6 +3978,7 @@ impl TerminalView {
             blocklist_vertical_scroll_state: Default::default(),
             alt_screen_vertical_scroll_state: Default::default(),
             alt_screen_scroll_top: Lines::zero(),
+            subagent_visibility_refresh_pending: false,
             horizontal_clipped_scroll_state: Default::default(),
             is_selecting: false,
             context_menu_state: None,
@@ -24594,6 +24598,7 @@ impl TypedActionView for TerminalView {
             | ToggleUsageFooter
             | RevealChildAgent { .. }
             | StopChildAgentConversation { .. }
+            | SubagentCardVisibilityMayHaveChanged
             | SwitchAgentViewToConversation { .. }
             | OpenChildAgentInNewPane { .. }
             | OpenChildAgentInNewTab { .. }
@@ -25560,6 +25565,29 @@ impl TypedActionView for TerminalView {
                 ctx.emit(Event::StopChildAgentConversation {
                     conversation_id: *conversation_id,
                 });
+            }
+            SubagentCardVisibilityMayHaveChanged => {
+                // 滚动只改变几何,不会改变状态卡订阅的任何模型;而状态卡是独立
+                // view,父视图重绘不带动它。所以这里显式在**下一帧**通知它重算。
+                //
+                // 为什么必须延后一帧:`last_frame_position_cache` 在每帧 `build_scene`
+                // **之后**才写入(`core/app.rs`),所以同帧内读到的仍是滚动前的位置快照。
+                // 这里用零延时 timer 而不是直接调:future 在后台线程完成、回调在主线程
+                // 投递,而本轮(事件处理 + 渲染)期间主线程不 yield ⇒ 投递落在下一帧
+                // 渲染之前,那时读到的才是滚动后的位置。
+                if !self.subagent_visibility_refresh_pending {
+                    self.subagent_visibility_refresh_pending = true;
+                    ctx.spawn(
+                        warpui::r#async::Timer::after(std::time::Duration::ZERO),
+                        |me, _, ctx| {
+                            me.subagent_visibility_refresh_pending = false;
+                            let status_bar = me.input.as_ref(ctx).agent_status_bar().clone();
+                            status_bar.update(ctx, |bar, ctx| {
+                                bar.notify_child_agent_status_card(ctx)
+                            });
+                        },
+                    );
+                }
             }
             // 编排 pill bar:原地把本 pane 的 agent view 切到目标会话。
             SwitchAgentViewToConversation { conversation_id } => {

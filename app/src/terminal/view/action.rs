@@ -400,6 +400,14 @@ pub enum TerminalAction {
     StopChildAgentConversation {
         conversation_id: AIConversationId,
     },
+    /// Oz 子代理:块列表发生了滚动,消息流内子代理行的**可见性可能变了**。
+    ///
+    /// 为什么需要显式信号:`View::render` 只在 view **自己**被标记为 dirty 时重跑
+    /// (`presenter::Presenter::invalidate` 按 view id 重绘,`ChildView::layout` 只是
+    /// 从缓存取子视图元素),所以「终端视图因滚动重绘」**不会**带动底部状态卡;
+    /// 而状态卡要按位置缓存判断可见性。这里由滚动处发信号,让终端视图在**下一帧**
+    /// 通知状态卡重算。
+    SubagentCardVisibilityMayHaveChanged,
     /// 把本 pane 的 agent view **原地**切换到指定会话(编排 pill bar 里点编排者
     /// pill、或无法跨 pane 聚焦时的回落路径)。
     ///
@@ -682,6 +690,9 @@ impl fmt::Debug for TerminalAction {
             ToggleUsageFooter => write!(f, "ToggleUsageFooter"),
             RevealChildAgent { .. } => write!(f, "RevealChildAgent"),
             StopChildAgentConversation { .. } => write!(f, "StopChildAgentConversation"),
+            SubagentCardVisibilityMayHaveChanged => {
+                write!(f, "SubagentCardVisibilityMayHaveChanged")
+            }
             SwitchAgentViewToConversation { .. } => write!(f, "SwitchAgentViewToConversation"),
             OpenChildAgentInNewPane { .. } => write!(f, "OpenChildAgentInNewPane"),
             OpenChildAgentInNewTab { .. } => write!(f, "OpenChildAgentInNewTab"),

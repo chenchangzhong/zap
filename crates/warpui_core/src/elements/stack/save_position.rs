@@ -14,6 +14,7 @@ pub struct SavePosition {
     child: Box<dyn Element>,
     position_id: String,
     for_single_frame: bool,
+    only_when_visible: bool,
 }
 
 impl SavePosition {
@@ -22,6 +23,7 @@ impl SavePosition {
             child,
             position_id: position_id.to_string(),
             for_single_frame: false,
+            only_when_visible: false,
         }
     }
 
@@ -29,6 +31,22 @@ impl SavePosition {
     /// of rendering the next frame the position is cleared.
     pub fn for_single_frame(mut self) -> Self {
         self.for_single_frame = true;
+        self
+    }
+
+    /// Only saves the position when the element is actually visible — i.e. not
+    /// fully removed by the enclosing clip bounds.
+    ///
+    /// Pair this with [`Self::for_single_frame`] to turn the position cache into a
+    /// **visibility signal**: a read-side `element_position_by_id_at_last_frame(..)`
+    /// returning `None` then means "this element was not visible in the last frame".
+    ///
+    /// Without it, a virtualized list that renders a margin beyond its viewport (so
+    /// that scrolling stays smooth) will keep publishing positions for elements that
+    /// are already scrolled out of sight, and a reader cannot tell those apart from
+    /// genuinely visible ones.
+    pub fn only_when_visible(mut self) -> Self {
+        self.only_when_visible = true;
         self
     }
 }
@@ -48,22 +66,33 @@ impl Element for SavePosition {
     }
 
     fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
-        if self.for_single_frame {
-            ctx.position_cache.cache_position_for_one_frame(
-                self.position_id.clone(),
-                RectF::new(
-                    origin,
-                    self.child.size().expect("size must be set before paint"),
-                ),
-            );
+        let size = self.child.size().expect("size must be set before paint");
+
+        // With `only_when_visible`, skip caching when the clip bounds fully remove
+        // this element. For single-frame positions the entry is cleared at the start
+        // of every frame, so skipping leaves it absent — which is the signal readers
+        // rely on.
+        let clipped_away = self.only_when_visible
+            && ctx
+                .scene
+                .visible_rect(Point::from_vec2f(origin, ctx.scene.z_index()), size)
+                .is_none();
+
+        if clipped_away {
+            // 单帧位置每帧起始就被清掉,「不写入」天然等于「不存在」;而永久位置不会
+            // 自动过期,必须显式清除,否则会留下上一帧的陈旧条目、让本开关失效。
+            if !self.for_single_frame {
+                ctx.position_cache.clear_position(&self.position_id);
+            }
         } else {
-            ctx.position_cache.cache_position_indefinitely(
-                self.position_id.clone(),
-                RectF::new(
-                    origin,
-                    self.child.size().expect("size must be set before paint"),
-                ),
-            );
+            let bounds = RectF::new(origin, size);
+            if self.for_single_frame {
+                ctx.position_cache
+                    .cache_position_for_one_frame(self.position_id.clone(), bounds);
+            } else {
+                ctx.position_cache
+                    .cache_position_indefinitely(self.position_id.clone(), bounds);
+            }
         }
 
         self.child.paint(origin, ctx, app);
