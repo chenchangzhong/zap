@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use serde_json::Value;
+use warp_util::path::{CleanPathResult, LineAndColumnArg};
 use warpui::ModelContext;
 
 use crate::notifications::item::NotificationCategory;
@@ -33,7 +34,13 @@ pub enum BridgeEvent {
     /// dsh 侧请求在 Zap 打开文件浏览器到指定项目目录。
     OpenFileExplorer { path: PathBuf },
     /// dsh 侧请求在 Zap 内打开一个文件/目录(文件链接拦截)。
-    OpenFile { path: PathBuf },
+    ///
+    /// `line_col` 来自 `path:line` / `path:line:col` 形式的链接(dsh 的代码引用常带行号),
+    /// 打开时用于定位;目录与普通文件链接为 `None`。
+    OpenFile {
+        path: PathBuf,
+        line_col: Option<LineAndColumnArg>,
+    },
     /// dsh 侧改动行点击:在 Zap 代码审核面板打开并定位到该文件。
     /// `path` 为 dsh 上报的绝对路径;改动卡片的表头按钮没有具体文件(打开
     /// 整个改动集),此时为 None。面板按 git 工作区 diff 定位,文件不在 diff
@@ -118,17 +125,34 @@ pub(crate) fn handle_zap_ipc(payload: &str) -> Option<BridgeEvent> {
         }
         "zap.open_file" => {
             let raw = params.get("path")?.as_str()?;
-            let path = PathBuf::from(raw);
-            // canonicalize 同时完成存在性校验(文件/目录均放行);不存在则忽略。
-            let canonical = match path.canonicalize() {
-                Ok(p) => p,
+            // dsh 的代码引用链接常带 `:line` / `:line:col` 后缀(如 `foo.vue:138`)。
+            // 先按原样 canonicalize:真实文件名里含冒号的场景优先,且省掉一次 stat;
+            // 失败再用 `CleanPathResult` 剥离行号(复用终端/编辑器同一套解析规则)。
+            let (canonical, line_col) = match PathBuf::from(raw).canonicalize() {
+                Ok(path) => (path, None),
                 Err(e) => {
-                    log::warn!("[dsh-bridge] IPC {method} canonicalize failed: {e}");
-                    return None;
+                    let parsed = CleanPathResult::with_line_and_column_number(raw);
+                    match PathBuf::from(&parsed.path).canonicalize() {
+                        Ok(path) => (path, parsed.line_and_column_num),
+                        Err(_) => {
+                            // 带上原始路径:插件侧拼出的绝对路径可能落在错误的根(会话 cwd 与
+                            // 项目目录不一致)上,没有 raw 路径无法定位是哪一侧算错了。
+                            log::warn!(
+                                "[dsh-bridge] IPC {method} canonicalize failed: raw={raw:?} err={e}"
+                            );
+                            return None;
+                        }
+                    }
                 }
             };
-            log::info!("[dsh-bridge] IPC OpenFile path={}", canonical.display());
-            Some(push_event(BridgeEvent::OpenFile { path: canonical }))
+            log::info!(
+                "[dsh-bridge] IPC OpenFile path={} line_col={line_col:?}",
+                canonical.display()
+            );
+            Some(push_event(BridgeEvent::OpenFile {
+                path: canonical,
+                line_col,
+            }))
         }
         "zap.open_code_review" => {
             // path 可选:改动卡片表头按钮只打开整个改动集,没有具体文件。

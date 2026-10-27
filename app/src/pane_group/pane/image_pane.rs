@@ -84,6 +84,12 @@ impl ImagePane {
     pub fn image_view(&self, ctx: &AppContext) -> ViewHandle<ImageViewerView> {
         self.view.as_ref(ctx).child(ctx)
     }
+
+    /// The `PaneView` wrapper, for hosts that render the pane outside a `PaneGroup`
+    /// (the `EditorLayout::Floating` overlay, which owns the pane directly).
+    pub fn pane_view(&self) -> &ViewHandle<PaneView<ImageViewerView>> {
+        &self.view
+    }
 }
 
 impl PaneContent for ImagePane {

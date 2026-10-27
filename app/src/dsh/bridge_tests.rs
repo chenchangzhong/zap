@@ -217,8 +217,9 @@ fn open_file_ok() {
 
     let event = handle_zap_ipc(&open_file_payload(file.to_str().unwrap(), 1)).unwrap();
     match event {
-        BridgeEvent::OpenFile { path } => {
+        BridgeEvent::OpenFile { path, line_col } => {
             assert_eq!(path, file.canonicalize().unwrap());
+            assert_eq!(line_col, None);
         }
         other => panic!("expected OpenFile, got {other:?}"),
     }
@@ -238,13 +239,40 @@ fn open_file_directory_ok() {
 
     let event = handle_zap_ipc(&open_file_payload(dir.to_str().unwrap(), 1)).unwrap();
     match event {
-        BridgeEvent::OpenFile { path } => {
+        BridgeEvent::OpenFile { path, line_col } => {
             assert_eq!(path, dir.canonicalize().unwrap());
+            assert_eq!(line_col, None);
         }
         other => panic!("expected OpenFile, got {other:?}"),
     }
 
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// zap.open_file:`path:line` 形式的代码引用 → 剥离行号后 canonicalize,并携带行号。
+#[test]
+fn open_file_with_line_suffix_resolves_path_and_line() {
+    let file = std::env::temp_dir().join(format!("zap-openfile-line-{}", std::process::id()));
+    std::fs::write(&file, "x").unwrap();
+    PENDING_EVENTS.lock().clear();
+
+    let raw = format!("{}:138", file.to_str().unwrap());
+    let event = handle_zap_ipc(&open_file_payload(&raw, 1)).unwrap();
+    match event {
+        BridgeEvent::OpenFile { path, line_col } => {
+            assert_eq!(path, file.canonicalize().unwrap());
+            assert_eq!(
+                line_col,
+                Some(LineAndColumnArg {
+                    line_num: 138,
+                    column_num: None,
+                })
+            );
+        }
+        other => panic!("expected OpenFile, got {other:?}"),
+    }
+
+    std::fs::remove_file(&file).unwrap();
 }
 
 /// zap.open_file:路径不存在 → None(canonicalize 失败)。

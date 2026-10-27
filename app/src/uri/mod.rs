@@ -13,7 +13,8 @@ use crate::root_view::{open_new_window_get_handles, OpenLaunchConfigArg};
 use crate::server::ids::ServerId;
 use crate::server::telemetry::{LaunchConfigUiLocation, TelemetryEvent};
 use crate::util::openable_file_type::{
-    is_file_openable_in_warp, is_markdown_file, is_runnable_shell_script, starts_with_shebang,
+    is_file_openable_in_warp, is_markdown_file, is_runnable_shell_script, is_supported_image_file,
+    starts_with_shebang,
 };
 use crate::workspace::active_terminal_in_window;
 use crate::workspace::{Workspace, WorkspaceAction, WorkspaceRegistry};
@@ -32,6 +33,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use url::Url;
+use warp_util::path::LineAndColumnArg;
 use warpui::notification::UserNotification;
 use warpui::{platform::TerminationMode, SingletonEntity as _, TypedActionView};
 
@@ -591,7 +593,7 @@ impl Action {
                     log::warn!("Could not parse path to open a new tab/window");
                     return;
                 };
-                open_file(window_id, path, ctx);
+                open_file(window_id, path, None, ctx);
             }
             Action::Docker => {
                 if let Err(err) = open_docker_container(url, ctx) {
@@ -689,7 +691,7 @@ pub fn handle_incoming_uri(url: &Url, ctx: &mut AppContext) {
     #[cfg(feature = "local_tty")]
     if url.scheme() == "file" {
         if let Ok(path) = url.to_file_path() {
-            open_file(primary_window_id, path, ctx);
+            open_file(primary_window_id, path, None, ctx);
         }
         return;
     }
@@ -744,7 +746,8 @@ fn get_primary_window(
 enum OpenFileAction {
     /// Open in the markdown notebook pane.
     Notebook,
-    /// Open in Zap's code/text editor pane.
+    /// Open in Zap's code/text editor pane, or in the in-app image viewer for images
+    /// (`resolve_file_target_to_open_in_warp` decides which).
     Editor,
     /// Open a session at the parent directory and queue the file as the pending command,
     /// or just open a session at the directory path if `path` is a directory.
@@ -765,19 +768,39 @@ fn classify_open_file_action(path: &Path) -> OpenFileAction {
         // shebang scripts that `is_file_openable_in_warp` rejects on extension alone
         // (e.g. an extensionless `#!/bin/sh` file without the user-execute bit) so
         // they don't fall through to the executor and produce a `permission denied`.
-        if is_file_openable_in_warp(path).is_some() || starts_with_shebang(path) {
+        // Images are binary files, so `is_file_openable_in_warp` rejects them too; without
+        // the image branch a PNG opened from dsh / a `file://` URL fell through to
+        // `ExecuteInSession`, which opened a terminal at its parent directory and tried to
+        // execute the image as a command. `resolve_file_target_to_open_in_warp` then routes
+        // them to the in-app image viewer (see `OpenFileAction::Editor` below).
+        if is_file_openable_in_warp(path).is_some()
+            || is_supported_image_file(path)
+            || starts_with_shebang(path)
+        {
             return OpenFileAction::Editor;
         }
     }
     OpenFileAction::ExecuteInSession
 }
 
-/// Handle an incoming `file://` URL.
+/// Handle an incoming `file://` URL or a dsh file link.
 /// * Markdown files are opened as notebook panes.
 /// * For directories, open a new session at the directory path.
 /// * For other files, open a new session at the parent directory path, then possibly execute the
 ///   file.
-pub(crate) fn open_file(window_id: Option<WindowId>, path: PathBuf, ctx: &mut AppContext) {
+///
+/// `line_col` 来自 `path:line` 形式的链接(dsh 代码引用);只有编辑器分支会用它定位,
+/// notebook / session 分支忽略。
+pub(crate) fn open_file(
+    window_id: Option<WindowId>,
+    path: PathBuf,
+    line_col: Option<LineAndColumnArg>,
+    ctx: &mut AppContext,
+) {
+    // 非 `local_fs` 构建没有编辑器分支(见下方 `#[cfg(feature = "local_fs")]`),行号无处可用。
+    #[cfg(not(feature = "local_fs"))]
+    let _ = line_col;
+
     let primary_window_and_view = window_id.and_then(|window_id| {
         ctx.root_view_id(window_id)
             .map(|view_id| (window_id, view_id))
@@ -833,7 +856,7 @@ pub(crate) fn open_file(window_id: Option<WindowId>, path: PathBuf, ctx: &mut Ap
                 if let Some(workspace) = workspaces.into_iter().next() {
                     workspace.update(ctx, |workspace, ctx| {
                         let source = CodeSource::Finder { path: path.clone() };
-                        workspace.open_file_with_target(path, target, None, source, ctx);
+                        workspace.open_file_with_target(path, target, line_col, source, ctx);
                     });
                 }
             }
@@ -1112,3 +1135,7 @@ fn safe_url_log_fields(url: &Url) -> String {
         url.path(),
     )
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

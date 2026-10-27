@@ -85,6 +85,7 @@ use warpui::windowing::WindowManager;
 use crate::ai::llms::{LLMPreferences, LLMPreferencesEvent};
 use crate::ai::onboarding::build_onboarding_models;
 
+use warp_util::path::LineAndColumnArg;
 use warpui::elements::{
     Border, ChildAnchor, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Stack,
 };
@@ -347,9 +348,9 @@ pub fn init(app: &mut AppContext) {
     // 阶段执行：该阶段不摘除任何 view，三个分类都能正常打开。
     app.add_global_action(
         "root_view:open_dsh_file",
-        |arg: &(WindowId, PathBuf), ctx| {
-            let (window_id, path) = arg;
-            crate::uri::open_file(Some(*window_id), path.clone(), ctx);
+        |arg: &(WindowId, PathBuf, Option<LineAndColumnArg>), ctx| {
+            let (window_id, path, line_col) = arg;
+            crate::uri::open_file(Some(*window_id), path.clone(), *line_col, ctx);
         },
     );
     app.add_action("root_view:add_file_pane", RootView::add_file_pane);

@@ -1290,11 +1290,14 @@ pub struct TransferredTab {
 
 /// `EditorLayout::Floating` 的浮层里承载的编辑器。
 ///
-/// 只支持代码编辑器与 Markdown 预览器 —— 图片与外部编辑器另有既有路径。pane 不进入
-/// 任何 `PaneGroup`,因此这里只保留 Workspace 渲染需要的具体类型。
+/// 支持代码编辑器、Markdown 预览器与图片查看器 —— 外部编辑器不走浮层(它有既有的
+/// 系统/外部程序路径)。pane 不进入任何 `PaneGroup`,因此这里只保留 Workspace 渲染需要的
+/// 具体类型。
 enum FloatingEditorPane {
     Code(CodePane),
     Markdown(FilePane),
+    /// 只读图片查看器(`EditorLayout::Floating` 下的图片打开)。
+    Image(ImagePane),
 }
 
 /// 待打开的悬浮编辑器:过渡动画期间先显示加载占位,动画结束后才真正创建 `CodePane`。
@@ -3511,13 +3514,13 @@ impl Workspace {
                         );
                         me.handle_dsh_open_file_explorer(path.clone(), ctx);
                     }
-                    crate::dsh::bridge::BridgeEvent::OpenFile { path } => {
+                    crate::dsh::bridge::BridgeEvent::OpenFile { path, line_col } => {
                         log::info!(
-                            "[dsh-open-file] OpenFile path={}, has_dsh={}",
+                            "[dsh-open-file] OpenFile path={}, line_col={line_col:?}, has_dsh={}",
                             path.display(),
                             me.has_dsh_pane(ctx)
                         );
-                        me.handle_dsh_open_file(path.clone(), ctx);
+                        me.handle_dsh_open_file(path.clone(), *line_col, ctx);
                     }
                     crate::dsh::bridge::BridgeEvent::OpenCodeReview { path } => {
                         log::info!(
@@ -6025,10 +6028,19 @@ impl Workspace {
                 let open_as_preview = false;
                 self.open_code(code_source, layout, line_col, open_as_preview, &[], ctx);
             }
-            FileTarget::ImageViewer(_layout) => {
-                // 图片始终在新标签页打开,见 `insert_image_pane`。target 携带的
-                // layout 在此被故意忽略。
-                self.open_image(path.clone(), self.get_active_session(ctx), ctx);
+            FileTarget::ImageViewer(layout) => {
+                let session = self.get_active_session(ctx);
+                if matches!(layout, EditorLayout::Floating) {
+                    // 复用 `EditorLayout::Floating` 的居中浮层(与 Markdown/代码同一套宿主
+                    // 逻辑)。图片查看器只读,`dismiss_floating_editor` 对非 Code 分支直接
+                    // 收起,不会弹未保存确认。
+                    let pane = ImagePane::new(Some(path.clone()), session, ctx);
+                    self.show_floating_editor(FloatingEditorPane::Image(pane), ctx);
+                } else {
+                    // 其余布局(包括 SplitPane)仍新开标签页:单图 pane 分屏会为每张图切分
+                    // 窗口,见 `insert_image_pane`。
+                    self.open_image(path.clone(), session, ctx);
+                }
             }
             FileTarget::ExternalEditor(editor) => {
                 crate::util::file::open_file_path_with_editor(
@@ -7886,11 +7898,13 @@ impl Workspace {
     /// Insert an already-constructed [`ImagePane`] as its own workspace tab. Shared by
     /// local [`Self::open_image`] and remote [`Self::open_remote_image`].
     ///
-    /// Images always open in a new tab rather than honoring `open_file_layout` (which
-    /// defaults to `SplitPane`). Unlike the code editor — whose `CodeView` stacks files
-    /// as internal tabs — an `ImagePane` holds a single image, so a `SplitPane` layout
-    /// would subdivide the window for every image opened. A new tab per image gives the
-    /// expected tab-stacking behavior instead.
+    /// This is the non-floating path: `EditorLayout::Floating` images are installed into
+    /// the overlay instead (see `open_file_with_target`'s `FileTarget::ImageViewer`
+    /// branch). The remaining layouts all open a new tab rather than honoring
+    /// `open_file_layout`'s `SplitPane` (which is the default). Unlike the code editor —
+    /// whose `CodeView` stacks files as internal tabs — an `ImagePane` holds a single
+    /// image, so a `SplitPane` layout would subdivide the window for every image opened.
+    /// A new tab per image gives the expected tab-stacking behavior instead.
     fn insert_image_pane(&mut self, pane: ImagePane, ctx: &mut ViewContext<Self>) {
         let new_tab_placement_setting = TabSettings::as_ref(ctx).new_tab_placement;
         let new_idx = match new_tab_placement_setting {
@@ -8900,6 +8914,14 @@ impl Workspace {
         // 否则那个定时器到点会把更早请求的文件创建出来,顶掉刚装好的这个。
         self.cancel_pending_floating_editor_materialization();
         match (&self.floating_editor_pane, pane) {
+            // 图片浮层里再打开一张图:直接原位替换。图片没有可合并的 tab/编辑状态,
+            // 走通用"收起再展开"会让每次换图都闪一次动画。
+            (Some(FloatingEditorPane::Image(_)), FloatingEditorPane::Image(new_pane)) => {
+                self.discard_floating_editor_pane(ctx);
+                self.floating_editor_pane = Some(FloatingEditorPane::Image(new_pane));
+                self.install_floating_editor_pane(ctx);
+                return;
+            }
             (Some(FloatingEditorPane::Code(existing)), FloatingEditorPane::Code(new_pane)) => {
                 let location = new_pane.file_view(ctx).as_ref(ctx).source().location();
                 match location {
@@ -8968,6 +8990,10 @@ impl Workspace {
             }
             Some(FloatingEditorPane::Markdown(pane)) => {
                 let view = pane.file_view(ctx);
+                view.update(ctx, |view, ctx| view.focus(ctx));
+            }
+            Some(FloatingEditorPane::Image(pane)) => {
+                let view = pane.image_view(ctx);
                 view.update(ctx, |view, ctx| view.focus(ctx));
             }
             None => {}
@@ -9066,13 +9092,40 @@ impl Workspace {
                     }
                 });
             }
+            Some(FloatingEditorPane::Image(pane)) => {
+                let pane_view = pane.pane_view().clone();
+                pane_view.update(ctx, |pane_view, ctx| {
+                    pane_view.set_detached_from_pane_group(ctx);
+                    let header = pane_view.header().clone();
+                    header.update(ctx, |header, ctx| {
+                        header.set_overflow_menu_rendered_by_host(true, ctx);
+                        header.set_draggable_disabled(true, ctx);
+                    });
+                });
+                ctx.subscribe_to_view(&pane_view, |me, _, event, ctx| {
+                    if matches!(event, crate::pane_group::pane::PaneViewEvent::CloseRequested) {
+                        me.dismiss_floating_editor(ctx);
+                    }
+                });
+                // 头部 overflow 菜单里的「关闭」由 `ImagePane` 转成 `PaneEvent::Close`(没有
+                // `PaneGroup` 接住),宿主接回收起流程。
+                let image_view = pane.image_view(ctx);
+                ctx.subscribe_to_view(&image_view, |me, _, event, ctx| {
+                    if matches!(
+                        event,
+                        crate::notebooks::image::ImageViewerEvent::Pane(PaneEvent::Close)
+                    ) {
+                        me.dismiss_floating_editor(ctx);
+                    }
+                });
+            }
             None => {
                 ctx.notify();
                 return;
             }
         }
 
-        // 两类浮层都要把焦点收进来。让位只解决"编辑器不抢 Esc";按键要真能到浮层的捕获层,
+        // 三类浮层都要把焦点收进来。让位只解决"编辑器不抢 Esc";按键要真能到浮层的捕获层,
         // 前提是 AppKit first responder 还在 WarpUI 上 —— 焦点一旦被活动 pane 拿走,内嵌 CEF
         // 的 pane 会把 responder 交给 webview,该窗口所有按键都进页面(实测:浮层完全无响应)。
         // 见 [`Self::focus_floating_editor_pane`] 与 [`Self::on_focus`] 的同一道守卫。
@@ -9115,6 +9168,11 @@ impl Workspace {
             FloatingEditorPane::Markdown(pane) => {
                 ctx.unsubscribe_to_view(pane.pane_view());
                 let view = pane.file_view(ctx);
+                ctx.unsubscribe_to_view(&view);
+            }
+            FloatingEditorPane::Image(pane) => {
+                ctx.unsubscribe_to_view(pane.pane_view());
+                let view = pane.image_view(ctx);
                 ctx.unsubscribe_to_view(&view);
             }
         }
@@ -20933,9 +20991,14 @@ impl Workspace {
     /// 同步调用 `uri::open_file` 会让 Notebook 分支重入更新 Workspace(panic:
     /// Circular view update)、令 Editor 分支取不到 Workspace 而静默失败。
     /// 故改为入队全局 action,在 effect flush 阶段(不摘除任何 view)执行。
-    fn handle_dsh_open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+    fn handle_dsh_open_file(
+        &mut self,
+        path: PathBuf,
+        line_col: Option<LineAndColumnArg>,
+        ctx: &mut ViewContext<Self>,
+    ) {
         let window_id = ctx.window_id();
-        ctx.dispatch_global_action("root_view:open_dsh_file", (window_id, path));
+        ctx.dispatch_global_action("root_view:open_dsh_file", (window_id, path, line_col));
     }
 
     /// dsh 改动行点击 → 打开 Zap 代码审核面板并定位到该文件。
@@ -20955,7 +21018,7 @@ impl Workspace {
             // (无路径)则无动作。
             log::warn!("[dsh-code-review] no dsh repo, path={path:?}");
             if let Some(path) = path {
-                self.handle_dsh_open_file(path, ctx);
+                self.handle_dsh_open_file(path, None, ctx);
             }
             return;
         }
@@ -23759,6 +23822,11 @@ impl View for Workspace {
                 Some(pane) => match pane {
                     FloatingEditorPane::Code(pane) => ChildView::new(pane.pane_view()).finish(),
                     FloatingEditorPane::Markdown(pane) => {
+                        ChildView::new(pane.pane_view()).finish()
+                    }
+                    FloatingEditorPane::Image(pane) => {
+                        // 图片查看器的 pane 背景是透明的,浮层卡片自己的背景/圆角/边框
+                        // 已经提供了视觉边界,这里只需把 pane 铺满卡片。
                         ChildView::new(pane.pane_view()).finish()
                     }
                 },

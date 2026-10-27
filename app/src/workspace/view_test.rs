@@ -2234,7 +2234,7 @@ fn test_open_file_notebook_from_uri_respects_floating_layout() {
             // `test_open_file_notebook_leaves_remote_session_to_file_pane` 锁定。)
             let pane = match workspace.floating_editor_pane.as_ref() {
                 Some(FloatingEditorPane::Markdown(pane)) => pane,
-                Some(FloatingEditorPane::Code(_)) | None => {
+                Some(FloatingEditorPane::Code(_)) | Some(FloatingEditorPane::Image(_)) | None => {
                     panic!("expected markdown floating pane")
                 }
             };
@@ -2243,6 +2243,74 @@ fn test_open_file_notebook_from_uri_respects_floating_layout() {
                 Some(markdown_path.as_path())
             );
             assert!(workspace.floating_editor_visible());
+        });
+    });
+}
+
+/// `EditorLayout::Floating` 下的图片必须进浮层(而不是新开标签页),并且真的把路径交给
+/// `ImageViewerView::open_local` —— 覆盖 dsh 图片链接 + floating 布局的组合路径。
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_open_image_respects_floating_layout() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let image_path = temp_dir.path().join("preview.png");
+        std::fs::write(&image_path, b"\x89PNG\r\n\x1a\n").expect("failed to write image");
+
+        workspace.update(&mut app, |workspace, ctx| {
+            EditorSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings
+                    .open_file_layout
+                    .set_value(EditorLayout::Floating, ctx));
+            });
+            let tabs_before = workspace.tab_count();
+            workspace.open_file_with_target(
+                image_path.clone(),
+                FileTarget::ImageViewer(EditorLayout::Floating),
+                None,
+                CodeSource::Finder {
+                    path: image_path.clone(),
+                },
+                ctx,
+            );
+            assert_eq!(workspace.tab_count(), tabs_before);
+            let pane = match workspace.floating_editor_pane.as_ref() {
+                Some(FloatingEditorPane::Image(pane)) => pane,
+                _ => panic!("expected image floating pane"),
+            };
+            // `local_path` 非空即证明 `open_local` 被调用过(同 Markdown 浮层测试的判据)。
+            assert_eq!(
+                pane.image_view(ctx).as_ref(ctx).local_path().as_deref(),
+                Some(image_path.as_path())
+            );
+            assert!(workspace.floating_editor_visible());
+        });
+    });
+}
+
+/// dsh / `file://` 入口的 target 解析必须把图片路由到内嵌查看器:该入口在 `uri::open_file`
+/// 里用 `resolve_file_target_to_open_in_warp`,它此前无条件返回 `CodeEditor`(把 PNG 当文本)。
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_resolve_file_target_to_open_in_warp_routes_images_to_viewer() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let image_path = temp_dir.path().join("photo.png");
+        std::fs::write(&image_path, b"\x89PNG\r\n\x1a\n").expect("failed to write image");
+
+        workspace.update(&mut app, |_workspace, ctx| {
+            assert_eq!(
+                crate::util::openable_file_type::resolve_file_target_to_open_in_warp(
+                    &image_path,
+                    EditorSettings::as_ref(ctx),
+                    Some(EditorLayout::Floating),
+                ),
+                FileTarget::ImageViewer(EditorLayout::Floating)
+            );
         });
     });
 }
@@ -2281,7 +2349,7 @@ fn test_open_file_notebook_leaves_remote_session_to_file_pane() {
             );
             let pane = match workspace.floating_editor_pane.as_ref() {
                 Some(FloatingEditorPane::Markdown(pane)) => pane,
-                Some(FloatingEditorPane::Code(_)) | None => {
+                Some(FloatingEditorPane::Code(_)) | Some(FloatingEditorPane::Image(_)) | None => {
                     panic!("expected markdown floating pane")
                 }
             };

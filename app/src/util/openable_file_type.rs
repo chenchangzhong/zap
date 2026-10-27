@@ -173,6 +173,12 @@ pub fn resolve_file_target_to_open_in_warp(
     let is_markdown = matches!(openable_file_type, Some(OpenableFileType::Markdown));
     let layout = layout.unwrap_or(*settings.open_file_layout);
 
+    // 二进制图片不在 `is_file_openable_in_warp` 的"可在 Zap 打开"集合里(它按内容判成
+    // binary),强制在 Zap 打开时不能把 PNG 当文本塞进 `CodeView`,改走内嵌图片查看器。
+    // SVG 属于可编辑文本,保持编辑器路径 —— 与 `resolve_file_target` 的 Zap 偏好一致。
+    if openable_file_type.is_none() && is_supported_image_file(path) {
+        return FileTarget::ImageViewer(layout);
+    }
     if is_markdown && *settings.prefer_markdown_viewer {
         return FileTarget::MarkdownViewer(layout);
     }
