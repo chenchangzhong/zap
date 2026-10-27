@@ -2691,9 +2691,7 @@ pub fn available_tool_names(params: &RequestParams) -> Vec<String> {
             if is_lrc && t.name == "run_shell_command" {
                 return false;
             }
-            if !web_enabled
-                && (t.name == tools::webfetch::TOOL_NAME || t.name == tools::websearch::TOOL_NAME)
-            {
+            if !web_enabled && is_byop_web_tool(&t.name) {
                 return false;
             }
             if t.name == "suggest_new_conversation" {
@@ -2750,9 +2748,7 @@ fn build_tools_array(params: &RequestParams) -> Vec<GenaiTool> {
             }
             // BYOP web 工具按 profile.web_search_enabled gating(用户已关闭隐私
             // 开关时不暴露给上游模型,避免误调外网请求)。
-            if !web_enabled
-                && (t.name == tools::webfetch::TOOL_NAME || t.name == tools::websearch::TOOL_NAME)
-            {
+            if !web_enabled && is_byop_web_tool(&t.name) {
                 return false;
             }
             // suggest_new_conversation:无 UI 实现,executor 在 Zap 改为
@@ -3941,8 +3937,7 @@ pub async fn generate_byop_output(
                     // 这里跳过避免双卡。
                     // todowrite 走 BYOP todo 拦截器,合成 Message::UpdateTodos 触发 chip,
                     // 这里也跳过占位避免出现一张无意义的"调用 todowrite"卡。
-                    if call.fn_name != tools::webfetch::TOOL_NAME
-                        && call.fn_name != tools::websearch::TOOL_NAME
+                    if !is_byop_web_tool(&call.fn_name)
                         && call.fn_name != tools::todowrite::TOOL_NAME
                     {
                         if let Some(msg_id) = tool_msg_ids.get(&call.call_id).cloned() {
@@ -4195,6 +4190,60 @@ pub async fn generate_byop_output(
         }
         unordered_tool_calls.sort_by(|a, b| a.call_id.cmp(&b.call_id));
         ordered_tool_calls.extend(unordered_tool_calls);
+        // BYOP web 工具并发预启动：同一轮里模型可能同时发多个 websearch / webfetch。
+        // 原来在下面的循环体内逐条 `.await`，总耗时是各条耗时之和；这里在进入循环前把
+        // 所有 web 调用放进 `FuturesUnordered`，循环体内按 call_id 取结果。等待某一条时
+        // 其余请求继续推进，因此多条搜索是同时在途的。
+        // 结果仍按 tool_call 原顺序 yield done 帧、按原顺序写入 `final_messages`，
+        // 所以 UI 卡片顺序与发给下一轮的 tool_result 顺序都不变。
+        //
+        // 这里同时预生成每张 web 卡的 UI 元数据（message.id + loading 卡预览字段）：
+        // 主循环里第一次遇到 web 调用时会把本轮所有 web 卡的 loading 帧按原序一次性发出，
+        // 让每张卡在请求真正启动前就进入 Searching / Fetching 态，而不是排队等前一条结束。
+        let mut pending_web_tool_calls = futures::stream::FuturesUnordered::new();
+        let mut web_call_uis: HashMap<String, WebCallUi> = HashMap::new();
+        let mut web_call_order: Vec<String> = Vec::new();
+        for call in ordered_tool_calls
+            .iter()
+            .filter(|call| is_byop_web_tool(&call.fn_name))
+        {
+            let fn_name = call.fn_name.clone();
+            let call_id = call.call_id.clone();
+            let args_str = tool_call_args_str(call);
+            let is_search = fn_name == tools::websearch::TOOL_NAME;
+            // 预解析 args 抽 query / url 给 UI loading 卡。args 解析失败也要发帧
+            // （用空字段兜底），保证 UI 至少看到一帧 loading，后续 dispatch
+            // 仍会返回 invalid_arguments → 切到 Error 卡。
+            let preview_query = if is_search {
+                serde_json::from_str::<tools::web_runtime::SearchToolArgs>(&args_str)
+                    .map(|a| a.query)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let preview_urls: Vec<String> = if !is_search {
+                serde_json::from_str::<tools::web_runtime::FetchArgs>(&args_str)
+                    .map(|a| vec![a.url])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            web_call_uis.insert(
+                call_id.clone(),
+                WebCallUi {
+                    is_search,
+                    msg_id: Uuid::new_v4().to_string(),
+                    preview_query,
+                    preview_urls,
+                },
+            );
+            web_call_order.push(call_id.clone());
+            pending_web_tool_calls.push(async move {
+                (call_id, dispatch_byop_web_tool(&fn_name, &args_str).await)
+            });
+        }
+        let mut web_loadings_emitted = false;
+        let mut finished_web_tool_calls: HashMap<String, Value> = HashMap::new();
         for call in ordered_tool_calls {
             // 诊断:dump 模型实际发的 tool_call raw payload
             // (call_id / fn_name / fn_arguments JSON 原文 + 类型标注),
@@ -4237,11 +4286,7 @@ pub async fn generate_byop_output(
             // UI(对齐 server-side ClientAction::AddMessagesToTask::UpdateTodos 路径)。
             // 然后追加 carrier ToolCall + ToolCallResult 给模型 unblock。
             if call.fn_name == tools::todowrite::TOOL_NAME {
-                let args_str = if call.fn_arguments.is_string() {
-                    call.fn_arguments.as_str().unwrap_or("").to_owned()
-                } else {
-                    call.fn_arguments.to_string()
-                };
+                let args_str = tool_call_args_str(&call);
 
                 match tools::todowrite::build_update_todos_messages(
                     &args_str,
@@ -4332,11 +4377,7 @@ pub async fn generate_byop_output(
             // 无需额外持久化状态;控制层也用它作为 `AIConversation` 的 id,
             // 保证消息与真实子会话一一对应。
             if call.fn_name == tools::subagent::TOOL_NAME {
-                let args_str = if call.fn_arguments.is_string() {
-                    call.fn_arguments.as_str().unwrap_or("").to_owned()
-                } else {
-                    call.fn_arguments.to_string()
-                };
+                let args_str = tool_call_args_str(&call);
                 match tools::subagent::SubagentArgs::parse(&args_str) {
                     Ok(args) => {
                         // 每个任务预生成一个子会话 id。帧里必须带满 N 个:控制层
@@ -4424,55 +4465,89 @@ pub async fn generate_byop_output(
             // `WebFetchView` 渲染:Searching/Fetching loading 卡片 → Success(URL 列表)
             // / Error 折叠卡。这两条不进 final_messages,直接 yield 让 UI 实时更新;
             // carrier + result 仍走 final_messages 给下一轮模型推理用。
-            if call.fn_name == tools::webfetch::TOOL_NAME
-                || call.fn_name == tools::websearch::TOOL_NAME
-            {
-                let args_str = if call.fn_arguments.is_string() {
-                    call.fn_arguments.as_str().unwrap_or("").to_owned()
-                } else {
-                    call.fn_arguments.to_string()
-                };
-                let is_search = call.fn_name == tools::websearch::TOOL_NAME;
+            if is_byop_web_tool(&call.fn_name) {
+                let args_str = tool_call_args_str(&call);
 
-                // 预解析 args 抽 query / url 给 UI loading 卡。args 解析失败也要 emit
-                // (用空字段兜底),保证 UI 至少看到一帧 loading,后续 dispatch
-                // 仍会返回 invalid_arguments → 切到 Error 卡。
-                let preview_query = if is_search {
-                    serde_json::from_str::<tools::web_runtime::SearchToolArgs>(&args_str)
-                        .map(|a| a.query)
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let preview_urls: Vec<String> = if !is_search {
-                    serde_json::from_str::<tools::web_runtime::FetchArgs>(&args_str)
-                        .map(|a| vec![a.url])
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                // 本轮第一张 web 卡走到这里时，按 tool_call 原序一次性发出全部 web 卡的
+                // loading 帧：第一张卡的绝对位置与逐条执行时一致，第 2..N 张卡提前到这里
+                // 与它一起转圈（因此相对中途出现的 todowrite / subagent 帧可能前移），
+                // 配合下面的并发执行，所有卡会同时进入转圈态。
+                if !web_loadings_emitted {
+                    web_loadings_emitted = true;
+                    // 多张卡一次 emit,减少 view tree 重排次数(与流式占位卡的 batch 约定一致)。
+                    let loading_msgs: Vec<api::Message> = web_call_order
+                        .iter()
+                        .filter_map(|web_call_id| {
+                            let ui = web_call_uis.get(web_call_id)?;
+                            let mut loading_msg = if ui.is_search {
+                                make_web_search_searching_message(
+                                    &current_task_id,
+                                    &request_id,
+                                    ui.preview_query.clone(),
+                                )
+                            } else {
+                                make_web_fetch_fetching_message(
+                                    &current_task_id,
+                                    &request_id,
+                                    ui.preview_urls.clone(),
+                                )
+                            };
+                            loading_msg.id = ui.msg_id.clone();
+                            Some(loading_msg)
+                        })
+                        .collect();
+                    if !loading_msgs.is_empty() {
+                        yield Ok(make_add_messages_event(&current_task_id, loading_msgs));
+                    }
+                }
 
-                // Searching/Fetching loading 帧与最终 Success/Error 帧必须共用同一个
-                // message.id —— `block.rs::handle_web_search_messages` 按 id 复用
-                // WebSearchView,id 不同会创建两张独立卡。
-                let web_msg_id = Uuid::new_v4().to_string();
-                let mut loading_msg = if is_search {
-                    make_web_search_searching_message(
-                        &current_task_id,
-                        &request_id,
-                        preview_query.clone(),
-                    )
-                } else {
-                    make_web_fetch_fetching_message(
-                        &current_task_id,
-                        &request_id,
-                        preview_urls.clone(),
-                    )
-                };
-                loading_msg.id = web_msg_id.clone();
-                yield Ok(make_add_messages_event(&current_task_id, vec![loading_msg]));
+                // loading 帧与最终 Success/Error 帧必须共用同一个 message.id ——
+                // `block.rs::handle_web_search_messages` 按 id 复用 WebSearchView，
+                // id 不同会创建两张独立卡。
+                let (is_search, web_msg_id, preview_query, preview_urls) =
+                    match web_call_uis.get(&call.call_id) {
+                        Some(ui) => (
+                            ui.is_search,
+                            ui.msg_id.clone(),
+                            ui.preview_query.clone(),
+                            ui.preview_urls.clone(),
+                        ),
+                        // 预启动循环与本分支用同一个谓词，理论不可达。真发生时用空预览 +
+                        // 新 id 走完协议路径，最多是这张卡没有 loading 帧。
+                        None => {
+                            log::warn!(
+                                "[byop] web card missing prebuilt UI metadata: call_id={}",
+                                call.call_id
+                            );
+                            (
+                                call.fn_name == tools::websearch::TOOL_NAME,
+                                Uuid::new_v4().to_string(),
+                                String::new(),
+                                Vec::new(),
+                            )
+                        }
+                    };
 
-                let result_json = dispatch_byop_web_tool(&call.fn_name, &args_str).await;
+                // 取本轮预启动的并发结果：先到的先缓存，等待期间其余 web 请求继续推进。
+                let result_json = loop {
+                    if let Some(result) = finished_web_tool_calls.remove(&call.call_id) {
+                        break result;
+                    }
+                    match pending_web_tool_calls.next().await {
+                        Some((call_id, result)) => {
+                            finished_web_tool_calls.insert(call_id, result);
+                        }
+                        None => {
+                            // 预启动集合里没有这一条（理论不可达），退回串行执行兜底。
+                            log::warn!(
+                                "[byop] web tool missing from concurrent prefetch set, \
+                                 falling back to serial: call_id={}",
+                                call.call_id
+                            );
+                            break dispatch_byop_web_tool(&call.fn_name, &args_str).await;
+                        }
+                    }
+                };
 
                 let mut done_msg = if is_search {
                     make_web_search_status_from_result(
@@ -4559,11 +4634,7 @@ pub async fn generate_byop_output(
                     // ToolCall 的 `tool` oneof 留 None(没有合适的结构化 variant),原始
                     // fn_name + args_str 通过 server_message_data 携带,
                     // serialize_outgoing_tool_call 的 carrier 分支会优先还原。
-                    let args_str = if call.fn_arguments.is_string() {
-                        call.fn_arguments.as_str().unwrap_or("").to_owned()
-                    } else {
-                        call.fn_arguments.to_string()
-                    };
+                    let args_str = tool_call_args_str(&call);
                     log::warn!(
                         "[byop] tool_call parse failed → emit synthetic error tool_result: \
                          tool={} call_id={} err={e:#}",
@@ -4874,6 +4945,40 @@ fn make_append_event(task_id: &str, message_id: &str, kind: AppendKind) -> api::
     }
 }
 
+/// 一张 BYOP web 卡的 UI 元数据，在执行并发预启动时一次性准备好。
+///
+/// loading 帧与最终 Success / Error 帧必须共用同一个 `msg_id`：
+/// `block.rs::handle_web_search_messages` / `handle_web_fetch_messages` 按 message.id
+/// 复用 view，id 不同会渲染成两张并排卡。
+struct WebCallUi {
+    is_search: bool,
+    msg_id: String,
+    preview_query: String,
+    preview_urls: Vec<String>,
+}
+
+/// 判断一次 tool call 是否由 BYOP 在本地拦截执行(`websearch` / `webfetch`)。
+///
+/// 这个判断同时决定"是否下发给模型"、"是否跳过流式占位卡"、"是否走本地执行分支"。
+/// 必须是唯一事实源:并发预启动集合与执行分支若用不同谓词,调用会被误判成普通工具,
+/// 交给 `parse_incoming_tool_call` 后变成 unknown tool,web 工具根本不会执行。
+fn is_byop_web_tool(fn_name: &str) -> bool {
+    fn_name == tools::webfetch::TOOL_NAME || fn_name == tools::websearch::TOOL_NAME
+}
+
+/// 把 genai `ToolCall.fn_arguments` 还原成协议要求的 JSON 字符串。
+///
+/// `fn_arguments` 是 `Value`:provider 可能给字符串,也可能给已解析的对象,两种都要
+/// 转成 `tools::*` 的 `from_args` 期望的 `&str`。所有读取点必须共用这一套逻辑,否则
+/// 某处漏判会把对象二次序列化成 `"\"{...}\""`,上游模型只能看到 invalid_arguments。
+fn tool_call_args_str(call: &ToolCall) -> String {
+    if call.fn_arguments.is_string() {
+        call.fn_arguments.as_str().unwrap_or("").to_owned()
+    } else {
+        call.fn_arguments.to_string()
+    }
+}
+
 /// BYOP web 工具(`webfetch` / `websearch`)的本地分发器。
 ///
 /// 不通过 protobuf executor —— 直接在本地用 reqwest 跑 HTTP,把结构化结果
@@ -4930,11 +5035,7 @@ fn parse_incoming_tool_call(
 ) -> anyhow::Result<api::message::tool_call::Tool> {
     // genai ToolCall.fn_arguments 是 Value;tools::* 的 from_args 期望 &str,
     // 把 Value 序列化回字符串后传入(原协议就是字符串 JSON)。
-    let args_str = if call.fn_arguments.is_string() {
-        call.fn_arguments.as_str().unwrap_or("").to_owned()
-    } else {
-        call.fn_arguments.to_string()
-    };
+    let args_str = tool_call_args_str(call);
     if tools::mcp::is_mcp_function(&call.fn_name) {
         return tools::mcp::parse_mcp_tool_call(&call.fn_name, &args_str, mcp_ctx);
     }
