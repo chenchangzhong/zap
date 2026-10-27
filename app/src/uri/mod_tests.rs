@@ -35,9 +35,49 @@ fn markdown_routes_to_notebook() {
 }
 
 #[test]
-fn non_image_binary_still_executes_in_session() {
-    // 对照:不能被图片分支误伤 —— MP4 仍按既有策略在终端里执行。
-    let (_dir, path) = write_temp_file("clip.mp4", b"\x00\x00\x00\x18ftypmp42");
+fn non_image_binary_opens_with_system_default() {
+    // dmg / mp4 这类二进制既不能当文本打开,也不该落进终端执行。
+    for name in ["installer.dmg", "clip.mp4"] {
+        let (_dir, path) = write_temp_file(name, b"binary");
+        assert_eq!(
+            classify_open_file_action(&path),
+            OpenFileAction::OpenWithSystemDefault,
+            "{name} should be handed to the OS default application"
+        );
+    }
+}
+
+#[test]
+fn unknown_extension_binary_content_opens_with_system_default() {
+    // 白名单外的新格式:扩展名判不出来,靠文件头兜底。
+    let (_dir, path) = write_temp_file("payload.bin2", &[0x00, 0x01, 0x02, 0xFF, 0x00]);
+    assert_eq!(
+        classify_open_file_action(&path),
+        OpenFileAction::OpenWithSystemDefault
+    );
+}
+
+#[test]
+fn unknown_extension_text_content_stays_in_editor() {
+    let (_dir, path) = write_temp_file("notes.bin2", b"hello world\n");
+    assert_eq!(classify_open_file_action(&path), OpenFileAction::Editor);
+}
+
+#[test]
+fn empty_unknown_extension_stays_in_editor() {
+    // 空文件不能被内容嗅探误判成二进制(否则新建的空文件会交给系统程序)。
+    let (_dir, path) = write_temp_file("empty.bin2", b"");
+    assert_eq!(classify_open_file_action(&path), OpenFileAction::Editor);
+}
+
+#[test]
+#[cfg(unix)]
+fn executable_script_still_executes_in_session() {
+    // 对照:可执行脚本仍按既有语义在终端里执行,不能被二进制分支误伤。
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, path) = write_temp_file("run.sh", b"#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
         classify_open_file_action(&path),
         OpenFileAction::ExecuteInSession

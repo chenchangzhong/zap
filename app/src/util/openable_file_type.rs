@@ -263,6 +263,24 @@ mod tests {
     }
 
     #[test]
+    fn test_expanded_binary_extensions_not_openable() {
+        // 新增的常见二进制格式:文件树/编辑器/搜索都不该把它们当文本。
+        for name in [
+            "photo.heic",
+            "clip.webm",
+            "bundle.zst",
+            "app.apk",
+            "data.parquet",
+            "model.onnx",
+        ] {
+            assert!(
+                is_file_openable_in_warp(Path::new(name)).is_none(),
+                "{name} should be treated as binary"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(feature = "local_fs")]
     fn test_open_code_panels_file_editor_default_is_warp() {
         use crate::util::file::external_editor::settings::OpenCodePanelsFileEditor;

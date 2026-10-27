@@ -13,8 +13,8 @@ use crate::root_view::{open_new_window_get_handles, OpenLaunchConfigArg};
 use crate::server::ids::ServerId;
 use crate::server::telemetry::{LaunchConfigUiLocation, TelemetryEvent};
 use crate::util::openable_file_type::{
-    is_file_openable_in_warp, is_markdown_file, is_runnable_shell_script, is_supported_image_file,
-    starts_with_shebang,
+    is_file_content_binary, is_file_openable_in_warp, is_markdown_file, is_runnable_shell_script,
+    is_supported_image_file, starts_with_shebang,
 };
 use crate::workspace::active_terminal_in_window;
 use crate::workspace::{Workspace, WorkspaceAction, WorkspaceRegistry};
@@ -749,13 +749,17 @@ enum OpenFileAction {
     /// Open in Zap's code/text editor pane, or in the in-app image viewer for images
     /// (`resolve_file_target_to_open_in_warp` decides which).
     Editor,
-    /// Open a session at the parent directory and queue the file as the pending command,
-    /// or just open a session at the directory path if `path` is a directory.
+    /// Open an executable script in a terminal, or open a session at `path` when it is a
+    /// directory.
     ExecuteInSession,
+    /// Hand the file to the OS default application. Used for binary files that are neither
+    /// scripts nor viewable in Zap (disk images, archives, documents, media…); opening a
+    /// terminal and executing them is never useful.
+    OpenWithSystemDefault,
 }
 
-/// Pure routing decision for `open_file`. Extracted so it can be unit-tested without
-/// standing up a full `AppContext`.
+/// Routing decision for `open_file`. Unknown extensions get a 1KB content sniff (see
+/// `is_file_content_binary`), so tests must create real files.
 fn classify_open_file_action(path: &Path) -> OpenFileAction {
     if is_markdown_file(path) {
         return OpenFileAction::Notebook;
@@ -768,29 +772,32 @@ fn classify_open_file_action(path: &Path) -> OpenFileAction {
         // shebang scripts that `is_file_openable_in_warp` rejects on extension alone
         // (e.g. an extensionless `#!/bin/sh` file without the user-execute bit) so
         // they don't fall through to the executor and produce a `permission denied`.
-        // Images are binary files, so `is_file_openable_in_warp` rejects them too; without
-        // the image branch a PNG opened from dsh / a `file://` URL fell through to
-        // `ExecuteInSession`, which opened a terminal at its parent directory and tried to
-        // execute the image as a command. `resolve_file_target_to_open_in_warp` then routes
-        // them to the in-app image viewer (see `OpenFileAction::Editor` below).
-        if is_file_openable_in_warp(path).is_some()
-            || is_supported_image_file(path)
-            || starts_with_shebang(path)
-        {
+        if is_supported_image_file(path) || starts_with_shebang(path) {
             return OpenFileAction::Editor;
         }
+        if is_file_openable_in_warp(path).is_some() {
+            // 扩展名白名单之外的新二进制格式(apk/webm/heic…)会被 `is_binary_file` 当作
+            // 文本;读 1KB 文件头兜底,避免把二进制塞进代码编辑器。文本文件多读这一点点
+            // 成本可以忽略。
+            if is_file_content_binary(path) {
+                return OpenFileAction::OpenWithSystemDefault;
+            }
+            return OpenFileAction::Editor;
+        }
+        // 其余是二进制白名单里的普通文件(dmg/zip/pdf/mp4/exe…):既不能当文本打开,
+        // 也不该在终端里执行 —— 交给系统默认程序。
+        return OpenFileAction::OpenWithSystemDefault;
     }
     OpenFileAction::ExecuteInSession
 }
 
 /// Handle an incoming `file://` URL or a dsh file link.
 /// * Markdown files are opened as notebook panes.
-/// * For directories, open a new session at the directory path.
-/// * For other files, open a new session at the parent directory path, then possibly execute the
-///   file.
+/// * Executable scripts run in a terminal; directories open a session at their path.
+/// * Binary files (`.dmg`, `.zip`, …) are handed to the OS default application.
 ///
 /// `line_col` 来自 `path:line` 形式的链接(dsh 代码引用);只有编辑器分支会用它定位,
-/// notebook / session 分支忽略。
+/// notebook / system-default 分支忽略。
 pub(crate) fn open_file(
     window_id: Option<WindowId>,
     path: PathBuf,
@@ -861,6 +868,8 @@ pub(crate) fn open_file(
                 }
             }
         }
+    } else if action == OpenFileAction::OpenWithSystemDefault {
+        ctx.open_file_path(&path);
     } else {
         let directory_path = if path.is_file() {
             match path.parent() {
