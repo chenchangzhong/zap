@@ -427,6 +427,160 @@ fn byop_fork_repair_records_translate_existing_repair_keys() {
     );
 }
 
+/// 带真实 tool 的 assistant tool call 消息:`tool: None` 的 tool call 不会生成
+/// client output message,恢复后不属于任何 exchange,无法用来复现 rewind 截断。
+fn byop_run_shell_tool_call_message(message_id: &str, call_id: &str) -> api::Message {
+    use api::message::tool_call::run_shell_command::WaitUntilCompleteValue;
+
+    api::Message {
+        id: message_id.to_owned(),
+        task_id: "root-task".to_owned(),
+        server_message_data: String::new(),
+        citations: vec![],
+        message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+            tool_call_id: call_id.to_owned(),
+            tool: Some(api::message::tool_call::Tool::RunShellCommand(
+                api::message::tool_call::RunShellCommand {
+                    command: "echo hi".to_owned(),
+                    is_read_only: true,
+                    uses_pager: false,
+                    is_risky: false,
+                    citations: vec![],
+                    wait_until_complete_value: Some(WaitUntilCompleteValue::WaitUntilComplete(
+                        true,
+                    )),
+                    risk_category: 0,
+                },
+            )),
+        })),
+        request_id: "request-2".to_owned(),
+        timestamp: None,
+    }
+}
+
+/// 构造 rewind 用例的会话:三轮 request,第二轮里有一个带真实 tool 的 assistant tool call,
+/// 第三轮用来把 rewind 点放到 tool call 之后。
+fn byop_rewind_fixture_conversation() -> crate::ai::agent::conversation::AIConversation {
+    crate::ai::agent::conversation::AIConversation::new_restored(
+        AIConversationId::new(),
+        vec![byop_test_task(
+            "root-task",
+            vec![
+                byop_user_query_message("user-query-1", "request-1", "first turn", None),
+                byop_user_query_message("user-query-2", "request-2", "second turn", None),
+                byop_run_shell_tool_call_message("assistant-1", "call-a"),
+                byop_user_query_message("user-query-3", "request-3", "third turn", None),
+            ],
+        )],
+        Some(empty_agent_conversation_data_for_test()),
+    )
+    .expect("conversation should restore")
+}
+
+/// 恢复会话 → 模拟 controller preflight 追加真实 tool result → rewind 到第 `truncate_index`
+/// 个 exchange。返回会话 id 与 root task id,供调用方断言保留下来的消息。
+fn restore_and_rewind_byop_fixture(
+    app: &mut warpui::App,
+    history_model: &warpui::ModelHandle<BlocklistAIHistoryModel>,
+    truncate_index: usize,
+) -> AIConversationId {
+    let conversation = byop_rewind_fixture_conversation();
+    let conversation_id = conversation.id();
+    let task_id = conversation.get_root_task_id().clone();
+    let exchange_ids = conversation
+        .root_task_exchanges()
+        .map(|exchange| exchange.id)
+        .collect::<Vec<_>>();
+    assert_eq!(exchange_ids.len(), 3, "expected three exchanges");
+
+    history_model.update(app, |model, ctx| {
+        model.restore_conversations(EntityId::new(), vec![conversation], ctx);
+    });
+
+    // preflight 把可用结果直接追加进 source messages(不经 response stream)。
+    history_model.update(app, |model, ctx| {
+        model
+            .conversation_mut(&conversation_id)
+            .expect("conversation should exist")
+            .append_byop_preflight_messages_to_task(
+                task_id,
+                vec![byop_tool_result_message(
+                    "root-task",
+                    "preflight-result",
+                    "call-a",
+                )],
+                ctx,
+            )
+            .expect("preflight result should be appended");
+    });
+
+    history_model.update(app, |model, ctx| {
+        model
+            .truncate_conversation_from_exchange(conversation_id, exchange_ids[truncate_index], ctx)
+            .expect("truncation should succeed");
+    });
+
+    conversation_id
+}
+
+fn retained_message_ids(
+    app: &warpui::App,
+    history_model: &warpui::ModelHandle<BlocklistAIHistoryModel>,
+    conversation_id: AIConversationId,
+) -> Vec<String> {
+    history_model.read(app, |model, _| {
+        model
+            .conversation(&conversation_id)
+            .expect("conversation should still exist")
+            .get_root_task()
+            .expect("root task should be retained")
+            .messages()
+            .map(|message| message.id.clone())
+            .collect()
+    })
+}
+
+/// rewind 按 exchange 截断 history:BYOP preflight 追加的 tool result 归属其 tool call 所在的
+/// exchange,因此 rewind 到该 exchange 时两者一起消失(否则会留下"只有 result 没有 call"的孤立
+/// 消息,使后续请求被 readiness 永久阻断 `OrphanToolResult`);rewind 到更晚的 exchange 时两者
+/// 都必须保留。
+#[test]
+fn byop_preflight_tool_result_follows_its_exchange_on_rewind() {
+    App::test((), |mut app| async move {
+        // preflight 追加消息要求 sqlite sender 可用,因此不用默认的 mock 句柄。
+        initialize_settings_for_tests(&mut app);
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(16);
+        let mut global_resource_handles = GlobalResourceHandles::mock(&mut app);
+        global_resource_handles.model_event_sender = Some(sender);
+        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+
+        // rewind 到第三轮(在 tool call 之后):tool call 与它的 result 都必须保留。
+        let kept_conversation = restore_and_rewind_byop_fixture(&mut app, &history_model, 2);
+        let kept_message_ids = retained_message_ids(&app, &history_model, kept_conversation);
+        assert!(kept_message_ids.contains(&"assistant-1".to_owned()));
+        assert!(
+            kept_message_ids.contains(&"preflight-result".to_owned()),
+            "rewind point after the tool call must not drop the preflight result"
+        );
+        assert!(!kept_message_ids.contains(&"user-query-3".to_owned()));
+
+        // rewind 到第二轮(tool call 所在 exchange):两者必须一起被移除。
+        let removed_conversation = restore_and_rewind_byop_fixture(&mut app, &history_model, 1);
+        let removed_message_ids = retained_message_ids(&app, &history_model, removed_conversation);
+        assert!(removed_message_ids.contains(&"user-query-1".to_owned()));
+        assert!(
+            !removed_message_ids.contains(&"assistant-1".to_owned()),
+            "truncated tool call must be removed"
+        );
+        assert!(
+            !removed_message_ids.contains(&"preflight-result".to_owned()),
+            "preflight tool result must be removed together with its tool call, \
+             otherwise it becomes an orphan result that blocks the next BYOP request"
+        );
+    });
+}
+
 #[test]
 fn test_ai_queries_for_terminal_view_up_arrow_history() {
     App::test((), |mut app| async move {

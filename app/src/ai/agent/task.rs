@@ -715,11 +715,61 @@ impl Task {
         Ok(())
     }
 
-    pub(super) fn append_source_messages(
+    /// BYOP preflight 直接向 task source 追加 tool result 消息(不经过 response stream
+    /// 渲染),同时把这些消息登记到**对应 tool call 所属 exchange 的 `added_message_ids`**。
+    ///
+    /// 登记是必须的:rewind 的 `truncate_from_exchange`、按 block 的 fork 都以
+    /// exchange 的 `added_message_ids` 作为 history 去留的唯一依据。未登记的 preflight
+    /// 消息在 rewind 后会残留在截断点之后,而它的 assistant tool call 已被移除,形成
+    /// "只有 result 没有 call" 的孤立 tool result,使后续 BYOP 请求被 readiness
+    /// 永久阻断(`OrphanToolResult`,用户只能新开会话)。
+    pub(super) fn append_byop_preflight_messages(
         &mut self,
         messages: Vec<api::Message>,
     ) -> Result<(), UpdateTaskError> {
+        let mut exchange_by_message_id = HashMap::new();
+        for exchange in &self.exchanges {
+            for message_id in &exchange.added_message_ids {
+                exchange_by_message_id.insert(message_id.clone(), exchange.id);
+            }
+        }
+        let mut exchange_by_tool_call_id = HashMap::new();
+        for message in self.messages() {
+            let Some(Message::ToolCall(tool_call)) = message.message.as_ref() else {
+                continue;
+            };
+            let message_id = MessageId::new(message.id.clone());
+            if let Some(exchange_id) = exchange_by_message_id.get(&message_id) {
+                exchange_by_tool_call_id.insert(tool_call.tool_call_id.clone(), *exchange_id);
+            }
+        }
+
+        let mut registered = Vec::new();
+        for message in &messages {
+            let Some(Message::ToolCallResult(result)) = message.message.as_ref() else {
+                continue;
+            };
+            match exchange_by_tool_call_id.get(&result.tool_call_id) {
+                Some(exchange_id) => {
+                    registered.push((MessageId::new(message.id.clone()), *exchange_id));
+                }
+                // 找不到 tool call 所属 exchange 时不强行归属:宁可维持现状(该消息
+                // 不被截断移除),也不要把它塞进错误的 exchange。
+                None => log::warn!(
+                    "[byop-readiness] preflight tool result has no assistant tool call in any \
+                     exchange task_id={} tool_call_id={}",
+                    message.task_id,
+                    result.tool_call_id
+                ),
+            }
+        }
+
         self.try_get_source_mut()?.messages.extend(messages);
+        for (message_id, exchange_id) in registered {
+            if let Some(exchange) = self.exchange_mut(exchange_id) {
+                exchange.added_message_ids.insert(message_id);
+            }
+        }
         Ok(())
     }
 

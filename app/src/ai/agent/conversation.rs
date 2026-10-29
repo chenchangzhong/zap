@@ -1785,7 +1785,9 @@ impl AIConversation {
             .map(|message| message.id.clone())
             .collect::<HashSet<_>>();
         self.task_store
-            .modify_task(&task_id, |task| task.append_source_messages(messages))
+            .modify_task(&task_id, |task| {
+                task.append_byop_preflight_messages(messages)
+            })
             .ok_or(UpdateConversationError::TaskNotFound)??;
         if let Err(e) = self.send_updated_conversation_state_for_byop_preflight(ctx) {
             if let Some(rollback_result) = self.task_store.modify_task(&task_id, |task| {
